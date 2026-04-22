@@ -8,3 +8,6 @@
 2026/04/21 Hermit
 添加sys_getdents64 功能：读取文件的目录项，并返回到userbuf
 添加sys_sleep
+添加dup2
+
+Todo: 跑一边basic的样例，看看原操作系统实现的系统调用如何

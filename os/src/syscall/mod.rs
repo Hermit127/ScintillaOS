@@ -18,8 +18,9 @@ const SYSCALL_WAITPID: usize = 260;
 
 const SYSCALL_GETDENTS64: usize = 61;
 const SYSCALL_FSTAT: usize = 80;
-//defined in our syscall table, but not implemented yet
 const SYSCALL_SLEEP: usize = 300;
+//defined in our syscall table, but not implemented yet
+
 
 
 mod fs;
