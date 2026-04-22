@@ -4,6 +4,7 @@
 
 其中,Kstat的部分参数是默认值，没有填入真实值
 目前没有做stat_buf的指针安全性检查
+
 2026/04/22 LYZ
 ext4 文件系统迁移（两阶段方案一次实现到读写可用）：
 1. 块设备层解耦：新增内核自有 `BlockDevice` trait，`virtio_blk` 与 `ram_blk` 改为实现内核 trait，不再依赖 easyfs。
@@ -23,3 +24,7 @@ ext4 文件系统迁移（两阶段方案一次实现到读写可用）：
 
 详细排错记录见：
 `documents/ext4_migration_detailed_log_2026-04-22.md`
+
+2026/04/22 Duyuheng
+添加brk功能与测试文件，调用负责动态调整进程的堆顶指针（program_brk），通过映射或解除映射物理页来扩展或收缩进程的数据段。
+

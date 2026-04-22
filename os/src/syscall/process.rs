@@ -193,6 +193,43 @@ pub fn sys_sigaction(
     }
 }
 
+pub fn sys_brk(brk_addr: usize) -> isize {
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+
+    if brk_addr == 0 {
+        return inner.program_brk as isize;
+    }
+
+    let heap_bottom = inner.heap_bottom;
+    if brk_addr < heap_bottom {
+        return -1;
+    }
+    
+    let old_brk = inner.program_brk;
+
+    let old_brk_page = (old_brk + crate::config::PAGE_SIZE - 1) /  crate::config::PAGE_SIZE;
+    let new_brk_page = (brk_addr + crate::config::PAGE_SIZE - 1) / crate::config::PAGE_SIZE;
+
+    if new_brk_page > old_brk_page {
+        let start_va = polyhal::VirtAddr::new(old_brk_page * crate::config::PAGE_SIZE);
+        let end_va = polyhal::VirtAddr::new(new_brk_page * crate::config::PAGE_SIZE);
+
+        let map_area = crate::mm::MapArea::new(
+            start_va,
+            end_va,
+            crate::mm::MapType::Framed,
+            crate::mm::MapPermission::R | crate::mm::MapPermission::W | crate::mm::MapPermission::U,
+        );
+        inner.memory_set.push(map_area, None);
+    }else if new_brk_page < old_brk_page {
+        let limit_va = polyhal::VirtAddr::new(new_brk_page * crate::config::PAGE_SIZE);
+        inner.memory_set.shrink_to(limit_va);
+    }
+
+    inner.program_brk = brk_addr;
+    brk_addr as isize
+}
 pub fn sys_sleep(duration: u64) -> isize {
     let task = current_task().unwrap();
     let wakeup_time = sys_get_time() + duration;

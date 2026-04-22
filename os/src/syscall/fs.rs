@@ -98,6 +98,23 @@ pub fn sys_dup(fd: usize) -> isize {
     new_fd as isize
 }
 
+pub fn sys_dup2(fd: usize, new_fd: usize) -> isize {
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    if fd >= inner.fd_table.len() || new_fd >= inner.fd_table.len() {
+        return -1;
+    }
+    if inner.fd_table[fd].is_none() {
+        return -1;
+    }
+    // if new_fd is already used, close it first
+    if inner.fd_table[new_fd].is_some() {
+        inner.fd_table[new_fd].take();
+    }
+    inner.fd_table[new_fd] = Some(Arc::clone(inner.fd_table[fd].as_ref().unwrap()));
+    new_fd as isize
+}
+
 pub fn sys_fstat(fd: usize, stat_buf: *mut u8) -> isize {
     let task = current_task().unwrap();
     let token = current_user_token();
