@@ -231,21 +231,13 @@ pub fn sys_brk(brk_addr: usize) -> isize {
     brk_addr as isize
 }
 pub fn sys_sleep(duration: u64) -> isize {
-    let task = current_task().unwrap();
-    let wakeup_time = sys_get_time() + duration;
-    {
-        let mut inner = task.inner_exclusive_access();
-        inner.sleeping = Some(wakeup_time);
-        drop(inner);
-    }
-    loop{
+    let wakeup_time = sys_get_time() + duration as isize;
+    loop {
         let now = sys_get_time();
-        if now >= wakeup_time{
+        if now >= wakeup_time {
             break;
         }
         sys_yield();
     }
-    let mut inner = task.inner_exclusive_access();
-    inner.sleeping = None;
     0
 }
