@@ -5,8 +5,8 @@ use core::{
 
 extern crate alloc;
 
-use easyfs::BlockDevice;
 use log::info;
+use super::BlockDevice;
 
 // 虚拟IO设备
 pub struct RamDiskBlock {

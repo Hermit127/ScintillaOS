@@ -117,3 +117,4 @@ pub fn sys_fstat(fd: usize, stat_buf: *mut u8) -> isize {
     } else {
         -1
     }
+}

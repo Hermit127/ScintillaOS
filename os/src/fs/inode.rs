@@ -1,11 +1,122 @@
-use super::{File, Kstat, S_IFREG};
-use crate::drivers::BLOCK_DEVICE;
+use super::{File, Kstat};
+use crate::drivers::{BlockDevice, BLOCK_DEVICE};
 use crate::sync::UPSafeCell;
+use alloc::format;
+use alloc::string::{String, ToString};
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 use bitflags::*;
-use easyfs::{EasyFileSystem, Inode};
+use ext4_rs::{Ext4, InodeFileType};
 use lazy_static::*;
+
+struct Ext4BlockDeviceAdapter {
+    inner: Arc<dyn BlockDevice>,
+}
+
+impl ext4_rs::BlockDevice for Ext4BlockDeviceAdapter {
+    fn read_offset(&self, offset: usize) -> Vec<u8> {
+        const SECTOR_SIZE: usize = 512;
+        const EXT4_BLOCK_SIZE: usize = ext4_rs::BLOCK_SIZE;
+        let sector_start = offset / SECTOR_SIZE;
+        let sector_offset = offset % SECTOR_SIZE;
+        let raw_len = sector_offset + EXT4_BLOCK_SIZE;
+        let sector_count = (raw_len + SECTOR_SIZE - 1) / SECTOR_SIZE;
+        let mut raw = vec![0u8; sector_count * SECTOR_SIZE];
+        for i in 0..sector_count {
+            let begin = i * SECTOR_SIZE;
+            self.inner
+                .read_block(sector_start + i, &mut raw[begin..begin + SECTOR_SIZE]);
+        }
+        raw[sector_offset..sector_offset + EXT4_BLOCK_SIZE].to_vec()
+    }
+
+    fn write_offset(&self, offset: usize, data: &[u8]) {
+        const SECTOR_SIZE: usize = 512;
+        let sector_start = offset / SECTOR_SIZE;
+        let sector_offset = offset % SECTOR_SIZE;
+        let raw_len = sector_offset + data.len();
+        let sector_count = (raw_len + SECTOR_SIZE - 1) / SECTOR_SIZE;
+        let mut raw = vec![0u8; sector_count * SECTOR_SIZE];
+        for i in 0..sector_count {
+            let begin = i * SECTOR_SIZE;
+            self.inner
+                .read_block(sector_start + i, &mut raw[begin..begin + SECTOR_SIZE]);
+        }
+        raw[sector_offset..sector_offset + data.len()].copy_from_slice(data);
+        for i in 0..sector_count {
+            let begin = i * SECTOR_SIZE;
+            self.inner
+                .write_block(sector_start + i, &raw[begin..begin + SECTOR_SIZE]);
+        }
+    }
+}
+
+lazy_static! {
+    static ref EXT4_FS: UPSafeCell<Ext4> = {
+        let device = Arc::new(Ext4BlockDeviceAdapter {
+            inner: BLOCK_DEVICE.clone(),
+        });
+        unsafe { UPSafeCell::new(Ext4::open(device)) }
+    };
+}
+
+fn with_ext4<R>(f: impl FnOnce(&Ext4) -> R) -> R {
+    let fs = EXT4_FS.exclusive_access();
+    f(&fs)
+}
+
+fn trim_cstr_suffix(path: &str) -> &str {
+    path.trim_end_matches('\0')
+}
+
+fn normalize_candidates(path: &str) -> Vec<String> {
+    let path = trim_cstr_suffix(path);
+    if path.is_empty() {
+        return Vec::new();
+    }
+    if path.starts_with('/') {
+        return vec![path.to_string()];
+    }
+    let mut out = vec![format!("/{}", path)];
+    if !path.contains('/') {
+        out.push(format!("/bin/{}", path));
+    }
+    out
+}
+
+fn normalize_create_path(path: &str) -> Option<String> {
+    let path = trim_cstr_suffix(path);
+    if path.is_empty() {
+        return None;
+    }
+    if path.starts_with('/') {
+        Some(path.to_string())
+    } else {
+        Some(format!("/{}", path))
+    }
+}
+
+fn lookup_inode(path: &str) -> Option<(u32, String)> {
+    for candidate in normalize_candidates(path) {
+        let inode = with_ext4(|fs| {
+            let mut parent = 2u32;
+            let mut off = 0u32;
+            fs.generic_open(
+                candidate.as_str(),
+                &mut parent,
+                false,
+                InodeFileType::S_IFREG.bits(),
+                &mut off,
+            )
+            .ok()
+        });
+        if let Some(inode_num) = inode {
+            return Some((inode_num, candidate));
+        }
+    }
+    None
+}
 
 pub struct OSInode {
     readable: bool,
@@ -15,63 +126,67 @@ pub struct OSInode {
 
 pub struct OSInodeInner {
     offset: usize,
-    inode: Arc<Inode>,
+    inode_num: u32,
 }
 
 impl OSInode {
-    pub fn new(readable: bool, writable: bool, inode: Arc<Inode>) -> Self {
+    pub fn new(readable: bool, writable: bool, inode_num: u32) -> Self {
         Self {
             readable,
             writable,
-            inner: unsafe { UPSafeCell::new(OSInodeInner { offset: 0, inode }) },
+            inner: unsafe {
+                UPSafeCell::new(OSInodeInner {
+                    offset: 0,
+                    inode_num,
+                })
+            },
         }
     }
+
     pub fn read_all(&self) -> Vec<u8> {
         let mut inner = self.inner.exclusive_access();
         let mut buffer = [0u8; 512];
-        let mut v: Vec<u8> = Vec::new();
+        let mut out = Vec::new();
         loop {
-            let len = inner.inode.read_at(inner.offset, &mut buffer);
+            let len = with_ext4(|fs| fs.read_at(inner.inode_num, inner.offset, &mut buffer).ok())
+                .unwrap_or(0);
             if len == 0 {
                 break;
             }
             inner.offset += len;
-            v.extend_from_slice(&buffer[..len]);
+            out.extend_from_slice(&buffer[..len]);
         }
-        v
+        out
     }
 
     fn stat_inner(&self) -> Kstat {
         let inner = self.inner.exclusive_access();
-        let mut st = Kstat::new(S_IFREG);
-        st.st_ino = Arc::as_ptr(&inner.inode) as usize as u64;
-        let mut offset = 0usize;
-        let mut block = [0u8; 512];
-        loop {
-            let len = inner.inode.read_at(offset, &mut block);
-            if len == 0 {
-                break;
-            }
-            offset += len;
-        }
-        st.st_size = offset as i64;
-        st.st_blocks = (offset as u64 + 511) / 512;
+        let inode_ref = with_ext4(|fs| fs.get_inode_ref(inner.inode_num));
+        let inode = inode_ref.inode;
+        let mut st = Kstat::new(inode.mode() as u32);
+        st.st_ino = inode_ref.inode_num as u64;
+        st.st_size = inode.size() as i64;
+        st.st_blksize = ext4_rs::BLOCK_SIZE as u32;
+        st.st_blocks = inode.blocks_count();
+        st.st_atime_sec = inode.atime() as i64;
+        st.st_mtime_sec = inode.mtime() as i64;
+        st.st_ctime_sec = inode.ctime() as i64;
         st
     }
 }
 
-lazy_static! {
-    pub static ref ROOT_INODE: Arc<Inode> = {
-        let efs = EasyFileSystem::open(BLOCK_DEVICE.clone());
-        Arc::new(EasyFileSystem::root_inode(&efs))
-    };
-}
-
 pub fn list_apps() {
     println!("/**** APPS ****");
-    for app in ROOT_INODE.ls() {
-        println!("{}", app);
-    }
+    with_ext4(|fs| {
+        if let Ok(bin_ino) = fs.ext4_dir_open("/bin") {
+            for entry in fs.ext4_dir_get_entries(bin_ino) {
+                let name = entry.get_name();
+                if name != "." && name != ".." && !name.is_empty() {
+                    println!("{}", name);
+                }
+            }
+        }
+    });
     println!("**************/");
 }
 
@@ -86,8 +201,8 @@ bitflags! {
 }
 
 impl OpenFlags {
-    /// Do not check validity for simplicity
-    /// Return (readable, writable)
+    /// Do not check validity for simplicity.
+    /// Return (readable, writable).
     pub fn read_write(&self) -> (bool, bool) {
         if self.is_empty() {
             (true, false)
@@ -99,48 +214,85 @@ impl OpenFlags {
     }
 }
 
-pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
+pub fn open_file(path: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
     let (readable, writable) = flags.read_write();
+
     if flags.contains(OpenFlags::CREATE) {
-        if let Some(inode) = ROOT_INODE.find(name) {
-            // clear size
-            inode.clear();
-            Some(Arc::new(OSInode::new(readable, writable, inode)))
-        } else {
-            // create file
-            ROOT_INODE
-                .create(name)
-                .map(|inode| Arc::new(OSInode::new(readable, writable, inode)))
-        }
-    } else {
-        ROOT_INODE.find(name).map(|inode| {
-            if flags.contains(OpenFlags::TRUNC) {
-                inode.clear();
+        let create_path = normalize_create_path(path)?;
+        let inode_num = with_ext4(|fs| {
+            let mut parent = 2u32;
+            let mut off = 0u32;
+            match fs.generic_open(
+                create_path.as_str(),
+                &mut parent,
+                false,
+                InodeFileType::S_IFREG.bits(),
+                &mut off,
+            ) {
+                Ok(existing) => {
+                    if flags.contains(OpenFlags::TRUNC) {
+                        let mut inode_ref = fs.get_inode_ref(existing);
+                        if fs.truncate_inode(&mut inode_ref, 0).is_err() {
+                            return None;
+                        }
+                    }
+                    Some(existing)
+                }
+                Err(_) => {
+                    let mut parent = 2u32;
+                    let mut off = 0u32;
+                    fs.generic_open(
+                        create_path.as_str(),
+                        &mut parent,
+                        true,
+                        InodeFileType::S_IFREG.bits(),
+                        &mut off,
+                    )
+                    .ok()
+                }
             }
-            Arc::new(OSInode::new(readable, writable, inode))
-        })
+        })?;
+        return Some(Arc::new(OSInode::new(readable, writable, inode_num)));
     }
+
+    let (inode_num, _) = lookup_inode(path)?;
+    if flags.contains(OpenFlags::TRUNC) {
+        let truncated = with_ext4(|fs| {
+            let mut inode_ref = fs.get_inode_ref(inode_num);
+            fs.truncate_inode(&mut inode_ref, 0).is_ok()
+        });
+        if !truncated {
+            return None;
+        }
+    }
+    Some(Arc::new(OSInode::new(readable, writable, inode_num)))
 }
 
 impl File for OSInode {
     fn readable(&self) -> bool {
         self.readable
     }
+
     fn writable(&self) -> bool {
         self.writable
     }
+
     fn read(&self, buf: &mut [u8]) -> usize {
         let mut inner = self.inner.exclusive_access();
-        let rsize = inner.inode.read_at(inner.offset, buf);
-        inner.offset += rsize;
-        rsize
+        let read_size = with_ext4(|fs| fs.read_at(inner.inode_num, inner.offset, buf).ok())
+            .unwrap_or(0);
+        inner.offset += read_size;
+        read_size
     }
+
     fn write(&self, buf: &mut [u8]) -> usize {
         let mut inner = self.inner.exclusive_access();
-        let wsize = inner.inode.write_at(inner.offset, buf);
-        inner.offset += wsize;
-        wsize
+        let write_size = with_ext4(|fs| fs.write_at(inner.inode_num, inner.offset, buf).ok())
+            .unwrap_or(0);
+        inner.offset += write_size;
+        write_size
     }
+
     fn stat(&self) -> Kstat {
         self.stat_inner()
     }
