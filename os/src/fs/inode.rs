@@ -303,7 +303,7 @@ impl File for OSInode {
     fn getdents64(&self, buf: &mut [u8]) -> isize {
         const DIRENT64_FIXED_SIZE: usize = 8 + 8 + 2 + 1;
         let mut inner = self.inner.exclusive_access();
-        let entries = inner.inode.ls();
+        let entries = with_ext4(|fs| fs.ext4_dir_get_entries(inner.inode_num));
         if inner.offset >= entries.len() {
             return 0;
         }
@@ -311,8 +311,9 @@ impl File for OSInode {
         let mut written = 0usize;
         let mut entry_index = inner.offset;
         while entry_index < entries.len() {
-            let name = entries[entry_index].as_bytes();
-            let record_size = Self::align_up(DIRENT64_FIXED_SIZE + name.len() + 1, 8);
+            let name = entries[entry_index].get_name();
+            let name_bytes = name.as_bytes();
+            let record_size = Self::align_up(DIRENT64_FIXED_SIZE + name_bytes.len() + 1, 8);
             if written + record_size > buf.len() {
                 if written == 0 {
                     return -1;
@@ -336,8 +337,8 @@ impl File for OSInode {
             record[18] = 0;
 
             let name_start = DIRENT64_FIXED_SIZE;
-            record[name_start..name_start + name.len()].copy_from_slice(name);
-            record[name_start + name.len()] = 0;
+            record[name_start..name_start + name_bytes.len()].copy_from_slice(name_bytes);
+            record[name_start + name_bytes.len()] = 0;
 
             written += record_size;
             entry_index += 1;

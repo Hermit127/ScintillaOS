@@ -28,3 +28,13 @@ ext4 文件系统迁移（两阶段方案一次实现到读写可用）：
 2026/04/22 Duyuheng
 添加brk功能与测试文件，调用负责动态调整进程的堆顶指针（program_brk），通过映射或解除映射物理页来扩展或收缩进程的数据段。
 
+2026/04/22 LYZ
+合并与运行问题修复：
+1. 处理 `git pull` 后的冲突文件，清理 `documents/worklog.md`、`os/src/fs/inode.rs`、`os/src/syscall/fs.rs` 中的合并标记。
+2. 修复 ext4 后端目录遍历实现，去掉 `OSInodeInner` 中不存在的 `inode` 字段访问，改为基于 `inode_num` 读取目录项。
+3. 简化 `sys_sleep` 实现，移除当前 `TaskControlBlockInner` 中不存在的 `sleeping` 状态记录，保留等待循环。
+4. 修正 `getdents64` 目录项名称类型转换问题，确保目录项写入缓冲区时使用字节切片。
+
+验证结果：
+- `cargo check -p os --target riscv64gc-unknown-none-elf` 已通过，仅保留既有 warning。
+
