@@ -67,6 +67,9 @@ pub struct TaskControlBlockInner {
     // if the task is frozen by a signal
     pub frozen: bool,
     pub trap_ctx_backup: Option<TrapFrame>,
+    // record the stack
+    pub heap_bottom: usize,
+    pub program_brk: usize,
 }
 
 impl TaskControlBlockInner {
@@ -125,6 +128,8 @@ impl TaskControlBlock {
         trace!("os::task::TaskControlBlock::new");
         // memory_set with elf program headers/trampoline/trap context/user stack
         let (memory_set, user_sp, entry_point) = MemorySet::from_elf(elf_data);
+
+        let heap_bottom = user_sp;
         // alloc a pid and a kernel stack in kernel space
         let pid_handle = pid_alloc();
         let kstack = KernelStack::new();
@@ -156,6 +161,9 @@ impl TaskControlBlock {
                     frozen: false,
                     trap_ctx_backup: None,
                     kernel_stack: kstack,
+                    // added
+                    heap_bottom,
+                    program_brk: heap_bottom,
                 })
             },
         };
@@ -169,6 +177,9 @@ impl TaskControlBlock {
         trace!("os::task::TaskControlBlock::exec");
         // memory_set with elf program headers/trampoline/trap context/user stack
         let (memory_set, mut user_sp, entry_point) = MemorySet::from_elf(elf_data);
+
+        let heap_bottom = user_sp;
+
         memory_set.activate();
         // push arguments on user stack
         user_sp -= (args.len() + 1) * core::mem::size_of::<usize>();
@@ -200,6 +211,10 @@ impl TaskControlBlock {
         let mut inner = self.inner_exclusive_access();
         // substitute memory_set
         inner.memory_set = memory_set;
+
+        // added
+        inner.heap_bottom = heap_bottom;
+        inner.program_brk = heap_bottom;
         // update trap_cx ppn
         // FIXME: This is a temporary solution
         inner.trap_cx = TrapFrame::new();
@@ -253,6 +268,8 @@ impl TaskControlBlock {
                     frozen: false,
                     trap_ctx_backup: None,
                     kernel_stack: kstack,
+                    heap_bottom: parent_inner.heap_bottom,
+                    program_brk: parent_inner.program_brk,
                 })
             },
         });

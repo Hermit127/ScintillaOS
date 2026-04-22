@@ -249,3 +249,7 @@ pub fn sigprocmask(mask: u32) -> isize {
 pub fn sigreturn() -> isize {
     sys_sigreturn()
 }
+
+pub fn brk(brk_addr: usize) -> isize {
+    sys_brk(brk_addr)
+}
