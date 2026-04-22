@@ -118,3 +118,30 @@ pub fn sys_fstat(fd: usize, stat_buf: *mut u8) -> isize {
         -1
     }
 }
+
+
+pub fn sys_getdents64(fd: usize, dirp: *mut u8, len: usize) -> isize {
+    if len == 0 {
+        return 0;
+    }
+    if dirp.is_null() {
+        return -1;
+    }
+    let task = current_task().unwrap();
+    let token = current_user_token();
+    let inner = task.inner_exclusive_access();
+    if fd >= inner.fd_table.len() {
+        return -1;
+    }
+    if let Some(file) = &inner.fd_table[fd] {
+        let file = file.clone();
+        drop(inner);
+        let user_buf = translated_byte_buffer(token, dirp, len);
+        file.getdents64(user_buf)
+    } else {
+        -1
+    }
+}
+
+
+

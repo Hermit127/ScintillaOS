@@ -62,6 +62,9 @@ pub trait File: Send + Sync {
     fn read(&self, buf: &mut [u8]) -> usize;
     fn write(&self, buf: &mut [u8]) -> usize;
     fn stat(&self) -> Kstat;
+    fn getdents64(&self, _buf: &mut [u8]) -> isize {
+        -1
+    }
 }
 
 pub use inode::{list_apps, open_file, OpenFlags};
