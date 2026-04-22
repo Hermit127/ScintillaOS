@@ -2,10 +2,8 @@ const SYSCALL_DUP: usize = 24;
 const SYSCALL_OPEN: usize = 56;
 const SYSCALL_CLOSE: usize = 57;
 const SYSCALL_PIPE: usize = 59;
-const SYSCALL_GETDENTS64: usize = 61;
 const SYSCALL_READ: usize = 63;
 const SYSCALL_WRITE: usize = 64;
-const SYSCALL_FSTAT: usize = 80;
 const SYSCALL_EXIT: usize = 93;
 const SYSCALL_YIELD: usize = 124;
 const SYSCALL_KILL: usize = 129;
@@ -17,6 +15,12 @@ const SYSCALL_GETPID: usize = 172;
 const SYSCALL_FORK: usize = 220;
 const SYSCALL_EXEC: usize = 221;
 const SYSCALL_WAITPID: usize = 260;
+
+const SYSCALL_GETDENTS64: usize = 61;
+const SYSCALL_FSTAT: usize = 80;
+//defined in our syscall table, but not implemented yet
+const SYSCALL_SLEEP: usize = 300;
+
 
 mod fs;
 mod process;
@@ -52,7 +56,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 3]) -> isize {
         SYSCALL_EXEC => sys_exec(args[0] as *const u8, args[1] as *const usize),
         SYSCALL_WAITPID => sys_waitpid(args[0] as isize, args[1] as *mut i32),
         SYSCALL_FSTAT => sys_fstat(args[0], args[1] as *mut u8),
-
+        SYSCALL_SLEEP => sys_sleep(args[0] as u64),
         _ => panic!("Unsupported syscall_id: {}", syscall_id),
     }
 }

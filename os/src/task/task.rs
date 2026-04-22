@@ -67,6 +67,7 @@ pub struct TaskControlBlockInner {
     // if the task is frozen by a signal
     pub frozen: bool,
     pub trap_ctx_backup: Option<TrapFrame>,
+    pub sleeping: Option<(Arc<TaskControlBlock>, usize)>,
 }
 
 impl TaskControlBlockInner {
@@ -156,6 +157,8 @@ impl TaskControlBlock {
                     frozen: false,
                     trap_ctx_backup: None,
                     kernel_stack: kstack,
+
+                    sleeping: None,
                 })
             },
         };
@@ -253,6 +256,8 @@ impl TaskControlBlock {
                     frozen: false,
                     trap_ctx_backup: None,
                     kernel_stack: kstack,
+                    //added by hermit
+                    sleeping: None,
                 })
             },
         });

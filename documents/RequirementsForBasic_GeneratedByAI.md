@@ -1,6 +1,24 @@
 你当前的测试集合来自 run-all.sh，一共这些 syscall 相关程序：
 brk, chdir, clone, close, dup2, dup, execve, exit, fork, fstat, getcwd, getdents, getpid, getppid, gettimeofday, mkdir_, mmap, mount, munmap, openat, open, pipe, read, sleep, times, umount, uname, unlink, wait, waitpid, write, yield。
 
+目前的evec和linux execve存在区别 
+目前还没有实现的：
+brk
+chdir
+clone
+dup2
+getcwd
+getppid
+mkdir
+mmap
+munmap
+openat
+
+unlink
+wait
+
+
+
 你的内核现状入口在 mod.rs、fs.rs、process.rs。
 
 重点先提醒一个大坑：

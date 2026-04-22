@@ -192,3 +192,23 @@ pub fn sys_sigaction(
         -1
     }
 }
+
+pub fn sys_sleep(duration: u64) -> isize {
+    let task = current_task().unwrap();
+    let wakeup_time = sys_get_time() + duration;
+    {
+        let mut inner = task.inner_exclusive_access();
+        inner.sleeping = Some(wakeup_time);
+        drop(inner);
+    }
+    loop{
+        let now = sys_get_time();
+        if now >= wakeup_time{
+            break;
+        }
+        sys_yield();
+    }
+    let mut inner = task.inner_exclusive_access();
+    inner.sleeping = None;
+    0
+}
