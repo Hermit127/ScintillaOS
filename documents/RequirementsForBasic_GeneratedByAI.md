@@ -54,6 +54,8 @@ getdents64
 至少返回一个合法 linux_dirent64 结构，d_reclen 对齐，d_name 非空。
 失败返回 -1。
 用例 getdents.c。
+
+
 mkdirat/mkdir、unlinkat/unlink、chdir、getcwd
 含义：目录与路径管理。
 最小实现：
@@ -63,6 +65,9 @@ getcwd(buf,size) 返回 buf，失败返回 NULL。
 mkdir 创建目录后可被 open(O_DIRECTORY) 打开。
 unlink 删除目录项后再次 open 失败。
 用例 chdir.c、getcwd.c、mkdir_.c、unlink.c。
+
+
+
 进程与调度
 
 fork
