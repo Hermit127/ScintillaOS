@@ -22,7 +22,7 @@ impl MemorySet {
     pub fn token(&self) -> PageTable {
         self.page_table.0
     }
-    fn push(&mut self, mut map_area: MapArea, data: Option<&[u8]>) {
+    pub fn push(&mut self, mut map_area: MapArea, data: Option<&[u8]>) {
         map_area.map(&self.page_table);
         if let Some(data) = data {
             map_area.copy_data(&self.page_table, data);
@@ -120,6 +120,16 @@ impl MemorySet {
     pub fn recycle_data_pages(&mut self) {
         //*self = Self::new_bare();
         self.areas.clear();
+    }
+    pub fn shrink_to(&mut self, limit_va: VirtAddr) {
+        self.areas.retain_mut(|area| {
+            if area.vaddr_range.get_start() >= limit_va {
+                area.unmap(&self.page_table);
+                false
+            } else {
+                true
+            }
+        });
     }
 }
 

@@ -135,8 +135,6 @@ pub fn sys_fstat(fd: usize, stat_buf: *mut u8) -> isize {
         -1
     }
 }
-
-
 pub fn sys_getdents64(fd: usize, dirp: *mut u8, len: usize) -> isize {
     if len == 0 {
         return 0;
@@ -159,6 +157,3 @@ pub fn sys_getdents64(fd: usize, dirp: *mut u8, len: usize) -> isize {
         -1
     }
 }
-
-
-

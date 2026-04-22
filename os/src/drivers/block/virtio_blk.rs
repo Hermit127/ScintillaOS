@@ -9,7 +9,7 @@ use log::debug;
 use polyhal::consts::VIRT_ADDR_START;
 use polyhal::pagetable::PAGE_SIZE;
 use polyhal::PhysAddr;
-use virtio_drivers::device::blk::VirtIOBlk;
+use virtio_drivers::device::blk::{SECTOR_SIZE, VirtIOBlk};
 use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
 use virtio_drivers::{BufferDirection, Hal};
 
@@ -31,12 +31,14 @@ unsafe impl Send for VirtIOBlock {}
 
 impl BlockDevice for VirtIOBlock {
     fn read_block(&self, block_id: usize, buf: &mut [u8]) {
+        assert_eq!(buf.len() % SECTOR_SIZE, 0);
         self.0
             .exclusive_access()
             .read_blocks(block_id, buf)
             .expect("Error when reading VirtIOBlk");
     }
     fn write_block(&self, block_id: usize, buf: &[u8]) {
+        assert_eq!(buf.len() % SECTOR_SIZE, 0);
         self.0
             .exclusive_access()
             .write_blocks(block_id, buf)

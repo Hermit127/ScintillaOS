@@ -35,6 +35,8 @@ KERNEL_ELF := target/$(TARGET)/$(MODE)/os
 KERNEL_BIN := $(KERNEL_ELF).bin
 DISASM_TMP := target/$(TARGET)/$(MODE)/asm
 FS_IMG := target/$(TARGET)/$(MODE)/fs.img
+ROOTFS_DIR := target/$(TARGET)/$(MODE)/rootfs
+ROOTFS_BIN_DIR := $(ROOTFS_DIR)/bin
 # FS_IMG := fs-img.img
 APPS := user/src/bin/*
 
@@ -75,7 +77,15 @@ $(KERNEL_BIN): kernel
 fs-img: $(APPS)
 	@cd user && make build TARGET=$(TARGET) TEST=$(TEST)
 	@rm -f $(FS_IMG)
-	@cargo install easyfs-packer && easyfs-packer -s user/src/bin/ -t target/$(TARGET)/release/
+	@rm -rf $(ROOTFS_DIR)
+	@mkdir -p $(ROOTFS_BIN_DIR)
+	@for src in user/src/bin/*.rs; do \
+		app=$$(basename $$src .rs); \
+		cp target/$(TARGET)/release/$$app $(ROOTFS_BIN_DIR)/; \
+	done
+	@dd if=/dev/zero of=$(FS_IMG) bs=1M count=128
+	@mke2fs -t ext4 -b 4096 -F -d $(ROOTFS_DIR) $(FS_IMG)
+	@tune2fs -O ^has_journal $(FS_IMG) >/dev/null 2>&1 || true
 	cp target/$(TARGET)/$(MODE)/fs.img fs-img.img
 
 $(APPS):

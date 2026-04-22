@@ -1,3 +1,4 @@
+mod device;
 #[cfg(any(target_arch = "x86_64", target_arch = "loongarch64"))]
 mod ram_blk;
 
@@ -7,8 +8,8 @@ mod virtio_blk;
 pub use virtio_blk::VirtIOBlock;
 
 use alloc::sync::Arc;
-use easyfs::BlockDevice;
 use lazy_static::*;
+pub use device::BlockDevice;
 
 #[cfg(any(target_arch = "x86_64", target_arch = "loongarch64"))]
 use ram_blk::RamDiskBlock;

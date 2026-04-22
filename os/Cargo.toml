@@ -17,7 +17,7 @@ buddy_system_allocator = "0.11.0"
 bitflags = "1.2.1"
 xmas-elf = "0.7.0"
 virtio-drivers = { git = "https://github.com/rcore-os/virtio-drivers", rev = "61ece50" }
-easyfs = "0.1"
+ext4_rs = "1.3.3"
 log = "0.4"
 fdt = "0.1.5"
 
