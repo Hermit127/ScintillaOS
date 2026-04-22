@@ -1,6 +1,24 @@
 你当前的测试集合来自 run-all.sh，一共这些 syscall 相关程序：
 brk, chdir, clone, close, dup2, dup, execve, exit, fork, fstat, getcwd, getdents, getpid, getppid, gettimeofday, mkdir_, mmap, mount, munmap, openat, open, pipe, read, sleep, times, umount, uname, unlink, wait, waitpid, write, yield。
 
+目前的evec和linux execve存在区别 
+目前还没有实现的：
+brk
+chdir
+clone
+dup2
+getcwd
+getppid
+mkdir
+mmap
+munmap
+openat
+
+unlink
+wait
+
+
+
 你的内核现状入口在 mod.rs、fs.rs、process.rs。
 
 重点先提醒一个大坑：
@@ -54,6 +72,8 @@ getdents64
 至少返回一个合法 linux_dirent64 结构，d_reclen 对齐，d_name 非空。
 失败返回 -1。
 用例 getdents.c。
+
+
 mkdirat/mkdir、unlinkat/unlink、chdir、getcwd
 含义：目录与路径管理。
 最小实现：
@@ -63,6 +83,9 @@ getcwd(buf,size) 返回 buf，失败返回 NULL。
 mkdir 创建目录后可被 open(O_DIRECTORY) 打开。
 unlink 删除目录项后再次 open 失败。
 用例 chdir.c、getcwd.c、mkdir_.c、unlink.c。
+
+
+
 进程与调度
 
 fork

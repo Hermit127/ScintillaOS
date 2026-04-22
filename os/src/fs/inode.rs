@@ -173,6 +173,10 @@ impl OSInode {
         st.st_ctime_sec = inode.ctime() as i64;
         st
     }
+
+    fn align_up(value: usize, align: usize) -> usize {
+        (value + align - 1) & !(align - 1)
+    }
 }
 
 pub fn list_apps() {
@@ -216,7 +220,6 @@ impl OpenFlags {
 
 pub fn open_file(path: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
     let (readable, writable) = flags.read_write();
-
     if flags.contains(OpenFlags::CREATE) {
         let create_path = normalize_create_path(path)?;
         let inode_num = with_ext4(|fs| {
@@ -295,5 +298,52 @@ impl File for OSInode {
 
     fn stat(&self) -> Kstat {
         self.stat_inner()
+    }
+
+    fn getdents64(&self, buf: &mut [u8]) -> isize {
+        const DIRENT64_FIXED_SIZE: usize = 8 + 8 + 2 + 1;
+        let mut inner = self.inner.exclusive_access();
+        let entries = inner.inode.ls();
+        if inner.offset >= entries.len() {
+            return 0;
+        }
+
+        let mut written = 0usize;
+        let mut entry_index = inner.offset;
+        while entry_index < entries.len() {
+            let name = entries[entry_index].as_bytes();
+            let record_size = Self::align_up(DIRENT64_FIXED_SIZE + name.len() + 1, 8);
+            if written + record_size > buf.len() {
+                if written == 0 {
+                    return -1;
+                }
+                break;
+            }
+
+            let record = &mut buf[written..written + record_size];
+            record.fill(0);
+
+            let d_ino = (entry_index as u64) + 1;
+            record[0..8].copy_from_slice(&d_ino.to_le_bytes());
+
+            let d_off = (entry_index as i64) + 1;
+            record[8..16].copy_from_slice(&d_off.to_le_bytes());
+
+            let d_reclen = record_size as u16;
+            record[16..18].copy_from_slice(&d_reclen.to_le_bytes());
+
+            // easyfs currently does not expose a stable per-entry type here.
+            record[18] = 0;
+
+            let name_start = DIRENT64_FIXED_SIZE;
+            record[name_start..name_start + name.len()].copy_from_slice(name);
+            record[name_start + name.len()] = 0;
+
+            written += record_size;
+            entry_index += 1;
+        }
+
+        inner.offset = entry_index;
+        written as isize
     }
 }
