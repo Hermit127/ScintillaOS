@@ -70,6 +70,7 @@ pub struct TaskControlBlockInner {
     // record the stack
     pub heap_bottom: usize,
     pub program_brk: usize,
+    pub sleeping : Option<u64>,
 }
 
 impl TaskControlBlockInner {
@@ -164,6 +165,7 @@ impl TaskControlBlock {
                     // added
                     heap_bottom,
                     program_brk: heap_bottom,
+                    sleeping: None,
                 })
             },
         };
@@ -270,6 +272,7 @@ impl TaskControlBlock {
                     kernel_stack: kstack,
                     heap_bottom: parent_inner.heap_bottom,
                     program_brk: parent_inner.program_brk,
+                    sleeping: None,
                 })
             },
         });
