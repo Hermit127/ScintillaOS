@@ -63,8 +63,9 @@ bitflags! {
         const RDONLY = 0;
         const WRONLY = 1 << 0;
         const RDWR = 1 << 1;
-        const CREATE = 1 << 9;
-        const TRUNC = 1 << 10;
+        const CREATE = 0x40;
+        const TRUNC = 0x200;
+        const DIRECTORY = 0x10000;
     }
 }
 
@@ -73,6 +74,9 @@ pub fn dup(fd: usize) -> isize {
 }
 pub fn open(path: &str, flags: OpenFlags) -> isize {
     sys_open(path, flags.bits)
+}
+pub fn openat(dirfd: isize, path: &str, flags: OpenFlags, mode: u32) -> isize {
+    sys_openat(dirfd, path, flags.bits, mode)
 }
 pub fn close(fd: usize) -> isize {
     sys_close(fd)
