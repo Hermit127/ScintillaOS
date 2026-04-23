@@ -1,5 +1,6 @@
 use crate::fs::{open_file, OpenFlags};
 use crate::mm::{translated_ref, translated_refmut, translated_str};
+use crate::mm::MapPermission;
 use crate::task::{
     add_task, current_task, current_user_token, exit_current_and_run_next, pid2task,
     suspend_current_and_run_next, SignalAction, SignalFlags, MAX_SIG,
@@ -10,6 +11,17 @@ use alloc::vec::Vec;
 use log::info;
 use polyhal::time::Time;
 use polyhal_trap::trapframe::TrapFrameArgs;
+
+// permission
+const PROT_NONE: usize = 0;
+const PROT_READ: usize = 1;
+const PROT_WRITE: usize = 2;
+const PROT_EXEC: usize = 4;
+
+// signal
+const MAP_SHARED: usize = 0x01;
+const MAP_PRIVATE: usize = 0x02;
+const MAP_ANONYMOUS: usize = 0x20;
 
 pub fn sys_exit(exit_code: i32) -> ! {
     exit_current_and_run_next(exit_code);
@@ -241,4 +253,66 @@ pub fn sys_sleep(duration: u64) -> isize {
         sys_yield();
     }
     0
+}
+
+fn get_map_permission(prot: usize) -> MapPermission {
+    let mut perm = MapPermission::U; 
+    if prot & PROT_READ != 0 { perm |= MapPermission::R; }
+    if prot & PROT_WRITE != 0 { perm |= MapPermission::W; }
+    if prot & PROT_EXEC != 0 { perm |= MapPermission::X; }
+    perm
+}
+
+pub fn sys_mmap(
+    start: usize,
+    len: usize,
+    prot: usize,
+    flags: usize,
+    fd: i32,
+    offset: usize,
+) -> isize {
+    if start % crate::config::PAGE_SIZE != 0 || len == 0 {
+        return -1;
+    }
+
+    let task = crate::task::current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+
+    let permission = get_map_permission(prot);
+
+    let start_addr = polyhal::VirtAddr::from(start);
+    let end_addr = polyhal::VirtAddr::from(start + len);
+    
+    let start_vaddr_aligned = start_addr.floor(); 
+    let end_vaddr_aligned = end_addr.ceil();
+
+    if inner.memory_set.is_overlap(start_vaddr_aligned, end_vaddr_aligned) {
+        return -1;
+    }
+
+    if (flags & MAP_ANONYMOUS) != 0 {
+        inner.memory_set.insert_framed_area(start_addr, end_addr, permission);
+        return start as isize;
+    } else {
+        if fd < 0 || fd as usize >= inner.fd_table.len() {
+            return -1;
+        }
+        
+        if let Some(file) = inner.fd_table[fd as usize].clone() {
+            let ok = inner.memory_set.insert_file_area(
+                start_addr, 
+                end_addr, 
+                permission, 
+                file, 
+                offset
+            );
+            if ok {
+                return start as isize;
+            } else {
+                return -1;
+            }
+        } else {
+            return -1;
+        }
+    }
 }

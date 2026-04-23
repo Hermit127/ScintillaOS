@@ -131,6 +131,48 @@ impl MemorySet {
             }
         });
     }
+    pub fn insert_framed_area(
+        &mut self, 
+        start_addr: polyhal::VirtAddr, 
+        end_addr: polyhal::VirtAddr, 
+        permission: MapPermission
+    ) {
+        let mut map_area = MapArea::new(start_addr, end_addr, MapType::Framed, permission);
+        map_area.map(&self.page_table);
+        self.areas.push(map_area);
+    }
+    pub fn insert_file_area(
+        &mut self,
+        start_addr: polyhal::VirtAddr,
+        end_addr: polyhal::VirtAddr,
+        permission: MapPermission,
+        file: alloc::sync::Arc<dyn crate::fs::File>, 
+        _offset: usize
+    ) -> bool {
+        self.insert_framed_area(start_addr, end_addr, permission);
+        
+        let area = self.areas.last().unwrap();
+        
+        for vaddr in area.vaddr_range.clone() {
+            let (paddr, _flags) = self.page_table.translate(vaddr).unwrap();
+            
+            let page_content = paddr.slice_mut_with_len(crate::config::PAGE_SIZE);
+            
+            let read_len = file.read(page_content);
+            if read_len == 0 {
+                break;
+            }
+        }
+        true
+    }
+    pub fn is_overlap(&self, start_addr: polyhal::VirtAddr, end_addr: polyhal::VirtAddr) -> bool {
+        for area in self.areas.iter() {
+            if start_addr < area.vaddr_range.get_end() && end_addr > area.vaddr_range.get_start() {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 pub struct MapArea {
