@@ -70,36 +70,56 @@ fn trim_cstr_suffix(path: &str) -> &str {
     path.trim_end_matches('\0')
 }
 
-fn normalize_candidates(path: &str) -> Vec<String> {
-    let path = trim_cstr_suffix(path);
-    if path.is_empty() {
-        return Vec::new();
+fn strip_relative_prefix(mut path: &str) -> &str {
+    while path.starts_with("./") {
+        path = &path[2..];
     }
-    if path.starts_with('/') {
-        return vec![path.to_string()];
-    }
-    let mut out = vec![format!("/{}", path)];
-    if !path.contains('/') {
-        out.push(format!("/bin/{}", path));
-    }
-    out
+    path
 }
 
-fn normalize_create_path(path: &str) -> Option<String> {
-    let path = trim_cstr_suffix(path);
+fn join_dir_and_name(base: &str, rel: &str) -> String {
+    if base == "/" {
+        format!("/{}", rel)
+    } else {
+        format!("{}/{}", base.trim_end_matches('/'), rel)
+    }
+}
+
+fn normalize_path(base_dir: Option<&str>, path: &str) -> Option<String> {
+    let path = strip_relative_prefix(trim_cstr_suffix(path));
     if path.is_empty() {
         return None;
     }
     if path.starts_with('/') {
-        Some(path.to_string())
-    } else {
-        Some(format!("/{}", path))
+        return Some(path.to_string());
     }
+    if path == "." {
+        return Some(base_dir.unwrap_or("/").to_string());
+    }
+    Some(match base_dir {
+        Some(base) => join_dir_and_name(base, path),
+        None => format!("/{}", path),
+    })
 }
 
-fn lookup_inode(path: &str) -> Option<(u32, String)> {
-    for candidate in normalize_candidates(path) {
-        let inode = with_ext4(|fs| {
+fn candidate_paths(base_dir: Option<&str>, path: &str, want_dir: bool) -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Some(primary) = normalize_path(base_dir, path) {
+        candidates.push(primary.clone());
+        let path = strip_relative_prefix(trim_cstr_suffix(path));
+        if base_dir.is_none() && !path.starts_with('/') && !path.contains('/') && !want_dir {
+            let bin_fallback = format!("/bin/{}", path);
+            if bin_fallback != primary {
+                candidates.push(bin_fallback);
+            }
+        }
+    }
+    candidates
+}
+
+fn lookup_existing(base_dir: Option<&str>, path: &str, want_dir: bool) -> Option<(u32, String, bool)> {
+    for candidate in candidate_paths(base_dir, path, want_dir) {
+        let inode = match with_ext4(|fs| {
             let mut parent = 2u32;
             let mut off = 0u32;
             fs.generic_open(
@@ -110,10 +130,17 @@ fn lookup_inode(path: &str) -> Option<(u32, String)> {
                 &mut off,
             )
             .ok()
-        });
-        if let Some(inode_num) = inode {
-            return Some((inode_num, candidate));
+        }) {
+            Some(inode) => inode,
+            None => continue,
+        };
+
+        let inode_ref = with_ext4(|fs| fs.get_inode_ref(inode));
+        let is_dir = inode_ref.inode.is_dir();
+        if want_dir && !is_dir {
+            continue;
         }
+        return Some((inode, candidate, is_dir));
     }
     None
 }
@@ -127,10 +154,12 @@ pub struct OSInode {
 pub struct OSInodeInner {
     offset: usize,
     inode_num: u32,
+    path: String,
+    is_dir: bool,
 }
 
 impl OSInode {
-    pub fn new(readable: bool, writable: bool, inode_num: u32) -> Self {
+    pub fn new(readable: bool, writable: bool, inode_num: u32, path: String, is_dir: bool) -> Self {
         Self {
             readable,
             writable,
@@ -138,6 +167,8 @@ impl OSInode {
                 UPSafeCell::new(OSInodeInner {
                     offset: 0,
                     inode_num,
+                    path,
+                    is_dir,
                 })
             },
         }
@@ -199,67 +230,94 @@ bitflags! {
         const RDONLY = 0;
         const WRONLY = 1 << 0;
         const RDWR = 1 << 1;
-        const CREATE = 1 << 9;
-        const TRUNC = 1 << 10;
+        const CREATE = 0x40;
+        const TRUNC = 0x200;
+        const DIRECTORY = 0x10000;
     }
 }
 
 impl OpenFlags {
-    /// Do not check validity for simplicity.
+    const TRUNC_LEGACY_BITS: u32 = 1 << 10;
+
+    pub fn from_raw(flags: u32) -> Self {
+        Self::from_bits_truncate(flags)
+    }
+
+    pub fn create_requested(&self) -> bool {
+        self.contains(Self::CREATE)
+    }
+
+    pub fn trunc_requested(&self) -> bool {
+        (self.bits() & (Self::TRUNC.bits() | Self::TRUNC_LEGACY_BITS)) != 0
+    }
+
+    pub fn directory_requested(&self) -> bool {
+        self.contains(Self::DIRECTORY)
+    }
+
     /// Return (readable, writable).
     pub fn read_write(&self) -> (bool, bool) {
-        if self.is_empty() {
-            (true, false)
-        } else if self.contains(Self::WRONLY) {
+        if self.contains(Self::WRONLY) {
             (false, true)
-        } else {
+        } else if self.contains(Self::RDWR) {
             (true, true)
+        } else {
+            (true, false)
         }
     }
 }
 
 pub fn open_file(path: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
-    let (readable, writable) = flags.read_write();
-    if flags.contains(OpenFlags::CREATE) {
-        let create_path = normalize_create_path(path)?;
+    open_file_at(None, path, flags)
+}
+
+pub fn open_file_at(base_dir: Option<&str>, path: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
+    let want_dir = flags.directory_requested();
+
+    if flags.create_requested() {
+        let normalized = normalize_path(base_dir, path)?;
+        if want_dir {
+            return None;
+        }
+        if let Some((inode_num, full_path, is_dir)) = lookup_existing(base_dir, path, false) {
+            if flags.trunc_requested() && !is_dir {
+                let truncated = with_ext4(|fs| {
+                    let mut inode_ref = fs.get_inode_ref(inode_num);
+                    fs.truncate_inode(&mut inode_ref, 0).is_ok()
+                });
+                if !truncated {
+                    return None;
+                }
+            }
+            let (readable, writable) = if is_dir { (false, false) } else { flags.read_write() };
+            return Some(Arc::new(OSInode::new(readable, writable, inode_num, full_path, is_dir)));
+        }
+
         let inode_num = with_ext4(|fs| {
             let mut parent = 2u32;
             let mut off = 0u32;
-            match fs.generic_open(
-                create_path.as_str(),
+            fs.generic_open(
+                normalized.as_str(),
                 &mut parent,
-                false,
+                true,
                 InodeFileType::S_IFREG.bits(),
                 &mut off,
-            ) {
-                Ok(existing) => {
-                    if flags.contains(OpenFlags::TRUNC) {
-                        let mut inode_ref = fs.get_inode_ref(existing);
-                        if fs.truncate_inode(&mut inode_ref, 0).is_err() {
-                            return None;
-                        }
-                    }
-                    Some(existing)
-                }
-                Err(_) => {
-                    let mut parent = 2u32;
-                    let mut off = 0u32;
-                    fs.generic_open(
-                        create_path.as_str(),
-                        &mut parent,
-                        true,
-                        InodeFileType::S_IFREG.bits(),
-                        &mut off,
-                    )
-                    .ok()
-                }
-            }
+            )
+            .ok()
         })?;
-        return Some(Arc::new(OSInode::new(readable, writable, inode_num)));
+        let (readable, writable) = flags.read_write();
+        return Some(Arc::new(OSInode::new(
+            readable,
+            writable,
+            inode_num,
+            normalized,
+            false,
+        )));
     }
 
-    let (inode_num, _) = lookup_inode(path)?;
-    if flags.contains(OpenFlags::TRUNC) {
+    let (inode_num, full_path, is_dir) = lookup_existing(base_dir, path, want_dir)?;
+
+    if flags.trunc_requested() && !is_dir {
         let truncated = with_ext4(|fs| {
             let mut inode_ref = fs.get_inode_ref(inode_num);
             fs.truncate_inode(&mut inode_ref, 0).is_ok()
@@ -268,7 +326,15 @@ pub fn open_file(path: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
             return None;
         }
     }
-    Some(Arc::new(OSInode::new(readable, writable, inode_num)))
+
+    let (readable, writable) = if is_dir { (false, false) } else { flags.read_write() };
+    Some(Arc::new(OSInode::new(
+        readable,
+        writable,
+        inode_num,
+        full_path,
+        is_dir,
+    )))
 }
 
 impl File for OSInode {
@@ -300,9 +366,20 @@ impl File for OSInode {
         self.stat_inner()
     }
 
+    fn is_dir(&self) -> bool {
+        self.inner.exclusive_access().is_dir
+    }
+
+    fn path(&self) -> Option<String> {
+        Some(self.inner.exclusive_access().path.clone())
+    }
+
     fn getdents64(&self, buf: &mut [u8]) -> isize {
         const DIRENT64_FIXED_SIZE: usize = 8 + 8 + 2 + 1;
         let mut inner = self.inner.exclusive_access();
+        if !inner.is_dir {
+            return -1;
+        }
         let entries = with_ext4(|fs| fs.ext4_dir_get_entries(inner.inode_num));
         if inner.offset >= entries.len() {
             return 0;
@@ -311,7 +388,8 @@ impl File for OSInode {
         let mut written = 0usize;
         let mut entry_index = inner.offset;
         while entry_index < entries.len() {
-            let name = entries[entry_index].get_name();
+            let entry = &entries[entry_index];
+            let name = entry.get_name();
             let name_bytes = name.as_bytes();
             let record_size = Self::align_up(DIRENT64_FIXED_SIZE + name_bytes.len() + 1, 8);
             if written + record_size > buf.len() {
@@ -324,17 +402,11 @@ impl File for OSInode {
             let record = &mut buf[written..written + record_size];
             record.fill(0);
 
-            let d_ino = (entry_index as u64) + 1;
-            record[0..8].copy_from_slice(&d_ino.to_le_bytes());
-
+            record[0..8].copy_from_slice(&(entry.inode as u64).to_le_bytes());
             let d_off = (entry_index as i64) + 1;
             record[8..16].copy_from_slice(&d_off.to_le_bytes());
-
-            let d_reclen = record_size as u16;
-            record[16..18].copy_from_slice(&d_reclen.to_le_bytes());
-
-            // easyfs currently does not expose a stable per-entry type here.
-            record[18] = 0;
+            record[16..18].copy_from_slice(&(record_size as u16).to_le_bytes());
+            record[18] = entry.get_de_type();
 
             let name_start = DIRENT64_FIXED_SIZE;
             record[name_start..name_start + name_bytes.len()].copy_from_slice(name_bytes);

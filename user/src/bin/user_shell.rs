@@ -173,7 +173,14 @@ pub fn main() -> i32 {
                                     close(pipe_fd[1]);
                                 }
                                 // execute new application
-                                if exec(args_copy[0].as_str(), args_addr.as_slice()) == -1 {
+                                let mut exec_path = args_copy[0].clone();
+                                if !exec_path.starts_with('/') {
+                                    let cmd = String::from(exec_path.trim_end_matches('\0'));
+                                    exec_path = String::from("/bin/");
+                                    exec_path.push_str(cmd.as_str());
+                                    exec_path.push('\0');
+                                }
+                                if exec(exec_path.as_str(), args_addr.as_slice()) == -1 {
                                     println!("Error when executing!");
                                     return -4;
                                 }

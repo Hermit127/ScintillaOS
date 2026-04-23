@@ -3,7 +3,7 @@ use core::arch::asm;
 use crate::SignalAction;
 
 const SYSCALL_DUP: usize = 24;
-const SYSCALL_OPEN: usize = 56;
+const SYSCALL_OPENAT: usize = 56;
 const SYSCALL_CLOSE: usize = 57;
 const SYSCALL_PIPE: usize = 59;
 const SYSCALL_READ: usize = 63;
@@ -21,8 +21,10 @@ const SYSCALL_FORK: usize = 220;
 const SYSCALL_EXEC: usize = 221;
 const SYSCALL_WAITPID: usize = 260;
 
+const AT_FDCWD: isize = -100;
+
 #[cfg(target_arch = "riscv64")]
-fn syscall(id: usize, args: [usize; 3]) -> isize {
+fn syscall(id: usize, args: [usize; 6]) -> isize {
     let mut ret: isize;
     unsafe {
         asm!(
@@ -30,6 +32,9 @@ fn syscall(id: usize, args: [usize; 3]) -> isize {
             inlateout("x10") args[0] => ret,
             in("x11") args[1],
             in("x12") args[2],
+            in("x13") args[3],
+            in("x14") args[4],
+            in("x15") args[5],
             in("x17") id
         );
     }
@@ -37,7 +42,7 @@ fn syscall(id: usize, args: [usize; 3]) -> isize {
 }
 
 #[cfg(target_arch = "aarch64")]
-fn syscall(id: usize, args: [usize; 3]) -> isize {
+fn syscall(id: usize, args: [usize; 6]) -> isize {
     let mut ret: isize;
     unsafe {
         asm!(
@@ -45,6 +50,9 @@ fn syscall(id: usize, args: [usize; 3]) -> isize {
             inlateout("x0") args[0] => ret,
             in("x1") args[1],
             in("x2") args[2],
+            in("x3") args[3],
+            in("x4") args[4],
+            in("x5") args[5],
             in("x8") id
         );
     }
@@ -52,7 +60,7 @@ fn syscall(id: usize, args: [usize; 3]) -> isize {
 }
 
 #[cfg(target_arch = "x86_64")]
-fn syscall(id: usize, args: [usize; 3]) -> isize {
+fn syscall(id: usize, args: [usize; 6]) -> isize {
     let mut ret: isize;
     unsafe {
         asm!(
@@ -66,6 +74,9 @@ fn syscall(id: usize, args: [usize; 3]) -> isize {
             in("rdi") args[0],
             in("rsi") args[1],
             in("rdx") args[2],
+            in("r10") args[3],
+            in("r8") args[4],
+            in("r9") args[5],
             inlateout("rax") id => ret
         );
     }
@@ -73,7 +84,7 @@ fn syscall(id: usize, args: [usize; 3]) -> isize {
 }
 
 #[cfg(target_arch = "loongarch64")]
-fn syscall(id: usize, args: [usize; 3]) -> isize {
+fn syscall(id: usize, args: [usize; 6]) -> isize {
     let mut ret: isize;
     unsafe {
         asm!(
@@ -81,6 +92,9 @@ fn syscall(id: usize, args: [usize; 3]) -> isize {
             inlateout("$r4") args[0] => ret,
             in("$r5") args[1],
             in("$r6") args[2],
+            in("$r7") args[3],
+            in("$r8") args[4],
+            in("$r9") args[5],
             in("$r11") id
         );
     }
@@ -88,66 +102,86 @@ fn syscall(id: usize, args: [usize; 3]) -> isize {
 }
 
 pub fn sys_dup(fd: usize) -> isize {
-    syscall(SYSCALL_DUP, [fd, 0, 0])
+    syscall(SYSCALL_DUP, [fd, 0, 0, 0, 0, 0])
 }
 
 pub fn sys_open(path: &str, flags: u32) -> isize {
-    syscall(SYSCALL_OPEN, [path.as_ptr() as usize, flags as usize, 0])
+    sys_openat(AT_FDCWD, path, flags, 0)
+}
+
+pub fn sys_openat(dirfd: isize, path: &str, flags: u32, mode: u32) -> isize {
+    syscall(
+        SYSCALL_OPENAT,
+        [
+            dirfd as usize,
+            path.as_ptr() as usize,
+            flags as usize,
+            mode as usize,
+            0,
+            0,
+        ],
+    )
 }
 
 pub fn sys_close(fd: usize) -> isize {
-    syscall(SYSCALL_CLOSE, [fd, 0, 0])
+    syscall(SYSCALL_CLOSE, [fd, 0, 0, 0, 0, 0])
 }
 
 pub fn sys_pipe(pipe: &mut [usize]) -> isize {
-    syscall(SYSCALL_PIPE, [pipe.as_mut_ptr() as usize, 0, 0])
+    syscall(SYSCALL_PIPE, [pipe.as_mut_ptr() as usize, 0, 0, 0, 0, 0])
 }
 
 pub fn sys_read(fd: usize, buffer: &mut [u8]) -> isize {
     syscall(
         SYSCALL_READ,
-        [fd, buffer.as_mut_ptr() as usize, buffer.len()],
+        [fd, buffer.as_mut_ptr() as usize, buffer.len(), 0, 0, 0],
     )
 }
 
 pub fn sys_write(fd: usize, buffer: &[u8]) -> isize {
-    syscall(SYSCALL_WRITE, [fd, buffer.as_ptr() as usize, buffer.len()])
+    syscall(
+        SYSCALL_WRITE,
+        [fd, buffer.as_ptr() as usize, buffer.len(), 0, 0, 0],
+    )
 }
 
 pub fn sys_exit(exit_code: i32) -> ! {
-    syscall(SYSCALL_EXIT, [exit_code as usize, 0, 0]);
+    syscall(SYSCALL_EXIT, [exit_code as usize, 0, 0, 0, 0, 0]);
     panic!("sys_exit never returns!");
 }
 
 pub fn sys_yield() -> isize {
-    syscall(SYSCALL_YIELD, [0, 0, 0])
+    syscall(SYSCALL_YIELD, [0, 0, 0, 0, 0, 0])
 }
 
 pub fn sys_kill(pid: usize, signal: i32) -> isize {
-    syscall(SYSCALL_KILL, [pid, signal as usize, 0])
+    syscall(SYSCALL_KILL, [pid, signal as usize, 0, 0, 0, 0])
 }
 
 pub fn sys_get_time() -> isize {
-    syscall(SYSCALL_GET_TIME, [0, 0, 0])
+    syscall(SYSCALL_GET_TIME, [0, 0, 0, 0, 0, 0])
 }
 
 pub fn sys_getpid() -> isize {
-    syscall(SYSCALL_GETPID, [0, 0, 0])
+    syscall(SYSCALL_GETPID, [0, 0, 0, 0, 0, 0])
 }
 
 pub fn sys_fork() -> isize {
-    syscall(SYSCALL_FORK, [0, 0, 0])
+    syscall(SYSCALL_FORK, [0, 0, 0, 0, 0, 0])
 }
 
 pub fn sys_exec(path: &str, args: &[*const u8]) -> isize {
     syscall(
         SYSCALL_EXEC,
-        [path.as_ptr() as usize, args.as_ptr() as usize, 0],
+        [path.as_ptr() as usize, args.as_ptr() as usize, 0, 0, 0, 0],
     )
 }
 
 pub fn sys_waitpid(pid: isize, exit_code: *mut i32) -> isize {
-    syscall(SYSCALL_WAITPID, [pid as usize, exit_code as usize, 0])
+    syscall(
+        SYSCALL_WAITPID,
+        [pid as usize, exit_code as usize, 0, 0, 0, 0],
+    )
 }
 
 pub fn sys_sigaction(
@@ -157,28 +191,18 @@ pub fn sys_sigaction(
 ) -> isize {
     syscall(
         SYSCALL_SIGACTION,
-        [signum as usize, action as usize, old_action as usize],
+        [signum as usize, action as usize, old_action as usize, 0, 0, 0],
     )
-    /*
-    syscall(
-        SYSCALL_SIGACTION,
-        [
-            signum as usize,
-            action.map_or(0, |r| r as *const _ as usize),
-            old_action.map_or(0, |r| r as *mut _ as usize),
-        ],
-    )
-    */
 }
 
 pub fn sys_sigprocmask(mask: u32) -> isize {
-    syscall(SYSCALL_SIGPROCMASK, [mask as usize, 0, 0])
+    syscall(SYSCALL_SIGPROCMASK, [mask as usize, 0, 0, 0, 0, 0])
 }
 
 pub fn sys_sigreturn() -> isize {
-    syscall(SYSCALL_SIGRETURN, [0, 0, 0])
+    syscall(SYSCALL_SIGRETURN, [0, 0, 0, 0, 0, 0])
 }
 
 pub fn sys_brk(brk_addr: usize) -> isize {
-    syscall(SYSCALL_BRK, [brk_addr, 0, 0])
+    syscall(SYSCALL_BRK, [brk_addr, 0, 0, 0, 0, 0])
 }

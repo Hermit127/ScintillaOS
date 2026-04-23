@@ -38,6 +38,38 @@ ext4 文件系统迁移（两阶段方案一次实现到读写可用）：
 验证结果：
 - `cargo check -p os --target riscv64gc-unknown-none-elf` 已通过，仅保留既有 warning。
 
+
+2026/04/23 LYZ
+ext4 体系下文件调用适配（openat/read/write/close/fd目录语义）
+- syscall 参数通道从 3 参数扩展到 6 参数，支持 `openat(dirfd, path, flags, mode)` 标准调用形态。
+- `SYS_openat(56)` 作为统一入口，`open` 实现为 `openat(AT_FDCWD, ...)` 语法糖。
+- 新增 `dirfd` 目录 fd 处理：支持 `AT_FDCWD` 与“目录 fd + 相对路径”解析。
+- `OpenFlags` 对齐 Linux 关键位：`O_CREATE(0x40) / O_TRUNC(0x200) / O_DIRECTORY(0x10000)`，并兼容旧 `TRUNC` 位。
+- ext4 inode 封装补充目录属性与路径元信息，供 openat 相对解析与 getdents 使用。
+- 用户态 syscall 封装同步升级为 6 参数寄存器调用，新增 `openat` 封装。
+
+效果
+- 现有 ext4 启动链路正常，系统可进入 shell；
+- 文件 fd 与管道 fd 仍统一走 fd 表；
+- close/read/write 行为保持最小语义（成功返回字节数/0，错误返回 -1）。
+
+兼容性提醒
+- 当前按 Linux 语义解释 `0x200` 为 `O_TRUNC`；若存在旧二进制将 `0x200` 当 CREATE，行为会不一致，需重编译用户程序。
+
+已知兼容性提醒（保留）：
+- 当前仍以 `-1` 作为通用错误返回，未细分完整 errno；
+- `AT_FDCWD` 目前按根目录语义处理，未实现独立 cwd 状态；
+- 如存在旧二进制将 `0x200` 当 CREATE，需要重编译用户程序以匹配当前语义。
+
+2026/04/23 Codex
+文件调用适配回归修复（二次修复）
+- 修复 `sys_openat` 丢失导致的编译错误：`syscall/mod.rs` 已切到 `SYS_openat(56)`，但 `os/src/syscall/fs.rs` 被旧版本覆盖，缺少 `sys_openat` 实现，已恢复并重新接入 `AT_FDCWD` 与目录 fd 相对路径解析。
+- 修复无关残留导入：移除 `os/src/syscall/fs.rs` 中无用的 `ext4_rs::path`。
+- 补充 rootfs 测试资源：`Makefile` 生成镜像时新增 `/mnt` 目录与 `/text.txt` 文件，避免 `openat/open` 相关用例因基础文件缺失而失败。
+
+验证：
+- `cargo check -p os --target riscv64gc-unknown-none-elf` 通过。
+
 2026/04/23 Duyuheng
 添加了mmap系统调用，实现了函数功能，但是没有添加到系统调用里。
 mmap内部实现：

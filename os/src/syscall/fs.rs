@@ -1,7 +1,9 @@
-use crate::fs::{make_pipe, open_file, Kstat, OpenFlags};
+use crate::fs::{make_pipe, open_file, open_file_at, Kstat, OpenFlags};
 use crate::mm::{translated_byte_buffer, translated_refmut, translated_str};
 use crate::task::{current_task, current_user_token};
 use alloc::sync::Arc;
+
+const AT_FDCWD: isize = -100;
 
 pub fn sys_write(fd: usize, buf: *mut u8, len: usize) -> isize {
     let token = current_user_token();
@@ -44,10 +46,44 @@ pub fn sys_read(fd: usize, buf: *mut u8, len: usize) -> isize {
 }
 
 pub fn sys_open(path: *const u8, flags: u32) -> isize {
+    sys_openat(AT_FDCWD, path, flags, 0)
+}
+
+pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isize {
     let task = current_task().unwrap();
     let token = current_user_token();
     let path = translated_str(token, path);
-    if let Some(inode) = open_file(path.as_str(), OpenFlags::from_bits(flags).unwrap()) {
+
+    let open_flags = OpenFlags::from_raw(flags);
+    let base_dir = if dirfd == AT_FDCWD {
+        None
+    } else {
+        if dirfd < 0 {
+            return -1;
+        }
+        let inner = task.inner_exclusive_access();
+        let dirfd = dirfd as usize;
+        if dirfd >= inner.fd_table.len() {
+            return -1;
+        }
+        let Some(file) = &inner.fd_table[dirfd] else {
+            return -1;
+        };
+        if !file.is_dir() {
+            return -1;
+        }
+        let base = file.path();
+        drop(inner);
+        base
+    };
+
+    let inode = if dirfd == AT_FDCWD {
+        open_file(path.as_str(), open_flags)
+    } else {
+        open_file_at(base_dir.as_deref(), path.as_str(), open_flags)
+    };
+
+    if let Some(inode) = inode {
         let mut inner = task.inner_exclusive_access();
         let fd = inner.alloc_fd();
         inner.fd_table[fd] = Some(inode);

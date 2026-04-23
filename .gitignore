@@ -25,3 +25,5 @@ pushall.sh
 *.log
 fs-img.img
 virt.out
+
+testsuits-for-oskernel
