@@ -119,7 +119,7 @@ fn candidate_paths(base_dir: Option<&str>, path: &str, want_dir: bool) -> Vec<St
 
 fn lookup_existing(base_dir: Option<&str>, path: &str, want_dir: bool) -> Option<(u32, String, bool)> {
     for candidate in candidate_paths(base_dir, path, want_dir) {
-        let inode = with_ext4(|fs| {
+        let inode = match with_ext4(|fs| {
             let mut parent = 2u32;
             let mut off = 0u32;
             fs.generic_open(
@@ -130,7 +130,10 @@ fn lookup_existing(base_dir: Option<&str>, path: &str, want_dir: bool) -> Option
                 &mut off,
             )
             .ok()
-        })?;
+        }) {
+            Some(inode) => inode,
+            None => continue,
+        };
 
         let inode_ref = with_ext4(|fs| fs.get_inode_ref(inode));
         let is_dir = inode_ref.inode.is_dir();
