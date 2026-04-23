@@ -60,3 +60,12 @@ ext4 体系下文件调用适配（openat/read/write/close/fd目录语义）
 - 当前仍以 `-1` 作为通用错误返回，未细分完整 errno；
 - `AT_FDCWD` 目前按根目录语义处理，未实现独立 cwd 状态；
 - 如存在旧二进制将 `0x200` 当 CREATE，需要重编译用户程序以匹配当前语义。
+
+2026/04/23 Codex
+文件调用适配回归修复（二次修复）
+- 修复 `sys_openat` 丢失导致的编译错误：`syscall/mod.rs` 已切到 `SYS_openat(56)`，但 `os/src/syscall/fs.rs` 被旧版本覆盖，缺少 `sys_openat` 实现，已恢复并重新接入 `AT_FDCWD` 与目录 fd 相对路径解析。
+- 修复无关残留导入：移除 `os/src/syscall/fs.rs` 中无用的 `ext4_rs::path`。
+- 补充 rootfs 测试资源：`Makefile` 生成镜像时新增 `/mnt` 目录与 `/text.txt` 文件，避免 `openat/open` 相关用例因基础文件缺失而失败。
+
+验证：
+- `cargo check -p os --target riscv64gc-unknown-none-elf` 通过。

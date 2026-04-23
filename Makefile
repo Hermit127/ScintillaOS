@@ -37,6 +37,7 @@ DISASM_TMP := target/$(TARGET)/$(MODE)/asm
 FS_IMG := target/$(TARGET)/$(MODE)/fs.img
 ROOTFS_DIR := target/$(TARGET)/$(MODE)/rootfs
 ROOTFS_BIN_DIR := $(ROOTFS_DIR)/bin
+ROOTFS_MNT_DIR := $(ROOTFS_DIR)/mnt
 # FS_IMG := fs-img.img
 APPS := user/src/bin/*
 
@@ -78,7 +79,8 @@ fs-img: $(APPS)
 	@cd user && make build TARGET=$(TARGET) TEST=$(TEST)
 	@rm -f $(FS_IMG)
 	@rm -rf $(ROOTFS_DIR)
-	@mkdir -p $(ROOTFS_BIN_DIR)
+	@mkdir -p $(ROOTFS_BIN_DIR) $(ROOTFS_MNT_DIR)
+	@printf "ext4 open test file\n" > $(ROOTFS_DIR)/text.txt
 	@for src in user/src/bin/*.rs; do \
 		app=$$(basename $$src .rs); \
 		cp target/$(TARGET)/release/$$app $(ROOTFS_BIN_DIR)/; \
