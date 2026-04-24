@@ -8,6 +8,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use ext4_rs::crc32;
 use log::info;
 use polyhal::time::Time;
 use polyhal_trap::trapframe::TrapFrameArgs;
@@ -326,5 +327,23 @@ pub fn sys_mmap(
         } else {
             return -1;
         }
+    }
+}
+
+pub fn sys_munmap(start: usize, len: usize) -> isize {
+    if start % crate::config::PAGE_SIZE != 0 || len == 0 {
+        return -1;
+    }
+
+    let task = crate::task::current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+
+    let start_addr = polyhal::VirtAddr::from(start);
+    let end_addr = polyhal::VirtAddr::from(start + len);
+
+    if inner.memory_set.munmap(start_addr, end_addr) {
+        0
+    } else {
+        -1
     }
 }

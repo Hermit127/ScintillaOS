@@ -176,6 +176,39 @@ impl MemorySet {
         }
         true
     }
+    pub fn munmap(&mut self, start_addr: polyhal::VirtAddr, end_addr: polyhal::VirtAddr) -> bool {
+        let start_vaddr = start_addr.floor();
+        let end_vaddr = end_addr.ceil();
+
+        let mut found_idx = None;
+        for (i, area) in self.areas.iter().enumerate() {
+            if area.vaddr_range.get_start() <= start_vaddr && area.vaddr_range.get_end() >= end_vaddr {
+                found_idx = Some(i);
+                break;
+            }
+        }
+
+        if let Some(idx) = found_idx {
+            let start_match = self.areas[idx].vaddr_range.get_start() == start_vaddr;
+            let end_match = self.areas[idx].vaddr_range.get_end() == end_vaddr;
+
+            if start_match && end_match {
+                let mut removed_area = self.areas.remove(idx);
+                removed_area.unmap(&self.page_table);
+            } else {
+                let area = &mut self.areas[idx];
+                let mut curr = start_vaddr;
+                while curr < end_vaddr {
+                    if area.data_frames.remove(&curr).is_some() {
+                        self.page_table.unmap_page(curr);
+                    }
+                    curr = curr + crate::config::PAGE_SIZE;
+                }
+            }
+            return true;
+        }
+        false
+    }
 }
 
 pub struct MapArea {

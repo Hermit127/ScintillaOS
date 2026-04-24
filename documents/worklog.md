@@ -54,6 +54,9 @@ syscall需要扩展参数数量
 完成getcwd unlink chdir调用
 mkdir依然存在问题
 
+2026/04/24 dyh
+恢复了mmap的系统调用
+实现了munmap的系统调用，解除地址映射，为mmap的逆过程。
 
 MERGE不要用AI!!!  请手动检查每一行冲突!!!
 MERGE不要用AI!!!  请手动检查每一行冲突!!!

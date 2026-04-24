@@ -19,6 +19,7 @@ const SYSCALL_GET_TIME: usize = 169;
 const SYSCALL_GETPID: usize = 172;
 const SYSCALL_GETPPID: usize = 173;
 const SYSCALL_BRK: usize = 214;
+const SYSCALL_MUNMAP: usize = 215;
 const SYSCALL_FORK: usize = 220;
 const SYSCALL_EXEC: usize = 221;
 const SYSCALL_MMAP: usize = 222;
@@ -76,6 +77,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         // keep x86_64 dup2 syscall number for compatibility
         SYSCALL_DUP2 => sys_dup2(args[0], args[1]),
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4] as i32, args[5]),
+        SYSCALL_MUNMAP => sys_munmap(args[0], args[1]),
         _ => panic!("Unsupported syscall_id: {}", syscall_id),
     }
 }
