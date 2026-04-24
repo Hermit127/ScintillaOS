@@ -107,7 +107,13 @@ fn candidate_paths(base_dir: Option<&str>, path: &str, want_dir: bool) -> Vec<St
     if let Some(primary) = normalize_path(base_dir, path) {
         candidates.push(primary.clone());
         let path = strip_relative_prefix(trim_cstr_suffix(path));
-        if base_dir.is_none() && !path.starts_with('/') && !path.contains('/') && !want_dir {
+        if base_dir.is_none()
+            && !path.starts_with('/')
+            && !path.contains('/')
+            && path != "."
+            && path != ".."
+            && !want_dir
+        {
             let bin_fallback = format!("/bin/{}", path);
             if bin_fallback != primary {
                 candidates.push(bin_fallback);
@@ -119,6 +125,11 @@ fn candidate_paths(base_dir: Option<&str>, path: &str, want_dir: bool) -> Vec<St
 
 fn lookup_existing(base_dir: Option<&str>, path: &str, want_dir: bool) -> Option<(u32, String, bool)> {
     for candidate in candidate_paths(base_dir, path, want_dir) {
+        // ext4_rs::generic_open("/") may return an invalid inode number.
+        // Handle root path explicitly to preserve UNIX-like "."/"/" behavior.
+        if candidate == "/" {
+            return Some((2, candidate, true));
+        }
         let inode = match with_ext4(|fs| {
             let mut parent = 2u32;
             let mut off = 0u32;
@@ -377,20 +388,27 @@ impl File for OSInode {
     fn getdents64(&self, buf: &mut [u8]) -> isize {
         const DIRENT64_FIXED_SIZE: usize = 8 + 8 + 2 + 1;
         let mut inner = self.inner.exclusive_access();
-        if !inner.is_dir {
+        let inode_is_dir = with_ext4(|fs| fs.get_inode_ref(inner.inode_num).inode.is_dir());
+        if !inode_is_dir {
             return -1;
         }
         let entries = with_ext4(|fs| fs.ext4_dir_get_entries(inner.inode_num));
+
+        let mut written = 0usize;
+        let mut entry_index = inner.offset;
+
         if inner.offset >= entries.len() {
             return 0;
         }
 
-        let mut written = 0usize;
-        let mut entry_index = inner.offset;
         while entry_index < entries.len() {
             let entry = &entries[entry_index];
             let name = entry.get_name();
             let name_bytes = name.as_bytes();
+            if name_bytes.is_empty() {
+                entry_index += 1;
+                continue;
+            }
             let record_size = Self::align_up(DIRENT64_FIXED_SIZE + name_bytes.len() + 1, 8);
             if written + record_size > buf.len() {
                 if written == 0 {
