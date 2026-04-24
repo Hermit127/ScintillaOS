@@ -70,44 +70,54 @@ fn trim_cstr_suffix(path: &str) -> &str {
     path.trim_end_matches('\0')
 }
 
-fn strip_relative_prefix(mut path: &str) -> &str {
-    while path.starts_with("./") {
-        path = &path[2..];
-    }
-    path
-}
-
-fn join_dir_and_name(base: &str, rel: &str) -> String {
-    if base == "/" {
-        format!("/{}", rel)
-    } else {
-        format!("{}/{}", base.trim_end_matches('/'), rel)
-    }
-}
-
 fn normalize_path(base_dir: Option<&str>, path: &str) -> Option<String> {
-    let path = strip_relative_prefix(trim_cstr_suffix(path));
+    let path = trim_cstr_suffix(path);
     if path.is_empty() {
         return None;
     }
-    if path.starts_with('/') {
-        return Some(path.to_string());
+
+    let mut parts: Vec<&str> = Vec::new();
+    let is_abs = path.starts_with('/');
+    if !is_abs {
+        for comp in base_dir.unwrap_or("/").split('/') {
+            match comp {
+                "" | "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                _ => parts.push(comp),
+            }
+        }
     }
-    if path == "." {
-        return Some(base_dir.unwrap_or("/").to_string());
+
+    for comp in path.split('/') {
+        match comp {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            _ => parts.push(comp),
+        }
     }
-    Some(match base_dir {
-        Some(base) => join_dir_and_name(base, path),
-        None => format!("/{}", path),
-    })
+
+    if parts.is_empty() {
+        return Some("/".to_string());
+    }
+    Some(format!("/{}", parts.join("/")))
 }
 
 fn candidate_paths(base_dir: Option<&str>, path: &str, want_dir: bool) -> Vec<String> {
     let mut candidates = Vec::new();
     if let Some(primary) = normalize_path(base_dir, path) {
         candidates.push(primary.clone());
-        let path = strip_relative_prefix(trim_cstr_suffix(path));
-        if base_dir.is_none() && !path.starts_with('/') && !path.contains('/') && !want_dir {
+        let path = trim_cstr_suffix(path).trim_start_matches("./");
+        if base_dir.is_none()
+            && !path.starts_with('/')
+            && !path.contains('/')
+            && path != "."
+            && path != ".."
+            && !want_dir
+        {
             let bin_fallback = format!("/bin/{}", path);
             if bin_fallback != primary {
                 candidates.push(bin_fallback);
@@ -119,6 +129,11 @@ fn candidate_paths(base_dir: Option<&str>, path: &str, want_dir: bool) -> Vec<St
 
 fn lookup_existing(base_dir: Option<&str>, path: &str, want_dir: bool) -> Option<(u32, String, bool)> {
     for candidate in candidate_paths(base_dir, path, want_dir) {
+        // ext4_rs::generic_open("/") may return an invalid inode number.
+        // Handle root path explicitly to preserve UNIX-like "."/"/" behavior.
+        if candidate == "/" {
+            return Some((2, candidate, true));
+        }
         let inode = match with_ext4(|fs| {
             let mut parent = 2u32;
             let mut off = 0u32;
@@ -271,6 +286,70 @@ pub fn open_file(path: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
     open_file_at(None, path, flags)
 }
 
+pub fn mkdir_at(base_dir: Option<&str>, path: &str) -> bool {
+    let normalized = match normalize_path(base_dir, path) {
+        Some(path) if path != "/" => path,
+        _ => return false,
+    };
+    if lookup_existing(None, normalized.as_str(), false).is_some() {
+        return false;
+    }
+    with_ext4(|fs| {
+        let mut parent = 2u32;
+        let mut off = 0u32;
+        fs.generic_open(
+            normalized.as_str(),
+            &mut parent,
+            true,
+            InodeFileType::S_IFDIR.bits(),
+            &mut off,
+        )
+        .is_ok()
+    })
+}
+
+pub fn unlink_at(base_dir: Option<&str>, path: &str) -> bool {
+    let normalized = match normalize_path(base_dir, path) {
+        Some(path) if path != "/" => path,
+        _ => return false,
+    };
+    with_ext4(|fs| {
+        let mut parent_inode_num = 2u32;
+        let mut nameoff = 0u32;
+        let child_inode = match fs.generic_open(
+            normalized.as_str(),
+            &mut parent_inode_num,
+            false,
+            0,
+            &mut nameoff,
+        ) {
+            Ok(inode) => inode,
+            Err(_) => return false,
+        };
+
+        let mut child_inode_ref = fs.get_inode_ref(child_inode);
+        if child_inode_ref.inode.is_dir() {
+            return false;
+        }
+
+        let child_link_cnt = child_inode_ref.inode.links_count();
+        let child_size = child_inode_ref.inode.size();
+        if child_link_cnt == 1 && child_size > 0 {
+            if fs.truncate_inode(&mut child_inode_ref, 0).is_err() {
+                return false;
+            }
+        }
+
+        let name = match normalized.rsplit('/').next() {
+            Some(name) if !name.is_empty() => name,
+            _ => return false,
+        };
+        let mut parent_inode_ref = fs.get_inode_ref(parent_inode_num);
+        fs.unlink(&mut parent_inode_ref, &mut child_inode_ref, name)
+            .is_ok()
+    })
+}
+
 pub fn open_file_at(base_dir: Option<&str>, path: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
     let want_dir = flags.directory_requested();
 
@@ -377,20 +456,27 @@ impl File for OSInode {
     fn getdents64(&self, buf: &mut [u8]) -> isize {
         const DIRENT64_FIXED_SIZE: usize = 8 + 8 + 2 + 1;
         let mut inner = self.inner.exclusive_access();
-        if !inner.is_dir {
+        let inode_is_dir = with_ext4(|fs| fs.get_inode_ref(inner.inode_num).inode.is_dir());
+        if !inode_is_dir {
             return -1;
         }
         let entries = with_ext4(|fs| fs.ext4_dir_get_entries(inner.inode_num));
+
+        let mut written = 0usize;
+        let mut entry_index = inner.offset;
+
         if inner.offset >= entries.len() {
             return 0;
         }
 
-        let mut written = 0usize;
-        let mut entry_index = inner.offset;
         while entry_index < entries.len() {
             let entry = &entries[entry_index];
             let name = entry.get_name();
             let name_bytes = name.as_bytes();
+            if name_bytes.is_empty() {
+                entry_index += 1;
+                continue;
+            }
             let record_size = Self::align_up(DIRENT64_FIXED_SIZE + name_bytes.len() + 1, 8);
             if written + record_size > buf.len() {
                 if written == 0 {

@@ -56,6 +56,7 @@ pub struct TaskControlBlockInner {
     pub children: Vec<Arc<TaskControlBlock>>,
     pub exit_code: i32,
     pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
+    pub cwd: String,
     pub signals: SignalFlags,
     pub signal_mask: SignalFlags,
     // the signal which is being handling
@@ -154,6 +155,7 @@ impl TaskControlBlock {
                         // 2 -> stderr
                         Some(Arc::new(Stdout)),
                     ],
+                    cwd: String::from("/"),
                     signals: SignalFlags::empty(),
                     signal_mask: SignalFlags::empty(),
                     handling_sig: -1,
@@ -261,6 +263,7 @@ impl TaskControlBlock {
                     children: Vec::new(),
                     exit_code: 0,
                     fd_table: new_fd_table,
+                    cwd: parent_inner.cwd.clone(),
                     signals: SignalFlags::empty(),
                     // inherit the signal_mask and signal_action
                     signal_mask: parent_inner.signal_mask,
