@@ -11,3 +11,6 @@
 添加dup2
 
 Todo: 跑一边basic的样例，看看原操作系统实现的系统调用如何
+
+2026/04/23 Hermit
+添加getppid

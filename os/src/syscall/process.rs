@@ -30,6 +30,15 @@ pub fn sys_getpid() -> isize {
     current_task().unwrap().pid.0 as isize
 }
 
+pub fn sys_getppid() -> isize {
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+    match &inner.parent {
+        Some(parent_weak) => parent_weak.upgrade().map(|p| p.getpid() as isize).unwrap_or(1),
+        None => 0,
+    }
+}
+
 pub fn sys_fork() -> isize {
     let current_task = current_task().unwrap();
     let new_task = current_task.fork();
