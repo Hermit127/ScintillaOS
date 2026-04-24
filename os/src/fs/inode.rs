@@ -70,43 +70,47 @@ fn trim_cstr_suffix(path: &str) -> &str {
     path.trim_end_matches('\0')
 }
 
-fn strip_relative_prefix(mut path: &str) -> &str {
-    while path.starts_with("./") {
-        path = &path[2..];
-    }
-    path
-}
-
-fn join_dir_and_name(base: &str, rel: &str) -> String {
-    if base == "/" {
-        format!("/{}", rel)
-    } else {
-        format!("{}/{}", base.trim_end_matches('/'), rel)
-    }
-}
-
 fn normalize_path(base_dir: Option<&str>, path: &str) -> Option<String> {
-    let path = strip_relative_prefix(trim_cstr_suffix(path));
+    let path = trim_cstr_suffix(path);
     if path.is_empty() {
         return None;
     }
-    if path.starts_with('/') {
-        return Some(path.to_string());
+
+    let mut parts: Vec<&str> = Vec::new();
+    let is_abs = path.starts_with('/');
+    if !is_abs {
+        for comp in base_dir.unwrap_or("/").split('/') {
+            match comp {
+                "" | "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                _ => parts.push(comp),
+            }
+        }
     }
-    if path == "." {
-        return Some(base_dir.unwrap_or("/").to_string());
+
+    for comp in path.split('/') {
+        match comp {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            _ => parts.push(comp),
+        }
     }
-    Some(match base_dir {
-        Some(base) => join_dir_and_name(base, path),
-        None => format!("/{}", path),
-    })
+
+    if parts.is_empty() {
+        return Some("/".to_string());
+    }
+    Some(format!("/{}", parts.join("/")))
 }
 
 fn candidate_paths(base_dir: Option<&str>, path: &str, want_dir: bool) -> Vec<String> {
     let mut candidates = Vec::new();
     if let Some(primary) = normalize_path(base_dir, path) {
         candidates.push(primary.clone());
-        let path = strip_relative_prefix(trim_cstr_suffix(path));
+        let path = trim_cstr_suffix(path).trim_start_matches("./");
         if base_dir.is_none()
             && !path.starts_with('/')
             && !path.contains('/')
@@ -280,6 +284,70 @@ impl OpenFlags {
 
 pub fn open_file(path: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
     open_file_at(None, path, flags)
+}
+
+pub fn mkdir_at(base_dir: Option<&str>, path: &str) -> bool {
+    let normalized = match normalize_path(base_dir, path) {
+        Some(path) if path != "/" => path,
+        _ => return false,
+    };
+    if lookup_existing(None, normalized.as_str(), false).is_some() {
+        return false;
+    }
+    with_ext4(|fs| {
+        let mut parent = 2u32;
+        let mut off = 0u32;
+        fs.generic_open(
+            normalized.as_str(),
+            &mut parent,
+            true,
+            InodeFileType::S_IFDIR.bits(),
+            &mut off,
+        )
+        .is_ok()
+    })
+}
+
+pub fn unlink_at(base_dir: Option<&str>, path: &str) -> bool {
+    let normalized = match normalize_path(base_dir, path) {
+        Some(path) if path != "/" => path,
+        _ => return false,
+    };
+    with_ext4(|fs| {
+        let mut parent_inode_num = 2u32;
+        let mut nameoff = 0u32;
+        let child_inode = match fs.generic_open(
+            normalized.as_str(),
+            &mut parent_inode_num,
+            false,
+            0,
+            &mut nameoff,
+        ) {
+            Ok(inode) => inode,
+            Err(_) => return false,
+        };
+
+        let mut child_inode_ref = fs.get_inode_ref(child_inode);
+        if child_inode_ref.inode.is_dir() {
+            return false;
+        }
+
+        let child_link_cnt = child_inode_ref.inode.links_count();
+        let child_size = child_inode_ref.inode.size();
+        if child_link_cnt == 1 && child_size > 0 {
+            if fs.truncate_inode(&mut child_inode_ref, 0).is_err() {
+                return false;
+            }
+        }
+
+        let name = match normalized.rsplit('/').next() {
+            Some(name) if !name.is_empty() => name,
+            _ => return false,
+        };
+        let mut parent_inode_ref = fs.get_inode_ref(parent_inode_num);
+        fs.unlink(&mut parent_inode_ref, &mut child_inode_ref, name)
+            .is_ok()
+    })
 }
 
 pub fn open_file_at(base_dir: Option<&str>, path: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {

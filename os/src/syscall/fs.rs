@@ -1,9 +1,33 @@
-use crate::fs::{make_pipe, open_file, open_file_at, Kstat, OpenFlags};
+use crate::fs::{make_pipe, mkdir_at, open_file_at, unlink_at, File, Kstat, OpenFlags};
 use crate::mm::{translated_byte_buffer, translated_refmut, translated_str};
 use crate::task::{current_task, current_user_token};
+use alloc::string::String;
 use alloc::sync::Arc;
 
 const AT_FDCWD: isize = -100;
+
+fn resolve_base_dir(dirfd: isize) -> Option<String> {
+    let task = current_task().unwrap();
+    if dirfd == AT_FDCWD {
+        let inner = task.inner_exclusive_access();
+        return Some(inner.cwd.clone());
+    }
+    if dirfd < 0 {
+        return None;
+    }
+    let inner = task.inner_exclusive_access();
+    let dirfd = dirfd as usize;
+    if dirfd >= inner.fd_table.len() {
+        return None;
+    }
+    let Some(file) = &inner.fd_table[dirfd] else {
+        return None;
+    };
+    if !file.is_dir() {
+        return None;
+    }
+    file.path()
+}
 
 pub fn sys_write(fd: usize, buf: *mut u8, len: usize) -> isize {
     let token = current_user_token();
@@ -55,33 +79,11 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
     let path = translated_str(token, path);
 
     let open_flags = OpenFlags::from_raw(flags);
-    let base_dir = if dirfd == AT_FDCWD {
-        None
-    } else {
-        if dirfd < 0 {
-            return -1;
-        }
-        let inner = task.inner_exclusive_access();
-        let dirfd = dirfd as usize;
-        if dirfd >= inner.fd_table.len() {
-            return -1;
-        }
-        let Some(file) = &inner.fd_table[dirfd] else {
-            return -1;
-        };
-        if !file.is_dir() {
-            return -1;
-        }
-        let base = file.path();
-        drop(inner);
-        base
+    let base_dir = match resolve_base_dir(dirfd) {
+        Some(base) => base,
+        None => return -1,
     };
-
-    let inode = if dirfd == AT_FDCWD {
-        open_file(path.as_str(), open_flags)
-    } else {
-        open_file_at(base_dir.as_deref(), path.as_str(), open_flags)
-    };
+    let inode = open_file_at(Some(base_dir.as_str()), path.as_str(), open_flags);
 
     if let Some(inode) = inode {
         let mut inner = task.inner_exclusive_access();
@@ -91,6 +93,91 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
     } else {
         -1
     }
+}
+
+pub fn sys_mkdir(path: *const u8, mode: u32) -> isize {
+    sys_mkdirat(AT_FDCWD, path, mode)
+}
+
+pub fn sys_mkdirat(dirfd: isize, path: *const u8, _mode: u32) -> isize {
+    if path.is_null() {
+        return -1;
+    }
+    let token = current_user_token();
+    let path = translated_str(token, path);
+    let base_dir = match resolve_base_dir(dirfd) {
+        Some(base) => base,
+        None => return -1,
+    };
+    if mkdir_at(Some(base_dir.as_str()), path.as_str()) {
+        0
+    } else {
+        -1
+    }
+}
+
+pub fn sys_unlink(path: *const u8) -> isize {
+    sys_unlinkat(AT_FDCWD, path, 0)
+}
+
+pub fn sys_unlinkat(dirfd: isize, path: *const u8, flags: u32) -> isize {
+    // minimal unlinkat: only support regular unlink (flags == 0)
+    if flags != 0 || path.is_null() {
+        return -1;
+    }
+    let token = current_user_token();
+    let path = translated_str(token, path);
+    let base_dir = match resolve_base_dir(dirfd) {
+        Some(base) => base,
+        None => return -1,
+    };
+    if unlink_at(Some(base_dir.as_str()), path.as_str()) {
+        0
+    } else {
+        -1
+    }
+}
+
+pub fn sys_chdir(path: *const u8) -> isize {
+    if path.is_null() {
+        return -1;
+    }
+    let task = current_task().unwrap();
+    let token = current_user_token();
+    let path = translated_str(token, path);
+    let cwd = {
+        let inner = task.inner_exclusive_access();
+        inner.cwd.clone()
+    };
+    let Some(dir_inode) = open_file_at(Some(cwd.as_str()), path.as_str(), OpenFlags::DIRECTORY) else {
+        return -1;
+    };
+    let Some(new_cwd) = dir_inode.path() else {
+        return -1;
+    };
+    let mut inner = task.inner_exclusive_access();
+    inner.cwd = new_cwd;
+    0
+}
+
+pub fn sys_getcwd(buf: *mut u8, size: usize) -> isize {
+    if buf.is_null() || size == 0 {
+        return 0;
+    }
+    let task = current_task().unwrap();
+    let cwd = {
+        let inner = task.inner_exclusive_access();
+        inner.cwd.clone()
+    };
+    let need = cwd.len() + 1;
+    if need > size {
+        return 0;
+    }
+    let token = current_user_token();
+    let user_buf = translated_byte_buffer(token, buf, size);
+    user_buf[..cwd.len()].copy_from_slice(cwd.as_bytes());
+    user_buf[cwd.len()] = 0;
+    buf as isize
 }
 
 pub fn sys_close(fd: usize) -> isize {
