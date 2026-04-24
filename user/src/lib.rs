@@ -72,6 +72,9 @@ bitflags! {
 pub fn dup(fd: usize) -> isize {
     sys_dup(fd)
 }
+pub fn dup2(old_fd: usize, new_fd: usize) -> isize {
+    sys_dup2(old_fd, new_fd)
+}
 pub fn open(path: &str, flags: OpenFlags) -> isize {
     sys_open(path, flags.bits)
 }

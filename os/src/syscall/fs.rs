@@ -107,6 +107,14 @@ pub fn sys_close(fd: usize) -> isize {
 }
 
 pub fn sys_pipe(pipe: *mut usize) -> isize {
+    sys_pipe2(pipe, 0)
+}
+
+pub fn sys_pipe2(pipe: *mut usize, flags: usize) -> isize {
+    // minimal pipe2: only support flags == 0
+    if flags != 0 || pipe.is_null() {
+        return -1;
+    }
     let task = current_task().unwrap();
     let token = current_user_token();
     let mut inner = task.inner_exclusive_access();
@@ -135,19 +143,30 @@ pub fn sys_dup(fd: usize) -> isize {
 }
 
 pub fn sys_dup2(fd: usize, new_fd: usize) -> isize {
+    sys_dup3(fd, new_fd, 0)
+}
+
+pub fn sys_dup3(fd: usize, new_fd: usize, flags: usize) -> isize {
+    // minimal dup3: only support flags == 0 (dup2 semantics)
+    if flags != 0 {
+        return -1;
+    }
     let task = current_task().unwrap();
     let mut inner = task.inner_exclusive_access();
-    if fd >= inner.fd_table.len() || new_fd >= inner.fd_table.len() {
+    if fd >= inner.fd_table.len() {
         return -1;
     }
-    if inner.fd_table[fd].is_none() {
+    let Some(file) = inner.fd_table[fd].as_ref().cloned() else {
         return -1;
+    };
+    if fd == new_fd {
+        return new_fd as isize;
     }
-    // if new_fd is already used, close it first
-    if inner.fd_table[new_fd].is_some() {
-        inner.fd_table[new_fd].take();
+    while inner.fd_table.len() <= new_fd {
+        inner.fd_table.push(None);
     }
-    inner.fd_table[new_fd] = Some(Arc::clone(inner.fd_table[fd].as_ref().unwrap()));
+    inner.fd_table[new_fd].take();
+    inner.fd_table[new_fd] = Some(file);
     new_fd as isize
 }
 

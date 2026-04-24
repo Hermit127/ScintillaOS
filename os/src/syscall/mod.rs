@@ -1,7 +1,8 @@
-const SYSCALL_DUP: usize = 24;
+const SYSCALL_DUP: usize = 23;
+const SYSCALL_DUP3: usize = 24;
 const SYSCALL_OPENAT: usize = 56;
 const SYSCALL_CLOSE: usize = 57;
-const SYSCALL_PIPE: usize = 59;
+const SYSCALL_PIPE2: usize = 59;
 const SYSCALL_READ: usize = 63;
 const SYSCALL_WRITE: usize = 64;
 const SYSCALL_EXIT: usize = 93;
@@ -20,7 +21,6 @@ const SYSCALL_WAITPID: usize = 260;
 const SYSCALL_GETDENTS64: usize = 61;
 const SYSCALL_FSTAT: usize = 80;
 const SYSCALL_SLEEP: usize = 300;
-//defined in our syscall table, but not implemented yet
 const SYSCALL_DUP2: usize = 33;
 
 
@@ -36,9 +36,10 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     trace!("syscall: id: {}, args: {:?}", syscall_id, args);
     match syscall_id {
         SYSCALL_DUP => sys_dup(args[0]),
+        SYSCALL_DUP3 => sys_dup3(args[0], args[1], args[2]),
         SYSCALL_OPENAT => sys_openat(args[0] as isize, args[1] as *const u8, args[2] as u32, args[3] as u32),
         SYSCALL_CLOSE => sys_close(args[0]),
-        SYSCALL_PIPE => sys_pipe(args[0] as *mut usize),
+        SYSCALL_PIPE2 => sys_pipe2(args[0] as *mut usize, args[1]),
         SYSCALL_GETDENTS64 => sys_getdents64(args[0], args[1] as *mut u8, args[2]),
         SYSCALL_READ => sys_read(args[0], args[1] as *mut u8, args[2]),
         SYSCALL_WRITE => sys_write(args[0], args[1] as *mut u8, args[2]),
@@ -61,6 +62,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_FSTAT => sys_fstat(args[0], args[1] as *mut u8),
         SYSCALL_BRK => sys_brk(args[0]),
         SYSCALL_SLEEP => sys_sleep(args[0] as u64),
+        // keep x86_64 dup2 syscall number for compatibility
         SYSCALL_DUP2 => sys_dup2(args[0], args[1]),
         _ => panic!("Unsupported syscall_id: {}", syscall_id),
     }

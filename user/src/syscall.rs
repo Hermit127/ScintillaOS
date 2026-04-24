@@ -2,10 +2,11 @@ use core::arch::asm;
 
 use crate::SignalAction;
 
-const SYSCALL_DUP: usize = 24;
+const SYSCALL_DUP: usize = 23;
+const SYSCALL_DUP3: usize = 24;
 const SYSCALL_OPENAT: usize = 56;
 const SYSCALL_CLOSE: usize = 57;
-const SYSCALL_PIPE: usize = 59;
+const SYSCALL_PIPE2: usize = 59;
 const SYSCALL_READ: usize = 63;
 const SYSCALL_WRITE: usize = 64;
 const SYSCALL_EXIT: usize = 93;
@@ -105,6 +106,10 @@ pub fn sys_dup(fd: usize) -> isize {
     syscall(SYSCALL_DUP, [fd, 0, 0, 0, 0, 0])
 }
 
+pub fn sys_dup2(old_fd: usize, new_fd: usize) -> isize {
+    syscall(SYSCALL_DUP3, [old_fd, new_fd, 0, 0, 0, 0])
+}
+
 pub fn sys_open(path: &str, flags: u32) -> isize {
     sys_openat(AT_FDCWD, path, flags, 0)
 }
@@ -128,7 +133,7 @@ pub fn sys_close(fd: usize) -> isize {
 }
 
 pub fn sys_pipe(pipe: &mut [usize]) -> isize {
-    syscall(SYSCALL_PIPE, [pipe.as_mut_ptr() as usize, 0, 0, 0, 0, 0])
+    syscall(SYSCALL_PIPE2, [pipe.as_mut_ptr() as usize, 0, 0, 0, 0, 0])
 }
 
 pub fn sys_read(fd: usize, buffer: &mut [u8]) -> isize {

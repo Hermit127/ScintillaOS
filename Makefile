@@ -40,8 +40,7 @@ ROOTFS_BIN_DIR := $(ROOTFS_DIR)/bin
 ROOTFS_MNT_DIR := $(ROOTFS_DIR)/mnt
 OSCOMP_DIR ?= ../testsuits-for-oskernel/basic/user
 OSCOMP_BIN_DIR := $(OSCOMP_DIR)/build/$(ARCH)
-OSCOMP_APPS := open openat close read write
-# FS_IMG := fs-img.img
+# FS_IMG := fs-img.img 
 APPS := user/src/bin/*
 
 # BOARD
@@ -92,9 +91,9 @@ fs-img: $(APPS)
 		cp target/$(TARGET)/release/$$app $(ROOTFS_BIN_DIR)/; \
 	done
 	@if [ -d "$(OSCOMP_BIN_DIR)" ]; then \
-		for app in $(OSCOMP_APPS); do \
-			if [ -f "$(OSCOMP_BIN_DIR)/$$app" ]; then \
-				cp "$(OSCOMP_BIN_DIR)/$$app" "$(ROOTFS_BIN_DIR)/"; \
+		for app in "$(OSCOMP_BIN_DIR)"/*; do \
+			if [ -f "$$app" ] && [ -x "$$app" ]; then \
+				cp "$$app" "$(ROOTFS_BIN_DIR)/"; \
 			fi; \
 		done; \
 		if [ -f "$(OSCOMP_BIN_DIR)/text.txt" ]; then \
