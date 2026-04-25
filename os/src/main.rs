@@ -39,6 +39,10 @@ pub struct ArchInterfaceImpl;
 /// kernel interrupt
 #[polyhal::arch_interrupt]
 fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
+    //user time accounting
+    if let Some(task) = crate::task::current_task() {
+        task.record_time_user_to_kernel();
+    }
     // trace!("trap_type @ {:x?} {:#x?}", trap_type, ctx);
     match trap_type {
         Breakpoint => return,
@@ -85,6 +89,11 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
     if let Some((errno, msg)) = check_signals_error_of_current() {
         println!("[kernel] {}", msg);
         exit_current_and_run_next(errno);
+    }
+
+    // kernel time accounting
+    if let Some(task) = crate::task::current_task() {
+        task.record_time_kernel_to_user();
     }
 }
 

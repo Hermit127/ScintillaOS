@@ -23,6 +23,15 @@ const MAP_PRIVATE: usize = 0x02;
 const MAP_FIXED: usize = 0x10;
 const MAP_ANONYMOUS: usize = 0x20;
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Tms {
+    pub tms_utime: isize,
+    pub tms_stime: isize,
+    pub tms_cutime: isize,
+    pub tms_cstime: isize,
+}
+
 pub fn sys_exit(exit_code: i32) -> ! {
     exit_current_and_run_next(exit_code);
     panic!("Unreachable in sys_exit!");
@@ -346,4 +355,26 @@ pub fn sys_munmap(start: usize, len: usize) -> isize {
     } else {
         -1
     }
+}
+
+pub fn sys_times(tms_ptr: usize) -> isize {
+    let task = crate::task::current_task().unwrap();
+
+    task.record_time_suspend();
+    task.record_time_resume();
+
+    if tms_ptr != 0 {
+        let inner = task.inner_exclusive_access();
+        let tms = Tms {
+            tms_utime: inner.utime as isize,
+            tms_stime: inner.stime as isize,
+            tms_cutime: inner.cutime as isize,
+            tms_cstime: inner.cstime as isize,
+        };
+        let token = inner.get_user_token();
+        drop(inner);
+        *crate::mm::translated_refmut(token, tms_ptr as *mut Tms) = tms;
+    }
+
+    polyhal::time::Time::now().to_msec() as isize
 }

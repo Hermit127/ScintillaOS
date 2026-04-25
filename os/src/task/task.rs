@@ -72,6 +72,11 @@ pub struct TaskControlBlockInner {
     pub heap_bottom: usize,
     pub program_brk: usize,
     pub sleeping : Option<u64>,
+    pub utime: usize,
+    pub stime: usize,
+    pub cutime: usize,
+    pub cstime: usize,
+    pub last_time: usize,
 }
 
 impl TaskControlBlockInner {
@@ -168,6 +173,11 @@ impl TaskControlBlock {
                     heap_bottom,
                     program_brk: heap_bottom,
                     sleeping: None,
+                    utime: 0,
+                    stime: 0,
+                    cutime: 0,
+                    cstime: 0,
+                    last_time: polyhal::time::Time::now().to_msec() as usize,
                 })
             },
         };
@@ -276,6 +286,11 @@ impl TaskControlBlock {
                     heap_bottom: parent_inner.heap_bottom,
                     program_brk: parent_inner.program_brk,
                     sleeping: None,
+                    utime: 0,
+                    stime: 0,
+                    cutime: 0,
+                    cstime: 0,
+                    last_time: polyhal::time::Time::now().to_msec() as usize,
                 })
             },
         });
@@ -289,6 +304,28 @@ impl TaskControlBlock {
     }
     pub fn getpid(&self) -> usize {
         self.pid.0
+    }
+    pub fn record_time_user_to_kernel(&self) {
+        let mut inner = self.inner_exclusive_access();
+        let now = polyhal::time::Time::now().to_msec() as usize;
+        inner.utime += now - inner.last_time;
+        inner.last_time = now;
+    }
+    pub fn record_time_kernel_to_user(&self) {
+        let mut inner = self.inner_exclusive_access();
+        let now = polyhal::time::Time::now().to_msec() as usize;
+        inner.stime += now - inner.last_time;
+        inner.last_time = now;
+    }
+    pub fn record_time_suspend(&self) {
+        let mut inner = self.inner_exclusive_access();
+        let now = polyhal::time::Time::now().to_msec() as usize;
+        inner.stime += now - inner.last_time;
+        inner.last_time = now;
+    }
+    pub fn record_time_resume(&self) {
+        let mut inner = self.inner_exclusive_access();
+        inner.last_time = polyhal::time::Time::now().to_msec() as usize;
     }
 }
 

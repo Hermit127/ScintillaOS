@@ -30,6 +30,9 @@ pub fn suspend_current_and_run_next() {
     // There must be an application running.
     let task = take_current_task().unwrap();
 
+    //added for kernel time accounting
+    task.record_time_suspend();
+
     // ---- access current TCB exclusively
     let mut task_inner = task.inner_exclusive_access();
     let task_cx_ptr = &mut task_inner.task_cx as *mut KContext;
@@ -39,9 +42,11 @@ pub fn suspend_current_and_run_next() {
     // ---- release current PCB
 
     // push back to ready queue.
-    add_task(task);
+    add_task(task.clone());
     // jump to scheduling cycle
     schedule(task_cx_ptr);
+    //added fot reset time accounting
+    task.record_time_resume();
 }
 
 /// pid of usertests app in make run TEST=1
