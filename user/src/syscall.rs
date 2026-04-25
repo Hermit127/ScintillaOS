@@ -15,6 +15,7 @@ const SYSCALL_KILL: usize = 129;
 const SYSCALL_SIGACTION: usize = 134;
 const SYSCALL_SIGPROCMASK: usize = 135;
 const SYSCALL_SIGRETURN: usize = 139;
+const SYSCALL_TIMES: usize = 153;
 const SYSCALL_GET_TIME: usize = 169;
 const SYSCALL_GETPID: usize = 172;
 const SYSCALL_BRK: usize = 214;
@@ -23,6 +24,15 @@ const SYSCALL_EXEC: usize = 221;
 const SYSCALL_WAITPID: usize = 260;
 
 const AT_FDCWD: isize = -100;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Tms {
+    pub tms_utime: isize,
+    pub tms_stime: isize,
+    pub tms_cutime: isize,
+    pub tms_cstime: isize,
+}
 
 #[cfg(target_arch = "riscv64")]
 fn syscall(id: usize, args: [usize; 6]) -> isize {
@@ -210,4 +220,8 @@ pub fn sys_sigreturn() -> isize {
 
 pub fn sys_brk(brk_addr: usize) -> isize {
     syscall(SYSCALL_BRK, [brk_addr, 0, 0, 0, 0, 0])
+}
+
+pub fn sys_times(tms: *mut Tms) -> isize {
+    syscall(SYSCALL_TIMES, [tms as usize, 0, 0, 0, 0, 0])
 }

@@ -16,6 +16,8 @@ use alloc::vec::Vec;
 use buddy_system_allocator::LockedHeap;
 use syscall::*;
 
+pub use syscall::Tms;
+
 const USER_HEAP_SIZE: usize = 32768;
 
 static mut HEAP_SPACE: [u8; USER_HEAP_SIZE] = [0; USER_HEAP_SIZE];
@@ -259,4 +261,8 @@ pub fn sigreturn() -> isize {
 
 pub fn brk(brk_addr: usize) -> isize {
     sys_brk(brk_addr)
+}
+
+pub fn times(tms: &mut Tms) -> isize {
+    sys_times(tms as *mut Tms)
 }
