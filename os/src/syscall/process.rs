@@ -23,6 +23,8 @@ const MAP_PRIVATE: usize = 0x02;
 const MAP_FIXED: usize = 0x10;
 const MAP_ANONYMOUS: usize = 0x20;
 
+const UTSNAME_LEN: usize = 65;
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Tms {
@@ -30,6 +32,27 @@ pub struct Tms {
     pub tms_stime: isize,
     pub tms_cutime: isize,
     pub tms_cstime: isize,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct UtsName {
+    pub sysname: [u8; UTSNAME_LEN],
+    pub nodename: [u8; UTSNAME_LEN],
+    pub release: [u8; UTSNAME_LEN],
+    pub version: [u8; UTSNAME_LEN],
+    pub machine: [u8; UTSNAME_LEN],
+    pub domainname: [u8; UTSNAME_LEN],
+}
+
+
+impl UtsName {
+    fn set_str(field: &mut [u8; UTSNAME_LEN], s: &str) {
+        let bytes = s.as_bytes();
+        let len = bytes.len().min(UTSNAME_LEN - 1);
+        field[..len].copy_from_slice(&bytes[..len]);
+        field[len] = 0;
+    }
 }
 
 pub fn sys_exit(exit_code: i32) -> ! {
@@ -377,4 +400,37 @@ pub fn sys_times(tms_ptr: usize) -> isize {
     }
 
     polyhal::time::Time::now().to_msec() as isize
+}
+
+pub fn sys_uname(uts_ptr: usize) -> isize {
+    if uts_ptr == 0 {
+        return -1;
+    }
+
+    let task = crate::task::current_task().unwrap();
+    let token = task.inner_exclusive_access().get_user_token();
+    let uts = crate::mm::translated_refmut(token, uts_ptr as *mut UtsName);
+    
+    *uts = UtsName {
+        sysname: [0; UTSNAME_LEN],
+        nodename: [0; UTSNAME_LEN],
+        release: [0; UTSNAME_LEN],
+        version: [0; UTSNAME_LEN],
+        machine: [0; UTSNAME_LEN],
+        domainname: [0; UTSNAME_LEN],
+    };
+
+    UtsName::set_str(&mut uts.sysname, "Linux");
+    UtsName::set_str(&mut uts.nodename, "rCore-Tutorial");
+    UtsName::set_str(&mut uts.release, "5.10.0"); 
+    UtsName::set_str(&mut uts.version, "v0.1.0");
+
+    #[cfg(target_arch = "riscv64")]
+    UtsName::set_str(&mut uts.machine, "riscv64");
+    #[cfg(target_arch = "x86_64")]
+    UtsName::set_str(&mut uts.machine, "x86_64");
+    
+    UtsName::set_str(&mut uts.domainname, "localdomain");
+
+    0
 }
