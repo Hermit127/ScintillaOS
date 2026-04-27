@@ -80,7 +80,11 @@ $(KERNEL_BIN): kernel
 fs-img: $(APPS)
 	@cd user && make build TARGET=$(TARGET) TEST=$(TEST)
 	@if [ -d "$(OSCOMP_DIR)" ]; then \
-		$(MAKE) -C "$(OSCOMP_DIR)" ARCH=$(ARCH) clean binary; \
+		if [ ! -d "$(OSCOMP_BIN_DIR)" ] || [ -z "$$(ls -A $(OSCOMP_BIN_DIR) 2>/dev/null)" ]; then \
+			$(MAKE) -C "$(OSCOMP_DIR)" ARCH=$(ARCH) clean binary; \
+		else \
+			echo "[fs-img] using pre-built OSCOMP binaries: $(OSCOMP_BIN_DIR)"; \
+		fi; \
 	fi
 	@rm -f $(FS_IMG)
 	@rm -rf $(ROOTFS_DIR)
@@ -92,7 +96,7 @@ fs-img: $(APPS)
 	done
 	@if [ -d "$(OSCOMP_BIN_DIR)" ]; then \
 		for app in "$(OSCOMP_BIN_DIR)"/*; do \
-			if [ -f "$$app" ] && [ -x "$$app" ]; then \
+			if [ -f "$$app" ] && [ ! -d "$$app" ]; then \
 				cp "$$app" "$(ROOTFS_BIN_DIR)/"; \
 			fi; \
 		done; \

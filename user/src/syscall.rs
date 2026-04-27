@@ -4,6 +4,8 @@ use crate::SignalAction;
 
 const SYSCALL_DUP: usize = 23;
 const SYSCALL_DUP3: usize = 24;
+const SYSCALL_GETCWD: usize = 17;
+const SYSCALL_CHDIR: usize = 49;
 const SYSCALL_OPENAT: usize = 56;
 const SYSCALL_CLOSE: usize = 57;
 const SYSCALL_PIPE2: usize = 59;
@@ -224,4 +226,12 @@ pub fn sys_brk(brk_addr: usize) -> isize {
 
 pub fn sys_times(tms: *mut Tms) -> isize {
     syscall(SYSCALL_TIMES, [tms as usize, 0, 0, 0, 0, 0])
+}
+
+pub fn sys_chdir(path: &str) -> isize {
+    syscall(SYSCALL_CHDIR, [path.as_ptr() as usize, 0, 0, 0, 0, 0])
+}
+
+pub fn sys_getcwd(buf: &mut [u8]) -> isize {
+    syscall(SYSCALL_GETCWD, [buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0, 0])
 }

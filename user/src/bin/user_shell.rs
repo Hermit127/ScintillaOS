@@ -16,7 +16,7 @@ const LINE_START: &str = ">> ";
 use alloc::string::String;
 use alloc::vec::Vec;
 use user_lib::console::getchar;
-use user_lib::{close, dup, exec, fork, open, pipe, waitpid, OpenFlags};
+use user_lib::{close, dup, exec, fork, getcwd, chdir, open, pipe, waitpid, OpenFlags};
 
 #[derive(Debug)]
 struct ProcessArguments {
@@ -174,7 +174,19 @@ pub fn main() -> i32 {
                                 }
                                 // execute new application
                                 let mut exec_path = args_copy[0].clone();
-                                if !exec_path.starts_with('/') {
+                                let cmd_name = exec_path.trim_end_matches('\0');
+                                if cmd_name == "cd" {
+                                    if args_copy.len() < 2 {
+                                        println!("cd: missing argument");
+                                    } else {
+                                        let dir = args_copy[1].trim_end_matches('\0');
+                                        if chdir(dir) != 0 {
+                                            println!("cd: no such directory: {}", dir);
+                                        }
+                                    }
+                                    return 0;
+                                }
+                                if !exec_path.starts_with('/') && !exec_path.starts_with("./") && !exec_path.starts_with("../") {
                                     let cmd = String::from(exec_path.trim_end_matches('\0'));
                                     exec_path = String::from("/bin/");
                                     exec_path.push_str(cmd.as_str());

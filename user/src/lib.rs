@@ -263,6 +263,14 @@ pub fn brk(brk_addr: usize) -> isize {
     sys_brk(brk_addr)
 }
 
+pub fn chdir(path: &str) -> isize {
+    sys_chdir(path)
+}
+
+pub fn getcwd(buf: &mut [u8]) -> isize {
+    sys_getcwd(buf)
+}
+
 pub fn times(tms: &mut Tms) -> isize {
     sys_times(tms as *mut Tms)
 }
