@@ -82,6 +82,10 @@ pub fn sys_getppid() -> isize {
     }
 }
 
+pub fn sys_clone(flags: usize, _stack: usize, _ptid: usize, _tls: usize, _ctid: usize) -> isize {
+    sys_fork()
+}
+
 pub fn sys_fork() -> isize {
     let current_task = current_task().unwrap();
     let new_task = current_task.fork();
