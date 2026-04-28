@@ -82,8 +82,17 @@ pub fn sys_getppid() -> isize {
     }
 }
 
-pub fn sys_clone(flags: usize, _stack: usize, _ptid: usize, _tls: usize, _ctid: usize) -> isize {
-    sys_fork()
+pub fn sys_clone(_flags: usize, stack: usize, _ptid: usize, _tls: usize, _ctid: usize) -> isize {
+    let current_task = current_task().unwrap();
+    let new_task = current_task.fork();
+    let new_pid = new_task.pid.0;
+    let trap_cx = new_task.inner_exclusive_access().get_trap_cx();
+    trap_cx[TrapFrameArgs::RET] = 0;
+    if stack != 0 {
+        trap_cx[TrapFrameArgs::SP] = stack;
+    }
+    add_task(new_task);
+    new_pid as isize
 }
 
 pub fn sys_fork() -> isize {

@@ -68,6 +68,10 @@ mkdir依然存在问题
 实现了nanosleep，未测试
 完善了nanosleep，写了测试文件，暂未接入到sleep调用
 
+2026/4/28 stq
+目前可以使用basic_runner进行测试了，brk和chdir通过了测试，但是clone卡死了
+clone已经修复，mkdir与mount测试失败，pipe卡死，pipe之前的全部测试成功
+
 MERGE不要用AI!!!  请手动检查每一行冲突!!!
 MERGE不要用AI!!!  请手动检查每一行冲突!!!
 MERGE不要用AI!!!  请手动检查每一行冲突!!!
