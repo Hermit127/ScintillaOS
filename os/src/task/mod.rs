@@ -16,6 +16,8 @@ use polyhal::instruction::shutdown;
 use polyhal::kcontext::KContext;
 use polyhal_trap::trapframe::TrapFrameArgs;
 use task::{TaskControlBlock, TaskStatus};
+use crate::sync::UPSafeCell;
+use alloc::vec::Vec;
 
 pub use action::{SignalAction, SignalActions};
 pub use manager::{add_task, pid2task};
@@ -24,6 +26,25 @@ pub use processor::{
     current_task, current_user_token, init_kernel_page, run_tasks, schedule, take_current_task,
 };
 pub use signal::{SignalFlags, MAX_SIG};
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct TimeSpec {
+    pub tv_sec: usize,   
+    pub tv_nsec: usize,  
+}
+
+pub struct SleepTask {
+    pub wakeup_time: usize, 
+    pub task: Arc<TaskControlBlock>,
+}
+
+lazy_static! {
+    // public sleep queue for timer interrupt handler to access
+    pub static ref SLEEP_QUEUE: UPSafeCell<Vec<SleepTask>> = unsafe {
+        UPSafeCell::new(Vec::new())
+    };
+}
 
 pub fn suspend_current_and_run_next() {
     //trace!("os::task::suspend_current_and_run_next");
@@ -244,5 +265,30 @@ pub fn handle_signals() {
             break;
         }
         suspend_current_and_run_next();
+    }
+}
+
+pub fn add_sleep_task(wakeup_time: usize, task: Arc<TaskControlBlock>) {
+    SLEEP_QUEUE.exclusive_access().push(SleepTask { wakeup_time, task });
+}
+
+pub fn check_and_wake_up_tasks() {
+    let now = polyhal::time::Time::now().to_msec() as usize;
+    let mut queue = SLEEP_QUEUE.exclusive_access();
+    
+    let mut i = 0;
+    while i < queue.len() {
+        if queue[i].wakeup_time <= now {
+            
+            let sleep_task = queue.remove(i);
+
+            //wake up the task by changing its status to Ready and adding it back to the scheduler
+            let mut inner = sleep_task.task.inner_exclusive_access();
+            inner.task_status = TaskStatus::Ready; 
+            drop(inner);
+            add_task(sleep_task.task); 
+        } else {
+            i += 1;
+        }
     }
 }

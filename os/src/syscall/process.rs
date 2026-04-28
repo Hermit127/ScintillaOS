@@ -438,3 +438,30 @@ pub fn sys_uname(uts_ptr: usize) -> isize {
 
     0
 }
+
+pub fn sys_nanosleep(req_ptr: usize, rem_ptr: usize) -> isize {
+    let task = crate::task::current_task().unwrap();
+    let token = task.inner_exclusive_access().get_user_token();
+
+    let req = *crate::mm::translated_refmut(token, req_ptr as *mut crate::task::TimeSpec);
+
+    let duration_ms = req.tv_sec * 1000 + req.tv_nsec / 1_000_000;
+    let now = polyhal::time::Time::now().to_msec() as usize;
+    let wakeup_time = now + duration_ms;
+
+    let inner = task.inner_exclusive_access();
+    // inner.task_status = crate::task::TaskStatus::Blocking; 
+    drop(inner);
+
+    crate::task::add_sleep_task(wakeup_time, task.clone());
+
+    crate::task::suspend_current_and_run_next();
+
+    if rem_ptr != 0 {
+        let rem = crate::mm::translated_refmut(token, rem_ptr as *mut crate::task::TimeSpec);
+        rem.tv_sec = 0;
+        rem.tv_nsec = 0;
+    }
+
+    0 
+}

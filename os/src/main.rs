@@ -5,8 +5,7 @@
 use crate::{
     syscall::syscall,
     task::{
-        check_signals_error_of_current, current_add_signal, exit_current_and_run_next,
-        handle_signals, suspend_current_and_run_next, SignalFlags,
+        SignalFlags, check_and_wake_up_tasks, check_signals_error_of_current, current_add_signal, exit_current_and_run_next, handle_signals, suspend_current_and_run_next
     },
 };
 // use polyhal::api::ArchInterface;
@@ -75,6 +74,7 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             current_add_signal(SignalFlags::SIGILL);
         }
         Timer => {
+            check_and_wake_up_tasks();
             suspend_current_and_run_next();
         }
         _ => {
