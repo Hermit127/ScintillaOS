@@ -66,6 +66,7 @@ mkdir依然存在问题
 
 2026/4/28 dyh
 实现了nanosleep，未测试
+完善了nanosleep，写了测试文件，暂未接入到sleep调用
 
 MERGE不要用AI!!!  请手动检查每一行冲突!!!
 MERGE不要用AI!!!  请手动检查每一行冲突!!!

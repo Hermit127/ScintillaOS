@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 use buddy_system_allocator::LockedHeap;
 use syscall::*;
 
-pub use syscall::Tms;
+pub use syscall::{sys_nanosleep, TimeSpec, Tms};
 
 const USER_HEAP_SIZE: usize = 32768;
 
@@ -142,10 +142,11 @@ pub fn waitpid_nb(pid: usize, exit_code: &mut i32) -> isize {
 }
 
 pub fn sleep(period_ms: usize) {
-    let start = sys_get_time();
-    while sys_get_time() < start + period_ms as isize {
-        sys_yield();
-    }
+    let req = TimeSpec {
+        tv_sec: period_ms / 1000,
+        tv_nsec: (period_ms % 1000) * 1_000_000,
+    };
+    sys_nanosleep(&req, core::ptr::null_mut());
 }
 
 /// Action for a signal

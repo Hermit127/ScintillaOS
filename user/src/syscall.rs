@@ -24,6 +24,7 @@ const SYSCALL_BRK: usize = 214;
 const SYSCALL_FORK: usize = 401;
 const SYSCALL_EXEC: usize = 221;
 const SYSCALL_WAITPID: usize = 260;
+const SYSCALL_NANOSLEEP: usize = 101;
 
 const AT_FDCWD: isize = -100;
 
@@ -234,4 +235,15 @@ pub fn sys_chdir(path: &str) -> isize {
 
 pub fn sys_getcwd(buf: &mut [u8]) -> isize {
     syscall(SYSCALL_GETCWD, [buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0, 0])
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct TimeSpec {
+    pub tv_sec: usize,
+    pub tv_nsec: usize,
+}
+
+pub fn sys_nanosleep(req: *const TimeSpec, rem: *mut TimeSpec) -> isize {
+    syscall(SYSCALL_NANOSLEEP, [req as usize, rem as usize, 0, 0, 0, 0])
 }

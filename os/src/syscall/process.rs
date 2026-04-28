@@ -2,7 +2,7 @@ use crate::fs::{open_file, OpenFlags};
 use crate::mm::{translated_ref, translated_refmut, translated_str};
 use crate::task::{
     add_task, current_task, current_user_token, exit_current_and_run_next, pid2task,
-    suspend_current_and_run_next, SignalAction, SignalFlags, MAX_SIG,
+    sleep_current_and_run_next, suspend_current_and_run_next, SignalAction, SignalFlags, MAX_SIG,
 };
 use alloc::format;
 use alloc::string::String;
@@ -455,7 +455,7 @@ pub fn sys_nanosleep(req_ptr: usize, rem_ptr: usize) -> isize {
 
     crate::task::add_sleep_task(wakeup_time, task.clone());
 
-    crate::task::suspend_current_and_run_next();
+    sleep_current_and_run_next();
 
     if rem_ptr != 0 {
         let rem = crate::mm::translated_refmut(token, rem_ptr as *mut crate::task::TimeSpec);

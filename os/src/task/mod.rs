@@ -70,6 +70,19 @@ pub fn suspend_current_and_run_next() {
     task.record_time_resume();
 }
 
+pub fn sleep_current_and_run_next() {
+    let task = take_current_task().unwrap();
+    task.record_time_suspend();
+
+    let mut task_inner = task.inner_exclusive_access();
+    let task_cx_ptr = &mut task_inner.task_cx as *mut KContext;
+    drop(task_inner);
+
+    schedule(task_cx_ptr);
+
+    task.record_time_resume();
+}
+
 /// pid of usertests app in make run TEST=1
 pub const IDLE_PID: usize = 0;
 
@@ -205,10 +218,19 @@ fn call_user_signal_handler(sig: usize, signal: SignalFlags) {
         // put args (a0)
         trap_ctx[TrapFrameArgs::ARG0] = sig;
     } else {
-        info!("task id: {}", task.getpid());
-        info!("{:#x?}", task_inner.get_trap_cx());
-        // default action
-        println!("[K] task/call_user_signal_handler: default action: ignore it or kill process");
+        // default action: fatal signals kill the process, others are ignored
+        let fatal = signal.intersects(
+            SignalFlags::SIGSEGV
+                | SignalFlags::SIGABRT
+                | SignalFlags::SIGILL
+                | SignalFlags::SIGFPE
+                | SignalFlags::SIGBUS
+                | SignalFlags::SIGSYS,
+        );
+        if fatal {
+            task_inner.killed = true;
+            task_inner.signals ^= signal;
+        }
     }
 }
 
