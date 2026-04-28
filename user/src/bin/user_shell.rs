@@ -16,7 +16,7 @@ const LINE_START: &str = ">> ";
 use alloc::string::String;
 use alloc::vec::Vec;
 use user_lib::console::getchar;
-use user_lib::{close, dup, exec, fork, getcwd, chdir, open, pipe, waitpid, OpenFlags};
+use user_lib::{close, dup, exec, fork, chdir, open, pipe, waitpid, OpenFlags};
 
 #[derive(Debug)]
 struct ProcessArguments {

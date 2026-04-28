@@ -196,8 +196,10 @@ impl TaskControlBlock {
 
         memory_set.activate();
         // push arguments on user stack
-        user_sp -= (args.len() + 1) * core::mem::size_of::<usize>();
-        let argv_base = user_sp;
+        user_sp -= (args.len() + 2) * core::mem::size_of::<usize>();
+        *translated_refmut(memory_set.token(), user_sp as *mut usize) = args.len();
+        let crt_sp = user_sp;
+        let argv_base = user_sp + core::mem::size_of::<usize>();
         let mut argv: Vec<_> = (0..=args.len())
             .map(|arg| {
                 translated_refmut(
@@ -235,7 +237,7 @@ impl TaskControlBlock {
         // initialize trap_cx
         let mut trap_cx = TrapFrame::new();
         trap_cx[TrapFrameArgs::SEPC] = entry_point;
-        trap_cx[TrapFrameArgs::SP] = user_sp;
+        trap_cx[TrapFrameArgs::SP] = crt_sp;
         trap_cx[TrapFrameArgs::ARG0] = args.len();
         trap_cx[TrapFrameArgs::ARG1] = argv_base;
         *inner.get_trap_cx() = trap_cx;
