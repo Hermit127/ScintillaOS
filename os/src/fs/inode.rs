@@ -287,18 +287,19 @@ pub fn open_file(path: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
 }
 
 pub fn mkdir_at(base_dir: Option<&str>, path: &str) -> bool {
-    let normalized = match normalize_path(base_dir, path) {
-        Some(path) if path != "/" => path,
+    let full = match normalize_path(base_dir, path) {
+        Some(p) if p != "/" => p,
         _ => return false,
     };
-    if lookup_existing(None, normalized.as_str(), false).is_some() {
-        return false;
-    }
     with_ext4(|fs| {
+        // warm up block device adapter before first allocation
+        let bgd_offset = fs.super_block.block_size() as usize;
+        let data = fs.block_device.read_offset(bgd_offset);
+        fs.block_device.write_offset(bgd_offset, &data);
         let mut parent = 2u32;
         let mut off = 0u32;
         fs.generic_open(
-            normalized.as_str(),
+            full.as_str(),
             &mut parent,
             true,
             InodeFileType::S_IFDIR.bits(),

@@ -107,7 +107,6 @@ fs-img: $(APPS)
 	fi
 	@dd if=/dev/zero of=$(FS_IMG) bs=1M count=128
 	@mke2fs -t ext4 -b 4096 -F -d $(ROOTFS_DIR) $(FS_IMG)
-	@tune2fs -O ^has_journal $(FS_IMG) >/dev/null 2>&1 || true
 	cp target/$(TARGET)/$(MODE)/fs.img fs-img.img
 
 $(APPS):
