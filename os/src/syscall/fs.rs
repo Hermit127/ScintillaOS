@@ -1,13 +1,13 @@
-use crate::fs::{make_pipe, mkdir_at, open_file_at, unlink_at, File, Kstat, OpenFlags};
+use crate::fs::vfs::{vfs_resolve_path, Dentry, VfsSuperBlock};
+use crate::fs::{make_pipe, mkdir_at, open_file_at, unlink_at, Kstat, OpenFlags};
 use crate::mm::{translated_byte_buffer, translated_refmut, translated_str};
 use crate::task::{current_task, current_user_token};
-use alloc::string::String;
 use alloc::sync::Arc;
 
 const AT_FDCWD: isize = -100;
 
-fn resolve_base_dir(dirfd: isize) -> Option<String> {
-    let task = current_task().unwrap();
+fn resolve_base_dir(dirfd: isize) -> Option<Arc<Dentry>> {
+    let task = current_task()?;
     if dirfd == AT_FDCWD {
         let inner = task.inner_exclusive_access();
         return Some(inner.cwd.clone());
@@ -26,7 +26,10 @@ fn resolve_base_dir(dirfd: isize) -> Option<String> {
     if !file.is_dir() {
         return None;
     }
-    file.path()
+    let path = file.path()?;
+    let cwd = inner.cwd.clone();
+    drop(inner);
+    vfs_resolve_path(&cwd, &path)
 }
 
 pub fn sys_write(fd: usize, buf: *mut u8, len: usize) -> isize {
@@ -41,7 +44,6 @@ pub fn sys_write(fd: usize, buf: *mut u8, len: usize) -> isize {
             return -1;
         }
         let file = file.clone();
-        // release current task TCB manually to avoid multi-borrow
         drop(inner);
         file.write(translated_byte_buffer(token, buf, len)) as isize
     } else {
@@ -61,7 +63,6 @@ pub fn sys_read(fd: usize, buf: *mut u8, len: usize) -> isize {
         if !file.readable() {
             return -1;
         }
-        // release current task TCB manually to avoid multi-borrow
         drop(inner);
         file.read(translated_byte_buffer(token, buf, len)) as isize
     } else {
@@ -79,11 +80,8 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
     let path = translated_str(token, path);
 
     let open_flags = OpenFlags::from_raw(flags);
-    let base_dir = match resolve_base_dir(dirfd) {
-        Some(base) => base,
-        None => return -1,
-    };
-    let inode = open_file_at(Some(base_dir.as_str()), path.as_str(), open_flags);
+    let base_dir = resolve_base_dir(dirfd);
+    let inode = open_file_at(base_dir, path.as_str(), open_flags);
 
     if let Some(inode) = inode {
         let mut inner = task.inner_exclusive_access();
@@ -109,7 +107,7 @@ pub fn sys_mkdirat(dirfd: isize, path: *const u8, _mode: u32) -> isize {
         Some(base) => base,
         None => return -1,
     };
-    if mkdir_at(Some(base_dir.as_str()), path.as_str()) {
+    if mkdir_at(Some(base_dir), path.as_str()) {
         0
     } else {
         -1
@@ -121,7 +119,6 @@ pub fn sys_unlink(path: *const u8) -> isize {
 }
 
 pub fn sys_unlinkat(dirfd: isize, path: *const u8, flags: u32) -> isize {
-    // minimal unlinkat: only support regular unlink (flags == 0)
     if flags != 0 || path.is_null() {
         return -1;
     }
@@ -131,7 +128,7 @@ pub fn sys_unlinkat(dirfd: isize, path: *const u8, flags: u32) -> isize {
         Some(base) => base,
         None => return -1,
     };
-    if unlink_at(Some(base_dir.as_str()), path.as_str()) {
+    if unlink_at(Some(base_dir), path.as_str()) {
         0
     } else {
         -1
@@ -149,14 +146,14 @@ pub fn sys_chdir(path: *const u8) -> isize {
         let inner = task.inner_exclusive_access();
         inner.cwd.clone()
     };
-    let Some(dir_inode) = open_file_at(Some(cwd.as_str()), path.as_str(), OpenFlags::DIRECTORY) else {
+    let Some(dir_dentry) = vfs_resolve_path(&cwd, &path) else {
         return -1;
     };
-    let Some(new_cwd) = dir_inode.path() else {
-        return -1;
-    };
+    if !dir_dentry.is_dir {
+        return -20;
+    }
     let mut inner = task.inner_exclusive_access();
-    inner.cwd = new_cwd;
+    inner.cwd = dir_dentry;
     0
 }
 
@@ -165,18 +162,18 @@ pub fn sys_getcwd(buf: *mut u8, size: usize) -> isize {
         return 0;
     }
     let task = current_task().unwrap();
-    let cwd = {
+    let cwd_path = {
         let inner = task.inner_exclusive_access();
-        inner.cwd.clone()
+        inner.cwd.path.clone()
     };
-    let need = cwd.len() + 1;
+    let need = cwd_path.len() + 1;
     if need > size {
         return 0;
     }
     let token = current_user_token();
     let user_buf = translated_byte_buffer(token, buf, size);
-    user_buf[..cwd.len()].copy_from_slice(cwd.as_bytes());
-    user_buf[cwd.len()] = 0;
+    user_buf[..cwd_path.len()].copy_from_slice(cwd_path.as_bytes());
+    user_buf[cwd_path.len()] = 0;
     buf as isize
 }
 
@@ -198,7 +195,6 @@ pub fn sys_pipe(pipe: *mut usize) -> isize {
 }
 
 pub fn sys_pipe2(pipe: *mut usize, flags: usize) -> isize {
-    // minimal pipe2: only support flags == 0
     if flags != 0 || pipe.is_null() {
         return -1;
     }
@@ -235,7 +231,6 @@ pub fn sys_dup2(fd: usize, new_fd: usize) -> isize {
 }
 
 pub fn sys_dup3(fd: usize, new_fd: usize, flags: usize) -> isize {
-    // minimal dup3: only support flags == 0 (dup2 semantics)
     if flags != 0 {
         return -1;
     }
@@ -278,6 +273,7 @@ pub fn sys_fstat(fd: usize, stat_buf: *mut u8) -> isize {
         -1
     }
 }
+
 pub fn sys_getdents64(fd: usize, dirp: *mut u8, len: usize) -> isize {
     if len == 0 {
         return 0;
@@ -298,5 +294,71 @@ pub fn sys_getdents64(fd: usize, dirp: *mut u8, len: usize) -> isize {
         file.getdents64(user_buf)
     } else {
         -1
+    }
+}
+
+// ==================== mount / umount ====================
+
+use crate::drivers::BLOCK_DEVICE;
+use crate::fs::vfs::{vfs_mount, vfs_umount};
+
+pub fn sys_mount(
+    _source: *const u8,
+    target: *const u8,
+    fstype: *const u8,
+    _mountflags: usize,
+    _data: *const u8,
+) -> isize {
+    let token = current_user_token();
+    let target_path = translated_str(token, target);
+    let fstype_str = translated_str(token, fstype);
+
+    if fstype_str.as_str() != "ext4" {
+        return -22;
+    }
+
+    let task = current_task().unwrap();
+    let cwd = {
+        let inner = task.inner_exclusive_access();
+        inner.cwd.clone()
+    };
+
+    let mnt_point = match vfs_resolve_path(&cwd, target_path.as_str()) {
+        Some(d) => d,
+        None => return -1,
+    };
+
+    if !mnt_point.is_dir {
+        return -20;
+    }
+
+    let sb = VfsSuperBlock::new_ext4(BLOCK_DEVICE.clone(), "ext4");
+
+    if vfs_mount(mnt_point, sb) {
+        0
+    } else {
+        -16
+    }
+}
+
+pub fn sys_umount2(target: *const u8, _flags: usize) -> isize {
+    let token = current_user_token();
+    let target_path = translated_str(token, target);
+
+    let task = current_task().unwrap();
+    let cwd = {
+        let inner = task.inner_exclusive_access();
+        inner.cwd.clone()
+    };
+
+    let mnt_point = match vfs_resolve_path(&cwd, target_path.as_str()) {
+        Some(d) => d,
+        None => return -1,
+    };
+
+    if vfs_umount(&mnt_point) {
+        0
+    } else {
+        -22
     }
 }

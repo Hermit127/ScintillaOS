@@ -1,28 +1,27 @@
+use super::vfs::{
+    vfs_create, vfs_resolve_parent_and_name, vfs_resolve_path,
+    vfs_resolve_with_fallback, Dentry,
+};
 use super::{File, Kstat};
-use crate::drivers::{BlockDevice, BLOCK_DEVICE};
+use crate::drivers::BlockDevice;
 use crate::sync::UPSafeCell;
-use alloc::format;
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use alloc::sync::Arc;
-use alloc::vec;
-use alloc::vec::Vec;
 use bitflags::*;
-use ext4_rs::{Ext4, InodeFileType};
-use lazy_static::*;
 
-struct Ext4BlockDeviceAdapter {
-    inner: Arc<dyn BlockDevice>,
+pub struct Ext4BlockDeviceAdapter {
+    pub inner: Arc<dyn BlockDevice>,
 }
 
 impl ext4_rs::BlockDevice for Ext4BlockDeviceAdapter {
-    fn read_offset(&self, offset: usize) -> Vec<u8> {
+    fn read_offset(&self, offset: usize) -> alloc::vec::Vec<u8> {
         const SECTOR_SIZE: usize = 512;
         const EXT4_BLOCK_SIZE: usize = ext4_rs::BLOCK_SIZE;
         let sector_start = offset / SECTOR_SIZE;
         let sector_offset = offset % SECTOR_SIZE;
         let raw_len = sector_offset + EXT4_BLOCK_SIZE;
         let sector_count = (raw_len + SECTOR_SIZE - 1) / SECTOR_SIZE;
-        let mut raw = vec![0u8; sector_count * SECTOR_SIZE];
+        let mut raw = alloc::vec![0u8; sector_count * SECTOR_SIZE];
         for i in 0..sector_count {
             let begin = i * SECTOR_SIZE;
             self.inner
@@ -37,7 +36,7 @@ impl ext4_rs::BlockDevice for Ext4BlockDeviceAdapter {
         let sector_offset = offset % SECTOR_SIZE;
         let raw_len = sector_offset + data.len();
         let sector_count = (raw_len + SECTOR_SIZE - 1) / SECTOR_SIZE;
-        let mut raw = vec![0u8; sector_count * SECTOR_SIZE];
+        let mut raw = alloc::vec![0u8; sector_count * SECTOR_SIZE];
         for i in 0..sector_count {
             let begin = i * SECTOR_SIZE;
             self.inner
@@ -52,150 +51,40 @@ impl ext4_rs::BlockDevice for Ext4BlockDeviceAdapter {
     }
 }
 
-lazy_static! {
-    static ref EXT4_FS: UPSafeCell<Ext4> = {
-        let device = Arc::new(Ext4BlockDeviceAdapter {
-            inner: BLOCK_DEVICE.clone(),
-        });
-        unsafe { UPSafeCell::new(Ext4::open(device)) }
-    };
-}
-
-fn with_ext4<R>(f: impl FnOnce(&Ext4) -> R) -> R {
-    let fs = EXT4_FS.exclusive_access();
-    f(&fs)
-}
-
-fn trim_cstr_suffix(path: &str) -> &str {
-    path.trim_end_matches('\0')
-}
-
-fn normalize_path(base_dir: Option<&str>, path: &str) -> Option<String> {
-    let path = trim_cstr_suffix(path);
-    if path.is_empty() {
-        return None;
-    }
-
-    let mut parts: Vec<&str> = Vec::new();
-    let is_abs = path.starts_with('/');
-    if !is_abs {
-        for comp in base_dir.unwrap_or("/").split('/') {
-            match comp {
-                "" | "." => {}
-                ".." => {
-                    parts.pop();
-                }
-                _ => parts.push(comp),
-            }
-        }
-    }
-
-    for comp in path.split('/') {
-        match comp {
-            "" | "." => {}
-            ".." => {
-                parts.pop();
-            }
-            _ => parts.push(comp),
-        }
-    }
-
-    if parts.is_empty() {
-        return Some("/".to_string());
-    }
-    Some(format!("/{}", parts.join("/")))
-}
-
-fn candidate_paths(base_dir: Option<&str>, path: &str, want_dir: bool) -> Vec<String> {
-    let mut candidates = Vec::new();
-    if let Some(primary) = normalize_path(base_dir, path) {
-        candidates.push(primary.clone());
-        let path = trim_cstr_suffix(path).trim_start_matches("./");
-        if base_dir.is_none()
-            && !path.starts_with('/')
-            && !path.contains('/')
-            && path != "."
-            && path != ".."
-            && !want_dir
-        {
-            let bin_fallback = format!("/bin/{}", path);
-            if bin_fallback != primary {
-                candidates.push(bin_fallback);
-            }
-        }
-    }
-    candidates
-}
-
-fn lookup_existing(base_dir: Option<&str>, path: &str, want_dir: bool) -> Option<(u32, String, bool)> {
-    for candidate in candidate_paths(base_dir, path, want_dir) {
-        // ext4_rs::generic_open("/") may return an invalid inode number.
-        // Handle root path explicitly to preserve UNIX-like "."/"/" behavior.
-        if candidate == "/" {
-            return Some((2, candidate, true));
-        }
-        let inode = match with_ext4(|fs| {
-            let mut parent = 2u32;
-            let mut off = 0u32;
-            fs.generic_open(
-                candidate.as_str(),
-                &mut parent,
-                false,
-                InodeFileType::S_IFREG.bits(),
-                &mut off,
-            )
-            .ok()
-        }) {
-            Some(inode) => inode,
-            None => continue,
-        };
-
-        let inode_ref = with_ext4(|fs| fs.get_inode_ref(inode));
-        let is_dir = inode_ref.inode.is_dir();
-        if want_dir && !is_dir {
-            continue;
-        }
-        return Some((inode, candidate, is_dir));
-    }
-    None
-}
+// ==================== OSInode ====================
 
 pub struct OSInode {
     readable: bool,
     writable: bool,
+    dentry: Arc<Dentry>,
     inner: UPSafeCell<OSInodeInner>,
 }
 
 pub struct OSInodeInner {
     offset: usize,
-    inode_num: u32,
-    path: String,
-    is_dir: bool,
 }
 
 impl OSInode {
-    pub fn new(readable: bool, writable: bool, inode_num: u32, path: String, is_dir: bool) -> Self {
+    pub fn new(readable: bool, writable: bool, dentry: Arc<Dentry>) -> Self {
         Self {
             readable,
             writable,
-            inner: unsafe {
-                UPSafeCell::new(OSInodeInner {
-                    offset: 0,
-                    inode_num,
-                    path,
-                    is_dir,
-                })
-            },
+            dentry,
+            inner: unsafe { UPSafeCell::new(OSInodeInner { offset: 0 }) },
         }
     }
 
-    pub fn read_all(&self) -> Vec<u8> {
+    pub fn read_all(&self) -> alloc::vec::Vec<u8> {
         let mut inner = self.inner.exclusive_access();
         let mut buffer = [0u8; 512];
-        let mut out = Vec::new();
+        let mut out = alloc::vec::Vec::new();
         loop {
-            let len = with_ext4(|fs| fs.read_at(inner.inode_num, inner.offset, &mut buffer).ok())
-                .unwrap_or(0);
+            let len = self.dentry.super_block.with_ext4(|ext4| {
+                ext4
+                    .read_at(self.dentry.inode_num, inner.offset, &mut buffer)
+                    .ok()
+                    .unwrap_or(0)
+            });
             if len == 0 {
                 break;
             }
@@ -207,7 +96,10 @@ impl OSInode {
 
     fn stat_inner(&self) -> Kstat {
         let inner = self.inner.exclusive_access();
-        let inode_ref = with_ext4(|fs| fs.get_inode_ref(inner.inode_num));
+        let inode_ref = self
+            .dentry
+            .super_block
+            .with_ext4(|ext4| ext4.get_inode_ref(self.dentry.inode_num));
         let inode = inode_ref.inode;
         let mut st = Kstat::new(inode.mode() as u32);
         st.st_ino = inode_ref.inode_num as u64;
@@ -217,6 +109,7 @@ impl OSInode {
         st.st_atime_sec = inode.atime() as i64;
         st.st_mtime_sec = inode.mtime() as i64;
         st.st_ctime_sec = inode.ctime() as i64;
+        drop(inner);
         st
     }
 
@@ -225,20 +118,7 @@ impl OSInode {
     }
 }
 
-pub fn list_apps() {
-    println!("/**** APPS ****");
-    with_ext4(|fs| {
-        if let Ok(bin_ino) = fs.ext4_dir_open("/bin") {
-            for entry in fs.ext4_dir_get_entries(bin_ino) {
-                let name = entry.get_name();
-                if name != "." && name != ".." && !name.is_empty() {
-                    println!("{}", name);
-                }
-            }
-        }
-    });
-    println!("**************/");
-}
+// ==================== OpenFlags ====================
 
 bitflags! {
     pub struct OpenFlags: u32 {
@@ -270,7 +150,6 @@ impl OpenFlags {
         self.contains(Self::DIRECTORY)
     }
 
-    /// Return (readable, writable).
     pub fn read_write(&self) -> (bool, bool) {
         if self.contains(Self::WRONLY) {
             (false, true)
@@ -282,139 +161,124 @@ impl OpenFlags {
     }
 }
 
+// ==================== File Operations ====================
+
 pub fn open_file(path: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
     open_file_at(None, path, flags)
 }
 
-pub fn mkdir_at(base_dir: Option<&str>, path: &str) -> bool {
-    let full = match normalize_path(base_dir, path) {
-        Some(p) if p != "/" => p,
-        _ => return false,
-    };
-    with_ext4(|fs| {
-        let try_create = |fs: &Ext4| -> bool {
-            let mut parent = 2u32;
-            let mut off = 0u32;
-            fs.generic_open(
-                full.as_str(),
-                &mut parent,
-                true,
-                InodeFileType::S_IFDIR.bits(),
-                &mut off,
-            )
-            .is_ok()
-        };
-        try_create(fs) || try_create(fs)
-    })
-}
-
-pub fn unlink_at(base_dir: Option<&str>, path: &str) -> bool {
-    let normalized = match normalize_path(base_dir, path) {
-        Some(path) if path != "/" => path,
-        _ => return false,
-    };
-    with_ext4(|fs| {
-        let mut parent_inode_num = 2u32;
-        let mut nameoff = 0u32;
-        let child_inode = match fs.generic_open(
-            normalized.as_str(),
-            &mut parent_inode_num,
-            false,
-            0,
-            &mut nameoff,
-        ) {
-            Ok(inode) => inode,
-            Err(_) => return false,
-        };
-
-        let mut child_inode_ref = fs.get_inode_ref(child_inode);
-        if child_inode_ref.inode.is_dir() {
-            return false;
-        }
-
-        let child_link_cnt = child_inode_ref.inode.links_count();
-        let child_size = child_inode_ref.inode.size();
-        if child_link_cnt == 1 && child_size > 0 {
-            if fs.truncate_inode(&mut child_inode_ref, 0).is_err() {
-                return false;
-            }
-        }
-
-        let name = match normalized.rsplit('/').next() {
-            Some(name) if !name.is_empty() => name,
-            _ => return false,
-        };
-        let mut parent_inode_ref = fs.get_inode_ref(parent_inode_num);
-        fs.unlink(&mut parent_inode_ref, &mut child_inode_ref, name)
-            .is_ok()
-    })
-}
-
-pub fn open_file_at(base_dir: Option<&str>, path: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
+pub fn open_file_at(
+    base: Option<Arc<Dentry>>,
+    path: &str,
+    flags: OpenFlags,
+) -> Option<Arc<OSInode>> {
+    let start = base.unwrap_or_else(|| crate::fs::vfs::ROOT_DENTRY.clone());
     let want_dir = flags.directory_requested();
 
     if flags.create_requested() {
-        let normalized = normalize_path(base_dir, path)?;
         if want_dir {
             return None;
         }
-        if let Some((inode_num, full_path, is_dir)) = lookup_existing(base_dir, path, false) {
-            if flags.trunc_requested() && !is_dir {
-                let truncated = with_ext4(|fs| {
-                    let mut inode_ref = fs.get_inode_ref(inode_num);
-                    fs.truncate_inode(&mut inode_ref, 0).is_ok()
-                });
-                if !truncated {
-                    return None;
+
+        // 文件已存在？
+        if let Some(dentry) = vfs_resolve_with_fallback(&start, path) {
+            if !dentry.is_dir {
+                if flags.trunc_requested() {
+                    let truncated = dentry.super_block.with_ext4(|ext4| {
+                        let mut inode_ref = ext4.get_inode_ref(dentry.inode_num);
+                        ext4.truncate_inode(&mut inode_ref, 0).is_ok()
+                    });
+                    if !truncated {
+                        return None;
+                    }
                 }
+                let (readable, writable) = flags.read_write();
+                return Some(Arc::new(OSInode::new(readable, writable, dentry)));
             }
-            let (readable, writable) = if is_dir { (false, false) } else { flags.read_write() };
-            return Some(Arc::new(OSInode::new(readable, writable, inode_num, full_path, is_dir)));
         }
 
-        let inode_num = with_ext4(|fs| {
-            let mut parent = 2u32;
-            let mut off = 0u32;
-            fs.generic_open(
-                normalized.as_str(),
-                &mut parent,
-                true,
-                InodeFileType::S_IFREG.bits(),
-                &mut off,
-            )
-            .ok()
-        })?;
+        // 新建文件
+        let (parent, name) =
+            vfs_resolve_parent_and_name(&start, path)?;
+        let dentry = vfs_create(&parent, &name, false)?;
         let (readable, writable) = flags.read_write();
-        return Some(Arc::new(OSInode::new(
-            readable,
-            writable,
-            inode_num,
-            normalized,
-            false,
-        )));
+        return Some(Arc::new(OSInode::new(readable, writable, dentry)));
     }
 
-    let (inode_num, full_path, is_dir) = lookup_existing(base_dir, path, want_dir)?;
+    // 普通打开
+    let dentry = vfs_resolve_with_fallback(&start, path)?;
+    if want_dir && !dentry.is_dir {
+        return None;
+    }
 
-    if flags.trunc_requested() && !is_dir {
-        let truncated = with_ext4(|fs| {
-            let mut inode_ref = fs.get_inode_ref(inode_num);
-            fs.truncate_inode(&mut inode_ref, 0).is_ok()
+    if flags.trunc_requested() && !dentry.is_dir {
+        let truncated = dentry.super_block.with_ext4(|ext4| {
+            let mut inode_ref = ext4.get_inode_ref(dentry.inode_num);
+            ext4.truncate_inode(&mut inode_ref, 0).is_ok()
         });
         if !truncated {
             return None;
         }
     }
 
-    let (readable, writable) = if is_dir { (false, false) } else { flags.read_write() };
-    Some(Arc::new(OSInode::new(
-        readable,
-        writable,
-        inode_num,
-        full_path,
-        is_dir,
-    )))
+    let (readable, writable) = if dentry.is_dir {
+        (false, false)
+    } else {
+        flags.read_write()
+    };
+    Some(Arc::new(OSInode::new(readable, writable, dentry)))
 }
+
+pub fn mkdir_at(base: Option<Arc<Dentry>>, path: &str) -> bool {
+    let start = base.unwrap_or_else(|| crate::fs::vfs::ROOT_DENTRY.clone());
+
+    // 检查目标不存在
+    if vfs_resolve_path(&start, path).is_some() {
+        return false;
+    }
+
+    let (parent, name) = match vfs_resolve_parent_and_name(&start, path) {
+        Some(x) => x,
+        None => return false,
+    };
+
+    vfs_create(&parent, &name, true).is_some()
+}
+
+pub fn unlink_at(base: Option<Arc<Dentry>>, path: &str) -> bool {
+    let start = base.unwrap_or_else(|| crate::fs::vfs::ROOT_DENTRY.clone());
+    let dentry = match vfs_resolve_path(&start, path) {
+        Some(d) => d,
+        None => return false,
+    };
+
+    if dentry.is_dir {
+        return false;
+    }
+
+    let parent = match dentry.parent.clone() {
+        Some(p) => p,
+        None => return false,
+    };
+
+    dentry.super_block.with_ext4(|ext4| {
+        let mut child_inode_ref = ext4.get_inode_ref(dentry.inode_num);
+        let child_link_cnt = child_inode_ref.inode.links_count();
+        let child_size = child_inode_ref.inode.size();
+        if child_link_cnt == 1 && child_size > 0 {
+            if ext4.truncate_inode(&mut child_inode_ref, 0).is_err() {
+                return false;
+            }
+        }
+
+        let mut parent_inode_ref = ext4.get_inode_ref(parent.inode_num);
+        ext4
+            .unlink(&mut parent_inode_ref, &mut child_inode_ref, &dentry.name)
+            .is_ok()
+    })
+}
+
+// ==================== File Trait for OSInode ====================
 
 impl File for OSInode {
     fn readable(&self) -> bool {
@@ -427,16 +291,24 @@ impl File for OSInode {
 
     fn read(&self, buf: &mut [u8]) -> usize {
         let mut inner = self.inner.exclusive_access();
-        let read_size = with_ext4(|fs| fs.read_at(inner.inode_num, inner.offset, buf).ok())
-            .unwrap_or(0);
+        let read_size = self.dentry.super_block.with_ext4(|ext4| {
+            ext4
+                .read_at(self.dentry.inode_num, inner.offset, buf)
+                .ok()
+                .unwrap_or(0)
+        });
         inner.offset += read_size;
         read_size
     }
 
     fn write(&self, buf: &mut [u8]) -> usize {
         let mut inner = self.inner.exclusive_access();
-        let write_size = with_ext4(|fs| fs.write_at(inner.inode_num, inner.offset, buf).ok())
-            .unwrap_or(0);
+        let write_size = self.dentry.super_block.with_ext4(|ext4| {
+            ext4
+                .write_at(self.dentry.inode_num, inner.offset, buf)
+                .ok()
+                .unwrap_or(0)
+        });
         inner.offset += write_size;
         write_size
     }
@@ -446,21 +318,27 @@ impl File for OSInode {
     }
 
     fn is_dir(&self) -> bool {
-        self.inner.exclusive_access().is_dir
+        self.dentry.is_dir
     }
 
     fn path(&self) -> Option<String> {
-        Some(self.inner.exclusive_access().path.clone())
+        Some(self.dentry.path.clone())
     }
 
     fn getdents64(&self, buf: &mut [u8]) -> isize {
         const DIRENT64_FIXED_SIZE: usize = 8 + 8 + 2 + 1;
         let mut inner = self.inner.exclusive_access();
-        let inode_is_dir = with_ext4(|fs| fs.get_inode_ref(inner.inode_num).inode.is_dir());
+
+        let inode_is_dir = self.dentry.super_block.with_ext4(|ext4| {
+            ext4.get_inode_ref(self.dentry.inode_num).inode.is_dir()
+        });
         if !inode_is_dir {
             return -1;
         }
-        let entries = with_ext4(|fs| fs.ext4_dir_get_entries(inner.inode_num));
+
+        let entries = self.dentry.super_block.with_ext4(|ext4| {
+            ext4.ext4_dir_get_entries(self.dentry.inode_num)
+        });
 
         let mut written = 0usize;
         let mut entry_index = inner.offset;

@@ -1,6 +1,7 @@
 use super::{current_task, SignalActions};
 use super::{pid_alloc, PidHandle, SignalFlags};
 use crate::config::KERNEL_STACK_SIZE;
+use crate::fs::vfs::{Dentry, ROOT_DENTRY};
 use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{translated_refmut, MemorySet};
 use crate::sync::UPSafeCell;
@@ -56,7 +57,8 @@ pub struct TaskControlBlockInner {
     pub children: Vec<Arc<TaskControlBlock>>,
     pub exit_code: i32,
     pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
-    pub cwd: String,
+    pub cwd: Arc<Dentry>,
+    pub root: Arc<Dentry>,
     pub signals: SignalFlags,
     pub signal_mask: SignalFlags,
     // the signal which is being handling
@@ -160,7 +162,8 @@ impl TaskControlBlock {
                         // 2 -> stderr
                         Some(Arc::new(Stdout)),
                     ],
-                    cwd: String::from("/"),
+                    cwd: ROOT_DENTRY.clone(),
+                    root: ROOT_DENTRY.clone(),
                     signals: SignalFlags::empty(),
                     signal_mask: SignalFlags::empty(),
                     handling_sig: -1,
@@ -276,6 +279,7 @@ impl TaskControlBlock {
                     exit_code: 0,
                     fd_table: new_fd_table,
                     cwd: parent_inner.cwd.clone(),
+                    root: parent_inner.root.clone(),
                     signals: SignalFlags::empty(),
                     // inherit the signal_mask and signal_action
                     signal_mask: parent_inner.signal_mask,

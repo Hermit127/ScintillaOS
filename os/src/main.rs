@@ -114,6 +114,7 @@ fn main(hartid: usize) {
         mm::add_frames_range(*start, start + size);
     });
 
+    fs::mount_root();
     fs::list_apps();
     task::init_kernel_page();
     task::add_initproc();

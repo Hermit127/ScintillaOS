@@ -34,6 +34,9 @@ const SYSCALL_FSTAT: usize = 80;
 const SYSCALL_SLEEP: usize = 300;
 const SYSCALL_DUP2: usize = 33;
 
+const SYSCALL_MOUNT: usize = 40;
+const SYSCALL_UMOUNT2: usize = 41;
+
 
 mod fs;
 mod process;
@@ -86,6 +89,14 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_TIMES => sys_times(args[0]),
         SYSCALL_UNAME => sys_uname(args[0]),
         SYSCALL_NANOSLEEP => sys_nanosleep(args[0], args[1]),
+        SYSCALL_MOUNT => sys_mount(
+            args[0] as *const u8,
+            args[1] as *const u8,
+            args[2] as *const u8,
+            args[3],
+            args[4] as *const u8,
+        ),
+        SYSCALL_UMOUNT2 => sys_umount2(args[0] as *const u8, args[1]),
         _ => -1,
     }
 }

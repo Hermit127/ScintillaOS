@@ -11,6 +11,8 @@ const SYSCALL_CLOSE: usize = 57;
 const SYSCALL_PIPE2: usize = 59;
 const SYSCALL_READ: usize = 63;
 const SYSCALL_WRITE: usize = 64;
+const SYSCALL_MKDIRAT: usize = 34;
+const SYSCALL_UNLINKAT: usize = 35;
 const SYSCALL_EXIT: usize = 93;
 const SYSCALL_YIELD: usize = 124;
 const SYSCALL_KILL: usize = 129;
@@ -25,6 +27,9 @@ const SYSCALL_FORK: usize = 401;
 const SYSCALL_EXEC: usize = 221;
 const SYSCALL_WAITPID: usize = 260;
 const SYSCALL_NANOSLEEP: usize = 101;
+
+const SYSCALL_MOUNT: usize = 40;
+const SYSCALL_UMOUNT2: usize = 41;
 
 const AT_FDCWD: isize = -100;
 
@@ -246,4 +251,30 @@ pub struct TimeSpec {
 
 pub fn sys_nanosleep(req: *const TimeSpec, rem: *mut TimeSpec) -> isize {
     syscall(SYSCALL_NANOSLEEP, [req as usize, rem as usize, 0, 0, 0, 0])
+}
+
+pub fn sys_mount(source: &str, target: &str, fstype: &str, flags: usize, data: &[u8]) -> isize {
+    let src = alloc::format!("{}\0", source);
+    let tgt = alloc::format!("{}\0", target);
+    let fst = alloc::format!("{}\0", fstype);
+    syscall(
+        SYSCALL_MOUNT,
+        [
+            src.as_ptr() as usize,
+            tgt.as_ptr() as usize,
+            fst.as_ptr() as usize,
+            flags,
+            data.as_ptr() as usize,
+            0,
+        ],
+    )
+}
+
+pub fn sys_umount2(target: &str, flags: usize) -> isize {
+    let tgt = alloc::format!("{}\0", target);
+    syscall(SYSCALL_UMOUNT2, [tgt.as_ptr() as usize, flags, 0, 0, 0, 0])
+}
+
+pub fn sys_mkdir(path: *const u8, mode: u32) -> isize {
+    syscall(SYSCALL_MKDIRAT, [AT_FDCWD as usize, path as usize, mode as usize, 0, 0, 0])
 }

@@ -1,6 +1,8 @@
-mod inode;
+pub mod inode;
 mod pipe;
 mod stdio;
+pub mod vfs;
+
 use alloc::string::String;
 
 #[repr(C)]
@@ -74,6 +76,7 @@ pub trait File: Send + Sync {
     }
 }
 
-pub use inode::{list_apps, mkdir_at, open_file, open_file_at, unlink_at, OpenFlags};
+pub use inode::{mkdir_at, open_file, open_file_at, unlink_at, OpenFlags};
 pub use pipe::make_pipe;
 pub use stdio::{Stdin, Stdout};
+pub use vfs::{list_apps, mount_root};
