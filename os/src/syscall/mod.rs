@@ -68,7 +68,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         ),
         SYSCALL_SIGPROCMASK => sys_sigprocmask(args[0] as u32),
         SYSCALL_SIGRETURN => sys_sigreturn(),
-        SYSCALL_GET_TIME => sys_get_time(),
+        SYSCALL_GET_TIME => sys_get_time(args[0], args[1]),
         SYSCALL_GETPID => sys_getpid(),
         SYSCALL_GETPPID => sys_getppid(),
         SYSCALL_CLONE => sys_clone(args[0], args[1], args[2], args[3], args[4]),

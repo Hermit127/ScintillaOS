@@ -55,6 +55,12 @@ impl UtsName {
     }
 }
 
+#[repr(C)]
+struct TimeVal {
+    pub sec: u64,
+    pub usec: u64,
+}
+
 pub fn sys_exit(exit_code: i32) -> ! {
     exit_current_and_run_next(exit_code);
     panic!("Unreachable in sys_exit!");
@@ -65,8 +71,17 @@ pub fn sys_yield() -> isize {
     0
 }
 
-pub fn sys_get_time() -> isize {
-    Time::now().to_msec() as isize
+pub fn sys_get_time(ts_ptr: usize, _tz: usize) -> isize {
+    let now_ms = Time::now().to_msec() as u64;
+    if ts_ptr != 0 {
+        let token = current_user_token();
+        let ts = crate::mm::translated_refmut(token, ts_ptr as *mut TimeVal);
+        ts.sec = now_ms / 1000;
+        ts.usec = (now_ms % 1000) * 1000;
+        0
+    } else {
+        now_ms as isize
+    }
 }
 
 pub fn sys_getpid() -> isize {
@@ -307,9 +322,9 @@ pub fn sys_brk(brk_addr: usize) -> isize {
 }
 
 pub fn sys_sleep(duration: u64) -> isize {
-    let wakeup_time = sys_get_time() + duration as isize;
+    let wakeup_time = sys_get_time(0, 0) + duration as isize;
     loop {
-        let now = sys_get_time();
+        let now = sys_get_time(0, 0);
         if now >= wakeup_time {
             break;
         }
