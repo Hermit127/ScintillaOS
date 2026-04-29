@@ -173,7 +173,9 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
         // ++++ temporarily access child PCB exclusively
         let exit_code = child.inner_exclusive_access().exit_code;
         // ++++ release child PCB
-        *translated_refmut(inner.memory_set.token(), exit_code_ptr) = exit_code;
+        if !exit_code_ptr.is_null() {
+            *translated_refmut(inner.memory_set.token(), exit_code_ptr) = exit_code;
+        }
         found_pid as isize
     } else {
         -2

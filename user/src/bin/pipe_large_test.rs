@@ -14,49 +14,49 @@ const LENGTH: usize = 3000;
 pub fn main() -> i32 {
     // create pipes
     // parent write to child
-    let mut down_pipe_fd = [0usize; 2];
+    let mut down_pipe_fd = [0u32; 2];
     // child write to parent
-    let mut up_pipe_fd = [0usize; 2];
+    let mut up_pipe_fd = [0u32; 2];
     pipe(&mut down_pipe_fd);
     pipe(&mut up_pipe_fd);
     let mut random_str = [0u8; LENGTH];
     if fork() == 0 {
         // close write end of down pipe
-        close(down_pipe_fd[1]);
+        close(down_pipe_fd[1] as usize);
         // close read end of up pipe
-        close(up_pipe_fd[0]);
-        assert_eq!(read(down_pipe_fd[0], &mut random_str) as usize, LENGTH);
-        close(down_pipe_fd[0]);
+        close(up_pipe_fd[0] as usize);
+        assert_eq!(read(down_pipe_fd[0] as usize, &mut random_str) as usize, LENGTH);
+        close(down_pipe_fd[0] as usize);
         let sum: usize = random_str.iter().map(|v| *v as usize).sum::<usize>();
         println!("sum = {}(child)", sum);
         let sum_str = format!("{}", sum);
-        write(up_pipe_fd[1], sum_str.as_bytes());
-        close(up_pipe_fd[1]);
+        write(up_pipe_fd[1] as usize, sum_str.as_bytes());
+        close(up_pipe_fd[1] as usize);
         println!("Child process exited!");
         0
     } else {
         // close read end of down pipe
-        close(down_pipe_fd[0]);
+        close(down_pipe_fd[0] as usize);
         // close write end of up pipe
-        close(up_pipe_fd[1]);
+        close(up_pipe_fd[1] as usize);
         // generate a long random string
         for ch in random_str.iter_mut() {
             *ch = get_time() as u8;
         }
         // send it
         assert_eq!(
-            write(down_pipe_fd[1], &random_str) as usize,
+            write(down_pipe_fd[1] as usize, &random_str) as usize,
             random_str.len()
         );
         // close write end of down pipe
-        close(down_pipe_fd[1]);
+        close(down_pipe_fd[1] as usize);
         // calculate sum(parent)
         let sum: usize = random_str.iter().map(|v| *v as usize).sum::<usize>();
         println!("sum = {}(parent)", sum);
         // recv sum(child)
         let mut child_result = [0u8; 32];
-        let result_len = read(up_pipe_fd[0], &mut child_result) as usize;
-        close(up_pipe_fd[0]);
+        let result_len = read(up_pipe_fd[0] as usize, &mut child_result) as usize;
+        close(up_pipe_fd[0] as usize);
         // check
         assert_eq!(
             sum,

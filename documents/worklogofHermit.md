@@ -20,3 +20,9 @@ Todo: 跑一边basic的样例，看看原操作系统实现的系统调用如何
 修复 panic 问题：未识别 syscall 从 panic 改为返回 -1
 查看basic 测试操作流程文档：documents/basic_test_operational_flow.md
 加 SYSCALL_CHDIR=49 SYSCALL_GETCWD=17 常量 + sys_chdir sys_getcwd 函数
+
+2026/04/29 Hermit
+basic 测试适配：
+exec() 栈布局修复：push argc到栈顶，trap_cx.sp指向argc，兼容C crt.S
+sys_pipe2 从写usize(8B)改为u32(4B)，Rust侧pipe fd数组同步改为[u32;2]，修复C int fd[2]被覆盖
+编写 basic_runner.rs 一键测试，user_shell加cd/.路径支持

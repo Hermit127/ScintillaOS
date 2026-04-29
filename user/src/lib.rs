@@ -86,7 +86,7 @@ pub fn openat(dirfd: isize, path: &str, flags: OpenFlags, mode: u32) -> isize {
 pub fn close(fd: usize) -> isize {
     sys_close(fd)
 }
-pub fn pipe(pipe_fd: &mut [usize]) -> isize {
+pub fn pipe(pipe_fd: &mut [u32]) -> isize {
     sys_pipe(pipe_fd)
 }
 pub fn read(fd: usize, buf: &mut [u8]) -> isize {

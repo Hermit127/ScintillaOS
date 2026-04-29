@@ -29,35 +29,36 @@ pub fn main() -> i32 {
     for test_name in TESTS {
         let path = format!("/bin/{}\0", test_name);
 
-        let mut pipe_fd = [0usize; 2];
+        let mut pipe_fd = [0u32; 2];
         pipe(&mut pipe_fd);
 
         let pid = fork();
         if pid == 0 {
-            close(pipe_fd[0]);
+            close(pipe_fd[0] as usize);
             close(1);
-            let _ = dup(pipe_fd[1]);
-            close(pipe_fd[1]);
+            let _ = dup(pipe_fd[1] as usize);
+            close(pipe_fd[1] as usize);
 
             let args: [*const u8; 2] = [path.as_ptr(), core::ptr::null()];
             let _ = exec(path.as_str(), &args);
             exit(1);
         }
 
-        close(pipe_fd[1]);
+        close(pipe_fd[1] as usize);
 
         let mut output = String::new();
         let mut buf = [0u8; 256];
         loop {
-            let n = read(pipe_fd[0], &mut buf) as usize;
-            if n == 0 {
+            let n = read(pipe_fd[0] as usize, &mut buf);
+            if n <= 0 {
                 break;
             }
+            let n = n as usize;
             for &b in &buf[..n] {
                 output.push(b as char);
             }
         }
-        close(pipe_fd[0]);
+        close(pipe_fd[0] as usize);
 
         let mut exit_code: i32 = 0;
         waitpid(pid as usize, &mut exit_code);

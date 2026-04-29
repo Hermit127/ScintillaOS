@@ -210,8 +210,9 @@ pub fn sys_pipe2(pipe: *mut usize, flags: usize) -> isize {
     inner.fd_table[read_fd] = Some(pipe_read);
     let write_fd = inner.alloc_fd();
     inner.fd_table[write_fd] = Some(pipe_write);
-    *translated_refmut(token, pipe) = read_fd;
-    *translated_refmut(token, unsafe { pipe.add(1) }) = write_fd;
+    let p = pipe as *mut u8;
+    *translated_refmut(token, p as *mut u32) = read_fd as u32;
+    *translated_refmut(token, unsafe { p.add(4) } as *mut u32) = write_fd as u32;
     0
 }
 

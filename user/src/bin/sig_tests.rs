@@ -117,23 +117,23 @@ fn final_sig_test() {
     let mut old = SignalAction::default();
     new.handler = func as usize;
 
-    let mut pipe_fd = [0usize; 2];
+    let mut pipe_fd = [0u32; 2];
     pipe(&mut pipe_fd);
 
     let pid = fork();
     if pid == 0 {
-        close(pipe_fd[0]);
+        close(pipe_fd[0] as usize);
         if sigaction(SIGUSR1, Some(&new), Some(&mut old)) < 0 {
             panic!("Sigaction failed!");
         }
-        write(pipe_fd[1], &[0u8]);
-        close(pipe_fd[1]);
+        write(pipe_fd[1] as usize, &[0u8]);
+        close(pipe_fd[1] as usize);
         loop {yield_();}
     } else {
-        close(pipe_fd[1]);
+        close(pipe_fd[1] as usize);
         let mut buf = [0u8; 1];
-        assert_eq!(read(pipe_fd[0], &mut buf), 1);
-        close(pipe_fd[0]);
+        assert_eq!(read(pipe_fd[0] as usize, &mut buf), 1);
+        close(pipe_fd[0] as usize);
         if kill(pid as usize, SIGUSR1) < 0 {
             println!("Kill failed!");
             exit(-1);
