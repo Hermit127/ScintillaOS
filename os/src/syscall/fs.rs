@@ -313,7 +313,7 @@ pub fn sys_mount(
     let target_path = translated_str(token, target);
     let fstype_str = translated_str(token, fstype);
 
-    if fstype_str.as_str() != "ext4" {
+    if fstype_str.as_str() != "ext4" && fstype_str.as_str() != "vfat" {
         return -22;
     }
 
