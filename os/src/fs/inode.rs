@@ -232,9 +232,9 @@ pub fn open_file_at(
 pub fn mkdir_at(base: Option<Arc<Dentry>>, path: &str) -> bool {
     let start = base.unwrap_or_else(|| crate::fs::vfs::ROOT_DENTRY.clone());
 
-    // 检查目标不存在
-    if vfs_resolve_path(&start, path).is_some() {
-        return false;
+    // 已经存在且是目录 → 幂等成功
+    if let Some(existing) = vfs_resolve_path(&start, path) {
+        return existing.is_dir;
     }
 
     let (parent, name) = match vfs_resolve_parent_and_name(&start, path) {
@@ -261,7 +261,7 @@ pub fn unlink_at(base: Option<Arc<Dentry>>, path: &str) -> bool {
         None => return false,
     };
 
-    dentry.super_block.with_ext4(|ext4| {
+    let ok = dentry.super_block.with_ext4(|ext4| {
         let mut child_inode_ref = ext4.get_inode_ref(dentry.inode_num);
         let child_link_cnt = child_inode_ref.inode.links_count();
         let child_size = child_inode_ref.inode.size();
@@ -275,7 +275,15 @@ pub fn unlink_at(base: Option<Arc<Dentry>>, path: &str) -> bool {
         ext4
             .unlink(&mut parent_inode_ref, &mut child_inode_ref, &dentry.name)
             .is_ok()
-    })
+    });
+
+    if ok {
+        let mut children = parent.children.exclusive_access();
+        if let Some(list) = children.as_mut() {
+            list.retain(|c| c.name != dentry.name);
+        }
+    }
+    ok
 }
 
 // ==================== File Trait for OSInode ====================

@@ -35,7 +35,7 @@ const SYSCALL_SLEEP: usize = 300;
 const SYSCALL_DUP2: usize = 33;
 
 const SYSCALL_MOUNT: usize = 40;
-const SYSCALL_UMOUNT2: usize = 41;
+const SYSCALL_UMOUNT2: usize = 39;
 
 
 mod fs;

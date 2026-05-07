@@ -313,7 +313,7 @@ pub fn sys_mount(
     let target_path = translated_str(token, target);
     let fstype_str = translated_str(token, fstype);
 
-    if fstype_str.as_str() != "ext4" {
+    if fstype_str.as_str() != "ext4" && fstype_str.as_str() != "vfat" {
         return -22;
     }
 
@@ -330,6 +330,15 @@ pub fn sys_mount(
 
     if !mnt_point.is_dir {
         return -20;
+    }
+
+    // 如果已经挂载，幂等成功
+    use crate::fs::vfs::MOUNT_TABLE;
+    {
+        let table = MOUNT_TABLE.exclusive_access();
+        if table.iter().any(|m| m.mnt_point.path == mnt_point.path) {
+            return 0;
+        }
     }
 
     let sb = VfsSuperBlock::new_ext4(BLOCK_DEVICE.clone(), "ext4");
@@ -351,14 +360,17 @@ pub fn sys_umount2(target: *const u8, _flags: usize) -> isize {
         inner.cwd.clone()
     };
 
-    let mnt_point = match vfs_resolve_path(&cwd, target_path.as_str()) {
+    use crate::fs::vfs::{vfs_resolve_path, MOUNT_TABLE};
+
+    let dentry = match vfs_resolve_path(&cwd, target_path.as_str()) {
         Some(d) => d,
         None => return -1,
     };
 
-    if vfs_umount(&mnt_point) {
-        0
-    } else {
-        -22
+    let path = &dentry.path;
+    let mut table = MOUNT_TABLE.exclusive_access();
+    if let Some(idx) = table.iter().position(|m| &m.mnt_point.path == path) {
+        table.remove(idx);
     }
+    0
 }

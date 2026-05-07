@@ -82,3 +82,13 @@ pipe usize格式修改4字节格式(int)，以适配测试用例
 2026/4/29
 实现了vfs和dentry缓存块，完成mount和umount的实现，其余和文件有关的调用未测试，可能出现bug
 目前仍旧缺少缓存回收机制。
+
+2026/5/7
+ext4_rs 库修改!
+文件：ext4_rs-1.3.3/src/ext4_impls/balloc.rs
+改动：bgid = 1 → bgid = 0
+原因：balloc_alloc_block 中搜索空闲块的起始块组号硬编码为 1。单块组文件系统从组 1 开始读到不存在的块组描述符→ free_blocks_count = 0 → 直接 ENOSPC，从未检查组 0。
+
+同步方式：fork ext4_rs 到你的 GitHub，改一行代码，把 os/Cargo.toml 中的 ext4_rs = "1.3.3" 改成：
+
+ext4_rs = { git = "https://github.com/你的账号/ext4_rs", rev = "你的commit" }

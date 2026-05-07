@@ -25,7 +25,8 @@ impl VfsSuperBlock {
         let adapter = Arc::new(super::inode::Ext4BlockDeviceAdapter {
             inner: blk_device,
         });
-        let ext4 = Ext4::open(adapter);
+        let cache = Arc::new(super::block_cache::BlockCache::new(adapter));
+        let ext4 = Ext4::open(cache);
         Arc::new(VfsSuperBlock {
             fs_type,
             fs_data: unsafe { UPSafeCell::new(FsInner::Ext4(ext4)) },
@@ -290,7 +291,7 @@ pub fn vfs_create(parent: &Arc<Dentry>, name: &str, is_dir: bool) -> Option<Arc<
         let mut off = 0u32;
         ext4
             .generic_open(
-                fs_path.as_str(),
+                name,
                 &mut parent_inode,
                 true,
                 file_type.bits(),
@@ -316,9 +317,10 @@ pub fn vfs_create(parent: &Arc<Dentry>, name: &str, is_dir: bool) -> Option<Arc<
 // ==================== Mount Operations ====================
 
 pub fn vfs_mount(mnt_point: Arc<Dentry>, sb: Arc<VfsSuperBlock>) -> bool {
+    let path = mnt_point.path.clone();
     {
         let table = MOUNT_TABLE.exclusive_access();
-        if table.iter().any(|m| Arc::ptr_eq(&m.mnt_point, &mnt_point)) {
+        if table.iter().any(|m| m.mnt_point.path == path && path != "/") {
             return false;
         }
     }
@@ -326,7 +328,7 @@ pub fn vfs_mount(mnt_point: Arc<Dentry>, sb: Arc<VfsSuperBlock>) -> bool {
     let mnt_root = Dentry::new_mount_root(sb, mnt_point.path.clone());
 
     MOUNT_TABLE.exclusive_access().push(Mount {
-        mnt_point,
+        mnt_point: mnt_point.clone(),
         mnt_root: mnt_root.clone(),
     });
 
@@ -334,8 +336,9 @@ pub fn vfs_mount(mnt_point: Arc<Dentry>, sb: Arc<VfsSuperBlock>) -> bool {
 }
 
 pub fn vfs_umount(mnt_point: &Arc<Dentry>) -> bool {
+    let path = &mnt_point.path;
     let mut table = MOUNT_TABLE.exclusive_access();
-    if let Some(idx) = table.iter().position(|m| Arc::ptr_eq(&m.mnt_point, mnt_point)) {
+    if let Some(idx) = table.iter().position(|m| &m.mnt_point.path == path) {
         table.remove(idx);
         true
     } else {
