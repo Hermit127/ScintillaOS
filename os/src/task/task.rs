@@ -59,6 +59,7 @@ pub struct TaskControlBlockInner {
     pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
     pub cwd: Arc<Dentry>,
     pub root: Arc<Dentry>,
+    pub tid_ptr: usize,
     pub signals: SignalFlags,
     pub signal_mask: SignalFlags,
     // the signal which is being handling
@@ -164,6 +165,7 @@ impl TaskControlBlock {
                     ],
                     cwd: ROOT_DENTRY.clone(),
                     root: ROOT_DENTRY.clone(),
+                    tid_ptr: 0,
                     signals: SignalFlags::empty(),
                     signal_mask: SignalFlags::empty(),
                     handling_sig: -1,
@@ -280,6 +282,7 @@ impl TaskControlBlock {
                     fd_table: new_fd_table,
                     cwd: parent_inner.cwd.clone(),
                     root: parent_inner.root.clone(),
+                    tid_ptr: parent_inner.tid_ptr,
                     signals: SignalFlags::empty(),
                     // inherit the signal_mask and signal_action
                     signal_mask: parent_inner.signal_mask,

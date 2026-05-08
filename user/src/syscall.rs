@@ -29,7 +29,7 @@ const SYSCALL_WAITPID: usize = 260;
 const SYSCALL_NANOSLEEP: usize = 101;
 
 const SYSCALL_MOUNT: usize = 40;
-const SYSCALL_UMOUNT2: usize = 41;
+const SYSCALL_UMOUNT2: usize = 39;
 
 const AT_FDCWD: isize = -100;
 
