@@ -1,3 +1,6 @@
 [workspace]
 resolver = "2"
 members = ["os", "user"]
+
+[patch.crates-io]
+ext4_rs = { path = "ext4_rs_patched" }
