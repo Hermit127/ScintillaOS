@@ -158,10 +158,11 @@ impl MemorySet {
         end_addr: polyhal::VirtAddr,
         permission: MapPermission,
         file: alloc::sync::Arc<dyn crate::fs::File>, 
-        _offset: usize 
+        offset: usize 
     ) -> bool {
         self.insert_framed_area(start_addr, end_addr, permission);
         
+        file.seek(offset);
         let area = self.areas.last().unwrap();
         
         for vaddr in area.vaddr_range.clone() {

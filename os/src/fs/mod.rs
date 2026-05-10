@@ -66,15 +66,10 @@ pub trait File: Send + Sync {
     fn read(&self, buf: &mut [u8]) -> usize;
     fn write(&self, buf: &mut [u8]) -> usize;
     fn stat(&self) -> Kstat;
-    fn is_dir(&self) -> bool {
-        false
-    }
-    fn path(&self) -> Option<String> {
-        None
-    }
-    fn getdents64(&self, _buf: &mut [u8]) -> isize {
-        -1
-    }
+    fn is_dir(&self) -> bool { false }
+    fn path(&self) -> Option<String> { None }
+    fn getdents64(&self, _buf: &mut [u8]) -> isize { -1 }
+    fn seek(&self, _offset: usize) { }
 }
 
 pub use inode::{mkdir_at, open_file, open_file_at, unlink_at, OpenFlags};

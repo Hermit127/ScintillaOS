@@ -391,4 +391,8 @@ impl File for OSInode {
         inner.offset = entry_index;
         written as isize
     }
+
+    fn seek(&self, offset: usize) {
+        self.inner.exclusive_access().offset = offset;
+    }
 }

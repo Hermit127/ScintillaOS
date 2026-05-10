@@ -93,7 +93,7 @@ pub fn sys_getppid() -> isize {
     let inner = task.inner_exclusive_access();
     match &inner.parent {
         Some(parent_weak) => parent_weak.upgrade().map(|p| p.getpid() as isize).unwrap_or(1),
-        None => 0,
+        None => 1,
     }
 }
 
@@ -189,7 +189,7 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
         let exit_code = child.inner_exclusive_access().exit_code;
         // ++++ release child PCB
         if !exit_code_ptr.is_null() {
-            *translated_refmut(inner.memory_set.token(), exit_code_ptr) = exit_code;
+            *translated_refmut(inner.memory_set.token(), exit_code_ptr) = (exit_code << 8) as i32;
         }
         found_pid as isize
     } else {
@@ -464,6 +464,8 @@ pub fn sys_uname(uts_ptr: usize) -> isize {
     UtsName::set_str(&mut uts.machine, "riscv64");
     #[cfg(target_arch = "x86_64")]
     UtsName::set_str(&mut uts.machine, "x86_64");
+    #[cfg(target_arch = "loongarch64")]
+    UtsName::set_str(&mut uts.machine, "loongarch64");
     
     UtsName::set_str(&mut uts.domainname, "localdomain");
 
