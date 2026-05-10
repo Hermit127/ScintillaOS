@@ -85,8 +85,9 @@ kernel-rv:
 
 kernel-la:
 	@echo "===== Building kernel-la (loongarch64) ====="
+	@$(MAKE) fs-img ARCH=loongarch64
 	@$(MAKE) kernel ARCH=loongarch64
-	@rust-objcopy --binary-architecture=loongarch64 target/loongarch64-unknown-none/release/os --strip-all -O binary kernel-la
+	@cp target/loongarch64-unknown-none/release/os kernel-la
 	@echo "kernel-la ready"
 
 disk.img: fs-img
