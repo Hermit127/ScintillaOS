@@ -36,6 +36,12 @@ pub fn main() -> i32 {
     }
     println!("#### OS COMP TEST GROUP END basic-musl ####");
 
+    println!("#### OS COMP TEST GROUP START basic-glibc ####");
+    for test in TEST_LIST {
+        run_test(test);
+    }
+    println!("#### OS COMP TEST GROUP END basic-glibc ####");
+
     println!("===== ALL TESTS DONE =====");
     shutdown();
     0
