@@ -30,11 +30,11 @@ fn run_test(name: &str) -> i32 {
 
 #[no_mangle]
 pub fn main() -> i32 {
-    println!("#### OS COMP TEST GROUP START basic ####");
+    println!("#### OS COMP TEST GROUP START basic-musl ####");
     for test in TEST_LIST {
         run_test(test);
     }
-    println!("#### OS COMP TEST GROUP END basic ####");
+    println!("#### OS COMP TEST GROUP END basic-musl ####");
 
     println!("===== ALL TESTS DONE =====");
     shutdown();
