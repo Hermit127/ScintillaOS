@@ -275,3 +275,7 @@ pub fn getcwd(buf: &mut [u8]) -> isize {
 pub fn times(tms: &mut Tms) -> isize {
     sys_times(tms as *mut Tms)
 }
+
+pub fn shutdown() -> isize {
+    sys_shutdown()
+}

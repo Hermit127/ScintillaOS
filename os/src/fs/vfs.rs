@@ -348,11 +348,11 @@ pub fn vfs_umount(mnt_point: &Arc<Dentry>) -> bool {
 
 // ==================== Root Filesystem ====================
 
-use crate::drivers::BLOCK_DEVICE;
+use crate::drivers::{BLOCK_DEVICE, ROOT_BLOCK_DEVICE};
 
 lazy_static! {
     pub static ref ROOT_SB: Arc<VfsSuperBlock> = {
-        VfsSuperBlock::new_ext4(BLOCK_DEVICE.clone(), "ext4")
+        VfsSuperBlock::new_ext4(ROOT_BLOCK_DEVICE.clone(), "ext4")
     };
 
     pub static ref ROOT_DENTRY: Arc<Dentry> = Dentry::new_root(ROOT_SB.clone());
@@ -364,6 +364,12 @@ pub fn mount_root() {
         mnt_point: root.clone(),
         mnt_root: root,
     });
+}
+
+/// Mount the test disk (bus 0) at the specified mount point dentry.
+pub fn mount_test_disk_at(mnt_point: Arc<Dentry>) -> bool {
+    let test_sb = VfsSuperBlock::new_ext4(BLOCK_DEVICE.clone(), "ext4");
+    vfs_mount(mnt_point, test_sb)
 }
 
 pub fn list_apps() {

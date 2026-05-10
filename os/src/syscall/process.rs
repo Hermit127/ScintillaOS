@@ -333,6 +333,11 @@ pub fn sys_sleep(duration: u64) -> isize {
     0
 }
 
+pub fn sys_shutdown() -> isize {
+    polyhal::instruction::shutdown();
+    0
+}
+
 fn get_map_permission(prot: usize) -> crate::mm::MapPermission {
     let mut perm = crate::mm::MapPermission::U;
     if prot & PROT_READ != 0 { perm |= crate::mm::MapPermission::R; }
@@ -483,11 +488,32 @@ pub fn sys_nanosleep(req_ptr: usize, rem_ptr: usize) -> isize {
 
     sleep_current_and_run_next();
 
-    if rem_ptr != 0 {
+     if rem_ptr != 0 {
         let rem = crate::mm::translated_refmut(token, rem_ptr as *mut crate::task::TimeSpec);
         rem.tv_sec = 0;
         rem.tv_nsec = 0;
     }
 
     0 
+}
+
+pub fn sys_set_tid_address(tidptr: *mut i32) -> isize {
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    inner.tid_ptr = tidptr as usize;
+    task.getpid() as isize
+}
+
+pub fn sys_exit_group(status: i32) -> ! {
+    let task = current_task().unwrap();
+    let tid_ptr = {
+        let inner = task.inner_exclusive_access();
+        inner.tid_ptr
+    };
+    if tid_ptr != 0 {
+        *translated_refmut(current_user_token(), tid_ptr as *mut i32) = 0;
+    }
+
+    exit_current_and_run_next(status);
+    panic!("Unreachable in sys_exit_group!");
 }

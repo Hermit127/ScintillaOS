@@ -1,3 +1,3 @@
 pub mod block;
 
-pub use block::{BlockDevice, BLOCK_DEVICE};
+pub use block::{BlockDevice, BLOCK_DEVICE, ROOT_BLOCK_DEVICE};

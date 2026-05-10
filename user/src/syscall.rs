@@ -29,7 +29,9 @@ const SYSCALL_WAITPID: usize = 260;
 const SYSCALL_NANOSLEEP: usize = 101;
 
 const SYSCALL_MOUNT: usize = 40;
-const SYSCALL_UMOUNT2: usize = 41;
+const SYSCALL_UMOUNT2: usize = 39;
+
+const SYSCALL_SHUTDOWN: usize = 48;
 
 const AT_FDCWD: isize = -100;
 
@@ -273,6 +275,10 @@ pub fn sys_mount(source: &str, target: &str, fstype: &str, flags: usize, data: &
 pub fn sys_umount2(target: &str, flags: usize) -> isize {
     let tgt = alloc::format!("{}\0", target);
     syscall(SYSCALL_UMOUNT2, [tgt.as_ptr() as usize, flags, 0, 0, 0, 0])
+}
+
+pub fn sys_shutdown() -> isize {
+    syscall(SYSCALL_SHUTDOWN, [0, 0, 0, 0, 0, 0])
 }
 
 pub fn sys_mkdir(path: *const u8, mode: u32) -> isize {

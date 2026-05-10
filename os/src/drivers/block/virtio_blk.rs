@@ -14,8 +14,12 @@ use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
 use virtio_drivers::{BufferDirection, Hal};
 
 #[allow(unused)]
-#[cfg(target_arch = "riscv64")]
+#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
 const VIRTIO0: PhysAddr = polyhal::pa!(0x10001000);
+
+#[allow(unused)]
+#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
+const VIRTIO1: PhysAddr = polyhal::pa!(0x10002000);
 
 #[cfg(target_arch = "aarch64")]
 const VIRTIO0: PhysAddr = polyhal::pa!(0xa00_0000);
@@ -49,10 +53,14 @@ impl BlockDevice for VirtIOBlock {
 impl VirtIOBlock {
     #[allow(unused)]
     pub fn new() -> Self {
+        Self::new_at(VIRTIO0)
+    }
+
+    pub fn new_at(addr: PhysAddr) -> Self {
         unsafe {
             Self(UPSafeCell::new(
                 VirtIOBlk::<VirtioHal, MmioTransport>::new(
-                    MmioTransport::new(NonNull::new_unchecked(VIRTIO0.get_mut_ptr()))
+                    MmioTransport::new(NonNull::new_unchecked(addr.get_mut_ptr()))
                         .expect("this is not a valid virtio device"),
                 )
                 .unwrap(),
