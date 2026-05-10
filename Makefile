@@ -80,13 +80,13 @@ all: kernel-rv disk.img kernel-la
 kernel-rv:
 	@echo "===== Building kernel-rv (riscv64) ====="
 	@$(MAKE) kernel ARCH=riscv64
-	@cp target/riscv64gc-unknown-none-elf/release/os kernel-rv
+	@$(OBJCOPY) target/riscv64gc-unknown-none-elf/release/os --strip-all -O binary kernel-rv
 	@echo "kernel-rv ready"
 
 kernel-la:
 	@echo "===== Building kernel-la (loongarch64) ====="
 	@$(MAKE) kernel ARCH=loongarch64
-	@cp target/loongarch64-unknown-none/release/os kernel-la
+	@rust-objcopy --binary-architecture=loongarch64 target/loongarch64-unknown-none/release/os --strip-all -O binary kernel-la
 	@echo "kernel-la ready"
 
 disk.img: fs-img
