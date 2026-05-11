@@ -55,3 +55,17 @@ os/src/fs/inode.rs	mkdir_at 目录已存在→true；unlink_at 成功后清除 d
 os/src/fs/vfs.rs	vfs_create 只传 name；mount/umount 用 path 比较
 os/src/fs/block_cache.rs	新文件—4K 块级缓存
 os/src/fs/mod.rs	加 pub mod block_cache
+
+getppid: None => 0 改为 None => 1（init 进程返回 1）
+waitpid: 退出码编码 exit_code → (exit_code << 8) as i32（Linux 格式）
+loongarch uname: 加 #[cfg(target_arch = "loongarch64")] machine = "loongarch64"
+mmap: insert_file_area 读文件前 file.seek(0) 重置偏移（原来 write 后偏移在文件末尾，读不到内容）
+File trait: 加 seek 方法
+OSInode: 实现 seek
+修复了 4 个问题：
+
+问题	根因	修复
+getppid error	init 进程 parent=None 返回 0	改为返回 1
+waitpid error	退出码没用 Linux 编码 exit<<8	写 (exit<<8) as i32
+loongarch uname	#[cfg] 未覆盖 loongarch64	加 loongarch64 分支
+mmap error	文件偏移在 write 后被推进到末尾，mmap 读不到内容	insert_file_area 先 file.seek(0)

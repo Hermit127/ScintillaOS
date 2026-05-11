@@ -355,6 +355,7 @@ pub fn sys_mmap(
     offset: usize,
 ) -> isize {
     if start % crate::config::PAGE_SIZE != 0 || len == 0 {
+       
         return -1;
     }
 
@@ -367,6 +368,7 @@ pub fn sys_mmap(
     let end_addr = polyhal::VirtAddr::from(start + len);
 
     if inner.memory_set.is_overlap(start_addr, end_addr) {
+       
         return -1;
     }
 
@@ -375,6 +377,7 @@ pub fn sys_mmap(
         return start as isize;
     } else {
         if fd < 0 || fd as usize >= inner.fd_table.len() {
+            crate::println!("[mmap] bad fd={} table_len={}", fd, inner.fd_table.len());
             return -1;
         }
         
@@ -387,11 +390,14 @@ pub fn sys_mmap(
                 offset
             );
             if ok {
+                crate::println!("[mmap] success start={} len={}", start, len);
                 return start as isize;
             } else {
+                crate::println!("[mmap] insert_file_area failed");
                 return -1;
             }
         } else {
+            crate::println!("[mmap] fd {} not in table", fd);
             return -1;
         }
     }
