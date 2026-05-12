@@ -273,7 +273,7 @@ pub fn vfs_resolve_parent_and_name(
 
 // ==================== File Creation ====================
 
-pub fn vfs_create(parent: &Arc<Dentry>, name: &str, is_dir: bool) -> Option<Arc<Dentry>> {
+pub fn vfs_create(parent: &Arc<Dentry>, name: &str, is_dir: bool, uid: u32, gid: u32) -> Option<Arc<Dentry>> {
     let file_type = if is_dir {
         InodeFileType::S_IFDIR
     } else {
@@ -299,6 +299,13 @@ pub fn vfs_create(parent: &Arc<Dentry>, name: &str, is_dir: bool) -> Option<Arc<
             )
             .ok()
     })?;
+
+    parent.super_block.with_ext4(|ext4| {
+        let mut inode_ref = ext4.get_inode_ref(inode_num);
+        inode_ref.inode.set_uid(uid as u16);
+        inode_ref.inode.set_gid(gid as u16);
+        ext4.write_back_inode(&mut inode_ref);
+    });
 
     let child = Dentry::new_child(parent, name, inode_num, is_dir);
 

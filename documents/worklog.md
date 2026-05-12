@@ -92,3 +92,8 @@ ext4_rs 库修改!
 同步方式：fork ext4_rs 到你的 GitHub，改一行代码，把 os/Cargo.toml 中的 ext4_rs = "1.3.3" 改成：
 
 ext4_rs = { git = "https://github.com/你的账号/ext4_rs", rev = "你的commit" }
+
+
+2026/5/12 hermit
+更新用户系统，新增getgid，setgid等多项指令
+修复mmap和getppid中的bug，getppid为调用号问题，需要重新编译测试，mmap为RISC-V 静态二进制代码段常从 0x0 加载，修复方式：遇 NULL 时遍历 areas 找第一段空闲虚地址区间，而非直接用 0

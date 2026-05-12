@@ -107,6 +107,27 @@ pub fn get_time() -> isize {
 pub fn getpid() -> isize {
     sys_getpid()
 }
+pub fn getuid() -> isize {
+    sys_getuid()
+}
+pub fn geteuid() -> isize {
+    sys_geteuid()
+}
+pub fn getgid() -> isize {
+    sys_getgid()
+}
+pub fn getegid() -> isize {
+    sys_getegid()
+}
+pub fn gettid() -> isize {
+    sys_gettid()
+}
+pub fn setuid(uid: u32) -> isize {
+    sys_setuid(uid)
+}
+pub fn setgid(gid: u32) -> isize {
+    sys_setgid(gid)
+}
 pub fn fork() -> isize {
     sys_fork()
 }

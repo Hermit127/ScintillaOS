@@ -97,6 +97,58 @@ pub fn sys_getppid() -> isize {
     }
 }
 
+pub fn sys_getuid() -> isize {
+    current_task().unwrap().inner_exclusive_access().uid as isize
+}
+
+pub fn sys_geteuid() -> isize {
+    current_task().unwrap().inner_exclusive_access().euid as isize
+}
+
+pub fn sys_getgid() -> isize {
+    current_task().unwrap().inner_exclusive_access().gid as isize
+}
+
+pub fn sys_getegid() -> isize {
+    current_task().unwrap().inner_exclusive_access().egid as isize
+}
+
+pub fn sys_gettid() -> isize {
+    sys_getpid()
+}
+
+pub fn sys_setuid(uid: u32) -> isize {
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    if inner.euid == 0 {
+        inner.uid = uid;
+        inner.euid = uid;
+    } else {
+        if uid == inner.uid {
+            inner.euid = uid;
+        } else {
+            return -1;
+        }
+    }
+    0
+}
+
+pub fn sys_setgid(gid: u32) -> isize {
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    if inner.egid == 0 {
+        inner.gid = gid;
+        inner.egid = gid;
+    } else {
+        if gid == inner.gid {
+            inner.egid = gid;
+        } else {
+            return -1;
+        }
+    }
+    0
+}
+
 pub fn sys_clone(_flags: usize, stack: usize, _ptid: usize, _tls: usize, _ctid: usize) -> isize {
     let current_task = current_task().unwrap();
     let new_task = current_task.fork();

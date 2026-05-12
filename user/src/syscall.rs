@@ -22,6 +22,13 @@ const SYSCALL_SIGRETURN: usize = 139;
 const SYSCALL_TIMES: usize = 153;
 const SYSCALL_GET_TIME: usize = 169;
 const SYSCALL_GETPID: usize = 172;
+const SYSCALL_GETUID: usize = 174;
+const SYSCALL_GETEUID: usize = 175;
+const SYSCALL_GETGID: usize = 176;
+const SYSCALL_GETEGID: usize = 177;
+const SYSCALL_GETTID: usize = 178;
+const SYSCALL_SETUID: usize = 146;
+const SYSCALL_SETGID: usize = 144;
 const SYSCALL_BRK: usize = 214;
 const SYSCALL_FORK: usize = 401;
 const SYSCALL_EXEC: usize = 221;
@@ -283,4 +290,32 @@ pub fn sys_shutdown() -> isize {
 
 pub fn sys_mkdir(path: *const u8, mode: u32) -> isize {
     syscall(SYSCALL_MKDIRAT, [AT_FDCWD as usize, path as usize, mode as usize, 0, 0, 0])
+}
+
+pub fn sys_getuid() -> isize {
+    syscall(SYSCALL_GETUID, [0, 0, 0, 0, 0, 0])
+}
+
+pub fn sys_geteuid() -> isize {
+    syscall(SYSCALL_GETEUID, [0, 0, 0, 0, 0, 0])
+}
+
+pub fn sys_getgid() -> isize {
+    syscall(SYSCALL_GETGID, [0, 0, 0, 0, 0, 0])
+}
+
+pub fn sys_getegid() -> isize {
+    syscall(SYSCALL_GETEGID, [0, 0, 0, 0, 0, 0])
+}
+
+pub fn sys_gettid() -> isize {
+    syscall(SYSCALL_GETTID, [0, 0, 0, 0, 0, 0])
+}
+
+pub fn sys_setuid(uid: u32) -> isize {
+    syscall(SYSCALL_SETUID, [uid as usize, 0, 0, 0, 0, 0])
+}
+
+pub fn sys_setgid(gid: u32) -> isize {
+    syscall(SYSCALL_SETGID, [gid as usize, 0, 0, 0, 0, 0])
 }

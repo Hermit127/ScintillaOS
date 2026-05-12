@@ -5,6 +5,7 @@ use super::vfs::{
 use super::{File, Kstat};
 use crate::drivers::BlockDevice;
 use crate::sync::UPSafeCell;
+use crate::task::current_task;
 use alloc::string::String;
 use alloc::sync::Arc;
 use bitflags::*;
@@ -109,6 +110,8 @@ impl OSInode {
         st.st_atime_sec = inode.atime() as i64;
         st.st_mtime_sec = inode.mtime() as i64;
         st.st_ctime_sec = inode.ctime() as i64;
+        st.st_uid = inode.uid() as u32;
+        st.st_gid = inode.gid() as u32;
         drop(inner);
         st
     }
@@ -163,6 +166,39 @@ impl OpenFlags {
 
 // ==================== File Operations ====================
 
+fn check_file_permission(
+    dentry: &Arc<Dentry>,
+    euid: u32,
+    egid: u32,
+    want_read: bool,
+    want_write: bool,
+) -> bool {
+    if euid == 0 {
+        return true;
+    }
+    dentry.super_block.with_ext4(|ext4| {
+        let inode_ref = ext4.get_inode_ref(dentry.inode_num);
+        let mode = inode_ref.inode.mode();
+        let owner_perm = (mode >> 6) & 0o7;
+        let group_perm = (mode >> 3) & 0o7;
+        let other_perm = mode & 0o7;
+        let perm = if inode_ref.inode.uid() as u32 == euid {
+            owner_perm
+        } else if inode_ref.inode.gid() as u32 == egid {
+            group_perm
+        } else {
+            other_perm
+        };
+        if want_read && (perm & 0o4) == 0 {
+            return false;
+        }
+        if want_write && (perm & 0o2) == 0 {
+            return false;
+        }
+        true
+    })
+}
+
 pub fn open_file(path: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
     open_file_at(None, path, flags)
 }
@@ -193,6 +229,15 @@ pub fn open_file_at(
                     }
                 }
                 let (readable, writable) = flags.read_write();
+                let (euid, egid) = current_task()
+                    .map(|t| {
+                        let inner = t.inner_exclusive_access();
+                        (inner.euid, inner.egid)
+                    })
+                    .unwrap_or((0, 0));
+                if !check_file_permission(&dentry, euid, egid, readable, writable) {
+                    return None;
+                }
                 return Some(Arc::new(OSInode::new(readable, writable, dentry)));
             }
         }
@@ -200,7 +245,13 @@ pub fn open_file_at(
         // 新建文件
         let (parent, name) =
             vfs_resolve_parent_and_name(&start, path)?;
-        let dentry = vfs_create(&parent, &name, false)?;
+        let (euid, egid) = current_task()
+            .map(|t| {
+                let inner = t.inner_exclusive_access();
+                (inner.euid, inner.egid)
+            })
+            .unwrap_or((0, 0));
+        let dentry = vfs_create(&parent, &name, false, euid, egid)?;
         let (readable, writable) = flags.read_write();
         return Some(Arc::new(OSInode::new(readable, writable, dentry)));
     }
@@ -226,6 +277,15 @@ pub fn open_file_at(
     } else {
         flags.read_write()
     };
+    let (euid, egid) = current_task()
+        .map(|t| {
+            let inner = t.inner_exclusive_access();
+            (inner.euid, inner.egid)
+        })
+        .unwrap_or((0, 0));
+    if !check_file_permission(&dentry, euid, egid, readable, writable) {
+        return None;
+    }
     Some(Arc::new(OSInode::new(readable, writable, dentry)))
 }
 
@@ -242,7 +302,13 @@ pub fn mkdir_at(base: Option<Arc<Dentry>>, path: &str) -> bool {
         None => return false,
     };
 
-    vfs_create(&parent, &name, true).is_some()
+    let (euid, egid) = current_task()
+        .map(|t| {
+            let inner = t.inner_exclusive_access();
+            (inner.euid, inner.egid)
+        })
+        .unwrap_or((0, 0));
+    vfs_create(&parent, &name, true, euid, egid).is_some()
 }
 
 pub fn unlink_at(base: Option<Arc<Dentry>>, path: &str) -> bool {
