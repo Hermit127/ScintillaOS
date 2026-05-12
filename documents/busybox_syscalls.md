@@ -2,142 +2,180 @@
 
 ## 总览
 
-| 层级 | 数量 | 说明 |
-|------|------|------|
-| Tier 1（启动必现） | 5 | musl `_start` 阶段调用，缺少则进程崩溃 |
-| Tier 2（基础命令） | 8 | `sh`/`ls`/`cat`/`echo`/`pwd`/`sleep` 可用 |
-| Tier 3（扩展命令） | 5 | `cp`/`mv`/`rm`/`touch`/`chmod`/`test` 可用 |
-| Tier 4（stub 即可） | 12 | 返回 `-ENOSYS` 让 musl fallback |
-| **合计** | **30** | |
+| 层级 | 数量 | 说明 | 状态 |
+|------|------|------|------|
+| Tier 1（启动必现） | 5 | musl `_start` 阶段调用，缺少则进程崩溃 | ✅ 全部已实现 |
+| Tier 2（基础命令） | 13 | `sh`/`ls`/`cat`/`echo`/`pwd`/`sleep` 可用 | 7 已实现 / 6 未实现 |
+| Tier 3（扩展命令） | 8 | `cp`/`mv`/`rm`/`touch`/`chmod`/`test` 可用 | 0 已实现 / 8 未实现 |
+| Tier 4（stub 即可） | 14 | 返回 `-ENOSYS` 让 musl fallback | 0 已实现 / 14 未实现 |
+| **合计** | **40** | | **20 已实现 / 20 未实现** |
 
 ---
 
-## Tier 1：启动必现（musl `_start` 立即调用）
+## 完整系统调用状态表
 
-### 1. exit_group (94)
+### 已实现 ✓
 
-**作用**：musl 的 `exit()` / `_Exit()` 最终调此 syscall，不是 `exit(93)`。缺少数进程无法正常退出。
+| syscall | 编号 | 实现函数 | 说明 |
+|---------|------|---------|------|
+| `getcwd` | 17 | `sys_getcwd` | 获取当前工作目录 |
+| `dup` | 23 | `sys_dup` | 复制 fd |
+| `dup3` | 24 | `sys_dup3` | 复制 fd（带 flags） |
+| `dup2` | 33 | `sys_dup2` | 复制 fd 到指定编号（兼容） |
+| `mkdirat` | 34 | `sys_mkdirat` | 创建目录 |
+| `unlinkat` | 35 | `sys_unlinkat` | 删除文件/目录 |
+| `umount2` | 39 | `sys_umount2` | 卸载文件系统 |
+| `mount` | 40 | `sys_mount` | 挂载文件系统 |
+| `shutdown` | 48 | `sys_shutdown` | **自定义**，冲突 `faccessat(48)` |
+| `chdir` | 49 | `sys_chdir` | 切换工作目录 |
+| `openat` | 56 | `sys_openat` | 打开文件 |
+| `close` | 57 | `sys_close` | 关闭文件 |
+| `pipe2` | 59 | `sys_pipe2` | 创建管道 |
+| `getdents64` | 61 | `sys_getdents64` | 读取目录项 |
+| `read` | 63 | `sys_read` | 读取文件 |
+| `write` | 64 | `sys_write` | 写入文件 |
+| `fstat` | 80 | `sys_fstat` | 获取 fd 对应文件状态 |
+| `exit` | 93 | `sys_exit` | 进程退出（单线程） |
+| `exit_group` | 94 | `sys_exit_group` | 进程组退出 |
+| `set_tid_address` | 96 | `sys_set_tid_address` | TLS tidptr 注册 |
+| `nanosleep` | 101 | `sys_nanosleep` | 纳秒级睡眠 |
+| `sched_yield` | 124 | `sys_yield` | 让出 CPU |
+| `kill` | 129 | `sys_kill` | 发送信号 |
+| `rt_sigaction` | 134 | `sys_sigaction` | 设置信号处理 |
+| `rt_sigprocmask` | 135 | `sys_sigprocmask` | 信号屏蔽 |
+| `rt_sigreturn` | 139 | `sys_sigreturn` | 信号返回 |
+| `setgid` | 144 | `sys_setgid` | 设置组 ID |
+| `setuid` | 146 | `sys_setuid` | 设置用户 ID |
+| `times` | 153 | `sys_times` | 进程时间统计 |
+| `uname` | 160 | `sys_uname` | 系统信息 |
+| `gettimeofday` | 169 | `sys_get_time` | 获取时间 |
+| `getpid` | 172 | `sys_getpid` | 获取进程 ID |
+| `getppid` | 173 | `sys_getppid` | 获取父进程 ID |
+| `getuid` | 174 | `sys_getuid` | 获取用户 ID |
+| `geteuid` | 175 | `sys_geteuid` | 获取有效用户 ID |
+| `getgid` | 176 | `sys_getgid` | 获取组 ID |
+| `getegid` | 177 | `sys_getegid` | 获取有效组 ID |
+| `gettid` | 178 | `sys_gettid` | 获取线程 ID |
+| `brk` | 214 | `sys_brk` | 堆内存分配 |
+| `munmap` | 215 | `sys_munmap` | 解除内存映射 |
+| `clone` | 220 | `sys_clone` | 创建子进程（fork 等效） |
+| `execve` | 221 | `sys_exec` | 执行程序 |
+| `mmap` | 222 | `sys_mmap` | 内存映射 |
+| `wait4` | 260 | `sys_waitpid` | 等待子进程 |
 
-**Linux 签名**：`void exit_group(int status)`
+### 未实现 — Tier 2：基础命令缺少
 
-**实现**：
-```rust
-pub fn sys_exit_group(status: i32) -> ! {
-    // 当前内核无进程组概念，直接调用 sys_exit 逻辑
-    sys_exit(status)
-}
-```
+| syscall | 编号 | 优先级 | 说明 |
+|---------|------|--------|------|
+| `ioctl` | 29 | ★★☆ | 终端属性查询（TCGETS）。至少需要 stub 返回 `-ENOTTY` |
+| `fcntl` | 25 | ★★★ | fd 属性控制（`F_GETFD`/`F_SETFD`/`F_DUPFD`），busybox 对每个 fd 调用 |
+| `lseek` | 62 | ★★★ | 文件偏移控制。`cat`/`sh` 重定向等必需 |
+| `readlinkat` | 78 | ★☆☆ | 符号链接解析。当前 ext4 无 symlink，stub 返回 `-EINVAL` |
+| `newfstatat` | 79 | ★★★ | **musl `stat()` 入口**。`ls`/`test`/`find` 等核心命令必需 |
+| `clock_gettime` | 113 | ★★☆ | `sleep`/`timeout` 命令需要。替换当前非标 `sys_sleep(300)` |
 
-**难度**：★☆☆ | **预估**：10 分钟
+### 未实现 — Tier 3：扩展命令缺少
+
+| syscall | 编号 | 优先级 | 说明 |
+|---------|------|--------|------|
+| `faccessat` | 48 | ★★★ | `test -f`/`-d`/`-r`/`-w` 等条件判断。⚠️ 与当前 `shutdown(48)` 冲突 |
+| `fchmodat` | 53 | ★★☆ | `chmod` 命令核心 |
+| `fchownat` | 54 | ★☆☆ | `chown` 命令核心 |
+| `utimensat` | 88 | ★★☆ | `touch` 命令修改文件时间戳 |
+| `umask` | 166 | ★★☆ | 文件创建权限掩码 |
+| `mprotect` | 226 | ★☆☆ | 内存页保护。stub 返回 0 即可 |
+| `renameat2` | 276 | ★★★ | `mv` 命令核心。跨目录移动文件必需 |
+
+### 未实现 — Tier 4：Stub 即可
+
+| syscall | 编号 | stub 返回值 | 说明 |
+|---------|------|-----------|------|
+| `eventfd2` | 19 | `-38` (ENOSYS) | 事件通知，busybox 不依赖 |
+| `epoll_create1` | 20 | `-38` (ENOSYS) | epoll，简单场景不需要 |
+| `statfs` | 43 | `-38` (ENOSYS) | 文件系统统计，后续实现 `df` 命令 |
+| `fstatfs` | 44 | `-38` (ENOSYS) | 同上 |
+| `sendfile` | 71 | `-38` (ENOSYS) | 零拷贝发送，少量 busybox applet 使用 |
+| `ppoll` | 73 | `-38` (ENOSYS) | poll，busybox sh 用阻塞 read |
+| `set_robust_list` | 99 | `-38` (ENOSYS) | 线程 robust mutex 列表，单线程不需要 |
+| `sched_getaffinity` | 123 | `-38` (ENOSYS) | CPU 亲和性，单核可忽略 |
+| `prctl` | 167 | `0` | 线程名称等控制，返回成功 |
+| `sysinfo` | 179 | `-38` (ENOSYS) | 系统信息，busybox 可降级 |
+| `madvise` | 233 | `0` | 内存建议，musl 分配内存时调用 |
+| `prlimit64` | 261 | `0` | 资源限制，返回成功 |
+| `getrandom` | 278 | `-38` (ENOSYS) | 随机数，musl fallback 到弱随机 |
+| `rseq` | 293 | `-38` (ENOSYS) | 可重启序列，musl 尝试注册 |
 
 ---
 
-### 2. set_tid_address (96)
+## Tier 1：启动必现 ✅ 全部已实现
 
-**作用**：musl 初始化线程本地存储（TLS）时，将 futex 地址注册到内核。**缺少则在 `_start` 阶段直接崩溃**，是 musl 的硬依赖。
-
-**Linux 签名**：`long set_tid_address(int *tidptr)`
-
-**实现**：
-```rust
-// TaskControlBlockInner 新增字段
-pub tid_ptr: usize,  // futex 唤醒地址（暂不实现 futex）
-
-pub fn sys_set_tid_address(tidptr: *mut i32) -> isize {
-    let task = current_task().unwrap();
-    let mut inner = task.inner_exclusive_access();
-    inner.tid_ptr = tidptr as usize;
-    task.getpid() as isize  // 返回 PID 作为 TID
-}
-```
-
-**难度**：★☆☆ | **预估**：15 分钟
-
----
-
-### 3-5. brk / mmap / munmap — 已有 ✓
+musl `_start` → `__libc_start_main` 阶段立即调用的 5 个 syscall 全部就绪：
 
 | syscall | 编号 | 状态 |
 |---------|------|------|
-| `brk` | 214 | 已有 `sys_brk` |
-| `mmap` | 222 | 已有 `sys_mmap` |
-| `munmap` | 215 | 已有 `sys_munmap` |
-
-**确认项**：`clone(220)` 现有的 `sys_clone` 需验证能否正确处理 musl 传入的 `CLONE_CHILD_SETTID`/`CLONE_VM` 等 flags。
+| `exit_group` | 94 | ✅ `sys_exit_group` |
+| `set_tid_address` | 96 | ✅ `sys_set_tid_address` |
+| `brk` | 214 | ✅ `sys_brk` |
+| `mmap` | 222 | ✅ `sys_mmap`（支持 anonymous + file-backed） |
+| `munmap` | 215 | ✅ `sys_munmap`（支持跨多 area 范围） |
 
 ---
 
-## Tier 2：基础命令可用
+## Tier 2：基础命令（`sh`/`ls`/`cat`/`echo`/`pwd`/`sleep`）
 
-完成 Tier 2 后，以下 busybox 命令可正常工作：
+完成 Tier 2 后以下 busybox 命令可用：
 
 ```
-sh    ls    cat    echo    pwd    sleep    true    false
+sh    ls    cat    echo    pwd    sleep    true    false    which
 ```
 
-### 6. lseek (62)
+### 待实现（6 个）
 
-**作用**：文件读写偏移控制。没有它，所有文件只能从偏移 0 顺序读。`cat` 勉强可用，但 shell 脚本中重定位、`ls` 读目录偏移等全依赖此。
+#### 1. lseek (62)
+
+**作用**：文件读写偏移控制。没有它，`cat` 只能读一次，shell 重定向会出错。
 
 **Linux 签名**：`off_t lseek(int fd, off_t offset, int whence)`
 
-**实现**：
+**实现要点**：
 ```rust
 pub fn sys_lseek(fd: usize, offset: i64, whence: i32) -> isize {
-    // SEEK_SET = 0, SEEK_CUR = 1, SEEK_END = 2
-    let task = current_task().unwrap();
-    let inner = task.inner_exclusive_access();
-    if fd >= inner.fd_table.len() { return -9; } // EBADF
-    let Some(file) = &inner.fd_table[fd] else { return -9; };
-    let file_size = file.stat().st_size;
-    let new_offset = match whence {
-        0 => offset,
-        1 => { /* 当前偏移 + offset */ },
-        2 => file_size + offset,
-        _ => return -22, // EINVAL
-    };
-    // OSInode 需要暴露 set_offset 方法
-    file.set_offset(new_offset as usize);
-    new_offset as isize
+    // SEEK_SET=0, SEEK_CUR=1, SEEK_END=2
+    // 通过 OSInode 的 inner.offset 获取/设置偏移
+    // OSInode 需新增 fn get_offset() 和 fn set_offset()
 }
 ```
 
-**OSInode 改动**：增加 `fn set_offset(&self, offset: usize)` 方法。
+**改动文件**：`syscall/fs.rs`、`fs/inode.rs`（新增 offset getter/setter）
 
 **难度**：★★☆ | **预估**：30 分钟
 
 ---
 
-### 7. newfstatat (79)
+#### 2. newfstatat (79)
 
-**作用**：**musl 的 `stat()` 实现入口**。`ls` 列出文件大小/类型/权限全靠它。`test`、`find` 等也依赖。
+**作用**：**musl 的 `stat()` libc 函数入口**。`ls` 列出文件大小/类型/权限全靠它。比 `fstat(80)` 更通用（支持路径解析）。
 
 **Linux 签名**：`int newfstatat(int dirfd, const char *path, struct stat *buf, int flags)`
 
-**实现**：
+**实现要点**：
 ```rust
-pub fn sys_newfstatat(dirfd: isize, path: *const u8, stat_buf: *mut u8, flags: usize) -> isize {
-    // AT_EMPTY_PATH = 0x1000: 允许对 fd 自身 stat（path 为空时使用 dirfd）
-    // AT_SYMLINK_NOFOLLOW = 0x100: 不跟随符号链接
-    if flags & 0x1000 != 0 {
-        // 直接对 dirfd 执行 fstat
-        return sys_fstat(dirfd as usize, stat_buf);
-    }
-    // 否则打开 path 获取 OSInode，调用 stat()
-    let token = current_user_token();
-    let path = translated_str(token, path);
-    // ... 类似 sys_openat 的路径解析，但不创建 fd
-    // 获取 stat，写入 stat_buf，关闭临时 inode
+pub fn sys_newfstatat(dirfd: isize, path: *const u8, _stat_buf: *mut u8, flags: usize) -> isize {
+    // AT_EMPTY_PATH = 0x1000: path 为空时对 dirfd 本身 stat → 委托 sys_fstat
+    // AT_SYMLINK_NOFOLLOW = 0x100: 不跟随符号链接（暂忽略，无 symlink 支持）
+    // 否则：解析 path → 获取 dentry → 调用 ext4 get_inode_ref → 填充 stat 结构
 }
 ```
 
-**难度**：★★☆ | **预估**：1 小时
+**改动文件**：`syscall/fs.rs`、`syscall/mod.rs`
+
+**难度**：★★★ | **预估**：1 小时
 
 ---
 
-### 8. fcntl (25)
+#### 3. fcntl (25)
 
-**作用**：busybox 对每个 fd 调 `F_GETFD`/`F_SETFD` 设置 `FD_CLOEXEC`。缺少时 busybox 的 fd 管理会出错。
+**作用**：busybox 对每个打开的 fd 调用 `F_GETFD`/`F_SETFD` 管理 `FD_CLOEXEC` 标志。缺少时 fd 管理出错。
 
 **Linux 签名**：`int fcntl(int fd, int cmd, ...)`
 
@@ -145,202 +183,194 @@ pub fn sys_newfstatat(dirfd: isize, path: *const u8, stat_buf: *mut u8, flags: u
 ```rust
 pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
     match cmd {
-        // F_GETFD = 1
-        1 => { /* 返回该 fd 的 O_CLOEXEC 标志 */ },
-        // F_SETFD = 2
-        2 => { /* 设置 O_CLOEXEC */ },
-        // F_DUPFD = 0
-        0 => { /* 同 dup，但从 arg 起分配 */ },
-        // F_DUPFD_CLOEXEC = 1030
-        1030 => { /* dup + set CLOEXEC */ },
+        0 => /* F_DUPFD: 同 dup，但从 arg 起分配 fd */,
+        1 => /* F_GETFD: 返回 cloexec 标志 */,
+        2 => /* F_SETFD: 设置 cloexec 标志 */,
+        1030 => /* F_DUPFD_CLOEXEC: dup + 设置 cloexec */,
         _ => -22, // EINVAL
     }
 }
 ```
 
-**TaskControlBlockInner 改动**：`fd_table` 增加对应的 `cloexec` 标志。
+**改动文件**：
+- `syscall/fs.rs` — 新增 `sys_fcntl`
+- `syscall/mod.rs` — 注册 `SYSCALL_FCNTL = 25`
+- `task/task.rs` — `fd_table` 每项改为 `(Option<Arc<dyn File>>, bool)` 增加 cloexec 标志
 
-**难度**：★★☆ | **预估**：1 小时
+**难度**：★★★ | **预估**：1 小时
 
 ---
 
-### 9. ioctl (29) — 初始 stub
+#### 4. ioctl (29)
 
-**作用**：busybox 对 stdin/stdout 调 `TCGETS` 获取终端属性。stub 版本返回 `-ENOTTY` 也能让 busybox 继续跑。
+**作用**：busybox 对 stdin/stdout 调 `TCGETS` 获取终端属性。stub 版本返回 `-ENOTTY` 即可让 busybox 继续运行。
 
 **Linux 签名**：`int ioctl(int fd, unsigned long request, ...)`
 
 **初始 stub**：
 ```rust
 pub fn sys_ioctl(_fd: usize, _request: usize, _arg: usize) -> isize {
-    -25 // ENOTTY — 不是终端
+    -25 // ENOTTY: 不是终端设备
 }
 ```
 
-**后续增强**：对 stdin/stdout(0/1) 返回固定 termios 结构体。
+**后续增强**：对 fd 0/1/2 返回固定的 `termios` 结构体（支持 ANSI 转义等）。
+
+**改动文件**：`syscall/fs.rs`、`syscall/mod.rs`
 
 **难度**：★☆☆（stub）/ ★★★（完整） | **预估**：10 分钟（stub）
 
 ---
 
-### 10. clock_gettime (113)
+#### 5. clock_gettime (113)
 
-**作用**：`sleep`/`timeout` 命令需要。sh 脚本中的 `sleep N` 依赖此 syscall。
+**作用**：`sleep`/`timeout` 命令需要。musl 的 `clock_gettime()` 是 `sleep()` 的时间基准，可替代当前非标准的 `sys_sleep(300)`。
 
 **Linux 签名**：`int clock_gettime(clockid_t clk_id, struct timespec *tp)`
 
-**实现**：
+**实现要点**：
 ```rust
 pub fn sys_clock_gettime(clk_id: usize, tp: *mut u8) -> isize {
-    let now = polyhal::time::Time::now();
-    let msec = now.to_msec() as usize;
+    // CLOCK_REALTIME=0, CLOCK_MONOTONIC=1
+    let now_ms = polyhal::time::Time::now().to_msec() as usize;
     let ts = TimeSpec {
-        tv_sec: msec / 1000,
-        tv_nsec: (msec % 1000) * 1_000_000,
+        tv_sec: now_ms / 1000,
+        tv_nsec: (now_ms % 1000) * 1_000_000,
     };
-    let token = current_user_token();
-    *translated_refmut(token, tp as *mut TimeSpec) = ts;
-    // CLOCK_REALTIME = 0, CLOCK_MONOTONIC = 1
+    // 写入用户空间 tp
     0
 }
 ```
+
+**改动文件**：`syscall/process.rs`、`syscall/mod.rs`
 
 **难度**：★★☆ | **预估**：30 分钟
 
 ---
 
-### 11. getuid / geteuid / getgid / getegid (174-177)
+#### 6. readlinkat (78)
 
-**作用**：busybox 做权限检查（判断是否 root）。
+**作用**：符号链接解析。当前 ext4 文件系统无 symlink 支持，stub 返回 `-EINVAL` 即可。后续如需支持 `ls -l` 显示链接目标，需扩展 ext4。
 
-**实现**：
-```rust
-pub fn sys_getuid() -> isize { 0 }   // root
-pub fn sys_geteuid() -> isize { 0 }
-pub fn sys_getgid() -> isize { 0 }
-pub fn sys_getegid() -> isize { 0 }
-```
-
-**难度**：★☆☆ | **预估**：5 分钟
-
----
-
-### 12. gettid (178)
-
-**作用**：musl 获取线程 ID。单线程等同 pid。
-
-**实现**：
-```rust
-pub fn sys_gettid() -> isize {
-    sys_getpid()
-}
-```
-
-**难度**：★☆☆ | **预估**：5 分钟
-
----
-
-### 13. readlinkat (78) — 初始 stub
-
-**作用**：符号链接解析。目前 ext4 不支持 symlink。
+**Linux 签名**：`ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz)`
 
 **初始 stub**：
 ```rust
 pub fn sys_readlinkat(_dirfd: isize, _path: *const u8, _buf: *mut u8, _bufsiz: usize) -> isize {
-    -22 // EINVAL — 不是符号链接
+    -22 // EINVAL: 不是符号链接
 }
 ```
 
-**后续**：ext4 支持 symlink 后可实现真实读取。
+**改动文件**：`syscall/fs.rs`、`syscall/mod.rs`
 
 **难度**：★☆☆（stub） | **预估**：5 分钟
 
 ---
 
-## Tier 3：更多命令可用
+### 已实现（7 个）✅
 
-完成 Tier 3 后，以下命令额外可用：
+| syscall | 编号 | 备注 |
+|---------|------|------|
+| `getuid`/`geteuid`/`getgid`/`getegid` | 174-177 | 返回 uid/euid/gid/egid |
+| `gettid` | 178 | 委托 `sys_getpid` |
+| `gettimeofday` | 169 | `sys_get_time` |
+| `nanosleep` | 101 | `sys_nanosleep` |
+
+---
+
+## Tier 3：扩展命令（`cp`/`mv`/`rm`/`touch`/`chmod`/`test`）
+
+完成 Tier 3 后以下命令额外可用：
 
 ```
-cp    mv    rm    touch    chmod    test
+cp    mv    rm    touch    chmod    chown    test    find    stat
 ```
 
-### 14. renameat2 (276)
+### 待实现（8 个）
 
-**作用**：**`mv` 命令核心**。跨目录移动文件需要。
+#### 7. renameat2 (276)
+
+**作用**：**`mv` 命令核心**。跨目录移动/重命名文件。
 
 **Linux 签名**：`int renameat2(int olddirfd, const char *oldpath, int newdirfd, const char *newpath, unsigned int flags)`
 
-**实现**：
-```rust
-pub fn sys_renameat2(olddirfd: isize, oldpath: *const u8,
-                     newdirfd: isize, newpath: *const u8, flags: usize) -> isize {
-    // 先实现 flags=0 的简单 rename（同目录内改名）
-    // 1. 解析 oldpath → old_dentry
-    // 2. 解析 newpath 的父目录 → new_parent_dentry + new_name
-    // 3. 检查 old 和 new 在同一文件系统
-    // 4. ext4 层面执行 rename（如果 ext4_rs 支持 link/unlink 组合）
-    //
-    // flags: RENAME_NOREPLACE=1, RENAME_EXCHANGE=2
-    -22  // 暂时返回 EINVAL，逐步实现
-}
-```
+**实现要点**：解析 old/new 路径 → 在同一文件系统内执行 rename（需 ext4_rs 支持 link/unlink 组合操作）。
+
+**改动文件**：`syscall/fs.rs`、`syscall/mod.rs`、`fs/vfs.rs`（新增 rename）
 
 **难度**：★★★ | **预估**：2 小时
 
 ---
 
-### 15. faccessat (48)
+#### 8. faccessat (48) ⚠️ 冲突
 
-**作用**：`test -f`、`test -d`、`test -r` 等命令依赖。
+**作用**：`test -f`/`-d`/`-r`/`-w`/`-x` 等条件判断的核心 syscall。
+
+**冲突说明**：当前 `SYSCALL_SHUTDOWN = 48` 占用了 `faccessat` 的编号。需要在放弃 `shutdown` 自定义编号或重新映射之间选择。
+
+**选项 A**：移除 `shutdown(48)`，改用 `faccessat(48)`
+**选项 B**：将 `shutdown` 移到其他编号，保留两者
 
 **Linux 签名**：`int faccessat(int dirfd, const char *path, int mode, int flags)`
 
-| mode | 值 | 检查 |
-|------|---|------|
-| `F_OK` | 0 | 文件是否存在 |
-| `R_OK` | 4 | 是否可读 |
-| `W_OK` | 2 | 是否可写 |
-| `X_OK` | 1 | 是否可执行 |
+**实现要点**：解析路径 → 检查 dentry 存在性(F_OK) / 返回 0(root 全权限)
 
-**实现**：
-```rust
-pub fn sys_faccessat(dirfd: isize, path: *const u8, mode: usize, flags: usize) -> isize {
-    // AT_EACCESS = 0x200: 用有效 UID 而非实际 UID
-    // 1. 解析 path → dentry
-    // 2. F_OK: dentry 存在则返回 0
-    // 3. R_OK/W_OK/X_OK: 在当前 root 模型下总是允许（返回 0）
-    // 4. 文件不存在则返回 -ENOENT(2)
-    0  // root 拥有全部权限
-}
-```
+**改动文件**：`syscall/fs.rs`、`syscall/mod.rs`
 
 **难度**：★★☆ | **预估**：30 分钟
 
 ---
 
-### 16. utimensat (88) — stub
+#### 9. fchmodat (53)
 
-**作用**：`touch` 命令修改文件时间戳。
+**作用**：`chmod` 命令核心。修改文件权限位。
 
-**初始 stub**：
-```rust
-pub fn sys_utimensat(_dirfd: isize, _path: *const u8, _times: *const u8, _flags: usize) -> isize {
-    0  // 假装成功，不做时间修改
-}
-```
+**Linux 签名**：`int fchmodat(int dirfd, const char *path, mode_t mode, int flags)`
 
-**后续**：通过 ext4 设置 inode 的 atime/mtime。
+**实现要点**：解析路径 → ext4 `set_inode_mode()` → 更新权限位
 
-**难度**：★☆☆（stub） | **预估**：5 分钟
+**改动文件**：`syscall/fs.rs`、`syscall/mod.rs`
+
+**难度**：★★☆ | **预估**：30 分钟
 
 ---
 
-### 17. umask (166)
+#### 10. fchownat (54)
 
-**作用**：文件创建权限掩码。
+**作用**：`chown` 命令核心。修改文件所有者。
 
-**实现**：
+**Linux 签名**：`int fchownat(int dirfd, const char *path, uid_t owner, gid_t group, int flags)`
+
+**实现要点**：解析路径 → ext4 `set_inode_uid()`/`set_inode_gid()`
+
+**改动文件**：`syscall/fs.rs`、`syscall/mod.rs`
+
+**难度**：★★☆ | **预估**：30 分钟
+
+---
+
+#### 11. utimensat (88)
+
+**作用**：`touch` 命令核心。修改文件 atime/mtime。
+
+**Linux 签名**：`int utimensat(int dirfd, const char *path, const struct timespec times[2], int flags)`
+
+**初始实现**：stub 返回 0（假装成功，不做实际时间修改）
+**后续增强**：通过 ext4 的 `set_inode_atime()`/`set_inode_mtime()` 写入时间戳
+
+**改动文件**：`syscall/fs.rs`、`syscall/mod.rs`
+
+**难度**：★☆☆（stub）/ ★★☆（完整） | **预估**：5 分钟（stub）
+
+---
+
+#### 12. umask (166)
+
+**作用**：设置文件创建权限掩码。busybox 创建文件前调用。
+
+**Linux 签名**：`mode_t umask(mode_t mask)`
+
+**实现要点**：
 ```rust
 pub fn sys_umask(mask: u32) -> isize {
     let task = current_task().unwrap();
@@ -351,105 +381,122 @@ pub fn sys_umask(mask: u32) -> isize {
 }
 ```
 
-**TaskControlBlockInner 新增**：`pub umask: u32`（初始值 `0o022`）。
+**改动文件**：`syscall/process.rs`、`syscall/mod.rs`、`task/task.rs`（新增 `umask` 字段）
 
 **难度**：★☆☆ | **预估**：10 分钟
 
 ---
 
-### 18. mprotect (226) — stub
+#### 13. mprotect (226)
 
-**作用**：musl 设置内存页保护（rwx）。由于内核无实际页保护，stub 即可。
+**作用**：musl 设置内存页保护（rwx）。内核无实际页保护机制，stub 返回 0 即可。
 
-**stub**：
+**Linux 签名**：`int mprotect(void *addr, size_t len, int prot)`
+
+**初始 stub**：
 ```rust
 pub fn sys_mprotect(_addr: usize, _len: usize, _prot: usize) -> isize {
-    0  // 所有内存可读写执行
+    0 // 所有内存可读写执行
 }
 ```
+
+**改动文件**：`syscall/process.rs`、`syscall/mod.rs`
 
 **难度**：★☆☆ | **预估**：5 分钟
 
 ---
 
-## Tier 4：stub 清单
+## Tier 4：Stub 清单
 
-以下 syscall 均可返回 `-38`（`ENOSYS`），musl 有 fallback 或 busybox 不依赖。
+以下 syscall 均可返回 `-38`（`ENOSYS`）或 `0`，musl 有 fallback 机制或 busybox 不依赖。
 
-| syscall | 编号 | stub 返回值 | 原因 |
+| syscall | 编号 | stub 返回值 | 说明 |
 |---------|------|-----------|------|
-| `set_robust_list` | 99 | `0` | 线程 robust mutex 列表。单线程 busybox 不需要，但 musl 调了 |
-| `getrandom` | 278 | `-38` | 栈 canary 随机数。musl 失败后会 fallback 到弱随机 |
-| `ppoll` | 73 | `-38` | busybox sh 用阻塞 read，不用 poll |
-| `epoll_create1` | 291 | `-38` | 简单场景不需要 epoll |
-| `eventfd2` | 290 | `-38` | 非必需 |
-| `prctl` | 167 | `0` | 线程名称等控制，返回成功即可 |
-| `prlimit64` | 261 | `0` | 资源限制，返回成功 |
-| `sysinfo` | 179 | `-38` | 系统信息，busybox 可降级 |
-| `statfs` | 43 | `-38` | 文件系统统计，`df` 命令需要（后续实现） |
+| `eventfd2` | 19 | `-38` | 事件通知机制 |
+| `epoll_create1` | 20 | `-38` | epoll 多路复用 |
+| `statfs` | 43 | `-38` | 文件系统统计（后续 `df` 命令需要） |
 | `fstatfs` | 44 | `-38` | 同上 |
-| `sched_getaffinity` | 123 | `-38` | CPU 亲和性，单核场景可忽略 |
-| `rseq` | 293 | `-38` | 可重启序列，musl 尝试注册，失败则跳过 |
-| `riscv_hwprobe` | 258 | `-38` | RISC-V 硬件探测，非必需 |
+| `sendfile` | 71 | `-38` | 零拷贝文件发送 |
+| `ppoll` | 73 | `-38` | 轮询 I/O，busybox sh 用阻塞 read |
+| `set_robust_list` | 99 | `0` | 线程 robust mutex 列表 |
+| `sched_getaffinity` | 123 | `-38` | CPU 亲和性，单核可忽略 |
+| `prctl` | 167 | `0` | 进程控制（线程名等） |
+| `sysinfo` | 179 | `-38` | 系统统计信息 |
+| `madvise` | 233 | `0` | 内存使用建议 |
+| `prlimit64` | 261 | `0` | 资源限制 |
+| `getrandom` | 278 | `-38` | 随机数（musl fallback 弱随机） |
+| `rseq` | 293 | `-38` | 可重启序列 |
 
 ---
 
-## 实现顺序
+## 实现顺序建议
 
 ```
-Phase 1: Tier 1 全部 + Tier 2 全部
-  ┌ exit_group(94) ── set_tid_address(96) ── lseek(62)
-  │ newfstatat(79) ── fcntl(25) ── ioctl(29,stub)
-  │ clock_gettime(113) ── getuid*4(174-177) ── gettid(178)
-  └ readlinkat(78,stub)
-    → BusyBox sh 可用
+Phase 1: Tier 2 全部（基础命令可用）
+  ┌ lseek(62) ── newfstatat(79) ── fcntl(25)
+  │ ioctl(29,stub) ── clock_gettime(113) ── readlinkat(78,stub)
+  └ → 完成后 sh/ls/cat/echo/pwd/sleep 可用
 
-Phase 2: Tier 3 全部 + Tier 4 stub 批量
-  ┌ renameat2(276) ── faccessat(48) ── utimensat(88,stub)
-  │ umask(166) ── mprotect(226,stub)
-  └ Tier 4 × 13 个 stub
-    → cp/mv/rm/touch/test 可用
+Phase 2: Tier 3 全部 + Tier 4 批量 stub
+  ┌ renameat2(276) ── faccessat(48) ── fchmodat(53)
+  │ fchownat(54) ── utimensat(88,stub) ── umask(166)
+  │ mprotect(226,stub)
+  └ Tier 4 × 14 个 stub
+    → 完成后 cp/mv/rm/touch/chmod/chown/test 可用
 
 Phase 3: 加固与补全
-  ┌ ioctl 完整实现（termios）
-  │ renameat2 完整实现（跨目录）
-  │ utimensat 完整实现（时间戳写入）
+  ┌ faccessat 编号冲突解决（shutdown 重新分配）
+  │ ioctl 完整实现（termios 支持 ANSI 转义）
+  │ renameat2 跨目录实现
   │ statfs/fstatfs 实现（df 命令）
-  └ ppoll 实现（可选）
+  │ utimensat 完整实现（时间戳写入）
+  └ newfstatat 完整 stat 结构体填充
 ```
 
 ---
 
 ## 数据结构变更汇总
 
-### `TaskControlBlockInner` 新增字段
+### `TaskControlBlockInner` 需新增字段
 
 ```rust
-pub tid_ptr: usize,      // set_tid_address(96) 设置的 futex 地址
-pub umask: u32,          // umask(166) 文件创建权限掩码
+pub umask: u32,          // umask(166) 文件创建权限掩码（初始值 0o022）
 ```
 
-### `OSInode` 新增方法
+### `fd_table` 改造
 
 ```rust
-fn set_offset(&self, offset: usize);
-fn get_offset(&self) -> usize;  // 已有 inner.offset
+// 当前：
+fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>
+
+// 改造为（支持 cloexec）：
+fd_table: Vec<Option<FdEntry>>
+
+struct FdEntry {
+    file: Arc<dyn File + Send + Sync>,
+    cloexec: bool,       // fcntl F_SETFD 控制
+}
 ```
 
-### `fd_table` 配套
+### `OSInode` 需新增方法
 
-每个 fd 增加 `cloexec: bool` 标志（随 `fcntl F_SETFD` 控制）。
+```rust
+fn get_offset(&self) -> usize;   // 读取 inner.offset（lseek SEEK_CUR 需要）
+fn set_offset(&self, offset: usize);  // 已有 fn seek（lseek SEEK_SET 需要）
+```
 
 ---
 
-## 边界情况处理
+## 边界情况说明
 
-| 场景 | 处理 |
-|------|------|
-| 未知 syscall 编号 | 当前返回 `-1`。Tier 4 stub 加入后，所有 Linux 常见编号都有明确返回值 |
-| `-1` vs `-EPERM` | `-1` 是 `EPERM`(不允许)，musl 可能误判。对 stub 应返回 `-38`(ENOSYS) |
-| 多线程 (clone flags) | 当前内核无真线程支持，`clone` 行为同 `fork`。busybox 单线程足够 |
-| `AT_FDCWD = -100` | 保留，与当前一致 |
+| 场景 | 处理方式 |
+|------|---------|
+| 未知 syscall 编号 | 当前返回 `-1`（`EPERM`）。Tier 4 stub 加入后应改为逐编号明确返回 |
+| `-1` vs `-38` | `-1` 在 Linux 上是 `EPERM`，musl 可能误判。stub 应返回 `-38`(`ENOSYS`) 或 `0` |
+| `shutdown(48)` vs `faccessat(48)` 冲突 | Phase 3 时需将 `shutdown` 移至其他编号（建议 0xFF 或未用编号） |
+| `sleep(300)` vs `clock_gettime(113)` + `nanosleep(101)` | `clock_gettime` 实现后可用 musl 标准 `sleep()`，废弃自定义 `sys_sleep` |
+| 多线程 (clone flags) | 当前 `sys_clone` 行为同 `fork`，单线程 busybox 足够 |
+| `AT_FDCWD = -100` | 保留，与当前实现一致 |
 
 ---
 
@@ -457,7 +504,7 @@ fn get_offset(&self) -> usize;  // 已有 inner.offset
 
 | 阶段 | syscall 数 | 时间 |
 |------|----------|------|
-| Phase 1（Tier 1+2） | 13 个 | 4~6 小时 |
-| Phase 2（Tier 3+4） | 18 个 | 2~4 小时 |
+| Phase 1（Tier 2） | 6 个实现 | 3~4 小时 |
+| Phase 2（Tier 3 + Tier 4） | 8 + 14 个 | 3~5 小时 |
 | Phase 3（加固） | 若干 | 视需要 |
-| **合计** | **~30 个** | **1~2 天** |
+| **合计** | **~28 个新 syscall** | **1~2 天** |
