@@ -70,6 +70,7 @@ pub trait File: Send + Sync {
     fn path(&self) -> Option<String> { None }
     fn getdents64(&self, _buf: &mut [u8]) -> isize { -1 }
     fn seek(&self, _offset: usize) { }
+    fn get_offset(&self) -> usize { 0 }
 }
 
 pub use inode::{mkdir_at, open_file, open_file_at, unlink_at, OpenFlags};

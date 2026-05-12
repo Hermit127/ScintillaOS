@@ -253,6 +253,43 @@ pub fn sys_dup3(fd: usize, new_fd: usize, flags: usize) -> isize {
     new_fd as isize
 }
 
+pub fn sys_lseek(fd: usize, offset: i64, whence: i32) -> isize {
+    const SEEK_SET: i32 = 0;
+    const SEEK_CUR: i32 = 1;
+    const SEEK_END: i32 = 2;
+
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+    if fd >= inner.fd_table.len() {
+        return -9; // EBADF
+    }
+    let Some(file) = &inner.fd_table[fd] else {
+        return -9; // EBADF
+    };
+    let file = file.clone();
+    drop(inner);
+
+    let new_off: i64 = match whence {
+        SEEK_SET => offset,
+        SEEK_CUR => {
+            let cur = file.get_offset() as i64;
+            cur + offset
+        }
+        SEEK_END => {
+            let size = file.stat().st_size;
+            size + offset
+        }
+        _ => return -22, // EINVAL
+    };
+
+    if new_off < 0 {
+        return -22; // EINVAL
+    }
+
+    file.seek(new_off as usize);
+    new_off as isize
+}
+
 pub fn sys_fstat(fd: usize, stat_buf: *mut u8) -> isize {
     let task = current_task().unwrap();
     let token = current_user_token();

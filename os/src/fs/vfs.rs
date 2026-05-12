@@ -280,32 +280,18 @@ pub fn vfs_create(parent: &Arc<Dentry>, name: &str, is_dir: bool, uid: u32, gid:
         InodeFileType::S_IFREG
     };
 
-    let fs_path = if parent.fs_path == "/" {
-        format!("/{}", name)
-    } else {
-        format!("{}/{}", parent.fs_path, name)
-    };
-
     let inode_num = parent.super_block.with_ext4(|ext4| {
-        let mut parent_inode = parent.inode_num;
-        let mut off = 0u32;
         ext4
-            .generic_open(
+            .create_with_attr(
+                parent.inode_num,
                 name,
-                &mut parent_inode,
-                true,
                 file_type.bits(),
-                &mut off,
+                uid as u16,
+                gid as u16,
             )
             .ok()
+            .map(|r| r.inode_num)
     })?;
-
-    parent.super_block.with_ext4(|ext4| {
-        let mut inode_ref = ext4.get_inode_ref(inode_num);
-        inode_ref.inode.set_uid(uid as u16);
-        inode_ref.inode.set_gid(gid as u16);
-        ext4.write_back_inode(&mut inode_ref);
-    });
 
     let child = Dentry::new_child(parent, name, inode_num, is_dir);
 
