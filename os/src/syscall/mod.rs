@@ -5,6 +5,7 @@ const SYSCALL_IOCTL: usize = 29;
 const SYSCALL_GETCWD: usize = 17;
 const SYSCALL_MKDIRAT: usize = 34;
 const SYSCALL_UNLINKAT: usize = 35;
+const SYSCALL_SYMLINKAT: usize = 36;
 const SYSCALL_CHDIR: usize = 49;
 const SYSCALL_OPENAT: usize = 56;
 const SYSCALL_CLOSE: usize = 57;
@@ -42,6 +43,7 @@ const SYSCALL_WAITPID: usize = 260;
 
 const SYSCALL_GETDENTS64: usize = 61;
 const SYSCALL_FSTATAT: usize = 79;
+const SYSCALL_READLINKAT: usize = 78;
 const SYSCALL_FSTAT: usize = 80;
 const SYSCALL_SLEEP: usize = 300;
 const SYSCALL_DUP2: usize = 33;
@@ -73,6 +75,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETCWD => sys_getcwd(args[0] as *mut u8, args[1]),
         SYSCALL_MKDIRAT => sys_mkdirat(args[0] as isize, args[1] as *const u8, args[2] as u32),
         SYSCALL_UNLINKAT => sys_unlinkat(args[0] as isize, args[1] as *const u8, args[2] as u32),
+        SYSCALL_SYMLINKAT => sys_symlinkat(args[0] as *const u8, args[1] as isize, args[2] as *const u8),
         SYSCALL_CHDIR => sys_chdir(args[0] as *const u8),
         SYSCALL_OPENAT => sys_openat(args[0] as isize, args[1] as *const u8, args[2] as u32, args[3] as u32),
         SYSCALL_CLOSE => sys_close(args[0]),
@@ -110,6 +113,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         //added
         SYSCALL_FSTAT => sys_fstat(args[0], args[1] as *mut u8),
         SYSCALL_FSTATAT => sys_fstatat(args[0] as isize, args[1] as *const u8, args[2] as *mut u8, args[3]),
+        SYSCALL_READLINKAT => sys_readlinkat(args[0] as isize, args[1] as *const u8, args[2] as *mut u8, args[3]),
         SYSCALL_BRK => sys_brk(args[0]),
         SYSCALL_SLEEP => sys_sleep(args[0] as u64),
         // keep x86_64 dup2 syscall number for compatibility

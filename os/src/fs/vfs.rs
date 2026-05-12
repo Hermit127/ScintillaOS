@@ -307,6 +307,39 @@ pub fn vfs_create(parent: &Arc<Dentry>, name: &str, is_dir: bool, uid: u32, gid:
     Some(child)
 }
 
+pub fn vfs_symlink(
+    parent: &Arc<Dentry>,
+    name: &str,
+    target: &str,
+    uid: u32,
+    gid: u32,
+) -> Option<Arc<Dentry>> {
+    let mode = ext4_rs::InodeFileType::S_IFLNK.bits() | 0o777;
+    let inode_num = parent.super_block.with_ext4(|ext4| {
+        ext4
+            .create_with_attr(parent.inode_num, name, mode, uid as u16, gid as u16)
+            .ok()
+            .map(|r| r.inode_num)
+    })?;
+
+    parent.super_block.with_ext4(|ext4| {
+        let _ = ext4.write_at(inode_num, 0, target.as_bytes());
+    });
+
+    let child = Dentry::new_child(parent, name, inode_num, false);
+
+    {
+        let mut children = parent.children.exclusive_access();
+        if let Some(list) = children.as_mut() {
+            list.push(child.clone());
+        } else {
+            *children = Some(alloc::vec![child.clone()]);
+        }
+    }
+
+    Some(child)
+}
+
 // ==================== Mount Operations ====================
 
 pub fn vfs_mount(mnt_point: Arc<Dentry>, sb: Arc<VfsSuperBlock>) -> bool {

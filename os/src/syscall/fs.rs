@@ -1,8 +1,9 @@
-use crate::fs::vfs::{vfs_resolve_path, Dentry, VfsSuperBlock};
-use crate::fs::{make_pipe, mkdir_at, open_file_at, unlink_at, File, Kstat, OpenFlags};
+use crate::fs::vfs::{vfs_resolve_path, vfs_resolve_with_fallback, Dentry, VfsSuperBlock};
+use crate::fs::{make_pipe, mkdir_at, open_file_at, symlink_at, unlink_at, File, Kstat, OpenFlags};
 use crate::mm::{translated_byte_buffer, translated_refmut, translated_str};
 use crate::task::{current_task, current_user_token};
 use alloc::sync::Arc;
+use alloc::vec;
 
 const AT_FDCWD: isize = -100;
 
@@ -408,6 +409,72 @@ pub fn sys_lseek(fd: usize, offset: i64, whence: i32) -> isize {
 
     file.seek(new_off as usize);
     new_off as isize
+}
+
+pub fn sys_symlinkat(target: *const u8, newdirfd: isize, linkpath: *const u8) -> isize {
+    if target.is_null() || linkpath.is_null() {
+        return -14; // EFAULT
+    }
+    let token = current_user_token();
+    let target_str = translated_str(token, target);
+    let linkpath_str = translated_str(token, linkpath);
+    if target_str.is_empty() || linkpath_str.is_empty() {
+        return -2; // ENOENT
+    }
+    let base = match resolve_base_dir(newdirfd) {
+        Some(b) => b,
+        None => return -2,
+    };
+    if symlink_at(Some(base), &target_str, &linkpath_str) {
+        0
+    } else {
+        -1
+    }
+}
+
+pub fn sys_readlinkat(dirfd: isize, path: *const u8, buf: *mut u8, bufsiz: usize) -> isize {
+    if buf.is_null() || bufsiz == 0 {
+        return -22; // EINVAL
+    }
+
+    let token = current_user_token();
+    let path_str = translated_str(token, path);
+    if path_str.is_empty() {
+        return -2; // ENOENT
+    }
+
+    let base = match resolve_base_dir(dirfd) {
+        Some(b) => b,
+        None => return -2,
+    };
+    let dentry = match vfs_resolve_with_fallback(&base, &path_str) {
+        Some(d) => d,
+        None => return -2,
+    };
+
+    let is_link = dentry.super_block.with_ext4(|ext4| {
+        let inode_ref = ext4.get_inode_ref(dentry.inode_num);
+        inode_ref.inode.is_link()
+    });
+
+    if !is_link {
+        return -22; // EINVAL — not a symlink
+    }
+
+    let link_target = dentry.super_block.with_ext4(|ext4| {
+        let mut link_data = vec![0u8; bufsiz.min(4096)];
+        let n = ext4
+            .read_at(dentry.inode_num, 0, &mut link_data)
+            .ok()
+            .unwrap_or(0);
+        link_data.truncate(n);
+        link_data
+    });
+
+    let len = link_target.len().min(bufsiz);
+    let user_buf = crate::mm::translated_byte_buffer(token, buf, len);
+    user_buf.copy_from_slice(&link_target[..len]);
+    len as isize
 }
 
 pub fn sys_fstatat(dirfd: isize, path: *const u8, stat_buf: *mut u8, flags: usize) -> isize {
