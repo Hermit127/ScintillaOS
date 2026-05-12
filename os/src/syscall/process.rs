@@ -406,8 +406,7 @@ pub fn sys_mmap(
     fd: i32,
     offset: usize,
 ) -> isize {
-    if start % crate::config::PAGE_SIZE != 0 || len == 0 {
-       
+    if len == 0 {
         return -1;
     }
 
@@ -416,65 +415,46 @@ pub fn sys_mmap(
 
     let permission = get_map_permission(prot);
 
-    let start_addr = polyhal::VirtAddr::from(start);
-    let end_addr = polyhal::VirtAddr::from(start + len);
+    let actual_start = if start == 0 && (flags & MAP_FIXED) == 0 {
+        inner.memory_set.max_end_vaddr().raw()
+    } else {
+        if start % crate::config::PAGE_SIZE != 0 {
+            return -1;
+        }
+        start
+    };
 
-    if start != 0 && inner.memory_set.is_overlap(start_addr, end_addr) {
+    let start_addr = polyhal::VirtAddr::from(actual_start);
+    let end_addr = polyhal::VirtAddr::from(actual_start + len);
+    let end_addr_ceil = end_addr.ceil();
+
+    if inner.memory_set.is_overlap(start_addr, end_addr_ceil) {
         return -1;
     }
 
-    if start == 0 {
-        let free_start_usize: usize = inner.memory_set.find_free_area(len).into();
-        let free_start = polyhal::VirtAddr::from(free_start_usize);
-        let free_end = polyhal::VirtAddr::from(free_start_usize + len);
-        if (flags & MAP_ANONYMOUS) != 0 {
-            inner.memory_set.insert_framed_area(free_start, free_end, permission);
-            return free_start_usize as isize;
-        } else {
-            if fd < 0 || fd as usize >= inner.fd_table.len() {
-                return -1;
-            }
-            if let Some(file) = inner.fd_table[fd as usize].clone() {
-                let ok = inner.memory_set.insert_file_area(
-                    free_start,
-                    free_end,
-                    permission,
-                    file,
-                    offset
-                );
-                if ok {
-                    return free_start_usize as isize;
-                } else {
-                    return -1;
-                }
-            } else {
-                return -1;
-            }
-        }
+    if (flags & MAP_ANONYMOUS) != 0 {
+        inner.memory_set.insert_framed_area(start_addr, end_addr, permission);
+        return actual_start as isize;
     } else {
-        if (flags & MAP_ANONYMOUS) != 0 {
-            inner.memory_set.insert_framed_area(start_addr, end_addr, permission);
-            return start as isize;
-        } else {
-            if fd < 0 || fd as usize >= inner.fd_table.len() {
-                return -1;
-            }
-            if let Some(file) = inner.fd_table[fd as usize].clone() {
-                let ok = inner.memory_set.insert_file_area(
-                    start_addr, 
-                    end_addr, 
-                    permission, 
-                    file, 
-                    offset
-                );
-                if ok {
-                    return start as isize;
-                } else {
-                    return -1;
-                }
+        if fd < 0 || fd as usize >= inner.fd_table.len() {
+            return -1;
+        }
+
+        if let Some(file) = inner.fd_table[fd as usize].clone() {
+            let ok = inner.memory_set.insert_file_area(
+                start_addr,
+                end_addr,
+                permission,
+                file,
+                offset
+            );
+            if ok {
+                return actual_start as isize;
             } else {
                 return -1;
             }
+        } else {
+            return -1;
         }
     }
 }
