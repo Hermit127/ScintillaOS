@@ -307,6 +307,99 @@ pub fn vfs_create(parent: &Arc<Dentry>, name: &str, is_dir: bool, uid: u32, gid:
     Some(child)
 }
 
+pub fn vfs_symlink(
+    parent: &Arc<Dentry>,
+    name: &str,
+    target: &str,
+    uid: u32,
+    gid: u32,
+) -> Option<Arc<Dentry>> {
+    let mode = ext4_rs::InodeFileType::S_IFLNK.bits() | 0o777;
+    let inode_num = parent.super_block.with_ext4(|ext4| {
+        ext4
+            .create_with_attr(parent.inode_num, name, mode, uid as u16, gid as u16)
+            .ok()
+            .map(|r| r.inode_num)
+    })?;
+
+    parent.super_block.with_ext4(|ext4| {
+        let _ = ext4.write_at(inode_num, 0, target.as_bytes());
+    });
+
+    let child = Dentry::new_child(parent, name, inode_num, false);
+
+    {
+        let mut children = parent.children.exclusive_access();
+        if let Some(list) = children.as_mut() {
+            list.push(child.clone());
+        } else {
+            *children = Some(alloc::vec![child.clone()]);
+        }
+    }
+
+    Some(child)
+}
+
+pub fn vfs_rename(old: &Arc<Dentry>, new_parent: &Arc<Dentry>, new_name: &str) -> bool {
+    if !Arc::ptr_eq(&old.super_block, &new_parent.super_block) {
+        return false;
+    }
+    let old_parent = match &old.parent {
+        Some(p) => p.clone(),
+        None => return false,
+    };
+
+    let ok = old.super_block.with_ext4(|ext4| {
+        let mut new_parent_inode = ext4.get_inode_ref(new_parent.inode_num);
+        let child_inode = ext4.get_inode_ref(old.inode_num);
+
+        if ext4
+            .dir_add_entry(&mut new_parent_inode, &child_inode, new_name)
+            .is_err()
+        {
+            return false;
+        }
+        ext4.write_back_inode(&mut new_parent_inode);
+
+        let mut old_parent_inode = ext4.get_inode_ref(old_parent.inode_num);
+        if ext4
+            .dir_remove_entry(&mut old_parent_inode, &old.name)
+            .is_err()
+        {
+            return false;
+        }
+        ext4.write_back_inode(&mut old_parent_inode);
+
+        true
+    });
+
+    if !ok {
+        return false;
+    }
+
+    // update old parent's children list
+    {
+        let mut children = old_parent.children.exclusive_access();
+        if let Some(list) = children.as_mut() {
+            list.retain(|c| c.name != old.name);
+        }
+    }
+
+    // update new parent's children list
+    let new_child = Dentry::new_child(new_parent, new_name, old.inode_num, old.is_dir);
+    {
+        let mut children = new_parent.children.exclusive_access();
+        if let Some(list) = children.as_mut() {
+            list.retain(|c| c.name != new_name);
+            list.push(new_child.clone());
+        } else {
+            *children = Some(alloc::vec![new_child.clone()]);
+        }
+    }
+
+    true
+}
+
 // ==================== Mount Operations ====================
 
 pub fn vfs_mount(mnt_point: Arc<Dentry>, sb: Arc<VfsSuperBlock>) -> bool {

@@ -57,6 +57,7 @@ pub struct TaskControlBlockInner {
     pub children: Vec<Arc<TaskControlBlock>>,
     pub exit_code: i32,
     pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
+    pub fd_cloexec: Vec<bool>,
     pub cwd: Arc<Dentry>,
     pub root: Arc<Dentry>,
     pub tid_ptr: usize,
@@ -104,9 +105,11 @@ impl TaskControlBlockInner {
     }
     pub fn alloc_fd(&mut self) -> usize {
         if let Some(fd) = (0..self.fd_table.len()).find(|fd| self.fd_table[*fd].is_none()) {
+            self.fd_cloexec[fd] = false;
             fd
         } else {
             self.fd_table.push(None);
+            self.fd_cloexec.push(false);
             self.fd_table.len() - 1
         }
     }
@@ -167,6 +170,7 @@ impl TaskControlBlock {
                         // 2 -> stderr
                         Some(Arc::new(Stdout)),
                     ],
+                    fd_cloexec: vec![false, false, false],
                     cwd: ROOT_DENTRY.clone(),
                     root: ROOT_DENTRY.clone(),
                     tid_ptr: 0,
@@ -288,6 +292,7 @@ impl TaskControlBlock {
                     children: Vec::new(),
                     exit_code: 0,
                     fd_table: new_fd_table,
+                    fd_cloexec: parent_inner.fd_cloexec.clone(),
                     cwd: parent_inner.cwd.clone(),
                     root: parent_inner.root.clone(),
                     tid_ptr: parent_inner.tid_ptr,

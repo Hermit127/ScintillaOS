@@ -1,6 +1,6 @@
 use super::vfs::{
-    vfs_create, vfs_resolve_parent_and_name, vfs_resolve_path,
-    vfs_resolve_with_fallback, Dentry,
+    vfs_create, vfs_rename, vfs_resolve_parent_and_name, vfs_resolve_path,
+    vfs_resolve_with_fallback, vfs_symlink, Dentry,
 };
 use super::{File, Kstat};
 use crate::drivers::BlockDevice;
@@ -309,6 +309,43 @@ pub fn mkdir_at(base: Option<Arc<Dentry>>, path: &str) -> bool {
         })
         .unwrap_or((0, 0));
     vfs_create(&parent, &name, true, euid, egid).is_some()
+}
+
+pub fn symlink_at(base: Option<Arc<Dentry>>, target: &str, linkpath: &str) -> bool {
+    let start = base.unwrap_or_else(|| crate::fs::vfs::ROOT_DENTRY.clone());
+    let (parent, name) = match vfs_resolve_parent_and_name(&start, linkpath) {
+        Some(x) => x,
+        None => return false,
+    };
+    let (euid, egid) = current_task()
+        .map(|t| {
+            let inner = t.inner_exclusive_access();
+            (inner.euid, inner.egid)
+        })
+        .unwrap_or((0, 0));
+    vfs_symlink(&parent, &name, target, euid, egid).is_some()
+}
+
+pub fn rename_at(
+    old_base: Option<Arc<Dentry>>,
+    oldpath: &str,
+    new_base: Option<Arc<Dentry>>,
+    newpath: &str,
+) -> bool {
+    let start_old = old_base.unwrap_or_else(|| crate::fs::vfs::ROOT_DENTRY.clone());
+    let start_new = new_base.unwrap_or_else(|| crate::fs::vfs::ROOT_DENTRY.clone());
+
+    let old_dentry = match vfs_resolve_path(&start_old, oldpath) {
+        Some(d) => d,
+        None => return false,
+    };
+
+    let (new_parent, new_name) = match vfs_resolve_parent_and_name(&start_new, newpath) {
+        Some(x) => x,
+        None => return false,
+    };
+
+    vfs_rename(&old_dentry, &new_parent, &new_name)
 }
 
 pub fn unlink_at(base: Option<Arc<Dentry>>, path: &str) -> bool {
