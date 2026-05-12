@@ -178,6 +178,59 @@ pub fn sys_getcwd(buf: *mut u8, size: usize) -> isize {
     buf as isize
 }
 
+pub fn sys_faccessat(dirfd: isize, path: *const u8, mode: usize, _flags: usize) -> isize {
+    const F_OK: usize = 0;
+    const R_OK: usize = 4;
+    const W_OK: usize = 2;
+    const X_OK: usize = 1;
+
+    let token = current_user_token();
+    let path_str = translated_str(token, path);
+    let base = match resolve_base_dir(dirfd) {
+        Some(b) => b,
+        None => return -2, // ENOENT
+    };
+    let dentry = match vfs_resolve_with_fallback(&base, &path_str) {
+        Some(d) => d,
+        None => return -2,
+    };
+
+    if mode == F_OK {
+        return 0;
+    }
+
+    let task = current_task().unwrap();
+    let (euid, egid) = {
+        let inner = task.inner_exclusive_access();
+        (inner.euid, inner.egid)
+    };
+
+    if euid == 0 {
+        return 0;
+    }
+
+    let allowed = dentry.super_block.with_ext4(|ext4| {
+        let inode_ref = ext4.get_inode_ref(dentry.inode_num);
+        let m = inode_ref.inode.mode();
+        let owner_perm = (m >> 6) & 0o7;
+        let group_perm = (m >> 3) & 0o7;
+        let other_perm = m & 0o7;
+        let perm = if inode_ref.inode.uid() as u32 == euid {
+            owner_perm
+        } else if inode_ref.inode.gid() as u32 == egid {
+            group_perm
+        } else {
+            other_perm
+        };
+        if (mode & R_OK) != 0 && (perm & 0o4) == 0 { return false; }
+        if (mode & W_OK) != 0 && (perm & 0o2) == 0 { return false; }
+        if (mode & X_OK) != 0 && (perm & 0o1) == 0 { return false; }
+        true
+    });
+
+    if allowed { 0 } else { -13 } // EACCES
+}
+
 pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
     const F_DUPFD: usize = 0;
     const F_GETFD: usize = 1;

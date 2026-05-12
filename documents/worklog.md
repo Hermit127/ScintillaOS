@@ -106,6 +106,7 @@ ext4_rs = { git = "https://github.com/你的账号/ext4_rs", rev = "你的commit
 
 修复：改成"一步到位"——用 ext4_rs 原生的 create_with_attr，创建 inode 的同时就把 uid/gid 写进去。
 
+以下的代码我都手动看过了，应该没有问题
 新增clock_gettime功能，通过测试 (获取系统时间)
 新增fstatat功能，通过测试 (根据路径 / 文件描述符，获取文件元数据（大小、类型、权限、时间等）)
 新增fcntl功能，通过测试 (对文件fd进行一系列操作，具体为复制，获取/修改fd标志，获取状态标志) (目前仍是最小实现！)
@@ -113,3 +114,4 @@ ext4_rs = { git = "https://github.com/你的账号/ext4_rs", rev = "你的commit
 修改vfs，新增symlinkat功能，通过测试(可以创建文件的快捷方式)
 新增readlinkat功能，通过测试(可以读取快捷方式指向谁)
 新增rename功能，通过测试(重命名，具体实现为调用ext4的接口，更改父目录的目录项列表)
+新增faccessat功能，通过测试(检查文件是否存在、是否可读/可写/可执行)
