@@ -95,5 +95,13 @@ ext4_rs = { git = "https://github.com/你的账号/ext4_rs", rev = "你的commit
 
 
 2026/5/12 hermit
-更新用户系统，新增getgid，setgid等多项指令
+更新用户系统，新增getgid，setgid等多项指令(具体功能为查询用户)
 修复mmap和getppid中的bug，getppid为调用号问题，需要重新编译测试，mmap为RISC-V 静态二进制代码段常从 0x0 加载，修复方式：遇 NULL 时遍历 areas 找第一段空闲虚地址区间，而非直接用 0
+
+2026/5/12 hermit
+新增lseek功能(查找文件指针)
+
+修复了lseek和之前用户系统与文件的bug
+原因：我之前设 uid/gid 的做法是"事后补刀"——ext4_rs 先把 inode 创建好写盘，然后我再单独读回来改 uid/gid 再写盘。这导致 inode 磁盘状态和 ext4_rs 内部缓存不一致。后续写文件内容时，write_at 读到不一致的 inode，计算出错误的块分配量，申请了一块巨大到不可能的内存 → 崩溃。
+
+修复：改成"一步到位"——用 ext4_rs 原生的 create_with_attr，创建 inode 的同时就把 uid/gid 写进去。
