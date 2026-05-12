@@ -1,5 +1,5 @@
 use crate::fs::vfs::{vfs_resolve_path, vfs_resolve_with_fallback, Dentry, VfsSuperBlock};
-use crate::fs::{make_pipe, mkdir_at, open_file_at, symlink_at, unlink_at, File, Kstat, OpenFlags};
+use crate::fs::{make_pipe, mkdir_at, open_file_at, rename_at, symlink_at, unlink_at, File, Kstat, OpenFlags};
 use crate::mm::{translated_byte_buffer, translated_refmut, translated_str};
 use crate::task::{current_task, current_user_token};
 use alloc::sync::Arc;
@@ -409,6 +409,37 @@ pub fn sys_lseek(fd: usize, offset: i64, whence: i32) -> isize {
 
     file.seek(new_off as usize);
     new_off as isize
+}
+
+pub fn sys_renameat2(
+    olddirfd: isize,
+    oldpath: *const u8,
+    newdirfd: isize,
+    newpath: *const u8,
+    _flags: usize,
+) -> isize {
+    if oldpath.is_null() || newpath.is_null() {
+        return -14; // EFAULT
+    }
+    let token = current_user_token();
+    let old_str = translated_str(token, oldpath);
+    let new_str = translated_str(token, newpath);
+    if old_str.is_empty() || new_str.is_empty() {
+        return -2; // ENOENT
+    }
+    let old_base = match resolve_base_dir(olddirfd) {
+        Some(b) => b,
+        None => return -2,
+    };
+    let new_base = match resolve_base_dir(newdirfd) {
+        Some(b) => b,
+        None => return -2,
+    };
+    if rename_at(Some(old_base), &old_str, Some(new_base), &new_str) {
+        0
+    } else {
+        -1
+    }
 }
 
 pub fn sys_symlinkat(target: *const u8, newdirfd: isize, linkpath: *const u8) -> isize {

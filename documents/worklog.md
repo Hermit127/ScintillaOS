@@ -112,3 +112,4 @@ ext4_rs = { git = "https://github.com/你的账号/ext4_rs", rev = "你的commit
 新增ioctl功能，通过测试(ioctl功能是一个非常复杂的功能，我们只实现了其中的两个，读 termios和窗口大小,用于通过busybox,后续需要逐步实现ioctl)
 修改vfs，新增symlinkat功能，通过测试(可以创建文件的快捷方式)
 新增readlinkat功能，通过测试(可以读取快捷方式指向谁)
+新增rename功能，通过测试(重命名，具体实现为调用ext4的接口，更改父目录的目录项列表)

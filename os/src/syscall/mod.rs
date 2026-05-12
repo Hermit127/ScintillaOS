@@ -53,6 +53,8 @@ const SYSCALL_UMOUNT2: usize = 39;
 
 const SYSCALL_SHUTDOWN: usize = 48;
 
+const SYSCALL_RENAMEAT2: usize = 276;
+
 const SYSCALL_SET_TID_ADDRESS: usize = 96;
 const SYSCALL_EXIT_GROUP: usize = 94;
 
@@ -133,6 +135,11 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         ),
         SYSCALL_UMOUNT2 => sys_umount2(args[0] as *const u8, args[1]),
         SYSCALL_SHUTDOWN => sys_shutdown(),
+        SYSCALL_RENAMEAT2 => sys_renameat2(
+            args[0] as isize, args[1] as *const u8,
+            args[2] as isize, args[3] as *const u8,
+            args[4],
+        ),
         _ => -1,
     }
 }
