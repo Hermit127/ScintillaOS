@@ -29,6 +29,7 @@ mod fs;
 mod lang_items;
 mod logging;
 mod mm;
+mod net;
 mod sync;
 mod syscall;
 mod task;
@@ -74,6 +75,7 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             current_add_signal(SignalFlags::SIGILL);
         }
         Timer => {
+            net::net_poll();
             check_and_wake_up_tasks();
             suspend_current_and_run_next();
         }
@@ -115,6 +117,7 @@ fn main(hartid: usize) {
     });
 
     fs::mount_root();
+    net::net_init();
     fs::list_apps();
     task::init_kernel_page();
     task::add_initproc();
