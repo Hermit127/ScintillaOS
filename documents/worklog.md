@@ -106,4 +106,5 @@ ext4_rs = { git = "https://github.com/你的账号/ext4_rs", rev = "你的commit
 
 修复：改成"一步到位"——用 ext4_rs 原生的 create_with_attr，创建 inode 的同时就把 uid/gid 写进去。
 
-新增clock_gettime功能，通过测试
+新增clock_gettime功能，通过测试 (获取系统时间)
+新增fstatat功能，通过测试 (根据路径 / 文件描述符，获取文件元数据（大小、类型、权限、时间等）)

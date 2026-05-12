@@ -1,5 +1,5 @@
 use crate::fs::vfs::{vfs_resolve_path, Dentry, VfsSuperBlock};
-use crate::fs::{make_pipe, mkdir_at, open_file_at, unlink_at, Kstat, OpenFlags};
+use crate::fs::{make_pipe, mkdir_at, open_file_at, unlink_at, File, Kstat, OpenFlags};
 use crate::mm::{translated_byte_buffer, translated_refmut, translated_str};
 use crate::task::{current_task, current_user_token};
 use alloc::sync::Arc;
@@ -288,6 +288,38 @@ pub fn sys_lseek(fd: usize, offset: i64, whence: i32) -> isize {
 
     file.seek(new_off as usize);
     new_off as isize
+}
+
+pub fn sys_fstatat(dirfd: isize, path: *const u8, stat_buf: *mut u8, flags: usize) -> isize {
+    const AT_EMPTY_PATH: usize = 0x1000;
+
+    if stat_buf.is_null() {
+        return -22; // EINVAL
+    }
+
+    if flags & AT_EMPTY_PATH != 0 {
+        return sys_fstat(dirfd as usize, stat_buf);
+    }
+
+    let token = current_user_token();
+    let path_str = translated_str(token, path);
+    if path_str.is_empty() {
+        return -2; // ENOENT
+    }
+
+    let base = match resolve_base_dir(dirfd) {
+        Some(b) => b,
+        None => return -2,
+    };
+    let dentry = match vfs_resolve_path(&base, &path_str) {
+        Some(d) => d,
+        None => return -2,
+    };
+
+    let inode = crate::fs::inode::OSInode::new(false, false, dentry);
+    let st = inode.stat();
+    *translated_refmut(token, stat_buf as *mut Kstat) = st;
+    0
 }
 
 pub fn sys_fstat(fd: usize, stat_buf: *mut u8) -> isize {
