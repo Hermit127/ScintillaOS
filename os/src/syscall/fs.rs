@@ -233,6 +233,70 @@ pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
     }
 }
 
+const TCGETS: usize = 0x5401;
+const TIOCGWINSZ: usize = 0x5413;
+
+#[repr(C)]
+struct Termios {
+    c_iflag: u32,
+    c_oflag: u32,
+    c_cflag: u32,
+    c_lflag: u32,
+    c_line: u8,
+    c_cc: [u8; 19],
+}
+
+#[repr(C)]
+struct Winsize {
+    ws_row: u16,
+    ws_col: u16,
+    ws_xpixel: u16,
+    ws_ypixel: u16,
+}
+
+fn is_terminal_fd(fd: usize) -> bool {
+    fd == 0 || fd == 1  // stdin/stdout
+}
+
+pub fn sys_ioctl(fd: usize, request: usize, arg: usize) -> isize {
+    let token = current_user_token();
+
+    match request {
+        TCGETS => {
+            if !is_terminal_fd(fd) {
+                return -25; // ENOTTY
+            }
+            if arg == 0 {
+                return -14; // EFAULT
+            }
+            let term = Termios {
+                c_iflag: 0x0500,  // ICRNL | IXON
+                c_oflag: 0x0005,  // OPOST | ONLCR
+                c_cflag: 0x04bf,  // CREAD | CS8 | B38400 | ...
+                c_lflag: 0x8a3b,  // ISIG | ICANON | ECHO | ECHOE | ECHOK | ...
+                c_line: 0,
+                c_cc: [0; 19],
+            };
+            *translated_refmut(token, arg as *mut Termios) = term;
+            0
+        }
+        TIOCGWINSZ => {
+            if arg == 0 {
+                return -14;
+            }
+            let ws = Winsize {
+                ws_row: 24,
+                ws_col: 80,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            *translated_refmut(token, arg as *mut Winsize) = ws;
+            0
+        }
+        _ => -25, // ENOTTY
+    }
+}
+
 pub fn sys_close(fd: usize) -> isize {
     let task = current_task().unwrap();
     let mut inner = task.inner_exclusive_access();
