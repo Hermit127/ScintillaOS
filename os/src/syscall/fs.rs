@@ -177,6 +177,62 @@ pub fn sys_getcwd(buf: *mut u8, size: usize) -> isize {
     buf as isize
 }
 
+pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
+    const F_DUPFD: usize = 0;
+    const F_GETFD: usize = 1;
+    const F_SETFD: usize = 2;
+    const F_GETFL: usize = 3;
+    const F_DUPFD_CLOEXEC: usize = 1030;
+    const FD_CLOEXEC: usize = 1;
+
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+
+    if fd >= inner.fd_table.len() || inner.fd_table[fd].is_none() {
+        return -9; // EBADF
+    }
+
+    match cmd {
+        F_DUPFD | F_DUPFD_CLOEXEC => {
+            while inner.fd_table.len() <= arg {
+                inner.fd_table.push(None);
+                inner.fd_cloexec.push(false);
+            }
+            let new_fd = (arg..inner.fd_table.len())
+                .find(|&i| inner.fd_table[i].is_none())
+                .unwrap_or_else(|| {
+                    inner.fd_table.push(None);
+                    inner.fd_cloexec.push(false);
+                    inner.fd_table.len() - 1
+                });
+            let file = inner.fd_table[fd].as_ref().unwrap().clone();
+            inner.fd_table[new_fd] = Some(file);
+            if cmd == F_DUPFD_CLOEXEC {
+                inner.fd_cloexec[new_fd] = true;
+            }
+            new_fd as isize
+        }
+        F_GETFD => {
+            if inner.fd_cloexec[fd] { FD_CLOEXEC as isize } else { 0 }
+        }
+        F_SETFD => {
+            inner.fd_cloexec[fd] = (arg & FD_CLOEXEC) != 0;
+            0
+        }
+        F_GETFL => {
+            if let Some(file) = &inner.fd_table[fd] {
+                let mut flags = 0usize;
+                if file.readable() && file.writable() { flags |= 2; } // O_RDWR
+                else if file.writable() { flags |= 1; } // O_WRONLY
+                0x8000 | flags as isize // O_LARGEFILE | access mode
+            } else {
+                -9
+            }
+        }
+        _ => -22, // EINVAL
+    }
+}
+
 pub fn sys_close(fd: usize) -> isize {
     let task = current_task().unwrap();
     let mut inner = task.inner_exclusive_access();

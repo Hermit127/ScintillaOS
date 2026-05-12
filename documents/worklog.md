@@ -108,3 +108,4 @@ ext4_rs = { git = "https://github.com/你的账号/ext4_rs", rev = "你的commit
 
 新增clock_gettime功能，通过测试 (获取系统时间)
 新增fstatat功能，通过测试 (根据路径 / 文件描述符，获取文件元数据（大小、类型、权限、时间等）)
+新增fcntl功能，通过测试 (对文件fd进行一系列操作，具体为复制，获取/修改fd标志，获取状态标志)
