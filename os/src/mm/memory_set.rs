@@ -140,6 +140,33 @@ impl MemorySet {
         false
     }
 
+    pub fn find_free_area(&self, len: usize) -> polyhal::VirtAddr {
+        let len = (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        if self.areas.is_empty() {
+            return polyhal::VirtAddr::from(PAGE_SIZE);
+        }
+        let mut bounds: alloc::vec::Vec<(usize, usize)> = self
+            .areas
+            .iter()
+            .map(|a| {
+                let s: usize = a.vaddr_range.get_start().into();
+                let e: usize = a.vaddr_range.get_end().into();
+                (s, e)
+            })
+            .collect();
+        bounds.sort_by_key(|(s, _)| *s);
+        let mut cursor: usize = PAGE_SIZE;
+        for (start, end) in bounds {
+            if cursor + len <= start {
+                return polyhal::VirtAddr::from(cursor);
+            }
+            if end > cursor {
+                cursor = end;
+            }
+        }
+        polyhal::VirtAddr::from(cursor)
+    }
+
     /// 插入匿名映射
     pub fn insert_framed_area(
         &mut self, 

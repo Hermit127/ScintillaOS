@@ -164,9 +164,12 @@ QEMU_EXEC += -nographic \
 				-smp 1 \
 				-D qemu.log -d in_asm,int,pcall,cpu_reset,guest_errors
 
-# Single-disk mode (root on bus 0, for local dev)
-QEMU_ARGS_SINGLE := -drive file=$(FS_IMG),if=none,format=raw,id=x0 \
-			-device $(VIRTIO_BLK_DEVICE),drive=x0,bus=$(VIRTIO_BLK_BUS)
+# Single-disk mode (same disk on both bus 0 and bus 1, for local dev)
+# ROOT_BLOCK_DEVICE uses bus 1, mount test & contest use bus 0
+QEMU_ARGS_SINGLE := -drive file=$(FS_IMG),if=none,format=raw,id=x0,file.locking=off \
+			-device $(VIRTIO_BLK_DEVICE),drive=x0,bus=$(VIRTIO_BLK_BUS) \
+			-drive file=$(FS_IMG),if=none,format=raw,id=x1,file.locking=off \
+			-device $(VIRTIO_BLK_DEVICE),drive=x1,bus=virtio-mmio-bus.1
 
 # Dual-disk mode (test disk bus 0, disk.img bus 1, for contest)
 QEMU_ARGS_DUAL := -drive file=$(TEST_DISK),if=none,format=raw,id=x0 \

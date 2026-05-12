@@ -97,6 +97,58 @@ pub fn sys_getppid() -> isize {
     }
 }
 
+pub fn sys_getuid() -> isize {
+    current_task().unwrap().inner_exclusive_access().uid as isize
+}
+
+pub fn sys_geteuid() -> isize {
+    current_task().unwrap().inner_exclusive_access().euid as isize
+}
+
+pub fn sys_getgid() -> isize {
+    current_task().unwrap().inner_exclusive_access().gid as isize
+}
+
+pub fn sys_getegid() -> isize {
+    current_task().unwrap().inner_exclusive_access().egid as isize
+}
+
+pub fn sys_gettid() -> isize {
+    sys_getpid()
+}
+
+pub fn sys_setuid(uid: u32) -> isize {
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    if inner.euid == 0 {
+        inner.uid = uid;
+        inner.euid = uid;
+    } else {
+        if uid == inner.uid {
+            inner.euid = uid;
+        } else {
+            return -1;
+        }
+    }
+    0
+}
+
+pub fn sys_setgid(gid: u32) -> isize {
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    if inner.egid == 0 {
+        inner.gid = gid;
+        inner.egid = gid;
+    } else {
+        if gid == inner.gid {
+            inner.egid = gid;
+        } else {
+            return -1;
+        }
+    }
+    0
+}
+
 pub fn sys_clone(_flags: usize, stack: usize, _ptid: usize, _tls: usize, _ctid: usize) -> isize {
     let current_task = current_task().unwrap();
     let new_task = current_task.fork();
@@ -367,38 +419,62 @@ pub fn sys_mmap(
     let start_addr = polyhal::VirtAddr::from(start);
     let end_addr = polyhal::VirtAddr::from(start + len);
 
-    if inner.memory_set.is_overlap(start_addr, end_addr) {
-       
+    if start != 0 && inner.memory_set.is_overlap(start_addr, end_addr) {
         return -1;
     }
 
-    if (flags & MAP_ANONYMOUS) != 0 {
-        inner.memory_set.insert_framed_area(start_addr, end_addr, permission);
-        return start as isize;
-    } else {
-        if fd < 0 || fd as usize >= inner.fd_table.len() {
-            crate::println!("[mmap] bad fd={} table_len={}", fd, inner.fd_table.len());
-            return -1;
-        }
-        
-        if let Some(file) = inner.fd_table[fd as usize].clone() {
-            let ok = inner.memory_set.insert_file_area(
-                start_addr, 
-                end_addr, 
-                permission, 
-                file, 
-                offset
-            );
-            if ok {
-                crate::println!("[mmap] success start={} len={}", start, len);
-                return start as isize;
-            } else {
-                crate::println!("[mmap] insert_file_area failed");
+    if start == 0 {
+        let free_start_usize: usize = inner.memory_set.find_free_area(len).into();
+        let free_start = polyhal::VirtAddr::from(free_start_usize);
+        let free_end = polyhal::VirtAddr::from(free_start_usize + len);
+        if (flags & MAP_ANONYMOUS) != 0 {
+            inner.memory_set.insert_framed_area(free_start, free_end, permission);
+            return free_start_usize as isize;
+        } else {
+            if fd < 0 || fd as usize >= inner.fd_table.len() {
                 return -1;
             }
+            if let Some(file) = inner.fd_table[fd as usize].clone() {
+                let ok = inner.memory_set.insert_file_area(
+                    free_start,
+                    free_end,
+                    permission,
+                    file,
+                    offset
+                );
+                if ok {
+                    return free_start_usize as isize;
+                } else {
+                    return -1;
+                }
+            } else {
+                return -1;
+            }
+        }
+    } else {
+        if (flags & MAP_ANONYMOUS) != 0 {
+            inner.memory_set.insert_framed_area(start_addr, end_addr, permission);
+            return start as isize;
         } else {
-            crate::println!("[mmap] fd {} not in table", fd);
-            return -1;
+            if fd < 0 || fd as usize >= inner.fd_table.len() {
+                return -1;
+            }
+            if let Some(file) = inner.fd_table[fd as usize].clone() {
+                let ok = inner.memory_set.insert_file_area(
+                    start_addr, 
+                    end_addr, 
+                    permission, 
+                    file, 
+                    offset
+                );
+                if ok {
+                    return start as isize;
+                } else {
+                    return -1;
+                }
+            } else {
+                return -1;
+            }
         }
     }
 }
