@@ -354,8 +354,7 @@ pub fn sys_mmap(
     fd: i32,
     offset: usize,
 ) -> isize {
-    if start % crate::config::PAGE_SIZE != 0 || len == 0 {
-       
+    if len == 0 {
         return -1;
     }
 
@@ -364,40 +363,45 @@ pub fn sys_mmap(
 
     let permission = get_map_permission(prot);
 
-    let start_addr = polyhal::VirtAddr::from(start);
-    let end_addr = polyhal::VirtAddr::from(start + len);
+    let actual_start = if start == 0 && (flags & MAP_FIXED) == 0 {
+        inner.memory_set.max_end_vaddr().raw()
+    } else {
+        if start % crate::config::PAGE_SIZE != 0 {
+            return -1;
+        }
+        start
+    };
 
-    if inner.memory_set.is_overlap(start_addr, end_addr) {
-       
+    let start_addr = polyhal::VirtAddr::from(actual_start);
+    let end_addr = polyhal::VirtAddr::from(actual_start + len);
+    let end_addr_ceil = end_addr.ceil();
+
+    if inner.memory_set.is_overlap(start_addr, end_addr_ceil) {
         return -1;
     }
 
     if (flags & MAP_ANONYMOUS) != 0 {
         inner.memory_set.insert_framed_area(start_addr, end_addr, permission);
-        return start as isize;
+        return actual_start as isize;
     } else {
         if fd < 0 || fd as usize >= inner.fd_table.len() {
-            crate::println!("[mmap] bad fd={} table_len={}", fd, inner.fd_table.len());
             return -1;
         }
-        
+
         if let Some(file) = inner.fd_table[fd as usize].clone() {
             let ok = inner.memory_set.insert_file_area(
-                start_addr, 
-                end_addr, 
-                permission, 
-                file, 
+                start_addr,
+                end_addr,
+                permission,
+                file,
                 offset
             );
             if ok {
-                crate::println!("[mmap] success start={} len={}", start, len);
-                return start as isize;
+                return actual_start as isize;
             } else {
-                crate::println!("[mmap] insert_file_area failed");
                 return -1;
             }
         } else {
-            crate::println!("[mmap] fd {} not in table", fd);
             return -1;
         }
     }

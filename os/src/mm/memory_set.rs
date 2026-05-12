@@ -177,38 +177,62 @@ impl MemorySet {
         }
         true
     }
+    pub fn max_end_vaddr(&self) -> polyhal::VirtAddr {
+        self.areas
+            .iter()
+            .map(|a| a.vaddr_range.get_end())
+            .max()
+            .unwrap_or_else(|| polyhal::VirtAddr::new(0))
+    }
+
     pub fn munmap(&mut self, start_addr: polyhal::VirtAddr, end_addr: polyhal::VirtAddr) -> bool {
         let start_vaddr = start_addr.floor();
         let end_vaddr = end_addr.ceil();
 
-        let mut found_idx = None;
-        for (i, area) in self.areas.iter().enumerate() {
-            if area.vaddr_range.get_start() <= start_vaddr && area.vaddr_range.get_end() >= end_vaddr {
-                found_idx = Some(i);
-                break;
-            }
-        }
+        let mut unmapped_any = false;
+        let mut i = 0;
 
-        if let Some(idx) = found_idx {
-            let start_match = self.areas[idx].vaddr_range.get_start() == start_vaddr;
-            let end_match = self.areas[idx].vaddr_range.get_end() == end_vaddr;
+        while i < self.areas.len() {
+            let area_start = self.areas[i].vaddr_range.get_start();
+            let area_end = self.areas[i].vaddr_range.get_end();
 
-            if start_match && end_match {
-                let mut removed_area = self.areas.remove(idx);
-                removed_area.unmap(&self.page_table);
-            } else {
-                let area = &mut self.areas[idx];
-                let mut curr = start_vaddr;
-                while curr < end_vaddr {
-                    if area.data_frames.remove(&curr).is_some() {
-                        self.page_table.unmap_page(curr);
+            if area_start < end_vaddr && area_end > start_vaddr {
+                let unmap_start = start_vaddr.max(area_start);
+                let unmap_end = end_vaddr.min(area_end);
+
+                let vaddrs: alloc::vec::Vec<VirtAddr> = self.areas[i]
+                    .data_frames
+                    .range(unmap_start..unmap_end)
+                    .map(|(&k, _)| k)
+                    .collect();
+
+                if !vaddrs.is_empty() {
+                    for vaddr in &vaddrs {
+                        self.page_table.unmap_page(*vaddr);
                     }
-                    curr = curr + crate::config::PAGE_SIZE;
+                    for vaddr in &vaddrs {
+                        self.areas[i].data_frames.remove(vaddr);
+                    }
+                    unmapped_any = true;
                 }
+
+                if self.areas[i].data_frames.is_empty() {
+                    self.areas.remove(i);
+                } else {
+                    let min_vaddr = *self.areas[i].data_frames.keys().min().unwrap();
+                    let max_vaddr = *self.areas[i].data_frames.keys().max().unwrap();
+                    self.areas[i].vaddr_range = VAddrRange::new(
+                        min_vaddr,
+                        max_vaddr + crate::config::PAGE_SIZE,
+                    );
+                    i += 1;
+                }
+            } else {
+                i += 1;
             }
-            return true;
         }
-        false
+
+        unmapped_any
     }
 }
 
