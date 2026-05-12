@@ -66,6 +66,23 @@ pub fn sys_exit(exit_code: i32) -> ! {
     panic!("Unreachable in sys_exit!");
 }
 
+pub fn sys_clock_gettime(clk_id: usize, tp: *mut u8) -> isize {
+    if tp.is_null() {
+        return -22; // EINVAL
+    }
+    match clk_id {
+        0 | 1 => { // CLOCK_REALTIME=0, CLOCK_MONOTONIC=1
+            let now_ms = Time::now().to_msec() as u64;
+            let token = current_user_token();
+            let ts = crate::mm::translated_refmut(token, tp as *mut crate::task::TimeSpec);
+            ts.tv_sec = (now_ms / 1000) as usize;
+            ts.tv_nsec = ((now_ms % 1000) * 1_000_000) as usize;
+            0
+        }
+        _ => -22, // EINVAL
+    }
+}
+
 pub fn sys_yield() -> isize {
     suspend_current_and_run_next();
     0

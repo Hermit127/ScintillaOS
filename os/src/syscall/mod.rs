@@ -12,6 +12,7 @@ const SYSCALL_READ: usize = 63;
 const SYSCALL_WRITE: usize = 64;
 const SYSCALL_EXIT: usize = 93;
 const SYSCALL_NANOSLEEP: usize = 101;
+const SYSCALL_CLOCK_GETTIME: usize = 113;
 const SYSCALL_YIELD: usize = 124;
 const SYSCALL_KILL: usize = 129;
 const SYSCALL_SIGACTION: usize = 134;
@@ -112,6 +113,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_TIMES => sys_times(args[0]),
         SYSCALL_UNAME => sys_uname(args[0]),
         SYSCALL_NANOSLEEP => sys_nanosleep(args[0], args[1]),
+        SYSCALL_CLOCK_GETTIME => sys_clock_gettime(args[0], args[1] as *mut u8),
         SYSCALL_MOUNT => sys_mount(
             args[0] as *const u8,
             args[1] as *const u8,

@@ -105,3 +105,5 @@ ext4_rs = { git = "https://github.com/你的账号/ext4_rs", rev = "你的commit
 原因：我之前设 uid/gid 的做法是"事后补刀"——ext4_rs 先把 inode 创建好写盘，然后我再单独读回来改 uid/gid 再写盘。这导致 inode 磁盘状态和 ext4_rs 内部缓存不一致。后续写文件内容时，write_at 读到不一致的 inode，计算出错误的块分配量，申请了一块巨大到不可能的内存 → 崩溃。
 
 修复：改成"一步到位"——用 ext4_rs 原生的 create_with_attr，创建 inode 的同时就把 uid/gid 写进去。
+
+新增clock_gettime功能，通过测试
