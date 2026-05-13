@@ -115,3 +115,6 @@ ext4_rs = { git = "https://github.com/你的账号/ext4_rs", rev = "你的commit
 新增readlinkat功能，通过测试(可以读取快捷方式指向谁)
 新增rename功能，通过测试(重命名，具体实现为调用ext4的接口，更改父目录的目录项列表)
 新增faccessat功能，通过测试(检查文件是否存在、是否可读/可写/可执行)
+
+2026/5/13 hermit
+新增utimensat功能，通过测试(修改文件的时间，如上次修改时间等)

@@ -178,6 +178,109 @@ pub fn sys_getcwd(buf: *mut u8, size: usize) -> isize {
     buf as isize
 }
 
+pub fn sys_utimensat(
+    dirfd: isize,
+    path: *const u8,
+    times: *const u8,
+    _flags: usize,
+) -> isize {
+    const UTIME_NOW: i64 = (1i64 << 30) - 1;
+    const UTIME_OMIT: i64 = (1i64 << 30) - 2;
+
+    #[repr(C)]
+    struct TimeSpec {
+        tv_sec: i64,
+        tv_nsec: i64,
+    }
+
+    let token = current_user_token();
+    let path_str = translated_str(token, path);
+    let base = match resolve_base_dir(dirfd) {
+        Some(b) => b,
+        None => return -2,
+    };
+    let dentry = match vfs_resolve_with_fallback(&base, &path_str) {
+        Some(d) => d,
+        None => return -2,
+    };
+
+    let task = current_task().unwrap();
+    let (euid, egid) = {
+        let inner = task.inner_exclusive_access();
+        (inner.euid, inner.egid)
+    };
+
+    if euid != 0 {
+        let permitted = dentry.super_block.with_ext4(|ext4| {
+            let inode_ref = ext4.get_inode_ref(dentry.inode_num);
+            if inode_ref.inode.uid() as u32 == euid {
+                return true;
+            }
+            let mode = inode_ref.inode.mode();
+            let perm = if inode_ref.inode.gid() as u32 == egid {
+                (mode >> 3) & 0o7
+            } else {
+                mode & 0o7
+            };
+            (perm & 0o2) != 0
+        });
+        if !permitted {
+            return -1; // EPERM
+        }
+    }
+
+    let now_sec = (polyhal::time::Time::now().to_msec() / 1000) as u32;
+
+    let (new_atime, new_mtime, changed) = if times.is_null() {
+        (Some(now_sec), Some(now_sec), true)
+    } else {
+        let ts0 = unsafe { &*(times as *const TimeSpec) };
+        let ts1 = unsafe { &*((times as *const TimeSpec).add(1)) };
+        let mut ch = false;
+
+        let at = if ts0.tv_nsec == UTIME_OMIT {
+            None
+        } else if ts0.tv_nsec == UTIME_NOW {
+            ch = true;
+            Some(now_sec)
+        } else {
+            ch = true;
+            Some(ts0.tv_sec as u32)
+        };
+
+        let mt = if ts1.tv_nsec == UTIME_OMIT {
+            None
+        } else if ts1.tv_nsec == UTIME_NOW {
+            ch = true;
+            Some(now_sec)
+        } else {
+            ch = true;
+            Some(ts1.tv_sec as u32)
+        };
+
+        if !ch {
+            return 0; // both UTIME_OMIT → ctime unchanged
+        }
+        (at, mt, true)
+    };
+
+    dentry.super_block.with_ext4(|ext4| {
+        let mut inode_ref = ext4.get_inode_ref(dentry.inode_num);
+        if let Some(a) = new_atime {
+            inode_ref.inode.set_atime(a);
+        }
+        if let Some(m) = new_mtime {
+            inode_ref.inode.set_mtime(m);
+        }
+        if changed {
+            inode_ref.inode.set_ctime(now_sec);
+        }
+        ext4.write_back_inode(&mut inode_ref);
+    });
+
+    0
+}
+
 pub fn sys_faccessat(dirfd: isize, path: *const u8, mode: usize, _flags: usize) -> isize {
     const F_OK: usize = 0;
     const R_OK: usize = 4;
