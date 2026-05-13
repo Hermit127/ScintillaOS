@@ -63,6 +63,7 @@ mod imp {
 }
 
 pub mod socket;
+pub mod syscall;
 
 #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
 use imp::NET_IFACE;
@@ -97,4 +98,13 @@ pub fn net_poll() {
             iface.poll(timestamp, device, sockets);
         }
     }
+}
+
+#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+pub fn with_net_iface<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&mut NetworkState) -> R,
+{
+    let mut guard = NET_IFACE.exclusive_access();
+    guard.as_mut().map(|state| f(state))
 }

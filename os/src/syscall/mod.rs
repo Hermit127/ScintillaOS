@@ -71,6 +71,9 @@ const SYSCALL_UTIMENSAT: usize = 88;
 
 const SYSCALL_RENAMEAT2: usize = 276;
 
+const SYSCALL_SOCKET: usize = 198;
+const SYSCALL_BIND: usize = 200;
+
 const SYSCALL_SET_TID_ADDRESS: usize = 96;
 const SYSCALL_EXIT_GROUP: usize = 94;
 
@@ -80,6 +83,7 @@ mod process;
 
 use fs::*;
 use process::*;
+use crate::net::syscall::{sys_socket, sys_bind};
 use log::*;
 use crate::task::SignalAction;
 
@@ -140,6 +144,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_DUP2 => sys_dup2(args[0], args[1]),
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4] as i32, args[5]),
         SYSCALL_MUNMAP => sys_munmap(args[0], args[1]),
+        SYSCALL_SOCKET => sys_socket(args[0], args[1], args[2]),
+        SYSCALL_BIND => sys_bind(args[0], args[1] as *const u8, args[2]),
         SYSCALL_MPROTECT => sys_mprotect(args[0], args[1], args[2]),
         // Tier 4 stubs
         SYSCALL_SET_ROBUST_LIST => 0,
