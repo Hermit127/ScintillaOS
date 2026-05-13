@@ -108,3 +108,21 @@ where
     let mut guard = NET_IFACE.exclusive_access();
     guard.as_mut().map(|state| f(state))
 }
+
+#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+pub fn with_net_iface_tcp_connect(
+    handle: smoltcp::iface::SocketHandle,
+    remote: smoltcp::wire::IpEndpoint,
+    local: smoltcp::wire::IpListenEndpoint,
+) {
+    let mut guard = NET_IFACE.exclusive_access();
+    if let Some(state) = guard.as_mut() {
+        let sock: &mut smoltcp::socket::tcp::Socket = state.sockets.get_mut(handle);
+        // Interface has `inner` as its only field (sixlowpan disabled).
+        // Transmute &mut Interface → &mut Context (= InterfaceInner).
+        let cx: &mut smoltcp::iface::Context = unsafe {
+            core::mem::transmute(&mut state.iface)
+        };
+        let _ = sock.connect(cx, remote, local);
+    }
+}
