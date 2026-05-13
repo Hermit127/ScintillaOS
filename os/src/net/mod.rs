@@ -62,6 +62,8 @@ mod imp {
     }
 }
 
+pub mod socket;
+
 #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
 use imp::NET_IFACE;
 #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
