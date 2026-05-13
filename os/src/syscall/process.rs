@@ -1,5 +1,5 @@
 use crate::fs::{open_file, OpenFlags};
-use crate::mm::{translated_ref, translated_refmut, translated_str};
+use crate::mm::{translated_ref, translated_refmut, translated_str, MapPermission};
 use crate::task::{
     add_task, current_task, current_user_token, exit_current_and_run_next, pid2task,
     sleep_current_and_run_next, suspend_current_and_run_next, SignalAction, SignalFlags, MAX_SIG,
@@ -412,7 +412,6 @@ pub fn sys_sleep(duration: u64) -> isize {
 
 pub fn sys_shutdown() -> isize {
     polyhal::instruction::shutdown();
-    0
 }
 
 fn get_map_permission(prot: usize) -> crate::mm::MapPermission {
@@ -482,6 +481,46 @@ pub fn sys_mmap(
             return -1;
         }
     }
+}
+
+pub fn sys_mprotect(addr: usize, len: usize, prot: usize) -> isize {
+    if addr % crate::config::PAGE_SIZE != 0 || len == 0 {
+        return -22; // EINVAL
+    }
+
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    let start = polyhal::VirtAddr::from(addr);
+    let end = polyhal::VirtAddr::from(addr + len);
+
+    let mut new_perm = MapPermission::U;
+    if prot & PROT_READ != 0 { new_perm |= MapPermission::R; }
+    if prot & PROT_WRITE != 0 { new_perm |= MapPermission::W; }
+    if prot & PROT_EXEC != 0 { new_perm |= MapPermission::X; }
+
+    for area in inner.memory_set.areas_mut().iter_mut() {
+        if area.vaddr_range.get_start() >= end || area.vaddr_range.get_end() <= start {
+            continue;
+        }
+        // For now, only handle case where range fully covers the area
+        if start <= area.vaddr_range.get_start() && end >= area.vaddr_range.get_end() {
+            area.set_perm(new_perm);
+            // Remap all pages with new permissions
+            for vaddr in area.vaddr_range {
+                let (paddr, _) = inner.memory_set.translate(vaddr)
+                    .expect("mprotect: page not mapped");
+                inner.memory_set.page_table_mut().unmap_page(vaddr);
+                inner.memory_set.page_table_mut().map_page(
+                    vaddr,
+                    paddr,
+                    new_perm.into(),
+                    polyhal::pagetable::MappingSize::Page4KB,
+                );
+            }
+            return 0;
+        }
+    }
+    -22 // EINVAL — range doesn't match any area exactly
 }
 
 pub fn sys_munmap(start: usize, len: usize) -> isize {
