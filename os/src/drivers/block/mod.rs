@@ -6,6 +6,8 @@ mod ram_blk;
 mod virtio_blk;
 #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
 pub use virtio_blk::VirtIOBlock;
+#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+pub use virtio_blk::VirtioHal;
 
 use alloc::sync::Arc;
 use lazy_static::*;

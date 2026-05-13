@@ -180,22 +180,33 @@ QEMU_ARGS_DUAL := -drive file=$(TEST_DISK),if=none,format=raw,id=x0 \
 # Test disk path (user can override)
 TEST_DISK ?= fs-img.img
 
+# virtio-net network configuration (SLIRP user-mode, riscv64/aarch64)
+ifeq ($(ARCH), riscv64)
+  QEMU_NET_ARGS := -netdev user,id=net0,hostfwd=tcp::5555-:5001,hostfwd=tcp::5556-:5201 \
+			-device virtio-net-device,netdev=net0,bus=virtio-mmio-bus.2
+else ifeq ($(ARCH), aarch64)
+  QEMU_NET_ARGS := -netdev user,id=net0,hostfwd=tcp::5555-:5001,hostfwd=tcp::5556-:5201 \
+			-device virtio-net-device,netdev=net0,bus=virtio-mmio-bus.2
+else
+  QEMU_NET_ARGS :=
+endif
+
 run-inner: build
-	$(QEMU_EXEC) $(QEMU_ARGS_SINGLE)
+	$(QEMU_EXEC) $(QEMU_ARGS_SINGLE) $(QEMU_NET_ARGS)
 
 run-dual: build disk.img
 	@echo "Running with dual-disk: $(TEST_DISK) + disk.img"
-	$(QEMU_EXEC) $(QEMU_ARGS_DUAL)
+	$(QEMU_EXEC) $(QEMU_ARGS_DUAL) $(QEMU_NET_ARGS)
 
 debug: build
 	@tmux new-session -d \
-		"$(QEMU_EXEC) -s -S" && \
+		"$(QEMU_EXEC) $(QEMU_ARGS_SINGLE) $(QEMU_NET_ARGS) -s -S" && \
 		tmux split-window -h "gdb -ex 'file $(KERNEL_ELF)' -ex 'target remote localhost:1234'" && \
 		tmux -2 attach-session -d
 
 
 gdbserver: build
-	@$(QEMU_EXEC) -s -S
+	@$(QEMU_EXEC) $(QEMU_ARGS_SINGLE) $(QEMU_NET_ARGS) -s -S
 
 gdbclient:
 	@gdb -ex 'file $(KERNEL_ELF)' -ex 'set arch riscv:rv64' -ex 'target remote localhost:1234'
