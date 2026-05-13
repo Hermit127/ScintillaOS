@@ -66,6 +66,7 @@ pub struct TaskControlBlockInner {
     pub euid: u32,
     pub gid: u32,
     pub egid: u32,
+    pub umask: u32,
     pub signals: SignalFlags,
     pub signal_mask: SignalFlags,
     // the signal which is being handling
@@ -180,6 +181,7 @@ impl TaskControlBlock {
                     euid: 0,
                     gid: 0,
                     egid: 0,
+                    umask: 0o022,
                     signals: SignalFlags::empty(),
                     signal_mask: SignalFlags::empty(),
                     handling_sig: -1,
@@ -303,6 +305,7 @@ impl TaskControlBlock {
                     euid: parent_inner.euid,
                     gid: parent_inner.gid,
                     egid: parent_inner.egid,
+                    umask: parent_inner.umask,
                     signals: SignalFlags::empty(),
                     // inherit the signal_mask and signal_action
                     signal_mask: parent_inner.signal_mask,

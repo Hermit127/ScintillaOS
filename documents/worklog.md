@@ -118,6 +118,8 @@ ext4_rs = { git = "https://github.com/你的账号/ext4_rs", rev = "你的commit
 
 2026/5/13 hermit
 新增utimensat功能，通过测试(修改文件的时间，如上次修改时间等)
+新增umask功能，通过测试(修改文件的权限)
+修改了网络架构，使得没有网卡也能通过编译
 
 
 2026/5/12 dyh

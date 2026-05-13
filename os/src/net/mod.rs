@@ -21,9 +21,9 @@ mod imp {
     }
 
     impl NetworkState {
-        pub fn new() -> Self {
-            let mut device = VirtIONetAdapter::new();
-            let mac_addr = device.mac_address();
+    pub fn new() -> Option<Self> {
+        let mut device = VirtIONetAdapter::new()?;
+        let mac_addr = device.mac_address();
             let mac = if mac_addr == [0u8; 6] {
                 DEFAULT_MAC
             } else {
@@ -38,15 +38,15 @@ mod imp {
             let dhcp_socket = DhcpSocket::new();
             let dhcp_handle = sockets.add(dhcp_socket);
 
-            Self {
-                device,
-                iface,
-                sockets,
-                dhcp_handle: Some(dhcp_handle),
-                clock_ms: 0,
-                inited: false,
-            }
-        }
+        Some(Self {
+            device,
+            iface,
+            sockets,
+            dhcp_handle: Some(dhcp_handle),
+            clock_ms: 0,
+            inited: false,
+        })
+    }
 
         pub fn poll(&mut self, ms_since_boot: u64) {
             self.clock_ms = ms_since_boot;
@@ -56,7 +56,7 @@ mod imp {
     }
 
     lazy_static! {
-        pub static ref NET_IFACE: UPSafeCell<NetworkState> = unsafe {
+        pub static ref NET_IFACE: UPSafeCell<Option<NetworkState>> = unsafe {
             UPSafeCell::new(NetworkState::new())
         };
     }
@@ -73,8 +73,12 @@ pub fn net_init() {
     #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
     {
         let mut state = NET_IFACE.exclusive_access();
-        state.inited = true;
-        log::info!("net: VirtIO-Net initialized, MAC={:02x?}", state.device.mac_address());
+        if let Some(state) = state.as_mut() {
+            state.inited = true;
+            log::info!("net: VirtIO-Net initialized, MAC={:02x?}", state.device.mac_address());
+        } else {
+            log::warn!("net: No virtio-net device available, networking disabled");
+        }
     }
 }
 
@@ -82,13 +86,15 @@ pub fn net_poll() {
     #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
     {
         let mut state = NET_IFACE.exclusive_access();
-        if !state.inited {
-            return;
+        if let Some(state) = state.as_mut() {
+            if !state.inited {
+                return;
+            }
+            state.clock_ms += 10;
+            let clock = state.clock_ms;
+            let timestamp = smoltcp::time::Instant::from_millis(clock as i64);
+            let NetworkState { ref mut iface, ref mut device, ref mut sockets, .. } = state;
+            iface.poll(timestamp, device, sockets);
         }
-        state.clock_ms += 10;
-        let clock = state.clock_ms;
-        let timestamp = smoltcp::time::Instant::from_millis(clock as i64);
-        let NetworkState { ref mut iface, ref mut device, ref mut sockets, .. } = &mut *state;
-        iface.poll(timestamp, device, sockets);
     }
 }

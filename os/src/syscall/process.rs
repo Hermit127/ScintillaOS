@@ -352,6 +352,14 @@ pub fn sys_sigaction(
     }
 }
 
+pub fn sys_umask(mask: u32) -> isize {
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    let old = inner.umask;
+    inner.umask = mask & 0o777;
+    old as isize
+}
+
 pub fn sys_brk(brk_addr: usize) -> isize {
     let task = current_task().unwrap();
     let mut inner = task.inner_exclusive_access();

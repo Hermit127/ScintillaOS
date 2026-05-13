@@ -32,23 +32,21 @@ pub struct VirtIONetAdapter {
 }
 
 impl VirtIONetAdapter {
-    pub fn new() -> Self {
+    pub fn new() -> Option<Self> {
         let transport = unsafe {
             MmioTransport::new(NonNull::new_unchecked(
                 PhysAddr::new(VIRTIO2).get_mut_ptr(),
             ))
-        }
-        .expect("failed to create MmioTransport for virtio-net");
-        let net = VirtIONet::new(transport, NET_BUF_SIZE)
-            .expect("failed to create VirtIONet");
-        Self {
+        }.ok()?;
+        let net = VirtIONet::new(transport, NET_BUF_SIZE).ok()?;
+        Some(Self {
             inner: unsafe {
                 UPSafeCell::new(VirtIONetInner { net })
             },
             rx_buf: [0u8; NET_BUF_SIZE],
             rx_len: 0,
             tx_buf: [0u8; NET_BUF_SIZE],
-        }
+        })
     }
 
     pub fn ack_interrupt(&self) {
