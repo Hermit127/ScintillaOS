@@ -40,7 +40,7 @@ iperf3 在 OS 内核中的完整调用链，从上到下六层：
 │  getrandom(278)                                           │
 ├──────────────────────────────────────────────────────┤
 │  Socket 管理层                                         │
-│  SocketTable (per-task)，统一 fd_table 类型             │
+│  SocketTable (per-task)，独立于 fd_table             │
 │  TcpSocket / UdpSocket 封装 smoltcp 的 socket 抽象      │
 │  阻塞 I/O 通过 TaskStatus::Blocking + 事件唤醒          │
 ├──────────────────────────────────────────────────────┤
@@ -148,7 +148,7 @@ smoltcp 是事件驱动的，需要定期调用 `iface.poll()` 来推动协议�
 
 新增 `os/src/net/socket.rs`，核心数据结构：
 
-**`SocketTable`**：每个 Task 的 socket 描述符表，使用 `BTreeMap<usize, SocketEntry>`。fd 编号从 `0x1000` 开始分配以区分普通文件 fd。
+**`SocketTable`**：每个 Task 的 socket 描述符表，使用 `BTreeMap<usize, SocketEntry>`。socket fd 与文件 fd 使用独立的命名空间，互不冲突。
 
 **`SocketEntry`**：包含 `Socket` 枚举、`nonblock` 标志、`cloexec` 标志。
 
@@ -156,14 +156,15 @@ smoltcp 是事件驱动的，需要定期调用 `iface.poll()` 来推动协议�
 
 **socket 生命周期管理**：smoltcp 要求所有活跃 socket 注册到全局 `SocketSet`。创建 socket 时通过 `SocketSet::add()` 获取 `SocketHandle`，后续操作通过 handle 索引访问。关闭 socket 时从 `SocketSet` 中移除。
 
-### 2.2 fd_table 改造
+### 2.2 与 fd_table 的关系
 
-当前 fd_table 类型为 `Vec<Option<Arc<dyn File>>>`。为了统一管理文件 fd 和 socket fd，需改造为 `Vec<Option<FdEntry>>`，其中 `FdEntry` 枚举：
+socket fd 与文件 fd **完全独立管理**，互不干扰：
 
-- `File(Arc<dyn File>)`：标准文件描述符
-- `Socket(SocketEntry)`：socket 描述符
+- 文件 fd 由 `fd_table: Vec<Option<Arc<dyn File>>>` 管理（保持不变）
+- socket fd 由 `socket_table: SocketTable` 管理（新增字段）
+- 两者使用独立编号空间，fd 编号可重复但不冲突——具体属于哪个表由系统调用类型决定
 
-这样 `close()`、`poll()` 等跨类型的系统调用可以根据 `FdEntry` 类型分发到正确的处理逻辑。
+需要同时处理两种 fd 的系统调用仅有 `close()`。修改 `sys_close` 使其先尝试 `fd_table`，失败时回退到 `socket_table`。未来实现 `poll()`/`ppoll()` 时同样遍历两个表。
 
 ### 2.3 核心 Socket 系统调用
 
@@ -407,17 +408,12 @@ musl libc 内部使用 `futex` 实现线程同步。当前内核无多线程支�
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `socket_table` | `SocketTable` | socket fd 管理表 |
+| `socket_table` | `SocketTable` | socket fd 管理表（独立于 `fd_table`） |
 | `block_reason` | `Option<BlockReason>` | 阻塞原因（等待 socket 可读/可写/可接受） |
 
-### fd_table 类型改造
+### fd_table 保持不变
 
-当前：`Vec<Option<Arc<dyn File>>>`
-
-改造为：`Vec<Option<FdEntry>>`，其中 `FdEntry` 为枚举：
-
-- `File(Arc<dyn File>)` — 标准文件描述符
-- `Socket(SocketEntry)` — socket 描述符
+文件 fd 管理完全不动——`fd_table: Vec<Option<Arc<dyn File>>>` 维持原样，所有现有文件系统调用代码不受影响。socket fd 通过新增的 `socket_table` 独立管理，只在 `close()` 和未来的 `poll()` 中需要同时查询两个表。
 
 ### 新增模块
 
@@ -454,7 +450,7 @@ Phase 1: 驱动 + 协议栈（2-3 天）
   └─ 验证: DHCP 获取 IP，Host ping Guest 成功
 
 Phase 2: Socket 系统调用（4-5 天）
-  ├─ SocketTable 数据结构 + fd_table 枚举改造
+  ├─ SocketTable 数据结构（独立于 fd_table）
   ├─ socket / bind / connect 实现
   ├─ listen / accept 实现（TCP 服务端）
   ├─ sendmsg / recvmsg 实现（iperf3 主 I/O 路径）
@@ -493,7 +489,7 @@ Phase 4: 集成测试 + 性能优化（2-3 天）
 | 虚拟网络模式 | QEMU SLIRP | 无需 root，port forwarding 即可实现 Host ↔ Guest 通信 |
 | IP 配置 | DHCP + 静态 fallback | smoltcp 内置 DHCP 客户端，兜底静态 `10.0.2.15/24` |
 | 阻塞 I/O 实现 | TaskStatus::Blocking + 轮询唤醒 | 复用现有调度器机制，无额外线程开销 |
-| fd 编号策略 | 文件 fd 与 socket fd 共用空间 | 简便统一的 `close()` / `poll()` 处理 |
+| fd 编号策略 | 文件 fd 与 socket fd 独立管理 | `close()`/`poll()` 中先查 `fd_table`，再查 `socket_table` |
 
 ---
 
@@ -505,7 +501,7 @@ Phase 4: 集成测试 + 性能优化（2-3 天）
 | QEMU SLIRP 性能低 | 中：吞吐受限，可能不满足竞赛要求 | 预留 TAP 网络方案（需 root），配合 vhost 加速 |
 | futex 缺失导致 musl 异常 | 中：musl 同步原语依赖 futex(98) | 至少提供 futex stub；iperf3 使用 `--without-pthread` 编译 |
 | 设备中断号不确定 | 低：不同 QEMU 版本可能分配不同 IRQ | 从设备树解析，或固定使用已知地址轮询 |
-| fd 编号冲突 | 中：`close()`/`poll()` 混淆 file fd 与 socket fd | 统一 `FdEntry` 枚举，按类型分发处理 |
+| fd 编号重叠 | 低：`close()`/`poll()` 需处理两个表 | 先查 `fd_table`，再查 `socket_table`，按系统调用类型自然分流 |
 | iperf3 二进制兼容性 | 低：musl 交叉编译可能遇到符号缺失 | 使用 `--disable-shared --enable-static` 确保全静态链接 |
 
 ---

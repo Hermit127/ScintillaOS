@@ -457,14 +457,15 @@ pub fn sys_ioctl(fd: usize, request: usize, arg: usize) -> isize {
 pub fn sys_close(fd: usize) -> isize {
     let task = current_task().unwrap();
     let mut inner = task.inner_exclusive_access();
-    if fd >= inner.fd_table.len() {
-        return -1;
+    if fd < inner.fd_table.len() && inner.fd_table[fd].is_some() {
+        inner.fd_table[fd].take();
+        return 0;
     }
-    if inner.fd_table[fd].is_none() {
-        return -1;
+    if inner.socket_table.remove(fd).is_some() {
+        // TODO: also remove from global SocketSet when socket cleanup is implemented
+        return 0;
     }
-    inner.fd_table[fd].take();
-    0
+    -1
 }
 
 pub fn sys_pipe(pipe: *mut usize) -> isize {
