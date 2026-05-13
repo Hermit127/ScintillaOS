@@ -119,6 +119,8 @@ ext4_rs = { git = "https://github.com/你的账号/ext4_rs", rev = "你的commit
 2026/5/13 hermit
 新增utimensat功能，通过测试(修改文件的时间，如上次修改时间等)
 新增umask功能，通过测试(修改文件的权限)
+新增最小化mprotect，通过测试(修改一段已存在内存区域的访问权限，后续需要添加更完整的mprotect)
+把busybox需要stub的系统调用全部添加了stub形式
 修改了网络架构，使得没有网卡也能通过编译
 
 

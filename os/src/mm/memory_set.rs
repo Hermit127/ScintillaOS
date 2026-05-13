@@ -167,6 +167,13 @@ impl MemorySet {
         polyhal::VirtAddr::from(cursor)
     }
 
+    pub fn page_table_mut(&mut self) -> &Arc<PageTableWrapper> {
+        &self.page_table
+    }
+    pub fn areas_mut(&mut self) -> &mut Vec<MapArea> {
+        &mut self.areas
+    }
+
     /// 插入匿名映射
     pub fn insert_framed_area(
         &mut self, 
@@ -271,6 +278,9 @@ pub struct MapArea {
 }
 
 impl MapArea {
+    pub fn set_perm(&mut self, perm: MapPermission) {
+        self.map_perm = perm;
+    }
     pub fn new(
         start_va: VirtAddr,
         end_va: VirtAddr,
