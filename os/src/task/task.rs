@@ -88,6 +88,7 @@ pub struct TaskControlBlockInner {
     pub cstime: usize,
     pub last_time: usize,
     pub socket_table: SocketTable,
+    pub block_reason: Option<BlockReason>,
 }
 
 impl TaskControlBlockInner {
@@ -200,6 +201,7 @@ impl TaskControlBlock {
                     cstime: 0,
                     last_time: polyhal::time::Time::now().to_msec() as usize,
                     socket_table: SocketTable::new(),
+                    block_reason: None,
                 })
             },
         };
@@ -324,6 +326,7 @@ impl TaskControlBlock {
                     cstime: 0,
                     last_time: polyhal::time::Time::now().to_msec() as usize,
                     socket_table: SocketTable::new(),
+                    block_reason: None,
                 })
             },
         });
@@ -360,6 +363,15 @@ impl TaskControlBlock {
         let mut inner = self.inner_exclusive_access();
         inner.last_time = polyhal::time::Time::now().to_msec() as usize;
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum BlockReason {
+    TcpRecv(usize),
+    TcpSend(usize),
+    TcpAccept(usize),
+    TcpConnect(usize),
+    UdpRecv(usize),
 }
 
 #[derive(Copy, Clone, PartialEq)]

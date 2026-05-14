@@ -15,7 +15,6 @@ use manager::remove_from_pid2task;
 use polyhal::instruction::shutdown;
 use polyhal::kcontext::KContext;
 use polyhal_trap::trapframe::TrapFrameArgs;
-use task::{TaskControlBlock, TaskStatus};
 use crate::sync::UPSafeCell;
 use alloc::vec::Vec;
 
@@ -26,6 +25,7 @@ pub use processor::{
     current_task, current_user_token, init_kernel_page, run_tasks, schedule, take_current_task,
 };
 pub use signal::{SignalFlags, MAX_SIG};
+pub use task::{BlockReason, TaskControlBlock, TaskStatus};
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -42,6 +42,9 @@ pub struct SleepTask {
 lazy_static! {
     // public sleep queue for timer interrupt handler to access
     pub static ref SLEEP_QUEUE: UPSafeCell<Vec<SleepTask>> = unsafe {
+        UPSafeCell::new(Vec::new())
+    };
+    pub static ref NET_BLOCK_QUEUE: UPSafeCell<Vec<Arc<TaskControlBlock>>> = unsafe {
         UPSafeCell::new(Vec::new())
     };
 }
@@ -79,6 +82,26 @@ pub fn sleep_current_and_run_next() {
     drop(task_inner);
 
     schedule(task_cx_ptr);
+
+    task.record_time_resume();
+}
+
+pub fn block_current_and_run_next(block_reason: BlockReason) {
+    let task = take_current_task().unwrap();
+    task.record_time_suspend();
+
+    let mut task_inner = task.inner_exclusive_access();
+    task_inner.block_reason = Some(block_reason);
+    let task_cx_ptr = &mut task_inner.task_cx as *mut KContext;
+    drop(task_inner);
+
+    NET_BLOCK_QUEUE.exclusive_access().push(task.clone());
+
+    schedule(task_cx_ptr);
+
+    let mut task_inner = task.inner_exclusive_access();
+    task_inner.block_reason = None;
+    drop(task_inner);
 
     task.record_time_resume();
 }

@@ -76,6 +76,7 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
         }
         Timer => {
             net::net_poll();
+            net::wake_net_blocked_tasks();
             check_and_wake_up_tasks();
             suspend_current_and_run_next();
         }

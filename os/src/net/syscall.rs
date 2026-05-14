@@ -8,7 +8,7 @@ use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
 
 use crate::mm::{translated_ref, translated_refmut};
 use crate::net::socket::{SocketEntry, SocketType};
-use crate::task::{current_task, current_user_token, suspend_current_and_run_next};
+use crate::task::{current_task, current_user_token, block_current_and_run_next, BlockReason};
 
 const SOCKET_BUFFER_SIZE: usize = 65536;
 const UDP_META_COUNT: usize = 16;
@@ -273,7 +273,7 @@ pub fn sys_connect(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
             if connected {
                 return 0;
             }
-            suspend_current_and_run_next();
+            block_current_and_run_next(BlockReason::TcpConnect(unsafe { core::mem::transmute(handle) }));
         }
     }
     0
@@ -337,7 +337,7 @@ pub fn sys_accept(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
             if active {
                 break;
             }
-            suspend_current_and_run_next();
+            block_current_and_run_next(BlockReason::TcpAccept(unsafe { core::mem::transmute(handle) }));
         }
     }
 
@@ -817,12 +817,12 @@ fn tcp_send(handle: SocketHandle, nonblock: bool, data: &[u8]) -> isize {
         return crate::net::with_net_iface(|iface| {
             let sock: &mut TcpSocket = iface.sockets.get_mut(handle);
             if !sock.is_active() {
-                return -32; // EPIPE
+                return -32;
             }
             match sock.send_slice(data) {
-                Ok(0) => -11, // EAGAIN
+                Ok(0) => -11,
                 Ok(n) => n as isize,
-                Err(_) => -32, // EPIPE
+                Err(_) => -32,
             }
         }).unwrap_or(-1);
     }
@@ -832,6 +832,7 @@ fn tcp_send(handle: SocketHandle, nonblock: bool, data: &[u8]) -> isize {
         if !sock_is_active_tcp(handle) {
             return -32;
         }
+        crate::net::net_poll();
         let sent = crate::net::with_net_iface(|iface| {
             let sock: &mut TcpSocket = iface.sockets.get_mut(handle);
             match sock.send_slice(&data[offset..]) {
@@ -842,9 +843,8 @@ fn tcp_send(handle: SocketHandle, nonblock: bool, data: &[u8]) -> isize {
         if sent > 0 {
             offset += sent as usize;
         } else if sent == 0 {
-            crate::net::net_poll();
             if !sock_can_send_tcp(handle) {
-                suspend_current_and_run_next();
+                block_current_and_run_next(BlockReason::TcpSend(unsafe { core::mem::transmute(handle) }));
             }
         } else {
             return sent;
@@ -862,11 +862,11 @@ fn tcp_recv(handle: SocketHandle, nonblock: bool, buf: &mut [u8]) -> isize {
         return crate::net::with_net_iface(|iface| {
             let sock: &mut TcpSocket = iface.sockets.get_mut(handle);
             if !sock.is_active() && sock.recv_queue() == 0 {
-                return 0; // connection closed, no data
+                return 0;
             }
             match sock.recv_slice(buf) {
                 Ok(0) if !sock.may_recv() => 0,
-                Ok(0) => -11, // EAGAIN
+                Ok(0) => -11,
                 Ok(n) => n as isize,
                 Err(_) => -11,
             }
@@ -878,18 +878,19 @@ fn tcp_recv(handle: SocketHandle, nonblock: bool, buf: &mut [u8]) -> isize {
         let result = crate::net::with_net_iface(|iface| {
             let sock: &mut TcpSocket = iface.sockets.get_mut(handle);
             match sock.recv_slice(buf) {
-                Ok(0) if !sock.may_recv() => Ok(0), // done — connection closed
-                Ok(0) => Err(()), // would block
+                Ok(0) if !sock.may_recv() => Ok(0),
+                Ok(0) => Err(()),
                 Ok(n) => Ok(n),
-                Err(_) => Err(()), // would block
+                Err(_) => Err(()),
             }
         });
         match result {
             Some(Ok(n)) => return n as isize,
             Some(Err(())) => {
-                if sock_recv_queue_tcp(handle) == 0 {
-                    suspend_current_and_run_next();
+                if !sock_is_active_tcp(handle) && sock_recv_queue_tcp(handle) == 0 {
+                    return 0;
                 }
+                block_current_and_run_next(BlockReason::TcpRecv(unsafe { core::mem::transmute(handle) }));
             }
             None => return -1,
         }
@@ -930,7 +931,7 @@ fn udp_recv(handle: SocketHandle, nonblock: bool, buf: &mut [u8]) -> isize {
         }).flatten();
         match result {
             Some(n) => return n,
-            None => suspend_current_and_run_next(),
+            None => block_current_and_run_next(BlockReason::UdpRecv(unsafe { core::mem::transmute(handle) })),
         }
     }
 }

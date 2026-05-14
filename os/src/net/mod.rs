@@ -148,3 +148,75 @@ pub fn with_net_iface_tcp_connect(
         let _ = sock.connect(cx, remote, local);
     }
 }
+
+#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+pub fn wake_net_blocked_tasks() {
+    use smoltcp::iface::SocketHandle;
+    use smoltcp::socket::tcp::Socket as TcpSocket;
+    use smoltcp::socket::udp::Socket as UdpSocket;
+    use crate::task::{add_task, BlockReason, TaskStatus, NET_BLOCK_QUEUE};
+
+    let mut to_wake = alloc::vec::Vec::new();
+    {
+        let mut queue = NET_BLOCK_QUEUE.exclusive_access();
+        let mut i = 0;
+        while i < queue.len() {
+            let should_wake = {
+                let inner = queue[i].inner_exclusive_access();
+                match &inner.block_reason {
+                    Some(BlockReason::TcpRecv(h)) => {
+                        let handle: SocketHandle = unsafe { core::mem::transmute(*h) };
+                        with_net_iface(|iface| {
+                            let sock: &TcpSocket = iface.sockets.get(handle);
+                            sock.can_recv() || !sock.may_recv()
+                        }).unwrap_or(true)
+                    }
+                    Some(BlockReason::TcpSend(h)) => {
+                        let handle: SocketHandle = unsafe { core::mem::transmute(*h) };
+                        with_net_iface(|iface| {
+                            let sock: &TcpSocket = iface.sockets.get(handle);
+                            sock.can_send()
+                        }).unwrap_or(true)
+                    }
+                    Some(BlockReason::TcpAccept(h)) => {
+                        let handle: SocketHandle = unsafe { core::mem::transmute(*h) };
+                        with_net_iface(|iface| {
+                            let sock: &TcpSocket = iface.sockets.get(handle);
+                            sock.is_active() && !sock.is_listening()
+                        }).unwrap_or(true)
+                    }
+                    Some(BlockReason::TcpConnect(h)) => {
+                        let handle: SocketHandle = unsafe { core::mem::transmute(*h) };
+                        with_net_iface(|iface| {
+                            let sock: &TcpSocket = iface.sockets.get(handle);
+                            sock.is_active()
+                        }).unwrap_or(true)
+                    }
+                    Some(BlockReason::UdpRecv(h)) => {
+                        let handle: SocketHandle = unsafe { core::mem::transmute(*h) };
+                        with_net_iface(|iface| {
+                            let sock: &UdpSocket = iface.sockets.get(handle);
+                            sock.can_recv()
+                        }).unwrap_or(true)
+                    }
+                    None => true, // block_reason cleared, should be woken
+                }
+            };
+            if should_wake {
+                to_wake.push(queue.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+    }
+    for task in to_wake {
+        let mut inner = task.inner_exclusive_access();
+        inner.task_status = TaskStatus::Ready;
+        inner.block_reason = None;
+        drop(inner);
+        add_task(task);
+    }
+}
+
+#[cfg(not(any(target_arch = "riscv64", target_arch = "aarch64")))]
+pub fn wake_net_blocked_tasks() {}
