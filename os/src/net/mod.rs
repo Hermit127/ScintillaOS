@@ -1,15 +1,18 @@
 #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
 mod imp {
+    use core::sync::atomic::{AtomicBool, Ordering};
     use smoltcp::iface::{Config, Interface, SocketSet};
     use smoltcp::socket::dhcpv4::Socket as DhcpSocket;
     use smoltcp::time::Instant;
-    use smoltcp::wire::{EthernetAddress, HardwareAddress};
+    use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, Ipv4Cidr, Ipv4Address};
 
     use crate::drivers::net::VirtIONetAdapter;
     use crate::sync::UPSafeCell;
     use lazy_static::lazy_static;
 
     const DEFAULT_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+
+    pub static NET_INITED: AtomicBool = AtomicBool::new(false);
 
     pub struct NetworkState {
         pub device: VirtIONetAdapter,
@@ -18,6 +21,7 @@ mod imp {
         pub dhcp_handle: Option<smoltcp::iface::SocketHandle>,
         pub clock_ms: u64,
         pub inited: bool,
+        pub dhcp_logged: bool,
     }
 
     impl NetworkState {
@@ -32,7 +36,16 @@ mod imp {
 
             let config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
             let now = Instant::from_millis(0);
-            let iface = Interface::new(config, &mut device, now);
+            let mut iface = Interface::new(config, &mut device, now);
+
+            // Register loopback as a local IP so 127.0.0.1 traffic stays within the stack
+            iface.update_ip_addrs(|addrs| {
+                let loopback = IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::new(127, 0, 0, 1), 8));
+                let _ = addrs.push(loopback);
+                // Static IP as fallback in case DHCP never completes
+                let static_ip = IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::new(10, 0, 2, 15), 24));
+                let _ = addrs.push(static_ip);
+            });
 
             let mut sockets = SocketSet::new(alloc::vec::Vec::new());
             let dhcp_socket = DhcpSocket::new();
@@ -45,6 +58,7 @@ mod imp {
             dhcp_handle: Some(dhcp_handle),
             clock_ms: 0,
             inited: false,
+            dhcp_logged: false,
         })
     }
 
@@ -91,6 +105,8 @@ pub mod syscall {
 use imp::NET_IFACE;
 #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
 use imp::NetworkState;
+#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+use imp::NET_INITED;
 
 pub fn net_init() {
     #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
@@ -98,9 +114,11 @@ pub fn net_init() {
         let mut state = NET_IFACE.exclusive_access();
         if let Some(state) = state.as_mut() {
             state.inited = true;
-            log::info!("net: VirtIO-Net initialized, MAC={:02x?}", state.device.mac_address());
+            NET_INITED.store(true, core::sync::atomic::Ordering::Relaxed);
+            println!("[net] VirtIO-Net initialized, MAC={:02x?}", state.device.mac_address());
+            println!("[net] Static IPs: loopback 127.0.0.0/8 + 10.0.2.15/24");
         } else {
-            log::warn!("net: No virtio-net device available, networking disabled");
+            println!("[net] No virtio-net device available, networking disabled");
         }
     }
 }
@@ -108,6 +126,9 @@ pub fn net_init() {
 pub fn net_poll() {
     #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
     {
+        if !NET_INITED.load(core::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         let mut state = NET_IFACE.exclusive_access();
         if let Some(state) = state.as_mut() {
             if !state.inited {
@@ -116,8 +137,21 @@ pub fn net_poll() {
             state.clock_ms += 10;
             let clock = state.clock_ms;
             let timestamp = smoltcp::time::Instant::from_millis(clock as i64);
-            let NetworkState { ref mut iface, ref mut device, ref mut sockets, .. } = state;
+            let NetworkState { ref mut iface, ref mut device, ref mut sockets, ref mut dhcp_handle, ref mut dhcp_logged, .. } = state;
             iface.poll(timestamp, device, sockets);
+
+            if !*dhcp_logged && iface.ip_addrs().len() > 2 {
+                *dhcp_logged = true;
+                println!("[net] DHCP assigned additional IP, total IPs:");
+                for addr in iface.ip_addrs() {
+                    println!("[net]   {}", addr);
+                }
+            } else if !*dhcp_logged && state.clock_ms == 500 {
+                println!("[net] Static IP configured (DHCP pending):");
+                for addr in iface.ip_addrs() {
+                    println!("[net]   {}", addr);
+                }
+            }
         }
     }
 }
@@ -155,6 +189,11 @@ pub fn wake_net_blocked_tasks() {
     use smoltcp::socket::tcp::Socket as TcpSocket;
     use smoltcp::socket::udp::Socket as UdpSocket;
     use crate::task::{add_task, BlockReason, TaskStatus, NET_BLOCK_QUEUE};
+
+    let inited = NET_INITED.load(core::sync::atomic::Ordering::Relaxed);
+    if !inited {
+        return;
+    }
 
     let mut to_wake = alloc::vec::Vec::new();
     {

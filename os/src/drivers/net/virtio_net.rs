@@ -14,7 +14,7 @@ const VIRTIO2: usize = 0x10003000;
 #[cfg(target_arch = "aarch64")]
 const VIRTIO2: usize = 0xa00_0300;
 
-const NET_BUF_SIZE: usize = 1526;
+const NET_BUF_SIZE: usize = 1536; // must be multiple of 8 for RxBuffer alignment
 const QUEUE_SIZE: usize = 64;
 
 struct VirtIONetInner {
@@ -33,12 +33,23 @@ pub struct VirtIONetAdapter {
 
 impl VirtIONetAdapter {
     pub fn new() -> Option<Self> {
-        let transport = unsafe {
-            MmioTransport::new(NonNull::new_unchecked(
-                PhysAddr::new(VIRTIO2).get_mut_ptr(),
-            ))
-        }.ok()?;
-        let net = VirtIONet::new(transport, NET_BUF_SIZE).ok()?;
+        let ptr = PhysAddr::new(VIRTIO2).get_mut_ptr();
+        println!("[net] probing VirtIO at {:#x}", VIRTIO2);
+        let transport = match unsafe { MmioTransport::new(NonNull::new_unchecked(ptr)) } {
+            Ok(t) => t,
+            Err(e) => {
+                println!("[net] MmioTransport::new failed: {:?}", e);
+                return None;
+            }
+        };
+        let net = match VirtIONet::new(transport, NET_BUF_SIZE) {
+            Ok(n) => n,
+            Err(e) => {
+                println!("[net] VirtIONet::new failed: {:?}", e);
+                return None;
+            }
+        };
+        println!("[net] VirtIONetAdapter initialized successfully");
         Some(Self {
             inner: unsafe {
                 UPSafeCell::new(VirtIONetInner { net })

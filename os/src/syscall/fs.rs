@@ -35,6 +35,7 @@ fn resolve_base_dir(dirfd: isize) -> Option<Arc<Dentry>> {
 }
 
 pub fn sys_write(fd: usize, buf: *mut u8, len: usize) -> isize {
+    let token = current_user_token();
     let task = current_task().unwrap();
     let inner = task.inner_exclusive_access();
     if let Some(entry) = inner.socket_table.get(fd) {
@@ -45,7 +46,6 @@ pub fn sys_write(fd: usize, buf: *mut u8, len: usize) -> isize {
         drop(inner);
         return socket_write(sockfd, buf, len);
     }
-    let token = current_user_token();
     if fd >= inner.fd_table.len() {
         return -1;
     }
@@ -62,6 +62,7 @@ pub fn sys_write(fd: usize, buf: *mut u8, len: usize) -> isize {
 }
 
 pub fn sys_read(fd: usize, buf: *mut u8, len: usize) -> isize {
+    let token = current_user_token();
     let task = current_task().unwrap();
     let inner = task.inner_exclusive_access();
     if let Some(entry) = inner.socket_table.get(fd) {
@@ -72,7 +73,6 @@ pub fn sys_read(fd: usize, buf: *mut u8, len: usize) -> isize {
         drop(inner);
         return socket_read(sockfd, buf, len);
     }
-    let token = current_user_token();
     if fd >= inner.fd_table.len() {
         return -1;
     }
