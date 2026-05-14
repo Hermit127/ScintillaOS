@@ -63,8 +63,18 @@ mod imp {
 }
 
 pub mod socket;
+
 #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
 pub mod syscall;
+
+#[cfg(not(any(target_arch = "riscv64", target_arch = "aarch64")))]
+pub mod syscall {
+    pub fn sys_socket(_domain: usize, _type_: usize, _protocol: usize) -> isize { -38 }
+    pub fn sys_bind(_sockfd: usize, _addr: *const u8, _addrlen: usize) -> isize { -38 }
+    pub fn sys_listen(_sockfd: usize, _backlog: usize) -> isize { -38 }
+    pub fn sys_accept(_sockfd: usize, _addr: *mut u8, _addrlen: *mut usize) -> isize { -38 }
+    pub fn sys_connect(_sockfd: usize, _addr: *const u8, _addrlen: usize) -> isize { -38 }
+}
 
 #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
 use imp::NET_IFACE;
