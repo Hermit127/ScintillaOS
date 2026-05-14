@@ -130,3 +130,14 @@ ext4_rs = { git = "https://github.com/你的账号/ext4_rs", rev = "你的commit
 2026/5/13 dyh
 建立sockettable
 新增socket系列系统调用
+
+2026/5/14 dyh
+完成Phase 2 数据收发系统调用：
+- 新增 sendmsg(211)/recvmsg(212)：支持 iovec scatter/gather，iperf3 主 I/O 路径
+- 新增 sendto(206)/recvfrom(207)：UDP 数据收发
+- 新增 setsockopt(208)/getsockopt(209)：TCP_NODELAY、SO_KEEPALIVE、SO_REUSEADDR 等
+- 新增 shutdown(210)/getpeername(205)/getsockname(204)
+- 修改 sys_read/sys_write 支持 socket fd（先查 socket_table 回退 fd_table）
+- 阻塞 I/O 使用 busy-poll + suspend_current_and_run_next
+- 为非网络架构(loongarch64/x86_64)添加 stub 函数
+- riscv64/loongarch64/x86_64 三架构 cargo check 通过

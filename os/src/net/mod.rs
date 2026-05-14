@@ -74,6 +74,17 @@ pub mod syscall {
     pub fn sys_listen(_sockfd: usize, _backlog: usize) -> isize { -38 }
     pub fn sys_accept(_sockfd: usize, _addr: *mut u8, _addrlen: *mut usize) -> isize { -38 }
     pub fn sys_connect(_sockfd: usize, _addr: *const u8, _addrlen: usize) -> isize { -38 }
+    pub fn sys_getsockname(_sockfd: usize, _addr: *mut u8, _addrlen: *mut usize) -> isize { -38 }
+    pub fn sys_getpeername(_sockfd: usize, _addr: *mut u8, _addrlen: *mut usize) -> isize { -38 }
+    pub fn sys_sendto(_sockfd: usize, _buf: *const u8, _len: usize, _flags: usize, _dest_addr: *const u8, _addrlen: usize) -> isize { -38 }
+    pub fn sys_recvfrom(_sockfd: usize, _buf: *mut u8, _len: usize, _flags: usize, _src_addr: *mut u8, _addrlen: *mut usize) -> isize { -38 }
+    pub fn sys_setsockopt(_sockfd: usize, _level: usize, _optname: usize, _optval: *const u8, _optlen: usize) -> isize { -38 }
+    pub fn sys_getsockopt(_sockfd: usize, _level: usize, _optname: usize, _optval: *mut u8, _optlen: *mut usize) -> isize { -38 }
+    pub fn sys_sock_shutdown(_sockfd: usize, _how: usize) -> isize { -38 }
+    pub fn sys_sendmsg(_sockfd: usize, _msg: *const u8, _flags: usize) -> isize { -38 }
+    pub fn sys_recvmsg(_sockfd: usize, _msg: *mut u8, _flags: usize) -> isize { -38 }
+    pub fn socket_read(_sockfd: usize, _buf: *mut u8, _len: usize) -> isize { -38 }
+    pub fn socket_write(_sockfd: usize, _buf: *const u8, _len: usize) -> isize { -38 }
 }
 
 #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]

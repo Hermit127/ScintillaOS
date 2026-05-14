@@ -76,6 +76,15 @@ const SYSCALL_BIND: usize = 200;
 const SYSCALL_LISTEN: usize = 201;
 const SYSCALL_ACCEPT: usize = 202;
 const SYSCALL_CONNECT: usize = 203;
+const SYSCALL_GETSOCKNAME: usize = 204;
+const SYSCALL_GETPEERNAME: usize = 205;
+const SYSCALL_SENDTO: usize = 206;
+const SYSCALL_RECVFROM: usize = 207;
+const SYSCALL_SETSOCKOPT: usize = 208;
+const SYSCALL_GETSOCKOPT: usize = 209;
+const SYSCALL_SOCK_SHUTDOWN: usize = 210;
+const SYSCALL_SENDMSG: usize = 211;
+const SYSCALL_RECVMSG: usize = 212;
 
 const SYSCALL_SET_TID_ADDRESS: usize = 96;
 const SYSCALL_EXIT_GROUP: usize = 94;
@@ -86,7 +95,12 @@ mod process;
 
 use fs::*;
 use process::*;
-use crate::net::syscall::{sys_socket, sys_bind, sys_listen, sys_accept, sys_connect};
+use crate::net::syscall::{
+    sys_socket, sys_bind, sys_listen, sys_accept, sys_connect,
+    sys_getsockname, sys_getpeername, sys_sendto, sys_recvfrom,
+    sys_setsockopt, sys_getsockopt, sys_sock_shutdown,
+    sys_sendmsg, sys_recvmsg,
+};
 use log::*;
 use crate::task::SignalAction;
 
@@ -152,6 +166,15 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_LISTEN => sys_listen(args[0], args[1]),
         SYSCALL_ACCEPT => sys_accept(args[0], args[1] as *mut u8, args[2] as *mut usize),
         SYSCALL_CONNECT => sys_connect(args[0], args[1] as *const u8, args[2]),
+        SYSCALL_GETSOCKNAME => sys_getsockname(args[0], args[1] as *mut u8, args[2] as *mut usize),
+        SYSCALL_GETPEERNAME => sys_getpeername(args[0], args[1] as *mut u8, args[2] as *mut usize),
+        SYSCALL_SENDTO => sys_sendto(args[0], args[1] as *const u8, args[2], args[3], args[4] as *const u8, args[5]),
+        SYSCALL_RECVFROM => sys_recvfrom(args[0], args[1] as *mut u8, args[2], args[3], args[4] as *mut u8, args[5] as *mut usize),
+        SYSCALL_SETSOCKOPT => sys_setsockopt(args[0], args[1], args[2], args[3] as *const u8, args[4]),
+        SYSCALL_GETSOCKOPT => sys_getsockopt(args[0], args[1], args[2], args[3] as *mut u8, args[4] as *mut usize),
+        SYSCALL_SOCK_SHUTDOWN => sys_sock_shutdown(args[0], args[1]),
+        SYSCALL_SENDMSG => sys_sendmsg(args[0], args[1] as *const u8, args[2]),
+        SYSCALL_RECVMSG => sys_recvmsg(args[0], args[1] as *mut u8, args[2]),
         SYSCALL_MPROTECT => sys_mprotect(args[0], args[1], args[2]),
         // Tier 4 stubs
         SYSCALL_SET_ROBUST_LIST => 0,

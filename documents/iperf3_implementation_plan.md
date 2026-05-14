@@ -6,17 +6,45 @@ iperf3 是一个用于测量 TCP、UDP 和 SCTP 网络带宽的标准工具。�
 
 ---
 
-## 当前状态
+## 当前状态（截至 2026/5/14）
 
 | 组件 | 状态 | 说明 |
 |------|------|------|
-| 网络驱动 | ❌ 无 | 只有 `virtio-blk`（块设备），无 `virtio-net` |
-| TCP/IP 协议栈 | ❌ 无 | 未引入 `smoltcp` 等协议栈 crate |
-| Socket 系统调用 | ❌ 无 | `syscall_ids.h` 定义了编号，内核未实现任何 socket 相关 |
-| QEMU 网络配置 | ❌ 无 | Makefile 中无 `-netdev` / `-device virtio-net` 参数 |
-| 网络相关依赖 | ❌ 无 | `Cargo.toml` 无 `smoltcp` 等依赖 |
+| 网络驱动 | ✅ 已实现 | `drivers/net/virtio_net.rs`，实现 smoltcp `phy::Device` trait |
+| TCP/IP 协议栈 | ✅ 已实现 | smoltcp v0.11，TCP/UDP/ICMP/DHCP/ARP |
+| Socket 系统调用 | ✅ 已实现 | 见下方清单，14 个 socket syscall 全部实现 |
+| 非网络架构兼容 | ✅ 已实现 | loongarch64/x86_64 提供 stub 返回 ENOSYS |
+| QEMU 网络配置 | ⚠️ 待验证 | 需 Makefile 添加 `-netdev user` + `-device virtio-net` |
+| 阻塞 I/O 机制 | ⚠️ 简化版 | 使用 busy-poll + `suspend_current_and_run_next()`，未实现 BlockReason 事件唤醒 |
+| iperf3 辅助 syscall | ⚠️ 部分实现 | `clock_gettime` 已实现(毫秒精度)；`getrandom`/`ppoll`/`futex`/`writev` 为 stub |
+| iperf3 交叉编译 | ❌ 未开始 | — |
 
-当前唯一可用的驱动栈是 `virtio-blk`（块设备），通过 `virtio_drivers` crate 的 `MmioTransport` 访问。该 crate 也内置了 `VirtIONet`，传输层可直接复用。ext4 文件系统和进程管理已成熟，可作为网络功能的底层支撑。
+### 系统调用实现清单
+
+| 编号 | syscall | Phase | 状态 |
+|------|---------|-------|------|
+| 198 | `socket` | 2 | ✅ |
+| 200 | `bind` | 2 | ✅ |
+| 201 | `listen` | 2 | ✅ |
+| 202 | `accept` | 2 | ✅ |
+| 203 | `connect` | 2 | ✅ |
+| 204 | `getsockname` | 2 | ✅ |
+| 205 | `getpeername` | 2 | ✅ |
+| 206 | `sendto` | 2 | ✅ |
+| 207 | `recvfrom` | 2 | ✅ |
+| 208 | `setsockopt` | 2 | ✅ |
+| 209 | `getsockopt` | 2 | ✅ |
+| 210 | `shutdown` | 2 | ✅ |
+| 211 | `sendmsg` | 2 | ✅ |
+| 212 | `recvmsg` | 2 | ✅ |
+| 113 | `clock_gettime` | 3 | ⚠️ 毫秒精度 |
+| 278 | `getrandom` | 3 | ❌ stub (-38) |
+| 73 | `ppoll` | 3 | ❌ stub (-38) |
+| 66 | `writev` | 3 | ❌ 未实现 |
+| 98 | `futex` | 3 | ❌ 未实现 |
+| 233 | `madvise` | 3 | ❌ 未实现 |
+
+扩展修改：`sys_read`/`sys_write`/`sys_close` 已兼容 socket fd（先查 `socket_table`，回退 `fd_table`）。
 
 ---
 
@@ -252,9 +280,9 @@ iperf3 使用阻塞 socket（默认模式），需要实现阻塞语义：
 
 | syscall | 编号 | 当前状态 | 作用 |
 |---------|------|---------|------|
-| `clock_gettime` | 113 | ❌ 未实现 | iperf3 带宽计算核心——使用 `CLOCK_MONOTONIC` 获取高精度时间 |
-| `getrandom` | 278 | ❌ 未实现 | 生成随机测试数据（避免全零数据触发压缩） |
-| `ppoll` | 73 | ❌ 未实现 | I/O 多路复用，等待多个 socket 就绪 |
+| `clock_gettime` | 113 | ⚠️ 已实现（毫秒精度） | iperf3 带宽计算核心——使用 `CLOCK_MONOTONIC` 获取高精度时间 |
+| `getrandom` | 278 | ❌ stub (-38) | 生成随机测试数据（避免全零数据触发压缩） |
+| `ppoll` | 73 | ❌ stub (-38) | I/O 多路复用，等待多个 socket 就绪 |
 | `writev` | 66 | ❌ 未实现 | 聚集写（iperf3 可能用于组合 header + payload） |
 | `futex` | 98 | ❌ 未实现 | musl libc 同步原语底层实现，至少需要 stub |
 | `madvise` | 233 | ❌ 未实现 | stub 返回 0 即可 |
@@ -359,30 +387,30 @@ musl libc 内部使用 `futex` 实现线程同步。当前内核无多线程支�
 
 ### 需要新增的系统调用
 
-| 阶段 | syscall | 编号 | 实现难度 | 说明 |
-|------|---------|------|---------|------|
-| Phase 2 | `socket` | 198 | ★★☆ | 创建 socket |
-| Phase 2 | `bind` | 200 | ★★☆ | 绑定地址 |
-| Phase 2 | `connect` | 203 | ★★★ | TCP 连接 + 阻塞等待 |
-| Phase 2 | `listen` | 201 | ★☆☆ | TCP 监听 |
-| Phase 2 | `accept` | 202 | ★★★ | TCP 接受连接 + 阻塞等待 |
-| Phase 2 | `sendto` | 206 | ★★☆ | UDP 发送 |
-| Phase 2 | `recvfrom` | 207 | ★★☆ | UDP 接收 |
-| Phase 2 | `sendmsg` | 211 | ★★★ | 通用发送（iperf3 主用） |
-| Phase 2 | `recvmsg` | 212 | ★★★ | 通用接收（iperf3 主用） |
-| Phase 2 | `shutdown` | 210 | ★★☆ | 连接关闭 |
-| Phase 2 | `setsockopt` | 208 | ★★★ | 设置 socket 选项 |
-| Phase 2 | `getsockopt` | 209 | ★★☆ | 获取 socket 选项 |
-| Phase 2 | `getpeername` | 205 | ★☆☆ | 获取对端地址 |
-| Phase 2 | `getsockname` | 204 | ★☆☆ | 获取本地地址 |
-| Phase 3 | `clock_gettime` | 113 | ★★☆ | 高精度计时 |
-| Phase 3 | `getrandom` | 278 | ★★☆ | 随机数生成 |
-| Phase 3 | `ppoll` | 73 | ★★★ | I/O 多路复用 |
-| Phase 3 | `writev` | 66 | ★★☆ | 聚集写 |
-| Phase 3 | `futex` | 98 | ★☆☆ | stub 即可 |
-| Phase 3 | `madvise` | 233 | ★☆☆ | stub 即可 |
+| 阶段 | syscall | 编号 | 实现难度 | 说明 | 状态 |
+|------|---------|------|---------|------|------|
+| Phase 2 | `socket` | 198 | ★★☆ | 创建 socket | ✅ |
+| Phase 2 | `bind` | 200 | ★★☆ | 绑定地址 | ✅ |
+| Phase 2 | `connect` | 203 | ★★★ | TCP 连接 + 阻塞等待 | ✅ |
+| Phase 2 | `listen` | 201 | ★☆☆ | TCP 监听 | ✅ |
+| Phase 2 | `accept` | 202 | ★★★ | TCP 接受连接 + 阻塞等待 | ✅ |
+| Phase 2 | `sendto` | 206 | ★★☆ | UDP 发送 | ✅ |
+| Phase 2 | `recvfrom` | 207 | ★★☆ | UDP 接收 | ✅ |
+| Phase 2 | `sendmsg` | 211 | ★★★ | 通用发送（iperf3 主用） | ✅ |
+| Phase 2 | `recvmsg` | 212 | ★★★ | 通用接收（iperf3 主用） | ✅ |
+| Phase 2 | `shutdown` | 210 | ★★☆ | 连接关闭 | ✅ |
+| Phase 2 | `setsockopt` | 208 | ★★★ | 设置 socket 选项 | ✅ |
+| Phase 2 | `getsockopt` | 209 | ★★☆ | 获取 socket 选项 | ✅ |
+| Phase 2 | `getpeername` | 205 | ★☆☆ | 获取对端地址 | ✅ |
+| Phase 2 | `getsockname` | 204 | ★☆☆ | 获取本地地址 | ✅ |
+| Phase 3 | `clock_gettime` | 113 | ★★☆ | 高精度计时 | ⚠️ 毫秒精度 |
+| Phase 3 | `getrandom` | 278 | ★★☆ | 随机数生成 | ❌ stub |
+| Phase 3 | `ppoll` | 73 | ★★★ | I/O 多路复用 | ❌ stub |
+| Phase 3 | `writev` | 66 | ★★☆ | 聚集写 | ❌ |
+| Phase 3 | `futex` | 98 | ★☆☆ | stub 即可 | ❌ |
+| Phase 3 | `madvise` | 233 | ★☆☆ | stub 即可 | ❌ |
 
-**总计：20 个新系统调用**（14 个 socket 相关 + 6 个辅助）
+**总计：20 个新系统调用**（14 个 socket 相关 ✅ + 6 个辅助 ⚠️/❌）
 
 ### 已实现的系统调用（无需改动）
 
@@ -406,10 +434,10 @@ musl libc 内部使用 `futex` 实现线程同步。当前内核无多线程支�
 
 ### TaskControlBlockInner 新增字段
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `socket_table` | `SocketTable` | socket fd 管理表（独立于 `fd_table`） |
-| `block_reason` | `Option<BlockReason>` | 阻塞原因（等待 socket 可读/可写/可接受） |
+| 字段 | 类型 | 说明 | 状态 |
+|------|------|------|------|
+| `socket_table` | `SocketTable` | socket fd 管理表（独立于 `fd_table`） | ✅ 已实现 |
+| `block_reason` | `Option<BlockReason>` | 阻塞原因（等待 socket 可读/可写/可接受） | ❌ 未实现（使用 busy-poll） |
 
 ### fd_table 保持不变
 
@@ -441,42 +469,54 @@ os/src/
 ## 实现阶段总览
 
 ```
-Phase 1: 驱动 + 协议栈（2-3 天）
-  ├─ smoltcp 依赖引入
-  ├─ VirtIO-Net 驱动 + smoltcp::phy::Device trait 实现
-  ├─ 网络栈初始化（Interface + DHCP + 路由）
-  ├─ 中断注册 + 协议栈轮询循环
-  ├─ QEMU 网络参数配置（SLIRP + hostfwd 端口转发）
-  └─ 验证: DHCP 获取 IP，Host ping Guest 成功
+Phase 1: 驱动 + 协议栈 ✅ 已完成 (2026/5/12-5/13)
+  ├─ ✅ smoltcp 依赖引入
+  ├─ ✅ VirtIO-Net 驱动 + smoltcp::phy::Device trait 实现
+  ├─ ✅ 网络栈初始化（Interface + DHCP + 路由）
+  ├─ ✅ 中断注册 + 协议栈轮询循环
+  ├─ ⚠️ QEMU 网络参数配置（SLIRP + hostfwd 端口转发）—— 需验证
+  └─ ⚠️ 验证: DHCP 获取 IP，Host ping Guest 成功 —— 需 QEMU 网络参数后验证
 
-Phase 2: Socket 系统调用（4-5 天）
-  ├─ SocketTable 数据结构（独立于 fd_table）
-  ├─ socket / bind / connect 实现
-  ├─ listen / accept 实现（TCP 服务端）
-  ├─ sendmsg / recvmsg 实现（iperf3 主 I/O 路径）
-  ├─ sendto / recvfrom 实现（UDP 支持）
-  ├─ setsockopt / shutdown 实现
-  ├─ 阻塞 I/O 实现（BlockReason + 事件唤醒）
-  └─ 验证: TCP echo server 用户程序，双向通信正确
+Phase 2: Socket 系统调用 ✅ 已完成 (2026/5/13-5/14)
+  ├─ ✅ SocketTable 数据结构（独立于 fd_table）
+  ├─ ✅ socket / bind / connect 实现
+  ├─ ✅ listen / accept 实现（TCP 服务端）
+  ├─ ✅ sendmsg / recvmsg 实现（iperf3 主 I/O 路径）
+  ├─ ✅ sendto / recvfrom 实现（UDP 支持）
+  ├─ ✅ setsockopt / getsockopt 实现（TCP_NODELAY / SO_REUSEADDR / SO_KEEPALIVE）
+  ├─ ✅ shutdown / getpeername / getsockname 实现
+  ├─ ✅ sys_read / sys_write 支持 socket fd
+  ├─ ⚠️ 阻塞 I/O 实现（当前为 busy-poll + suspend，非 BlockReason 事件唤醒）
+  └─ ⚠️ 验证: TCP echo server 用户程序，双向通信正确 —— 待实际运行测试
 
-Phase 3: 辅助 syscall + iperf3 编译（2-3 天）
-  ├─ clock_gettime(113) 实现
-  ├─ getrandom(278) 实现
-  ├─ ppoll(73) 实现
-  ├─ writev(66) 实现
-  ├─ futex(98) / madvise(233) stub
-  ├─ 交叉编译 iperf3 (riscv64-linux-musl, static)
-  └─ 验证: /bin/iperf3 -s 能启动并监听 5001 端口
+Phase 3: 辅助 syscall + iperf3 编译（待完成）
+  ├─ ⚠️ clock_gettime(113) 实现（已实现，毫秒精度）
+  ├─ ❌ getrandom(278) 实现
+  ├─ ❌ ppoll(73) 实现
+  ├─ ❌ writev(66) 实现
+  ├─ ❌ futex(98) / madvise(233) stub
+  ├─ ❌ 交叉编译 iperf3 (riscv64-linux-musl, static)
+  └─ ❌ 验证: /bin/iperf3 -s 能启动并监听 5001 端口
 
-Phase 4: 集成测试 + 性能优化（2-3 天）
-  ├─ TCP 全双工通信测试
-  ├─ iperf3 基本带宽测试（TCP/UDP）
-  ├─ 性能分析：TCP_NODELAY / 缓冲区 / 中断合并
-  ├─ 多场景测试（反向、多流、长时间运行）
-  └─ 验证: iperf3 输出正常带宽数据，无异常断开
-
-总计: 10-14 天
+Phase 4: 集成测试 + 性能优化（未开始）
+  ├─ ❌ TCP 全双工通信测试
+  ├─ ❌ iperf3 基本带宽测试（TCP/UDP）
+  ├─ ❌ 性能分析：TCP_NODELAY / 缓冲区 / 中断合并
+  ├─ ❌ 多场景测试（反向、多流、长时间运行）
+  └─ ❌ 验证: iperf3 输出正常带宽数据，无异常断开
 ```
+
+### 当前进度
+
+| Phase | 状态 | 完成度 | 关键缺失 |
+|-------|------|--------|---------|
+| Phase 1 | ✅ 完成 | 100% | QEMU 网络参数需验证 |
+| Phase 2 | ✅ 完成 | ~90% | 阻塞 I/O 非理想实现（busy-poll）；close 不清理全局 SocketSet |
+| Phase 3 | ⚠️ 进行中 | ~20% | getrandom / ppoll / writev / futex / madvise / iperf3 编译 |
+| Phase 4 | ❌ 未开始 | 0% | — |
+
+**架构支持**：riscv64、loongarch64、x86_64、aarch64 全部通过编译检查。
+**代码位置**：`os/src/net/syscall.rs`（~960 行，所有 socket 系统调用实现）。
 
 ---
 
