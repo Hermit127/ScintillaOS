@@ -8,6 +8,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, Ordering};
 use ext4_rs::crc32;
 use log::info;
 use polyhal::time::Time;
@@ -644,4 +645,165 @@ pub fn sys_exit_group(status: i32) -> ! {
 
     exit_current_and_run_next(status);
     panic!("Unreachable in sys_exit_group!");
+}
+
+// ---------------------------------------------------------------
+// Phase 3: auxiliary syscalls for iperf3
+// ---------------------------------------------------------------
+
+static RNG_STATE: AtomicU32 = AtomicU32::new(0x92f4a3b7);
+
+pub fn sys_getrandom(buf: *mut u8, buflen: usize, _flags: usize) -> isize {
+    if buf.is_null() || buflen == 0 {
+        return buflen as isize;
+    }
+    let mut state = RNG_STATE.load(Ordering::Relaxed);
+    let buf_slice: &mut [u8] = unsafe { core::slice::from_raw_parts_mut(buf, buflen) };
+    for b in buf_slice.iter_mut() {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        *b = state as u8;
+        state = state.wrapping_mul(1103515245).wrapping_add(12345);
+    }
+    RNG_STATE.store(state, Ordering::Relaxed);
+    buflen as isize
+}
+
+#[repr(C)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+const POLLIN: i16 = 0x001;
+const POLLOUT: i16 = 0x004;
+const POLLERR: i16 = 0x008;
+const POLLHUP: i16 = 0x010;
+
+fn poll_socket_status(entry: &crate::net::socket::SocketEntry) -> (bool, bool, bool) {
+    #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+    {
+        use smoltcp::socket::tcp::Socket as TcpSocket;
+        use smoltcp::socket::udp::Socket as UdpSocket;
+        use crate::net::socket::SocketType;
+        crate::net::with_net_iface(|iface| {
+            match entry.socket_type {
+                SocketType::Tcp => {
+                    let sock: &TcpSocket = iface.sockets.get(entry.handle);
+                    (sock.can_recv() || !sock.may_recv(),
+                     sock.can_send() || !sock.is_active(),
+                     !sock.is_active() && !sock.is_listening() && sock.recv_queue() == 0)
+                }
+                SocketType::Udp => {
+                    let sock: &UdpSocket = iface.sockets.get(entry.handle);
+                    (sock.can_recv(), true, false)
+                }
+            }
+        }).unwrap_or((false, false, false))
+    }
+    #[cfg(not(any(target_arch = "riscv64", target_arch = "aarch64")))]
+    {
+        (false, false, false)
+    }
+}
+
+pub fn sys_ppoll(fds: *mut u8, nfds: usize, tmo_p: *const u8, _sigmask: *const u8, _sigsetsize: usize) -> isize {
+    let token = current_user_token();
+    let pollfds: &mut [PollFd] = unsafe { core::slice::from_raw_parts_mut(fds as *mut PollFd, nfds) };
+
+    let start_ms = polyhal::time::Time::now().to_msec() as usize;
+
+    loop {
+        let mut ready = 0i32;
+        let task = current_task().unwrap();
+        let inner = task.inner_exclusive_access();
+
+        for pfd in pollfds.iter_mut() {
+            pfd.revents = 0;
+            if pfd.fd < 0 {
+                continue;
+            }
+            let fd = pfd.fd as usize;
+
+            // Check socket fd
+            if let Some(entry) = inner.socket_table.get(fd) {
+                let (readable, writable, error) = poll_socket_status(entry);
+                if (pfd.events & POLLIN) != 0 && readable { pfd.revents |= POLLIN; }
+                if (pfd.events & POLLOUT) != 0 && writable { pfd.revents |= POLLOUT; }
+                if error { pfd.revents |= POLLHUP; }
+                if pfd.revents != 0 { ready += 1; }
+                continue;
+            }
+
+            // Check file fd
+            if fd < inner.fd_table.len() && inner.fd_table[fd].is_some() {
+                if (pfd.events & POLLIN) != 0 { pfd.revents |= POLLIN; }
+                if (pfd.events & POLLOUT) != 0 { pfd.revents |= POLLOUT; }
+                ready += 1;
+                continue;
+            }
+
+            // fd not valid
+            pfd.revents |= POLLERR;
+            ready += 1;
+        }
+        drop(inner);
+        drop(task);
+
+        if ready > 0 {
+            return ready as isize;
+        }
+
+        // Check timeout
+        if !tmo_p.is_null() {
+            let tmo: &crate::task::TimeSpec = translated_ref(token, tmo_p as *const crate::task::TimeSpec);
+            let timeout_ms = tmo.tv_sec * 1000 + tmo.tv_nsec / 1_000_000;
+            if timeout_ms == 0 {
+                return 0;
+            }
+            let now_ms = polyhal::time::Time::now().to_msec() as usize;
+            if now_ms - start_ms >= timeout_ms {
+                return 0;
+            }
+        }
+
+        suspend_current_and_run_next();
+    }
+}
+
+pub fn sys_futex(_uaddr: *mut u32, futex_op: usize, _val: usize, _val2: usize, _uaddr2: *mut u32, _val3: usize) -> isize {
+    match futex_op & 0x0F {
+        0 | 9 => -38, // FUTEX_WAIT / FUTEX_WAIT_BITSET → ENOSYS (musl fallback to busy-wait)
+        1 => 0,       // FUTEX_WAKE → nobody waiting
+        _ => -38,
+    }
+}
+
+#[repr(C)]
+struct IovecLocal {
+    iov_base: *mut u8,
+    iov_len: usize,
+}
+
+pub fn sys_writev(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
+    let iovs: &[IovecLocal] = unsafe { core::slice::from_raw_parts(iov as *const IovecLocal, iovcnt) };
+    let mut total = 0usize;
+    for i in iovs {
+        let n = super::fs::sys_write(fd, i.iov_base, i.iov_len);
+        if n < 0 {
+            if total > 0 { return total as isize; }
+            return n;
+        }
+        total += n as usize;
+        if (n as usize) < i.iov_len {
+            break;
+        }
+    }
+    total as isize
+}
+
+pub fn sys_madvise(_addr: usize, _len: usize, _advice: usize) -> isize {
+    0
 }
