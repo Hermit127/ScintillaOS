@@ -63,6 +63,7 @@ mod imp {
 }
 
 pub mod socket;
+#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
 pub mod syscall;
 
 #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
