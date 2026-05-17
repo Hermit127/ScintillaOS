@@ -161,8 +161,10 @@ disasm-vim: kernel
 run: run-inner
 
 QEMU_EXEC += -nographic \
-				-smp 1 \
-				-D qemu.log -d in_asm,int,pcall,cpu_reset,guest_errors
+				-smp 1
+
+# Uncomment for QEMU debug log:
+# 				-D qemu.log -d in_asm,int,pcall,cpu_reset,guest_errors
 
 # Single-disk mode (same disk on both bus 0 and bus 1, for local dev)
 # ROOT_BLOCK_DEVICE uses bus 1, mount test & contest use bus 0
