@@ -400,7 +400,7 @@ impl File for OSInode {
         self.writable
     }
 
-    fn read(&self, buf: &mut [u8]) -> usize {
+    fn read(&self, buf: &mut [u8]) -> isize {
         let mut inner = self.inner.exclusive_access();
         let read_size = self.dentry.super_block.with_ext4(|ext4| {
             ext4
@@ -409,10 +409,10 @@ impl File for OSInode {
                 .unwrap_or(0)
         });
         inner.offset += read_size;
-        read_size
+        read_size as isize
     }
 
-    fn write(&self, buf: &mut [u8]) -> usize {
+    fn write(&self, buf: &mut [u8]) -> isize {
         let mut inner = self.inner.exclusive_access();
         let write_size = self.dentry.super_block.with_ext4(|ext4| {
             ext4
@@ -421,7 +421,7 @@ impl File for OSInode {
                 .unwrap_or(0)
         });
         inner.offset += write_size;
-        write_size
+        write_size as isize
     }
 
     fn stat(&self) -> Kstat {
@@ -502,4 +502,6 @@ impl File for OSInode {
     fn get_offset(&self) -> usize {
         self.inner.exclusive_access().offset
     }
+
+    fn as_any(&self) -> &dyn core::any::Any { self }
 }

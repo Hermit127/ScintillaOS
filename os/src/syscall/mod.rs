@@ -43,6 +43,7 @@ const SYSCALL_MPROTECT: usize = 226;
 const SYSCALL_MADVISE: usize = 233;
 const SYSCALL_SET_ROBUST_LIST: usize = 99;
 const SYSCALL_GETRANDOM: usize = 278;
+const SYSCALL_PSELECT6: usize = 72;
 const SYSCALL_PPOLL: usize = 73;
 const SYSCALL_STATFS: usize = 43;
 const SYSCALL_FSTATFS: usize = 44;
@@ -184,6 +185,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         // Tier 4 stubs
         SYSCALL_SET_ROBUST_LIST => 0,
         SYSCALL_GETRANDOM => sys_getrandom(args[0] as *mut u8, args[1], args[2]),
+        SYSCALL_PSELECT6 => sys_pselect6(args[0], args[1] as *mut u8, args[2] as *mut u8, args[3] as *mut u8, args[4] as *const u8, args[5] as *const u8),
         SYSCALL_PPOLL => sys_ppoll(args[0] as *mut u8, args[1], args[2] as *const u8, args[3] as *const u8, args[4]),
         SYSCALL_MADVISE => sys_madvise(args[0], args[1], args[2]),
         SYSCALL_STATFS => -38,

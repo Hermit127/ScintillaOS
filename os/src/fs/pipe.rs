@@ -111,7 +111,7 @@ impl File for Pipe {
     fn writable(&self) -> bool {
         self.writable
     }
-    fn read(&self, buf: &mut [u8]) -> usize {
+    fn read(&self, buf: &mut [u8]) -> isize {
         assert!(self.readable());
         let want_to_read = buf.len();
         let mut buf_iter = buf.into_iter();
@@ -121,7 +121,7 @@ impl File for Pipe {
             let loop_read = ring_buffer.available_read();
             if loop_read == 0 {
                 if ring_buffer.all_write_ends_closed() {
-                    return already_read;
+                    return already_read as isize;
                 }
                 drop(ring_buffer);
                 suspend_current_and_run_next();
@@ -132,15 +132,15 @@ impl File for Pipe {
                     *byte_ref = ring_buffer.read_byte();
                     already_read += 1;
                     if already_read == want_to_read {
-                        return want_to_read;
+                        return want_to_read as isize;
                     }
                 } else {
-                    return already_read;
+                    return already_read as isize;
                 }
             }
         }
     }
-    fn write(&self, buf: &mut [u8]) -> usize {
+    fn write(&self, buf: &mut [u8]) -> isize {
         assert!(self.writable());
         let want_to_write = buf.len();
         let mut buf_iter = buf.into_iter();
@@ -159,10 +159,10 @@ impl File for Pipe {
                     ring_buffer.write_byte( *byte_ref );
                     already_write += 1;
                     if already_write == want_to_write {
-                        return want_to_write;
+                        return want_to_write as isize;
                     }
                 } else {
-                    return already_write;
+                    return already_write as isize;
                 }
             }
         }
@@ -170,4 +170,5 @@ impl File for Pipe {
     fn stat(&self) -> Kstat {
         Kstat::new(S_IFIFO)
     }
+    fn as_any(&self) -> &dyn core::any::Any { self }
 }

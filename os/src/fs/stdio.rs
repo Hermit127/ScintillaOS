@@ -14,9 +14,8 @@ impl File for Stdin {
     fn writable(&self) -> bool {
         false
     }
-    fn read(&self, user_buf: &mut [u8]) -> usize {
+    fn read(&self, user_buf: &mut [u8]) -> isize {
         assert_eq!(user_buf.len(), 1);
-        // busy loop
         let c: u8;
         loop {
             if let Some(ch) = DebugConsole::getchar() {
@@ -28,12 +27,13 @@ impl File for Stdin {
         user_buf[0] = c as u8;
         1
     }
-    fn write(&self, _user_buf: &mut [u8]) -> usize {
+    fn write(&self, _user_buf: &mut [u8]) -> isize {
         panic!("Cannot write to stdin!");
     }
     fn stat(&self) -> Kstat {
         Kstat::new(S_IFCHR)
     }
+    fn as_any(&self) -> &dyn core::any::Any { self }
 }
 
 impl File for Stdout {
@@ -43,17 +43,18 @@ impl File for Stdout {
     fn writable(&self) -> bool {
         true
     }
-    fn read(&self, _user_buf: &mut [u8]) -> usize {
+    fn read(&self, _user_buf: &mut [u8]) -> isize {
         panic!("Cannot read from stdout!");
     }
-    fn write(&self, user_buf: &mut [u8]) -> usize {
+    fn write(&self, user_buf: &mut [u8]) -> isize {
         // for buffer in user_buf.buffers.iter() {
         //     print!("{}", core::str::from_utf8(*buffer).unwrap());
         // }
         print!("{}", core::str::from_utf8(user_buf).unwrap());
-        user_buf.len()
+        user_buf.len() as isize
     }
     fn stat(&self) -> Kstat {
         Kstat::new(S_IFCHR)
     }
+    fn as_any(&self) -> &dyn core::any::Any { self }
 }

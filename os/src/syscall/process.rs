@@ -1,5 +1,5 @@
 use crate::fs::{open_file, OpenFlags};
-use crate::mm::{translated_ref, translated_refmut, translated_str, MapPermission};
+use crate::mm::{translated_byte_buffer, translated_ref, translated_refmut, translated_str, MapPermission};
 use crate::task::{
     add_task, current_task, current_user_token, exit_current_and_run_next, pid2task,
     sleep_current_and_run_next, suspend_current_and_run_next, SignalAction, SignalFlags, MAX_SIG,
@@ -682,43 +682,19 @@ const POLLOUT: i16 = 0x004;
 const POLLERR: i16 = 0x008;
 const POLLHUP: i16 = 0x010;
 
-fn poll_socket_status(entry: &crate::net::socket::SocketEntry) -> (bool, bool, bool) {
-    #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
-    {
-        use smoltcp::socket::tcp::Socket as TcpSocket;
-        use smoltcp::socket::udp::Socket as UdpSocket;
-        use crate::net::socket::SocketType;
-        crate::net::with_net_iface(|iface| {
-            match entry.socket_type {
-                SocketType::Tcp => {
-                    let sock: &TcpSocket = iface.sockets.get(entry.handle);
-                    (sock.can_recv() || !sock.may_recv(),
-                     sock.can_send() || !sock.is_active(),
-                     !sock.is_active() && !sock.is_listening() && sock.recv_queue() == 0)
-                }
-                SocketType::Udp => {
-                    let sock: &UdpSocket = iface.sockets.get(entry.handle);
-                    (sock.can_recv(), true, false)
-                }
-            }
-        }).unwrap_or((false, false, false))
-    }
-    #[cfg(not(any(target_arch = "riscv64", target_arch = "aarch64")))]
-    {
-        (false, false, false)
-    }
-}
-
 pub fn sys_ppoll(fds: *mut u8, nfds: usize, tmo_p: *const u8, _sigmask: *const u8, _sigsetsize: usize) -> isize {
     let token = current_user_token();
-    let pollfds: &mut [PollFd] = unsafe { core::slice::from_raw_parts_mut(fds as *mut PollFd, nfds) };
+    let buf = translated_byte_buffer(token, fds, nfds * core::mem::size_of::<PollFd>());
+    let pollfds: &mut [PollFd] = unsafe {
+        core::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut PollFd, nfds)
+    };
 
     let start_ms = polyhal::time::Time::now().to_msec() as usize;
 
     loop {
         let mut ready = 0i32;
         let task = current_task().unwrap();
-        let inner = task.inner_exclusive_access();
+        let mut inner = task.inner_exclusive_access();
 
         for pfd in pollfds.iter_mut() {
             pfd.revents = 0;
@@ -727,22 +703,18 @@ pub fn sys_ppoll(fds: *mut u8, nfds: usize, tmo_p: *const u8, _sigmask: *const u
             }
             let fd = pfd.fd as usize;
 
-            // Check socket fd
-            if let Some(entry) = inner.socket_table.get(fd) {
-                let (readable, writable, error) = poll_socket_status(entry);
-                if (pfd.events & POLLIN) != 0 && readable { pfd.revents |= POLLIN; }
-                if (pfd.events & POLLOUT) != 0 && writable { pfd.revents |= POLLOUT; }
-                if error { pfd.revents |= POLLHUP; }
-                if pfd.revents != 0 { ready += 1; }
-                continue;
-            }
-
-            // Check file fd
-            if fd < inner.fd_table.len() && inner.fd_table[fd].is_some() {
-                if (pfd.events & POLLIN) != 0 { pfd.revents |= POLLIN; }
-                if (pfd.events & POLLOUT) != 0 { pfd.revents |= POLLOUT; }
-                ready += 1;
-                continue;
+            if fd < inner.fd_table.len() {
+                if let Some(file) = &inner.fd_table[fd] {
+                    let file = file.clone();
+                    drop(inner);
+                    let (readable, writable, error) = file.poll();
+                    if (pfd.events & POLLIN) != 0 && readable { pfd.revents |= POLLIN; }
+                    if (pfd.events & POLLOUT) != 0 && writable { pfd.revents |= POLLOUT; }
+                    if error { pfd.revents |= POLLHUP; }
+                    if pfd.revents != 0 { ready += 1; }
+                    inner = task.inner_exclusive_access();
+                    continue;
+                }
             }
 
             // fd not valid
@@ -765,6 +737,184 @@ pub fn sys_ppoll(fds: *mut u8, nfds: usize, tmo_p: *const u8, _sigmask: *const u
             }
             let now_ms = polyhal::time::Time::now().to_msec() as usize;
             if now_ms - start_ms >= timeout_ms {
+                return 0;
+            }
+        }
+
+        suspend_current_and_run_next();
+    }
+}
+
+// ---- pselect6 ----
+
+const FD_SETSIZE: usize = 1024;
+const FD_SET_LONGS: usize = FD_SETSIZE / 64;
+type FdSet = [u64; FD_SET_LONGS];
+
+fn fd_isset(set: &FdSet, fd: usize) -> bool {
+    if fd >= FD_SETSIZE {
+        return false;
+    }
+    (set[fd / 64] & (1u64 << (fd % 64))) != 0
+}
+
+fn fd_set(set: &mut FdSet, fd: usize) {
+    if fd < FD_SETSIZE {
+        set[fd / 64] |= 1u64 << (fd % 64);
+    }
+}
+
+fn fd_clr(set: &mut FdSet, fd: usize) {
+    if fd < FD_SETSIZE {
+        set[fd / 64] &= !(1u64 << (fd % 64));
+    }
+}
+
+fn copy_fdset(dst: &mut FdSet, src_ptr: *const u8) {
+    let token = current_user_token();
+    let src: &FdSet = translated_ref(token, src_ptr as *const FdSet);
+    *dst = *src;
+}
+
+fn write_fdset(dst_ptr: *mut u8, src: &FdSet) {
+    let token = current_user_token();
+    *translated_refmut(token, dst_ptr as *mut FdSet) = *src;
+}
+
+pub fn sys_pselect6(
+    nfds: usize,
+    readfds: *mut u8,
+    writefds: *mut u8,
+    exceptfds: *mut u8,
+    timeout: *const u8,
+    _sigmask: *const u8,
+) -> isize {
+    let token = current_user_token();
+
+    let mut rfds = [0u64; FD_SET_LONGS];
+    let mut wfds = [0u64; FD_SET_LONGS];
+    let mut efds = [0u64; FD_SET_LONGS];
+
+    if !readfds.is_null() {
+        copy_fdset(&mut rfds, readfds);
+    }
+    if !writefds.is_null() {
+        copy_fdset(&mut wfds, writefds);
+    }
+    if !exceptfds.is_null() {
+        copy_fdset(&mut efds, exceptfds);
+    }
+
+    let timeout_ms = if !timeout.is_null() {
+        let ts: &crate::task::TimeSpec = translated_ref(token, timeout as *const crate::task::TimeSpec);
+        ts.tv_sec * 1000 + ts.tv_nsec / 1_000_000
+    } else {
+        usize::MAX
+    };
+
+    let start_ms = polyhal::time::Time::now().to_msec() as usize;
+
+    loop {
+        let mut ready = 0i32;
+        let n = nfds.min(FD_SETSIZE);
+
+        let task = current_task().unwrap();
+        let mut inner = task.inner_exclusive_access();
+
+        let mut fd = 0usize;
+        while fd < n {
+            let check_read = fd_isset(&rfds, fd);
+            let check_write = fd_isset(&wfds, fd);
+            let check_except = fd_isset(&efds, fd);
+
+            if !check_read && !check_write && !check_except {
+                fd += 1;
+                continue;
+            }
+
+            let mut readable = false;
+            let mut writable = false;
+            let mut error = false;
+
+            if fd < inner.fd_table.len() {
+                if let Some(file) = &inner.fd_table[fd] {
+                    let file = file.clone();
+                    drop(inner);
+                    let (r, w, e) = file.poll();
+                    readable = r;
+                    writable = w;
+                    error = e;
+                    inner = task.inner_exclusive_access();
+                }
+            }
+            // Invalid fd: error only if requested in exceptfds
+            // Valid fd but file is None: should not happen with fd_table holes
+
+            if check_read && readable {
+                fd_set(&mut rfds, fd);
+                ready += 1;
+            } else {
+                fd_clr(&mut rfds, fd);
+            }
+            if check_write && writable {
+                fd_set(&mut wfds, fd);
+                ready += 1;
+            } else {
+                fd_clr(&mut wfds, fd);
+            }
+            if check_except && error {
+                fd_set(&mut efds, fd);
+                ready += 1;
+            } else {
+                fd_clr(&mut efds, fd);
+            }
+
+            fd += 1;
+        }
+
+        drop(inner);
+        drop(task);
+
+        if ready > 0 {
+            // Write back modified fd_sets
+            if !readfds.is_null() {
+                write_fdset(readfds, &rfds);
+            }
+            if !writefds.is_null() {
+                write_fdset(writefds, &wfds);
+            }
+            if !exceptfds.is_null() {
+                write_fdset(exceptfds, &efds);
+            }
+            return ready as isize;
+        }
+
+        // Check timeout
+        if timeout_ms == 0 {
+            // Zero timeout, return immediately with empty sets
+            if !readfds.is_null() {
+                write_fdset(readfds, &rfds);
+            }
+            if !writefds.is_null() {
+                write_fdset(writefds, &wfds);
+            }
+            if !exceptfds.is_null() {
+                write_fdset(exceptfds, &efds);
+            }
+            return 0;
+        }
+        if timeout_ms != usize::MAX {
+            let now_ms = polyhal::time::Time::now().to_msec() as usize;
+            if now_ms - start_ms >= timeout_ms {
+                if !readfds.is_null() {
+                    write_fdset(readfds, &rfds);
+                }
+                if !writefds.is_null() {
+                    write_fdset(writefds, &wfds);
+                }
+                if !exceptfds.is_null() {
+                    write_fdset(exceptfds, &efds);
+                }
                 return 0;
             }
         }

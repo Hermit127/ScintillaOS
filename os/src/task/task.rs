@@ -4,7 +4,6 @@ use crate::config::KERNEL_STACK_SIZE;
 use crate::fs::vfs::{Dentry, ROOT_DENTRY};
 use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{translated_refmut, MemorySet};
-use crate::net::socket::SocketTable;
 use crate::sync::UPSafeCell;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -87,7 +86,6 @@ pub struct TaskControlBlockInner {
     pub cutime: usize,
     pub cstime: usize,
     pub last_time: usize,
-    pub socket_table: SocketTable,
     pub block_reason: Option<BlockReason>,
 }
 
@@ -200,7 +198,6 @@ impl TaskControlBlock {
                     cutime: 0,
                     cstime: 0,
                     last_time: polyhal::time::Time::now().to_msec() as usize,
-                    socket_table: SocketTable::new(),
                     block_reason: None,
                 })
             },
@@ -325,7 +322,6 @@ impl TaskControlBlock {
                     cutime: 0,
                     cstime: 0,
                     last_time: polyhal::time::Time::now().to_msec() as usize,
-                    socket_table: SocketTable::new(),
                     block_reason: None,
                 })
             },

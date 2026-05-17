@@ -142,3 +142,7 @@ ext4_rs = { git = "https://github.com/你的账号/ext4_rs", rev = "你的commit
 - 为非网络架构(loongarch64/x86_64)添加 stub 函数
 - riscv64/loongarch64/x86_64 三架构 cargo check 通过
 实现socket的I/O阻塞
+
+2026/5/17 dyh
+把socket的表写入fd_table统一
+iperf3目前依旧无法运行

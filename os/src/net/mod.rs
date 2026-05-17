@@ -97,8 +97,11 @@ pub mod syscall {
     pub fn sys_sock_shutdown(_sockfd: usize, _how: usize) -> isize { -38 }
     pub fn sys_sendmsg(_sockfd: usize, _msg: *const u8, _flags: usize) -> isize { -38 }
     pub fn sys_recvmsg(_sockfd: usize, _msg: *mut u8, _flags: usize) -> isize { -38 }
-    pub fn socket_read(_sockfd: usize, _buf: *mut u8, _len: usize) -> isize { -38 }
-    pub fn socket_write(_sockfd: usize, _buf: *const u8, _len: usize) -> isize { -38 }
+    pub(crate) fn tcp_send(_handle: smoltcp::iface::SocketHandle, _nonblock: bool, _data: &[u8]) -> isize { -38 }
+    pub(crate) fn tcp_recv(_handle: smoltcp::iface::SocketHandle, _nonblock: bool, _buf: &mut [u8]) -> isize { -38 }
+    pub(crate) fn udp_send(_handle: smoltcp::iface::SocketHandle, _data: &[u8], _dest: smoltcp::wire::IpEndpoint) -> isize { -38 }
+    pub(crate) fn udp_write(_handle: smoltcp::iface::SocketHandle, _data: &[u8]) -> isize { -38 }
+    pub(crate) fn udp_recv(_handle: smoltcp::iface::SocketHandle, _nonblock: bool, _buf: &mut [u8]) -> isize { -38 }
 }
 
 #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]

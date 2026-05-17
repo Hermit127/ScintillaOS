@@ -1,7 +1,6 @@
 use crate::fs::vfs::{vfs_resolve_path, vfs_resolve_with_fallback, Dentry, VfsSuperBlock};
 use crate::fs::{make_pipe, mkdir_at, open_file_at, rename_at, symlink_at, unlink_at, File, Kstat, OpenFlags};
 use crate::mm::{translated_byte_buffer, translated_refmut, translated_str};
-use crate::net::syscall::{socket_read, socket_write};
 use crate::task::{current_task, current_user_token};
 use alloc::sync::Arc;
 use alloc::vec;
@@ -38,14 +37,6 @@ pub fn sys_write(fd: usize, buf: *mut u8, len: usize) -> isize {
     let token = current_user_token();
     let task = current_task().unwrap();
     let inner = task.inner_exclusive_access();
-    if let Some(entry) = inner.socket_table.get(fd) {
-        if entry.socket_type != crate::net::socket::SocketType::Tcp {
-            return -95;
-        }
-        let sockfd = fd;
-        drop(inner);
-        return socket_write(sockfd, buf, len);
-    }
     if fd >= inner.fd_table.len() {
         return -1;
     }
@@ -55,7 +46,7 @@ pub fn sys_write(fd: usize, buf: *mut u8, len: usize) -> isize {
         }
         let file = file.clone();
         drop(inner);
-        file.write(translated_byte_buffer(token, buf, len)) as isize
+        file.write(translated_byte_buffer(token, buf, len))
     } else {
         -1
     }
@@ -65,14 +56,6 @@ pub fn sys_read(fd: usize, buf: *mut u8, len: usize) -> isize {
     let token = current_user_token();
     let task = current_task().unwrap();
     let inner = task.inner_exclusive_access();
-    if let Some(entry) = inner.socket_table.get(fd) {
-        if entry.socket_type != crate::net::socket::SocketType::Tcp {
-            return -95;
-        }
-        let sockfd = fd;
-        drop(inner);
-        return socket_read(sockfd, buf, len);
-    }
     if fd >= inner.fd_table.len() {
         return -1;
     }
@@ -82,7 +65,7 @@ pub fn sys_read(fd: usize, buf: *mut u8, len: usize) -> isize {
             return -1;
         }
         drop(inner);
-        file.read(translated_byte_buffer(token, buf, len)) as isize
+        file.read(translated_byte_buffer(token, buf, len))
     } else {
         -1
     }
@@ -356,6 +339,7 @@ pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
     const F_GETFD: usize = 1;
     const F_SETFD: usize = 2;
     const F_GETFL: usize = 3;
+    const F_SETFL: usize = 4;
     const F_DUPFD_CLOEXEC: usize = 1030;
     const FD_CLOEXEC: usize = 1;
 
@@ -395,10 +379,14 @@ pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
         }
         F_GETFL => {
             if let Some(file) = &inner.fd_table[fd] {
-                let mut flags = 0usize;
-                if file.readable() && file.writable() { flags |= 2; } // O_RDWR
-                else if file.writable() { flags |= 1; } // O_WRONLY
-                0x8000 | flags as isize // O_LARGEFILE | access mode
+                file.get_flags() as isize
+            } else {
+                -9
+            }
+        }
+        F_SETFL => {
+            if let Some(file) = &inner.fd_table[fd] {
+                if file.set_flags(arg) { 0 } else { -22 }
             } else {
                 -9
             }
@@ -478,10 +466,6 @@ pub fn sys_close(fd: usize) -> isize {
         inner.fd_table[fd].take();
         return 0;
     }
-    if inner.socket_table.remove(fd).is_some() {
-        // TODO: also remove from global SocketSet when socket cleanup is implemented
-        return 0;
-    }
     -1
 }
 
@@ -526,8 +510,12 @@ pub fn sys_dup2(fd: usize, new_fd: usize) -> isize {
 }
 
 pub fn sys_dup3(fd: usize, new_fd: usize, flags: usize) -> isize {
-    if flags != 0 {
-        return -1;
+    const O_CLOEXEC: usize = 0x80000;
+    if flags != 0 && flags != O_CLOEXEC {
+        return -22; // EINVAL
+    }
+    if fd == new_fd {
+        return new_fd as isize;
     }
     let task = current_task().unwrap();
     let mut inner = task.inner_exclusive_access();
@@ -537,14 +525,13 @@ pub fn sys_dup3(fd: usize, new_fd: usize, flags: usize) -> isize {
     let Some(file) = inner.fd_table[fd].as_ref().cloned() else {
         return -1;
     };
-    if fd == new_fd {
-        return new_fd as isize;
-    }
     while inner.fd_table.len() <= new_fd {
         inner.fd_table.push(None);
+        inner.fd_cloexec.push(false);
     }
     inner.fd_table[new_fd].take();
     inner.fd_table[new_fd] = Some(file);
+    inner.fd_cloexec[new_fd] = (flags & O_CLOEXEC) != 0;
     new_fd as isize
 }
 
