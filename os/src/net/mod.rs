@@ -40,8 +40,12 @@ mod imp {
 
             // Register loopback as a local IP so 127.0.0.1 traffic stays within the stack
             iface.update_ip_addrs(|addrs| {
-                let loopback = IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::new(127, 0, 0, 1), 8));
-                let _ = addrs.push(loopback);
+                // Register loopback network for routing
+                let loopback_net = IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::new(127, 0, 0, 0), 8));
+                let _ = addrs.push(loopback_net);
+                // Register 127.0.0.1 as a specific host address for has_ip_addr matching
+                let loopback_host = IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::new(127, 0, 0, 1), 32));
+                let _ = addrs.push(loopback_host);
                 // Static IP as fallback in case DHCP never completes
                 let static_ip = IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::new(10, 0, 2, 15), 24));
                 let _ = addrs.push(static_ip);
@@ -246,12 +250,12 @@ pub fn wake_net_blocked_tasks() {
             }
         }
     }
-    for task in to_wake {
+    for task in &to_wake {
         let mut inner = task.inner_exclusive_access();
         inner.task_status = TaskStatus::Ready;
         inner.block_reason = None;
         drop(inner);
-        add_task(task);
+        add_task(task.clone());
     }
 }
 
