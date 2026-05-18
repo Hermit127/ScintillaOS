@@ -232,40 +232,33 @@ pub fn sys_exec(path: *const u8, mut args: *const usize) -> isize {
 /// If there is not a child process whose pid is same as given, return -1.
 /// Else if there is a child process but it is still running, return -2.
 pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
-    let task = current_task().unwrap();
-    // find a child process
-
-    // ---- access current PCB exclusively
-    let mut inner = task.inner_exclusive_access();
-    if !inner
-        .children
-        .iter()
-        .any(|p| pid == -1 || pid as usize == p.getpid())
-    {
-        return -1;
-        // ---- release current PCB
-    }
-    let pair = inner.children.iter().enumerate().find(|(_, p)| {
-        // ++++ temporarily access child PCB exclusively
-        p.inner_exclusive_access().is_zombie() && (pid == -1 || pid as usize == p.getpid())
-        // ++++ release child PCB
-    });
-    if let Some((idx, _)) = pair {
-        let child = inner.children.remove(idx);
-        // confirm that child will be deallocated after being removed from children list
-        assert_eq!(Arc::strong_count(&child), 1);
-        let found_pid = child.getpid();
-        // ++++ temporarily access child PCB exclusively
-        let exit_code = child.inner_exclusive_access().exit_code;
-        // ++++ release child PCB
-        if !exit_code_ptr.is_null() {
-            *translated_refmut(inner.memory_set.token(), exit_code_ptr) = (exit_code << 8) as i32;
+    loop {
+        let task = current_task().unwrap();
+        let mut inner = task.inner_exclusive_access();
+        if !inner
+            .children
+            .iter()
+            .any(|p| pid == -1 || pid as usize == p.getpid())
+        {
+            return -1;
         }
-        found_pid as isize
-    } else {
-        -2
+        let pair = inner.children.iter().enumerate().find(|(_, p)| {
+            p.inner_exclusive_access().is_zombie() && (pid == -1 || pid as usize == p.getpid())
+        });
+        if let Some((idx, _)) = pair {
+            let child = inner.children.remove(idx);
+            assert_eq!(Arc::strong_count(&child), 1);
+            let found_pid = child.getpid();
+            let exit_code = child.inner_exclusive_access().exit_code;
+            if !exit_code_ptr.is_null() {
+                *translated_refmut(inner.memory_set.token(), exit_code_ptr) = (exit_code << 8) as i32;
+            }
+            return found_pid as isize;
+        }
+        drop(inner);
+        drop(task);
+        suspend_current_and_run_next();
     }
-    // ---- release current PCB automatically
 }
 
 pub fn sys_kill(pid: usize, signum: i32) -> isize {
@@ -597,6 +590,43 @@ pub fn sys_uname(uts_ptr: usize) -> isize {
     UtsName::set_str(&mut uts.domainname, "localdomain");
 
     0
+}
+
+pub fn sys_syslog(action: usize, buf: *mut u8, len: usize) -> isize {
+    match action {
+        0 | 1 => 0, // open/close log
+        5 => { // clear
+            crate::logging::klog_clear();
+            0
+        }
+        2 | 3 | 4 => { // read / read all / read+clear
+            if buf.is_null() || len == 0 {
+                return 0;
+            }
+            let (part1, part2) = crate::logging::klog_bytes();
+            let total = part1.len() + part2.len();
+            if total == 0 {
+                return 0;
+            }
+            let copy_len = total.min(len);
+            let slice = unsafe { core::slice::from_raw_parts_mut(buf, copy_len) };
+            let from_p1 = part1.len().min(copy_len);
+            slice[..from_p1].copy_from_slice(&part1[..from_p1]);
+            if copy_len > from_p1 {
+                let from_p2 = copy_len - from_p1;
+                slice[from_p1..].copy_from_slice(&part2[..from_p2]);
+            }
+            if action == 4 {
+                crate::logging::klog_clear();
+            }
+            copy_len as isize
+        }
+        9 => { // number of unread chars
+            let (part1, part2) = crate::logging::klog_bytes();
+            (part1.len() + part2.len()) as isize
+        }
+        _ => -22, // EINVAL
+    }
 }
 
 pub fn sys_nanosleep(req_ptr: usize, rem_ptr: usize) -> isize {

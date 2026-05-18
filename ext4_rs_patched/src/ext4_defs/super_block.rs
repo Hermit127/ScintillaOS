@@ -6,12 +6,12 @@ use super::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Ext4Superblock {
     pub inodes_count: u32,         // Inodes count
-    blocks_count_lo: u32,          // Blocks count
+    pub blocks_count_lo: u32,          // Blocks count
     reserved_blocks_count_lo: u32, // Reserved blocks count
-    free_blocks_count_lo: u32,     // Free blocks count
-    free_inodes_count: u32,        // Free inodes count
+    pub free_blocks_count_lo: u32,     // Free blocks count
+    pub free_inodes_count: u32,        // Free inodes count
     pub first_data_block: u32,     // First data block
-    log_block_size: u32,           // Block size
+    pub log_block_size: u32,       // Block size
     log_cluster_size: u32,         // Deprecated fragment size
     blocks_per_group: u32,         // Blocks per group
     frags_per_group: u32,          // Deprecated fragments per group

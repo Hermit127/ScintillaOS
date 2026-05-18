@@ -17,6 +17,13 @@ pub fn print(args: fmt::Arguments) {
     Stdout.write_fmt(args).unwrap();
 }
 
+/// Write to both UART and kernel log buffer (for dmesg)
+pub fn log_write(args: fmt::Arguments) {
+    use core::fmt::Write;
+    crate::logging::klog_push(&alloc::format!("{}", args));
+    Stdout.write_fmt(args).unwrap();
+}
+
 #[macro_export]
 macro_rules! print {
     ($fmt: literal $(, $($arg: tt)+)?) => {

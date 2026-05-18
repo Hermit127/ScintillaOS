@@ -19,7 +19,7 @@ use crate::sync::UPSafeCell;
 use alloc::vec::Vec;
 
 pub use action::{SignalAction, SignalActions};
-pub use manager::{add_task, pid2task};
+pub use manager::{add_task, pid2task, PID2TCB};
 pub use pid::{pid_alloc, PidHandle};
 pub use processor::{
     current_task, current_user_token, init_kernel_page, run_tasks, schedule, take_current_task,

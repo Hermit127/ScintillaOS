@@ -74,6 +74,9 @@ impl OSInode {
             inner: unsafe { UPSafeCell::new(OSInodeInner { offset: 0 }) },
         }
     }
+    pub fn dentry(&self) -> &Arc<Dentry> {
+        &self.dentry
+    }
 
     pub fn read_all(&self) -> alloc::vec::Vec<u8> {
         let mut inner = self.inner.exclusive_access();
@@ -116,7 +119,7 @@ impl OSInode {
         st
     }
 
-    fn align_up(value: usize, align: usize) -> usize {
+    pub fn align_up(value: usize, align: usize) -> usize {
         (value + align - 1) & !(align - 1)
     }
 }
