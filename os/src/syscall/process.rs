@@ -634,8 +634,8 @@ pub fn sys_set_tid_address(tidptr: *mut i32) -> isize {
 }
 
 pub fn sys_exit_group(status: i32) -> ! {
-    let task = current_task().unwrap();
     let tid_ptr = {
+        let task = current_task().unwrap();
         let inner = task.inner_exclusive_access();
         inner.tid_ptr
     };

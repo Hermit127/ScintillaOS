@@ -149,11 +149,6 @@ pub fn net_poll() {
                 for addr in iface.ip_addrs() {
                     println!("[net]   {}", addr);
                 }
-            } else if !*dhcp_logged && state.clock_ms == 500 {
-                println!("[net] Static IP configured (DHCP pending):");
-                for addr in iface.ip_addrs() {
-                    println!("[net]   {}", addr);
-                }
             }
         }
     }

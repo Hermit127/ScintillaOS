@@ -80,6 +80,14 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
     let token = current_user_token();
     let path = translated_str(token, path);
 
+    if path == "/proc/mounts" {
+        let file = alloc::sync::Arc::new(crate::fs::proc::ProcMountsFile::new());
+        let mut inner = task.inner_exclusive_access();
+        let fd = inner.alloc_fd();
+        inner.fd_table[fd] = Some(file);
+        return fd as isize;
+    }
+
     let open_flags = OpenFlags::from_raw(flags);
     let base_dir = resolve_base_dir(dirfd);
     let inode = open_file_at(base_dir, path.as_str(), open_flags);
