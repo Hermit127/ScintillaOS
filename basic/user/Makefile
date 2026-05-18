@@ -6,6 +6,14 @@ src_dir := build/$(ARCH)
 bin_dir := build/bin
 out_dir := target
 cmake_build_args := -DARCH=$(ARCH) -DCHAPTER=$(CHAPTER)
+cmake_build_args += -DCMAKE_SYSTEM_NAME=Generic
+cmake_build_args += -DCMAKE_SYSTEM_PROCESSOR=$(ARCH)
+cmake_build_args += -DCMAKE_CROSSCOMPILING=TRUE
+cmake_build_args += -DCMAKE_C_COMPILER=$(ARCH)-linux-gnu-gcc
+cmake_build_args += -DCMAKE_ASM_COMPILER=$(ARCH)-linux-gnu-gcc
+cmake_build_args += -DCMAKE_C_FLAGS="-std=gnu17 -Wno-int-conversion -Wno-incompatible-pointer-types -Wno-implicit-function-declaration -fno-builtin -nostdinc -fno-stack-protector -ggdb -Wall -fno-pie -fno-pic"
+cmake_build_args += -DCMAKE_C_LINK_EXECUTABLE="<CMAKE_C_COMPILER> <FLAGS> <CMAKE_C_LINK_FLAGS> <LINK_FLAGS> <OBJECTS> -o <TARGET> <LINK_LIBRARIES>"
+cmake_build_args += -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY
 ifeq ($(MODE), release)
 cmake_build_args += -DCMAKE_BUILD_TYPE=Release
 else ifeq ($(MODE), debug)

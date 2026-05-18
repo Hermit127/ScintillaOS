@@ -389,7 +389,7 @@ pub fn sys_brk(brk_addr: usize) -> isize {
             crate::mm::MapType::Framed,
             crate::mm::MapPermission::R | crate::mm::MapPermission::W | crate::mm::MapPermission::U,
         );
-        inner.memory_set.push(map_area, None);
+        inner.memory_set.push(map_area, None, 0);
     }else if new_brk_page < old_brk_page {
         let limit_va = polyhal::VirtAddr::new(new_brk_page * crate::config::PAGE_SIZE);
         inner.memory_set.shrink_to(limit_va);

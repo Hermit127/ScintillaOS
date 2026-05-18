@@ -137,6 +137,7 @@ fs-img: $(APPS)
 		fi; \
 		mkdir -p "$(ROOTFS_MNT_DIR)"; \
 	fi
+	@cp -f tmp/hello_riscv64_musl $(ROOTFS_BIN_DIR)/hello 2>/dev/null || true
 	@dd if=/dev/zero of=$(FS_IMG) bs=1M count=128
 	@mke2fs -t ext4 -b 4096 -F -d $(ROOTFS_DIR) $(FS_IMG)
 	cp target/$(TARGET)/$(MODE)/fs.img fs-img.img

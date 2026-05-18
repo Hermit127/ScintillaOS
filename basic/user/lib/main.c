@@ -1,6 +1,6 @@
 #include <unistd.h>
 
-extern int main();
+extern int main(int, char **);
 
 int __start_main(long *p)
 {

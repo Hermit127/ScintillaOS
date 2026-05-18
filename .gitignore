@@ -35,3 +35,9 @@ kernel-rv
 kernel-la
 ext4_rs_patched/target/
 ext4_rs_patched/Cargo.lock
+
+# zig cross-compiler (dev tool)
+zig-macos-*/
+
+# temporary build/test artifacts
+tmp/

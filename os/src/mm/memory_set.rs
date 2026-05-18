@@ -12,6 +12,15 @@ pub struct MemorySet {
     areas: Vec<MapArea>,
 }
 
+pub struct LoadedElf {
+    pub memory_set: MemorySet,
+    pub user_sp: usize,
+    pub entry_point: usize,
+    pub ph_addr: usize,
+    pub ph_entsize: usize,
+    pub ph_num: usize,
+}
+
 impl MemorySet {
     pub fn new_bare() -> Self {
         Self {
@@ -22,30 +31,35 @@ impl MemorySet {
     pub fn token(&self) -> PageTable {
         self.page_table.0
     }
-    pub fn push(&mut self, mut map_area: MapArea, data: Option<&[u8]>) {
+    pub fn push(&mut self, mut map_area: MapArea, data: Option<&[u8]>, page_off: usize) {
         map_area.map(&self.page_table);
         if let Some(data) = data {
-            map_area.copy_data(&self.page_table, data);
+            map_area.copy_data(&self.page_table, data, page_off);
         }
         self.areas.push(map_area);
     }
-    /// Include sections in elf and trampoline and TrapContext and user stack,
-    /// also returns user_sp and entry point.
-    pub fn from_elf(elf_data: &[u8]) -> (Self, usize, usize) {
+    pub fn from_elf(elf_data: &[u8]) -> LoadedElf {
         trace!("os::mm::MemorySet::from_elf");
         let mut memory_set = Self::new_bare();
-        // map program headers of elf, with U flag
         let elf = xmas_elf::ElfFile::new(elf_data).unwrap();
         let elf_header = elf.header;
         let magic = elf_header.pt1.magic;
         assert_eq!(magic, [0x7f, 0x45, 0x4c, 0x46], "invalid elf!");
         let ph_count = elf_header.pt2.ph_count();
+        let e_phoff = elf_header.pt2.ph_offset() as usize;
+        let e_phentsize = elf_header.pt2.ph_entry_size() as usize;
         let mut max_end_va = VirtAddr::new(0);
+        let mut ph_addr = 0usize;
+        let mut first_load = true;
         for i in 0..ph_count {
             let ph = elf.program_header(i).unwrap();
             if ph.get_type().unwrap() == xmas_elf::program::Type::Load {
                 let start_va: VirtAddr = (ph.virtual_addr() as usize).into();
                 let end_va: VirtAddr = ((ph.virtual_addr() + ph.mem_size()) as usize).into();
+                if first_load {
+                    ph_addr = start_va.raw() + e_phoff;
+                    first_load = false;
+                }
                 let mut map_perm = MapPermission::U;
                 let ph_flags = ph.flags();
                 if ph_flags.is_read() {
@@ -59,9 +73,11 @@ impl MemorySet {
                 }
                 let map_area = MapArea::new(start_va, end_va, MapType::Framed, map_perm);
                 max_end_va = map_area.vaddr_range.get_end();
+                let page_off = start_va.raw() % PAGE_SIZE;
                 memory_set.push(
                     map_area,
                     Some(&elf.input[ph.offset() as usize..(ph.offset() + ph.file_size()) as usize]),
+                    page_off,
                 );
             }
         }
@@ -78,13 +94,16 @@ impl MemorySet {
                 MapPermission::R | MapPermission::W | MapPermission::U,
             ),
             None,
+            0,
         );
-        // map TrapContext
-        (
+        LoadedElf {
             memory_set,
-            user_stack_top,
-            elf.header.pt2.entry_point() as usize,
-        )
+            user_sp: user_stack_top,
+            entry_point: elf.header.pt2.entry_point() as usize,
+            ph_addr,
+            ph_entsize: e_phentsize,
+            ph_num: ph_count as usize,
+        }
     }
     pub fn from_existed_user(user_space: &MemorySet) -> MemorySet {
         trace!("os::mm::MemorySet::from_existed_user");
@@ -92,7 +111,7 @@ impl MemorySet {
         // copy data sections/trap_context/user_stack
         for area in user_space.areas.iter() {
             let new_area = MapArea::from_another(area);
-            memory_set.push(new_area, None);
+            memory_set.push(new_area, None, 0);
             // copy data from another space
             for vpn in area.vaddr_range {
                 let src = user_space.translate(vpn).unwrap().0;
@@ -333,25 +352,37 @@ impl MapArea {
 
     /// data: start-aligned but maybe with shorter length
     /// assume that all frames were cleared before
-    pub fn copy_data(&mut self, page_table: &Arc<PageTableWrapper>, data: &[u8]) {
+    /// page_off: offset within the first page where data should start
+    pub fn copy_data(&mut self, page_table: &Arc<PageTableWrapper>, data: &[u8], page_off: usize) {
         trace!("os::mm::memory_set::MapArea::copy_data");
         assert_eq!(self.map_type, MapType::Framed);
-        let mut start: usize = 0;
+        let mut data_pos: usize = 0;
         let mut curr_vaddr = self.vaddr_range.get_start();
         let len = data.len();
-        loop {
-            let src = &data[start..len.min(start + PAGE_SIZE)];
+
+        if page_off > 0 {
+            let first_chunk = (PAGE_SIZE - page_off).min(len);
+            let dst = &mut page_table
+                .translate((curr_vaddr.raw() + page_off).into())
+                .unwrap()
+                .0
+                .slice_mut_with_len(first_chunk);
+            dst.copy_from_slice(&data[..first_chunk]);
+            data_pos = first_chunk;
+            curr_vaddr = curr_vaddr + PAGE_SIZE;
+        }
+
+        while data_pos < len {
+            let chunk = len - data_pos;
+            let chunk = chunk.min(PAGE_SIZE);
+            let src = &data[data_pos..data_pos + chunk];
             let dst = &mut page_table
                 .translate(curr_vaddr.into())
                 .unwrap()
                 .0
-                .slice_mut_with_len(src.len());
+                .slice_mut_with_len(chunk);
             dst.copy_from_slice(src);
-            start += PAGE_SIZE;
-            if start >= len {
-                break;
-            }
-            // current_vpn.step();
+            data_pos += chunk;
             curr_vaddr = curr_vaddr + PAGE_SIZE;
         }
     }

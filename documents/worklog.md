@@ -146,3 +146,11 @@ ext4_rs = { git = "https://github.com/你的账号/ext4_rs", rev = "你的commit
 2026/5/17 dyh
 把socket的表写入fd_table统一
 iperf3目前依旧无法运行
+
+2026/5/18 hermit
+修复了严重bug
+Bug：copy_data 总是从页对齐地址开始写数据，而不是从 LOAD 段的实际 vaddr 开始。basic 测试的所有 LOAD 段 vaddr 都是 0x1000（页对齐），所以不受影响。musl hello 有 3 个 LOAD 段不是页对齐的（偏移 0x6e8/0x3d8/0x448），导致 _start 的代码被写到了错误的位置。
+
+修复：在 memory_set.rs 新增 page_off 参数，from_elf 里计算 vaddr % PAGE_SIZE 并传入 copy_data，首页从正确偏移写起。
+
+现在可以运行musl编写的hello world了，继续测试busybox
