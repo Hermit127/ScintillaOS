@@ -1,4 +1,4 @@
-pub mod block_cache;
+pub mod block_device_stream;
 pub mod inode;
 mod pipe;
 mod stdio;
@@ -73,7 +73,7 @@ pub trait File: Send + Sync {
     fn get_offset(&self) -> usize { 0 }
 }
 
-pub use inode::{mkdir_at, open_file, open_file_at, rename_at, symlink_at, unlink_at, OpenFlags};
+pub use inode::{mkdir_at, open_file, open_file_at, unlink_at, OpenFlags, rename_at, symlink_at};
 pub use pipe::make_pipe;
 pub use stdio::{Stdin, Stdout};
 pub use vfs::{list_apps, mount_root};

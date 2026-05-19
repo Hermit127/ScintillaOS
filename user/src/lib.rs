@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 use buddy_system_allocator::LockedHeap;
 use syscall::*;
 
-pub use syscall::{sys_nanosleep, TimeSpec, Tms};
+pub use syscall::*;
 
 const USER_HEAP_SIZE: usize = 32768;
 

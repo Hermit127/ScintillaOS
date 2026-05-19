@@ -142,3 +142,7 @@ ext4_rs = { git = "https://github.com/你的账号/ext4_rs", rev = "你的commit
 - 为非网络架构(loongarch64/x86_64)添加 stub 函数
 - riscv64/loongarch64/x86_64 三架构 cargo check 通过
 实现socket的I/O阻塞
+
+2026/5/19 LYZ
+完成lwext4的适配
+已经完成了对于basic的验证
