@@ -1,8 +1,10 @@
 #ifndef __STDDEF_H__
 #define __STDDEF_H__
 
-/* Represents true-or-false values */
+/* Representing true-or-false values */
+#if __STDC_VERSION__ < 202311L
 typedef int bool;
+#endif
 
 /* Explicitly-sized versions of integer types */
 typedef char int8;

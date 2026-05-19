@@ -3,8 +3,7 @@ use super::{pid_alloc, PidHandle, SignalFlags};
 use crate::config::KERNEL_STACK_SIZE;
 use crate::fs::vfs::{Dentry, ROOT_DENTRY};
 use crate::fs::{File, Stdin, Stdout};
-use crate::mm::{translated_refmut, MemorySet};
-use crate::net::socket::SocketTable;
+use crate::mm::{translated_refmut, LoadedElf, MemorySet};
 use crate::sync::UPSafeCell;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -87,7 +86,6 @@ pub struct TaskControlBlockInner {
     pub cutime: usize,
     pub cstime: usize,
     pub last_time: usize,
-    pub socket_table: SocketTable,
     pub block_reason: Option<BlockReason>,
 }
 
@@ -147,8 +145,7 @@ impl TaskControlBlock {
     }
     pub fn new(elf_data: &[u8]) -> Self {
         trace!("os::task::TaskControlBlock::new");
-        // memory_set with elf program headers/trampoline/trap context/user stack
-        let (memory_set, user_sp, entry_point) = MemorySet::from_elf(elf_data);
+        let LoadedElf { memory_set, user_sp, entry_point, .. } = MemorySet::from_elf(elf_data);
 
         let heap_bottom = user_sp;
         // alloc a pid and a kernel stack in kernel space
@@ -200,7 +197,6 @@ impl TaskControlBlock {
                     cutime: 0,
                     cstime: 0,
                     last_time: polyhal::time::Time::now().to_msec() as usize,
-                    socket_table: SocketTable::new(),
                     block_reason: None,
                 })
             },
@@ -213,59 +209,125 @@ impl TaskControlBlock {
     }
     pub fn exec(&self, elf_data: &[u8], args: Vec<String>) {
         trace!("os::task::TaskControlBlock::exec");
-        // memory_set with elf program headers/trampoline/trap context/user stack
-        let (memory_set, mut user_sp, entry_point) = MemorySet::from_elf(elf_data);
-
-        let heap_bottom = user_sp;
+        let LoadedElf { memory_set, user_sp: stack_top, entry_point, ph_addr, ph_entsize, ph_num } = MemorySet::from_elf(elf_data);
+        let heap_bottom = stack_top;
 
         memory_set.activate();
-        // push arguments on user stack
-        user_sp -= (args.len() + 2) * core::mem::size_of::<usize>();
-        *translated_refmut(memory_set.token(), user_sp as *mut usize) = args.len();
-        let crt_sp = user_sp;
-        let argv_base = user_sp + core::mem::size_of::<usize>();
-        let mut argv: Vec<_> = (0..=args.len())
-            .map(|arg| {
-                translated_refmut(
-                    memory_set.token(),
-                    (argv_base + arg * core::mem::size_of::<usize>()) as *mut usize,
-                )
-            })
-            .collect();
-        *argv[args.len()] = 0;
-        for i in 0..args.len() {
-            user_sp -= args[i].len() + 1;
-            *argv[i] = user_sp;
-            let mut p = user_sp;
-            for c in args[i].as_bytes() {
-                *translated_refmut(memory_set.token(), p as *mut u8) = *c;
-                p += 1;
+        let token = memory_set.token();
+        let argc = args.len();
+
+        const AT_NULL: u64 = 0;
+        const AT_PHDR: u64 = 3;
+        const AT_PHENT: u64 = 4;
+        const AT_PHNUM: u64 = 5;
+        const AT_PAGESZ: u64 = 6;
+        const AT_BASE: u64 = 7;
+        const AT_FLAGS: u64 = 8;
+        const AT_ENTRY: u64 = 9;
+        const AT_UID: u64 = 11;
+        const AT_EUID: u64 = 12;
+        const AT_GID: u64 = 13;
+        const AT_EGID: u64 = 14;
+        const AT_CLKTCK: u64 = 17;
+        const AT_SECURE: u64 = 23;
+        const AT_RANDOM: u64 = 25;
+        const AT_HWCAP: u64 = 16;
+
+        // Stack layout (high to low):
+        //   [arg strings] [16-align] [random 16B] [auxv entries][AT_NULL] [envp NULL] [argv NULL] [argv ptrs] [argc]
+        //   sp -> argc
+
+        let mut sp = stack_top;
+
+        // Step 1: write arg strings at top of stack
+        let mut string_addrs: Vec<usize> = Vec::with_capacity(argc);
+        for arg in args.iter().rev() {
+            sp -= arg.len() + 1;
+            let addr = sp;
+            string_addrs.push(addr);
+            for (i, &b) in arg.as_bytes().iter().enumerate() {
+                *translated_refmut(token, (addr + i) as *mut u8) = b;
             }
-            *translated_refmut(memory_set.token(), p as *mut u8) = 0;
+            *translated_refmut(token, (addr + arg.len()) as *mut u8) = 0;
         }
-        // make the user_sp aligned to 8B for k210 platform
-        user_sp -= user_sp % core::mem::size_of::<usize>();
+        string_addrs.reverse();
+
+        // Step 2: 16-byte alignment
+        sp -= sp % 16;
+
+        // Step 3: AT_RANDOM data (16 bytes below string area)
+        sp -= 16;
+        let random_addr = sp;
+        let rand1 = (polyhal::time::Time::now().to_nsec() as u64).wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let rand2 = rand1.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *translated_refmut(token, random_addr as *mut u64) = rand1;
+        *translated_refmut(token, (random_addr + 8) as *mut u64) = rand2;
+
+        // Step 4: auxv entries (each 16 bytes = 2*u64)
+        const AUXV_COUNT: usize = 16;
+        sp -= AUXV_COUNT * 16;
+        let mut a = sp;
+        macro_rules! auxv_write {
+            ($t:expr, $v:expr) => {
+                *translated_refmut(token, a as *mut u64) = $t;
+                a += 8;
+                *translated_refmut(token, a as *mut u64) = $v;
+                a += 8;
+            };
+        }
+
+        auxv_write!(AT_PHDR, ph_addr as u64);
+        auxv_write!(AT_PHENT, ph_entsize as u64);
+        auxv_write!(AT_PHNUM, ph_num as u64);
+        auxv_write!(AT_PAGESZ, crate::config::PAGE_SIZE as u64);
+        auxv_write!(AT_ENTRY, entry_point as u64);
+        auxv_write!(AT_BASE, 0u64);
+        auxv_write!(AT_FLAGS, 0u64);
+        auxv_write!(AT_UID, 0u64);
+        auxv_write!(AT_EUID, 0u64);
+        auxv_write!(AT_GID, 0u64);
+        auxv_write!(AT_EGID, 0u64);
+        auxv_write!(AT_CLKTCK, 100u64);
+        auxv_write!(AT_SECURE, 0u64);
+        auxv_write!(AT_HWCAP, 0u64);
+        auxv_write!(AT_RANDOM, random_addr as u64);
+        auxv_write!(AT_NULL, 0u64);
+
+        // Step 5: envp NULL
+        sp -= 8;
+        *translated_refmut(token, sp as *mut u64) = 0;
+
+        // Step 6: argv NULL sentinel
+        sp -= 8;
+        *translated_refmut(token, sp as *mut u64) = 0;
+
+        // Step 7: argv pointers
+        sp -= argc * 8;
+        let argv_base = sp;
+        for i in 0..argc {
+            *translated_refmut(token, (argv_base + i * 8) as *mut u64) = string_addrs[i] as u64;
+        }
+
+        // Step 8: argc
+        sp -= 8;
+        *translated_refmut(token, sp as *mut u64) = argc as u64;
+        let crt_sp = sp;
+
+        // 16-byte align crt_sp for riscv64 ABI (final alignment after all writes)
         memory_set.activate();
 
-        // **** access current TCB exclusively
         let mut inner = self.inner_exclusive_access();
-        // substitute memory_set
         inner.memory_set = memory_set;
-
-        // added
         inner.heap_bottom = heap_bottom;
         inner.program_brk = heap_bottom;
-        // update trap_cx ppn
-        // FIXME: This is a temporary solution
         inner.trap_cx = TrapFrame::new();
-        // initialize trap_cx
+
         let mut trap_cx = TrapFrame::new();
         trap_cx[TrapFrameArgs::SEPC] = entry_point;
         trap_cx[TrapFrameArgs::SP] = crt_sp;
-        trap_cx[TrapFrameArgs::ARG0] = args.len();
+        trap_cx[TrapFrameArgs::ARG0] = argc;
         trap_cx[TrapFrameArgs::ARG1] = argv_base;
         *inner.get_trap_cx() = trap_cx;
-        // **** release current PCB
     }
     pub fn fork(self: &Arc<TaskControlBlock>) -> Arc<TaskControlBlock> {
         trace!("os::task::TaskControlBlock::fork");
@@ -325,7 +387,6 @@ impl TaskControlBlock {
                     cutime: 0,
                     cstime: 0,
                     last_time: polyhal::time::Time::now().to_msec() as usize,
-                    socket_table: SocketTable::new(),
                     block_reason: None,
                 })
             },

@@ -143,6 +143,26 @@ ext4_rs = { git = "https://github.com/你的账号/ext4_rs", rev = "你的commit
 - riscv64/loongarch64/x86_64 三架构 cargo check 通过
 实现socket的I/O阻塞
 
+2026/5/17 dyh
+把socket的表写入fd_table统一
+iperf3目前依旧无法运行
+
+2026/5/18 hermit
+修复了严重bug
+Bug：copy_data 总是从页对齐地址开始写数据，而不是从 LOAD 段的实际 vaddr 开始。basic 测试的所有 LOAD 段 vaddr 都是 0x1000（页对齐），所以不受影响。musl hello 有 3 个 LOAD 段不是页对齐的（偏移 0x6e8/0x3d8/0x448），导致 _start 的代码被写到了错误的位置。
+
+修复：在 memory_set.rs 新增 page_off 参数，from_elf 里计算 vaddr % PAGE_SIZE 并传入 copy_data，首页从正确偏移写起。
+
+现在可以运行musl编写的hello world了，继续测试busybox
+
+2026/05/18 hermit
+busybox-musl版本中的一些指令初步可运行了。但是有一些权限冲突问题需要修改。busybox-glibc版本依然卡死。
+我做了初步的用户栈初始化，但是貌似还不够支持glibc版本。
+
+新增了/proc/mounts 内核虚拟文件，用来读取mount链表，从而支持ps.但是ps好像还有问题。我来修改一下。
+
+为支持 busybox 运行，新增了 /proc 虚拟文件系统（包括 getdents64 列出进程、/proc/mounts 挂载表、/proc/meminfo 内存信息、/proc/<pid>/stat 进程状态）、/dev/rtc 字符设备，以及 statfs/fstatfs（磁盘容量）、syslog（内核日志读取）、ioctl(RTC_RD_TIME)（硬件时钟）三个系统调用，同时将 waitpid 改为阻塞等待以避免过早返回导致忙等。
+
 2026/5/19 LYZ
 完成lwext4的适配
 已经完成了对于basic的验证

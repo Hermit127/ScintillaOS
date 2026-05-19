@@ -1,7 +1,47 @@
 use core::fmt::{self, Write};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use log::{self, info, Level, LevelFilter, Log, Metadata, Record};
 use polyhal::debug_console::DebugConsole;
+
+const KLOG_SIZE: usize = 0x10000; // 64KB ring buffer
+static KLOG_BUF: [u8; KLOG_SIZE] = [0u8; KLOG_SIZE];
+static KLOG_WRITE: AtomicUsize = AtomicUsize::new(0);
+
+pub fn klog_bytes() -> (&'static [u8], &'static [u8]) {
+    let w = KLOG_WRITE.load(Ordering::Relaxed) % KLOG_SIZE;
+    if w == 0 {
+        (&KLOG_BUF[..], &[])
+    } else {
+        (&KLOG_BUF[..w], &KLOG_BUF[w..])
+    }
+}
+
+pub fn klog_clear() {
+    let w = KLOG_WRITE.load(Ordering::Relaxed) % KLOG_SIZE;
+    let (part1, part2): (&[u8], &[u8]) = if w == 0 { (&KLOG_BUF[..], &[]) } else { (&KLOG_BUF[..w], &KLOG_BUF[w..]) };
+    unsafe {
+        let p1 = part1.as_ptr() as *mut u8;
+        let p2 = part2.as_ptr() as *mut u8;
+        core::ptr::write_bytes(p1, 0, part1.len());
+        core::ptr::write_bytes(p2, 0, part2.len());
+    }
+    KLOG_WRITE.store(0, Ordering::Relaxed);
+}
+
+pub fn klog_push(s: &str) {
+    let bytes = s.as_bytes();
+    let mut w = KLOG_WRITE.load(Ordering::Relaxed);
+    for &b in bytes {
+        let idx = w % KLOG_SIZE;
+        unsafe {
+            let ptr = KLOG_BUF.as_ptr().add(idx) as *mut u8;
+            core::ptr::write(ptr, b);
+        }
+        w += 1;
+    }
+    KLOG_WRITE.store(w, Ordering::Relaxed);
+}
 
 pub struct Logger;
 
@@ -44,6 +84,7 @@ impl Log for Logger {
 
 impl Write for Logger {
     fn write_str(&mut self, s: &str) -> fmt::Result {
+        klog_push(s);
         let mut buffer = [0u8; 4];
         for c in s.chars() {
             puts(c.encode_utf8(&mut buffer).as_bytes())

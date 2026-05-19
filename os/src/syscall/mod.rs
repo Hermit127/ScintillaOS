@@ -19,6 +19,7 @@ const SYSCALL_EXIT: usize = 93;
 const SYSCALL_FUTEX: usize = 98;
 const SYSCALL_NANOSLEEP: usize = 101;
 const SYSCALL_CLOCK_GETTIME: usize = 113;
+const SYSCALL_SYSLOG: usize = 116;
 const SYSCALL_YIELD: usize = 124;
 const SYSCALL_KILL: usize = 129;
 const SYSCALL_SIGACTION: usize = 134;
@@ -43,6 +44,7 @@ const SYSCALL_MPROTECT: usize = 226;
 const SYSCALL_MADVISE: usize = 233;
 const SYSCALL_SET_ROBUST_LIST: usize = 99;
 const SYSCALL_GETRANDOM: usize = 278;
+const SYSCALL_PSELECT6: usize = 72;
 const SYSCALL_PPOLL: usize = 73;
 const SYSCALL_STATFS: usize = 43;
 const SYSCALL_FSTATFS: usize = 44;
@@ -132,6 +134,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_EXIT => sys_exit(args[0] as i32),
         SYSCALL_EXIT_GROUP => sys_exit_group(args[0] as i32),
         SYSCALL_YIELD => sys_yield(),
+        SYSCALL_SYSLOG => sys_syslog(args[0], args[1] as *mut u8, args[2]),
         SYSCALL_KILL => sys_kill(args[0], args[1] as i32),
         SYSCALL_SIGACTION => sys_sigaction(
             args[0] as i32,
@@ -184,10 +187,11 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         // Tier 4 stubs
         SYSCALL_SET_ROBUST_LIST => 0,
         SYSCALL_GETRANDOM => sys_getrandom(args[0] as *mut u8, args[1], args[2]),
+        SYSCALL_PSELECT6 => sys_pselect6(args[0], args[1] as *mut u8, args[2] as *mut u8, args[3] as *mut u8, args[4] as *const u8, args[5] as *const u8),
         SYSCALL_PPOLL => sys_ppoll(args[0] as *mut u8, args[1], args[2] as *const u8, args[3] as *const u8, args[4]),
         SYSCALL_MADVISE => sys_madvise(args[0], args[1], args[2]),
-        SYSCALL_STATFS => -38,
-        SYSCALL_FSTATFS => -38,
+        SYSCALL_STATFS => sys_statfs(args[0] as *const u8, args[1] as *mut u8),
+        SYSCALL_FSTATFS => sys_fstatfs(args[0], args[1] as *mut u8),
         SYSCALL_PRCTL => 0,
         SYSCALL_PRLIMIT64 => 0,
         SYSCALL_SYSINFO => -38,

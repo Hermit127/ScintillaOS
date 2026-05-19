@@ -365,6 +365,10 @@ impl VfsSuperBlock {
             }
         })
     }
+
+    pub fn get_fs_stats(&self) -> ext4_mount_stats {
+        self.with_fs(|wrapper| wrapper.0.get_mount_stats())
+    }
 }
 
 // ==================== Dentry ====================

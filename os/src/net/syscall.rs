@@ -7,8 +7,9 @@ use smoltcp::socket::udp::Socket as UdpSocket;
 use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
 
 use crate::mm::{translated_ref, translated_refmut};
-use crate::net::socket::{SocketEntry, SocketType};
+use crate::net::socket::{SocketFile, SocketType};
 use crate::task::{current_task, current_user_token, block_current_and_run_next, BlockReason};
+use alloc::sync::Arc;
 
 const SOCKET_BUFFER_SIZE: usize = 65536;
 const UDP_META_COUNT: usize = 16;
@@ -152,8 +153,16 @@ fn add_to_socket_set(st: SocketType) -> Option<(SocketHandle, SocketType)> {
 fn sock_lookup(sockfd: usize) -> Option<(SocketHandle, SocketType, bool)> {
     let task = current_task()?;
     let inner = task.inner_exclusive_access();
-    let entry = inner.socket_table.get(sockfd)?;
-    Some((entry.handle, entry.socket_type, entry.nonblock))
+    if sockfd >= inner.fd_table.len() {
+        return None;
+    }
+    let file = inner.fd_table[sockfd].as_ref()?;
+    let sock = file.as_any().downcast_ref::<SocketFile>()?;
+    let handle = sock.get_handle();
+    let st = sock.socket_type;
+    let nonblock = sock.get_nonblock();
+    drop(inner);
+    Some((handle, st, nonblock))
 }
 
 pub fn sys_socket(domain: usize, type_: usize, _protocol: usize) -> isize {
@@ -177,13 +186,8 @@ pub fn sys_socket(domain: usize, type_: usize, _protocol: usize) -> isize {
         None => return -105,
     };
 
-    let fd = inner.socket_table.alloc_fd();
-    inner.socket_table.insert(fd, SocketEntry {
-        handle,
-        socket_type: st,
-        nonblock,
-        cloexec: false,
-    });
+    let fd = inner.alloc_fd();
+    inner.fd_table[fd] = Some(Arc::new(SocketFile::new(handle, st, nonblock)));
     fd as isize
 }
 
@@ -197,16 +201,10 @@ pub fn sys_bind(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
         None => return -22,
     };
 
-    let task = current_task().unwrap();
-    let inner = task.inner_exclusive_access();
-
-    let entry = match inner.socket_table.get(sockfd) {
-        Some(e) => e,
+    let (handle, st, _nonblock) = match sock_lookup(sockfd) {
+        Some(v) => v,
         None => return -9,
     };
-    let handle = entry.handle;
-    let st = entry.socket_type;
-    drop(inner);
 
     let endpoint = IpEndpoint::new(
         IpAddress::from(Ipv4Address::from_bytes(&ip.to_be_bytes())),
@@ -237,19 +235,13 @@ pub fn sys_connect(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
         None => return -22,
     };
 
-    let task = current_task().unwrap();
-    let inner = task.inner_exclusive_access();
-
-    let entry = match inner.socket_table.get(sockfd) {
-        Some(e) => e,
+    let (handle, st, nonblock) = match sock_lookup(sockfd) {
+        Some(v) => v,
         None => return -9,
     };
-    if entry.socket_type != SocketType::Tcp {
+    if st != SocketType::Tcp {
         return -95;
     }
-    let handle = entry.handle;
-    let nonblock = entry.nonblock;
-    drop(inner);
 
     let remote = IpEndpoint::new(
         IpAddress::from(Ipv4Address::from_bytes(&ip.to_be_bytes())),
@@ -280,18 +272,13 @@ pub fn sys_connect(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
 }
 
 pub fn sys_listen(sockfd: usize, _backlog: usize) -> isize {
-    let task = current_task().unwrap();
-    let inner = task.inner_exclusive_access();
-
-    let entry = match inner.socket_table.get(sockfd) {
-        Some(e) => e,
+    let (handle, st, _nonblock) = match sock_lookup(sockfd) {
+        Some(v) => v,
         None => return -9,
     };
-    if entry.socket_type != SocketType::Tcp {
+    if st != SocketType::Tcp {
         return -95;
     }
-    let handle = entry.handle;
-    drop(inner);
 
     let listening = crate::net::with_net_iface(|iface| {
         let sock: &TcpSocket = iface.sockets.get(handle);
@@ -308,15 +295,21 @@ pub fn sys_accept(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
     let task = current_task().unwrap();
     let inner = task.inner_exclusive_access();
 
-    let entry = match inner.socket_table.get(sockfd) {
-        Some(e) => e,
+    if sockfd >= inner.fd_table.len() {
+        return -9;
+    }
+    let sock = match inner.fd_table[sockfd].as_ref() {
+        Some(file) => match file.as_any().downcast_ref::<SocketFile>() {
+            Some(s) => s,
+            None => return -95,
+        },
         None => return -9,
     };
-    if entry.socket_type != SocketType::Tcp {
+    if sock.socket_type != SocketType::Tcp {
         return -95;
     }
-    let handle = entry.handle;
-    let nonblock = entry.nonblock;
+    let handle = sock.get_handle();
+    let nonblock = sock.get_nonblock();
     drop(inner);
 
     if !nonblock {
@@ -355,7 +348,7 @@ pub fn sys_accept(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
         sock.local_endpoint()
     }).flatten();
 
-    let mut task = current_task().unwrap();
+    let task = current_task().unwrap();
     let mut inner = task.inner_exclusive_access();
 
     let new_handle = crate::net::with_net_iface(|iface| {
@@ -375,17 +368,18 @@ pub fn sys_accept(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
         h
     }).expect("NET_IFACE");
 
-    if let Some(entry) = inner.socket_table.get_mut(sockfd) {
-        entry.handle = new_handle;
+    // Update the server socket's handle to the new one
+    if sockfd < inner.fd_table.len() {
+        if let Some(file) = &inner.fd_table[sockfd] {
+            if let Some(s) = file.as_any().downcast_ref::<SocketFile>() {
+                s.set_handle(new_handle);
+            }
+        }
     }
 
-    let new_fd = inner.socket_table.alloc_fd();
-    inner.socket_table.insert(new_fd, SocketEntry {
-        handle,
-        socket_type: SocketType::Tcp,
-        nonblock,
-        cloexec: false,
-    });
+    // The new fd gets the old (now active) handle
+    let new_fd = inner.alloc_fd();
+    inner.fd_table[new_fd] = Some(Arc::new(SocketFile::new(handle, SocketType::Tcp, nonblock)));
 
     if !addr.is_null() && !addrlen.is_null() {
         let token = current_user_token();
@@ -776,39 +770,9 @@ pub fn sys_getsockname(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isi
     }
 }
 
-/// socket_read: called from sys_read when fd is a socket
-pub fn socket_read(sockfd: usize, buf: *mut u8, len: usize) -> isize {
-    let (handle, st, nonblock) = match sock_lookup(sockfd) {
-        Some(v) => v,
-        None => return -9,
-    };
-
-    if st != SocketType::Tcp {
-        return -95; // EOPNOTSUPP: use recvfrom for UDP
-    }
-
-    let recv_buf = unsafe { core::slice::from_raw_parts_mut(buf, len) };
-    tcp_recv(handle, nonblock, recv_buf)
-}
-
-/// socket_write: called from sys_write when fd is a socket
-pub fn socket_write(sockfd: usize, buf: *const u8, len: usize) -> isize {
-    let (handle, st, nonblock) = match sock_lookup(sockfd) {
-        Some(v) => v,
-        None => return -9,
-    };
-
-    if st != SocketType::Tcp {
-        return -95;
-    }
-
-    let data = unsafe { core::slice::from_raw_parts(buf, len) };
-    tcp_send(handle, nonblock, data)
-}
-
 // ---- Internal helpers ----
 
-fn tcp_send(handle: SocketHandle, nonblock: bool, data: &[u8]) -> isize {
+pub(crate) fn tcp_send(handle: SocketHandle, nonblock: bool, data: &[u8]) -> isize {
     if data.is_empty() {
         return 0;
     }
@@ -853,7 +817,7 @@ fn tcp_send(handle: SocketHandle, nonblock: bool, data: &[u8]) -> isize {
     offset as isize
 }
 
-fn tcp_recv(handle: SocketHandle, nonblock: bool, buf: &mut [u8]) -> isize {
+pub(crate) fn tcp_recv(handle: SocketHandle, nonblock: bool, buf: &mut [u8]) -> isize {
     if buf.is_empty() {
         return 0;
     }
@@ -897,7 +861,7 @@ fn tcp_recv(handle: SocketHandle, nonblock: bool, buf: &mut [u8]) -> isize {
     }
 }
 
-fn udp_send(handle: SocketHandle, data: &[u8], dest: IpEndpoint) -> isize {
+pub(crate) fn udp_send(handle: SocketHandle, data: &[u8], dest: IpEndpoint) -> isize {
     crate::net::net_poll();
     crate::net::with_net_iface(|iface| {
         let sock: &mut UdpSocket = iface.sockets.get_mut(handle);
@@ -908,7 +872,28 @@ fn udp_send(handle: SocketHandle, data: &[u8], dest: IpEndpoint) -> isize {
     }).unwrap_or(-1)
 }
 
-fn udp_recv(handle: SocketHandle, nonblock: bool, buf: &mut [u8]) -> isize {
+pub(crate) fn udp_write(handle: SocketHandle, data: &[u8]) -> isize {
+    crate::net::net_poll();
+    crate::net::with_net_iface(|iface| {
+        let dest = {
+            let sock: &UdpSocket = iface.sockets.get(handle);
+            let ep = sock.endpoint();
+            ep.addr.map(|a| IpEndpoint::new(a, ep.port))
+        };
+        match dest {
+            Some(dest) => {
+                let sock: &mut UdpSocket = iface.sockets.get_mut(handle);
+                match sock.send_slice(data, dest) {
+                    Ok(()) => data.len() as isize,
+                    Err(_) => -11,
+                }
+            }
+            None => -89, // EDESTADDRREQ
+        }
+    }).unwrap_or(-1)
+}
+
+pub(crate) fn udp_recv(handle: SocketHandle, nonblock: bool, buf: &mut [u8]) -> isize {
     if nonblock {
         crate::net::net_poll();
         return crate::net::with_net_iface(|iface| {

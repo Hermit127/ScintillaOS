@@ -1,7 +1,6 @@
 use crate::fs::vfs::{vfs_resolve_path, vfs_resolve_with_fallback, Dentry, VfsSuperBlock};
-use crate::fs::{make_pipe, mkdir_at, open_file_at, rename_at, symlink_at, unlink_at, File, Kstat, OpenFlags};
+use crate::fs::{make_pipe, mkdir_at, open_file_at, rename_at, symlink_at, unlink_at, File, Kstat, OpenFlags, Urandom, DevNull};
 use crate::mm::{translated_byte_buffer, translated_refmut, translated_str};
-use crate::net::syscall::{socket_read, socket_write};
 use crate::task::{current_task, current_user_token};
 use alloc::sync::Arc;
 use alloc::vec;
@@ -38,14 +37,6 @@ pub fn sys_write(fd: usize, buf: *mut u8, len: usize) -> isize {
     let token = current_user_token();
     let task = current_task().unwrap();
     let inner = task.inner_exclusive_access();
-    if let Some(entry) = inner.socket_table.get(fd) {
-        if entry.socket_type != crate::net::socket::SocketType::Tcp {
-            return -95;
-        }
-        let sockfd = fd;
-        drop(inner);
-        return socket_write(sockfd, buf, len);
-    }
     if fd >= inner.fd_table.len() {
         return -1;
     }
@@ -55,7 +46,7 @@ pub fn sys_write(fd: usize, buf: *mut u8, len: usize) -> isize {
         }
         let file = file.clone();
         drop(inner);
-        file.write(translated_byte_buffer(token, buf, len)) as isize
+        file.write(translated_byte_buffer(token, buf, len))
     } else {
         -1
     }
@@ -65,14 +56,6 @@ pub fn sys_read(fd: usize, buf: *mut u8, len: usize) -> isize {
     let token = current_user_token();
     let task = current_task().unwrap();
     let inner = task.inner_exclusive_access();
-    if let Some(entry) = inner.socket_table.get(fd) {
-        if entry.socket_type != crate::net::socket::SocketType::Tcp {
-            return -95;
-        }
-        let sockfd = fd;
-        drop(inner);
-        return socket_read(sockfd, buf, len);
-    }
     if fd >= inner.fd_table.len() {
         return -1;
     }
@@ -82,7 +65,7 @@ pub fn sys_read(fd: usize, buf: *mut u8, len: usize) -> isize {
             return -1;
         }
         drop(inner);
-        file.read(translated_byte_buffer(token, buf, len)) as isize
+        file.read(translated_byte_buffer(token, buf, len))
     } else {
         -1
     }
@@ -97,6 +80,28 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
     let token = current_user_token();
     let path = translated_str(token, path);
 
+    // proc filesystem intercept
+    if let Some(file) = open_proc(&path) {
+        let mut inner = task.inner_exclusive_access();
+        let fd = inner.alloc_fd();
+        inner.fd_table[fd] = Some(file);
+        return fd as isize;
+    }
+
+    if path == "/dev/urandom" || path == "/dev/random" {
+        let mut inner = task.inner_exclusive_access();
+        let fd = inner.alloc_fd();
+        inner.fd_table[fd] = Some(Arc::new(Urandom));
+        return fd as isize;
+    }
+
+    if path == "/dev/null" {
+        let mut inner = task.inner_exclusive_access();
+        let fd = inner.alloc_fd();
+        inner.fd_table[fd] = Some(Arc::new(DevNull));
+        return fd as isize;
+    }
+
     let open_flags = OpenFlags::from_raw(flags);
     let base_dir = resolve_base_dir(dirfd);
     let inode = open_file_at(base_dir, path.as_str(), open_flags);
@@ -109,6 +114,28 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
     } else {
         -1
     }
+}
+
+fn open_proc(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
+    use crate::fs::proc::{DevRtcFile, ProcDirFile, ProcMeminfoFile, ProcMountsFile, ProcPidStatFile};
+    if path == "/proc" {
+        return Some(Arc::new(ProcDirFile::new()));
+    }
+    if path == "/proc/mounts" {
+        return Some(Arc::new(ProcMountsFile::new()));
+    }
+    if path == "/proc/meminfo" {
+        return Some(Arc::new(ProcMeminfoFile::new()));
+    }
+    if path == "/dev/rtc" || path == "/dev/misc/rtc" {
+        return Some(Arc::new(DevRtcFile));
+    }
+    if let Some(pid_str) = path.strip_prefix("/proc/").and_then(|s| s.strip_suffix("/stat")) {
+        if let Ok(pid) = pid_str.parse::<usize>() {
+            return Some(Arc::new(ProcPidStatFile::new(pid)));
+        }
+    }
+    None
 }
 
 pub fn sys_mkdir(path: *const u8, mode: u32) -> isize {
@@ -359,6 +386,7 @@ pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
     const F_GETFD: usize = 1;
     const F_SETFD: usize = 2;
     const F_GETFL: usize = 3;
+    const F_SETFL: usize = 4;
     const F_DUPFD_CLOEXEC: usize = 1030;
     const FD_CLOEXEC: usize = 1;
 
@@ -398,10 +426,14 @@ pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
         }
         F_GETFL => {
             if let Some(file) = &inner.fd_table[fd] {
-                let mut flags = 0usize;
-                if file.readable() && file.writable() { flags |= 2; } // O_RDWR
-                else if file.writable() { flags |= 1; } // O_WRONLY
-                0x8000 | flags as isize // O_LARGEFILE | access mode
+                file.get_flags() as isize
+            } else {
+                -9
+            }
+        }
+        F_SETFL => {
+            if let Some(file) = &inner.fd_table[fd] {
+                if file.set_flags(arg) { 0 } else { -22 }
             } else {
                 -9
             }
@@ -437,6 +469,58 @@ fn is_terminal_fd(fd: usize) -> bool {
 
 pub fn sys_ioctl(fd: usize, request: usize, arg: usize) -> isize {
     let token = current_user_token();
+
+    // RTC ioctl
+    const RTC_RD_TIME: usize = 0x80247009;
+    if request == RTC_RD_TIME {
+        let task = current_task().unwrap();
+        let inner = task.inner_exclusive_access();
+        if fd >= inner.fd_table.len() { return -9; }
+        let file = match &inner.fd_table[fd] {
+            Some(f) => f.clone(),
+            None => return -9,
+        };
+        if file.as_any().downcast_ref::<crate::fs::proc::DevRtcFile>().is_none() {
+            return -25;
+        }
+        drop(inner);
+        let now_ms = polyhal::time::Time::now().to_msec() as u64;
+        let secs = now_ms / 1000;
+        let days = (secs / 86400) as i32;
+        let rem = (secs % 86400) as i32;
+        let tm_sec = rem % 60;
+        let tm_min = (rem / 60) % 60;
+        let tm_hour = (rem / 3600) % 24;
+        // Jan 1 1970 was a Thursday
+        let mut tm_year = 1970 - 1900;
+        let mut days_left = days;
+        loop {
+            let days_in_year = if is_leap(1970 + tm_year as i32) { 366 } else { 365 };
+            if days_left < days_in_year { break; }
+            days_left -= days_in_year;
+            tm_year += 1;
+        }
+        let tm_yday = days_left;
+        let months_days: [i32; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        let mut tm_mon = 0;
+        let mut mdays = days_left;
+        for (i, &md) in months_days.iter().enumerate() {
+            let adj = if i == 1 && is_leap(1970 + tm_year as i32) { md + 1 } else { md };
+            if mdays < adj { tm_mon = i as i32; break; }
+            mdays -= adj;
+        }
+        let tm_mday = mdays + 1;
+        let tm_wday = ((days + 4) % 7) as i32; // 1970-01-01 was Thursday
+        let tm_isdst = -1;
+        #[repr(C)]
+        struct RtcTime {
+            tm_sec: i32, tm_min: i32, tm_hour: i32, tm_mday: i32, tm_mon: i32,
+            tm_year: i32, tm_wday: i32, tm_yday: i32, tm_isdst: i32,
+        }
+        let rtc = RtcTime { tm_sec, tm_min, tm_hour, tm_mday, tm_mon, tm_year, tm_wday, tm_yday, tm_isdst };
+        *translated_refmut(token, arg as *mut RtcTime) = rtc;
+        return 0;
+    }
 
     match request {
         TCGETS => {
@@ -479,10 +563,6 @@ pub fn sys_close(fd: usize) -> isize {
     let mut inner = task.inner_exclusive_access();
     if fd < inner.fd_table.len() && inner.fd_table[fd].is_some() {
         inner.fd_table[fd].take();
-        return 0;
-    }
-    if inner.socket_table.remove(fd).is_some() {
-        // TODO: also remove from global SocketSet when socket cleanup is implemented
         return 0;
     }
     -1
@@ -529,8 +609,12 @@ pub fn sys_dup2(fd: usize, new_fd: usize) -> isize {
 }
 
 pub fn sys_dup3(fd: usize, new_fd: usize, flags: usize) -> isize {
-    if flags != 0 {
-        return -1;
+    const O_CLOEXEC: usize = 0x80000;
+    if flags != 0 && flags != O_CLOEXEC {
+        return -22; // EINVAL
+    }
+    if fd == new_fd {
+        return new_fd as isize;
     }
     let task = current_task().unwrap();
     let mut inner = task.inner_exclusive_access();
@@ -540,14 +624,13 @@ pub fn sys_dup3(fd: usize, new_fd: usize, flags: usize) -> isize {
     let Some(file) = inner.fd_table[fd].as_ref().cloned() else {
         return -1;
     };
-    if fd == new_fd {
-        return new_fd as isize;
-    }
     while inner.fd_table.len() <= new_fd {
         inner.fd_table.push(None);
+        inner.fd_cloexec.push(false);
     }
     inner.fd_table[new_fd].take();
     inner.fd_table[new_fd] = Some(file);
+    inner.fd_cloexec[new_fd] = (flags & O_CLOEXEC) != 0;
     new_fd as isize
 }
 
@@ -837,4 +920,89 @@ pub fn sys_umount2(target: *const u8, _flags: usize) -> isize {
         table.remove(idx);
     }
     0
+}
+
+#[repr(C)]
+struct StatFs {
+    f_type: i64,
+    f_bsize: i64,
+    f_blocks: i64,
+    f_bfree: i64,
+    f_bavail: i64,
+    f_files: i64,
+    f_ffree: i64,
+    f_fsid: [i32; 2],
+    f_namelen: i64,
+    f_frsize: i64,
+    f_flags: i64,
+    f_spare: [i64; 4],
+}
+
+const EXT4_SUPER_MAGIC: i64 = 0xEF53;
+
+fn is_leap(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn fill_statfs_from_dentry(dentry: &Arc<Dentry>, buf: &mut StatFs) {
+    let stats = dentry.super_block.get_fs_stats();
+    let block_size = stats.block_size as i64;
+    let blocks = stats.blocks_count as i64;
+    let free_blocks = stats.free_blocks_count as i64;
+    let inodes = stats.inodes_count as i64;
+    let free_inodes = stats.free_inodes_count as i64;
+    *buf = StatFs {
+        f_type: EXT4_SUPER_MAGIC,
+        f_bsize: block_size,
+        f_blocks: blocks,
+        f_bfree: free_blocks,
+        f_bavail: free_blocks,
+        f_files: inodes,
+        f_ffree: free_inodes,
+        f_fsid: [0, 0],
+        f_namelen: 255,
+        f_frsize: block_size,
+        f_flags: 0,
+        f_spare: [0; 4],
+    };
+}
+
+pub fn sys_statfs(path: *const u8, buf: *mut u8) -> isize {
+    let token = current_user_token();
+    let path = translated_str(token, path);
+    let task = current_task().unwrap();
+    let cwd = {
+        let inner = task.inner_exclusive_access();
+        inner.cwd.clone()
+    };
+    let dentry = match vfs_resolve_path(&cwd, path.as_str()) {
+        Some(d) => d,
+        None => return -1,
+    };
+    let st = translated_refmut(token, buf as *mut StatFs);
+    fill_statfs_from_dentry(&dentry, st);
+    0
+}
+
+pub fn sys_fstatfs(fd: usize, buf: *mut u8) -> isize {
+    let token = current_user_token();
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+    if fd >= inner.fd_table.len() {
+        return -1;
+    }
+    let file = match &inner.fd_table[fd] {
+        Some(f) => f.clone(),
+        None => return -1,
+    };
+    let dentry = file.as_any().downcast_ref::<crate::fs::inode::OSInode>()
+        .map(|inode| inode.dentry());
+    match dentry {
+        Some(d) => {
+            let st = translated_refmut(token, buf as *mut StatFs);
+            fill_statfs_from_dentry(d, st);
+            0
+        }
+        None => return -1,
+    }
 }

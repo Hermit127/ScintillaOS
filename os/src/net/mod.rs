@@ -40,8 +40,12 @@ mod imp {
 
             // Register loopback as a local IP so 127.0.0.1 traffic stays within the stack
             iface.update_ip_addrs(|addrs| {
-                let loopback = IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::new(127, 0, 0, 1), 8));
-                let _ = addrs.push(loopback);
+                // Register loopback network for routing
+                let loopback_net = IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::new(127, 0, 0, 0), 8));
+                let _ = addrs.push(loopback_net);
+                // Register 127.0.0.1 as a specific host address for has_ip_addr matching
+                let loopback_host = IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::new(127, 0, 0, 1), 32));
+                let _ = addrs.push(loopback_host);
                 // Static IP as fallback in case DHCP never completes
                 let static_ip = IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::new(10, 0, 2, 15), 24));
                 let _ = addrs.push(static_ip);
@@ -97,8 +101,11 @@ pub mod syscall {
     pub fn sys_sock_shutdown(_sockfd: usize, _how: usize) -> isize { -38 }
     pub fn sys_sendmsg(_sockfd: usize, _msg: *const u8, _flags: usize) -> isize { -38 }
     pub fn sys_recvmsg(_sockfd: usize, _msg: *mut u8, _flags: usize) -> isize { -38 }
-    pub fn socket_read(_sockfd: usize, _buf: *mut u8, _len: usize) -> isize { -38 }
-    pub fn socket_write(_sockfd: usize, _buf: *const u8, _len: usize) -> isize { -38 }
+    pub(crate) fn tcp_send(_handle: smoltcp::iface::SocketHandle, _nonblock: bool, _data: &[u8]) -> isize { -38 }
+    pub(crate) fn tcp_recv(_handle: smoltcp::iface::SocketHandle, _nonblock: bool, _buf: &mut [u8]) -> isize { -38 }
+    pub(crate) fn udp_send(_handle: smoltcp::iface::SocketHandle, _data: &[u8], _dest: smoltcp::wire::IpEndpoint) -> isize { -38 }
+    pub(crate) fn udp_write(_handle: smoltcp::iface::SocketHandle, _data: &[u8]) -> isize { -38 }
+    pub(crate) fn udp_recv(_handle: smoltcp::iface::SocketHandle, _nonblock: bool, _buf: &mut [u8]) -> isize { -38 }
 }
 
 #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
@@ -143,11 +150,6 @@ pub fn net_poll() {
             if !*dhcp_logged && iface.ip_addrs().len() > 2 {
                 *dhcp_logged = true;
                 println!("[net] DHCP assigned additional IP, total IPs:");
-                for addr in iface.ip_addrs() {
-                    println!("[net]   {}", addr);
-                }
-            } else if !*dhcp_logged && state.clock_ms == 500 {
-                println!("[net] Static IP configured (DHCP pending):");
                 for addr in iface.ip_addrs() {
                     println!("[net]   {}", addr);
                 }
@@ -248,12 +250,12 @@ pub fn wake_net_blocked_tasks() {
             }
         }
     }
-    for task in to_wake {
+    for task in &to_wake {
         let mut inner = task.inner_exclusive_access();
         inner.task_status = TaskStatus::Ready;
         inner.block_reason = None;
         drop(inner);
-        add_task(task);
+        add_task(task.clone());
     }
 }
 

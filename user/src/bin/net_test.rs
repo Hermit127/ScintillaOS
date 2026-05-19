@@ -33,6 +33,47 @@ fn sockaddr(port: u16) -> SockAddrIn {
     }
 }
 
+fn sys_socket(domain: usize, socket_type: usize, protocol: usize) -> isize {
+    let mut ret: isize;
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            inlateout("x10") domain => ret,
+            in("x11") socket_type,
+            in("x12") protocol,
+            in("x17") SYS_SOCKET
+        );
+    }
+    ret
+}
+
+fn sys_bind(fd: usize, addr: usize, addrlen: usize) -> isize {
+    let mut ret: isize;
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            inlateout("x10") fd => ret,
+            in("x11") addr,
+            in("x12") addrlen,
+            in("x17") SYS_BIND
+        );
+    }
+    ret
+}
+
+fn sys_listen(fd: usize, backlog: usize) -> isize {
+    let mut ret: isize;
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            inlateout("x10") fd => ret,
+            in("x11") backlog,
+            in("x17") SYS_LISTEN
+        );
+    }
+    ret
+}
+
 #[no_mangle]
 pub fn main() -> i32 {
     println!("net_test: creating socket...");
