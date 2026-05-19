@@ -231,7 +231,9 @@ pub fn sys_exec(path: *const u8, mut args: *const usize) -> isize {
 
 /// If there is not a child process whose pid is same as given, return -1.
 /// Else if there is a child process but it is still running, return -2.
-pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
+/// If WNOHANG is set and no child has exited, return 0.
+pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: usize) -> isize {
+    const WNOHANG: usize = 1;
     loop {
         let task = current_task().unwrap();
         let mut inner = task.inner_exclusive_access();
@@ -256,6 +258,9 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
             return found_pid as isize;
         }
         drop(inner);
+        if options & WNOHANG != 0 {
+            return 0;
+        }
         drop(task);
         suspend_current_and_run_next();
     }
@@ -726,6 +731,9 @@ pub fn sys_ppoll(fds: *mut u8, nfds: usize, tmo_p: *const u8, _sigmask: *const u
         let task = current_task().unwrap();
         let mut inner = task.inner_exclusive_access();
 
+        // Poll network to process any pending packets before checking fds
+        crate::net::net_poll();
+
         for pfd in pollfds.iter_mut() {
             pfd.revents = 0;
             if pfd.fd < 0 {
@@ -847,6 +855,9 @@ pub fn sys_pselect6(
     loop {
         let mut ready = 0i32;
         let n = nfds.min(FD_SETSIZE);
+
+        // Poll network to process pending packets before checking fds
+        crate::net::net_poll();
 
         let task = current_task().unwrap();
         let mut inner = task.inner_exclusive_access();
@@ -973,6 +984,23 @@ pub fn sys_writev(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
     for i in iovs {
         let n = super::fs::sys_write(fd, i.iov_base, i.iov_len);
         if n < 0 {
+            if total > 0 { return total as isize; }
+            return n;
+        }
+        total += n as usize;
+        if (n as usize) < i.iov_len {
+            break;
+        }
+    }
+    total as isize
+}
+
+pub fn sys_readv(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
+    let iovs: &[IovecLocal] = unsafe { core::slice::from_raw_parts(iov as *const IovecLocal, iovcnt) };
+    let mut total = 0usize;
+    for i in iovs {
+        let n = super::fs::sys_read(fd, i.iov_base, i.iov_len);
+        if n <= 0 {
             if total > 0 { return total as isize; }
             return n;
         }

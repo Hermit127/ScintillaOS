@@ -250,14 +250,14 @@ pub fn sys_connect(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
 
     let local = IpListenEndpoint {
         addr: None,
-        port: 0,
+        port: 32768 + ((sockfd as u16).wrapping_mul(7919) % 32767),  // non-zero ephemeral port
     };
 
     crate::net::with_net_iface_tcp_connect(handle, remote, local);
+    crate::net::net_poll();
 
     if !nonblock {
         loop {
-            crate::net::net_poll();
             let connected = crate::net::with_net_iface(|iface| {
                 let sock: &TcpSocket = iface.sockets.get(handle);
                 sock.is_active()
@@ -268,7 +268,12 @@ pub fn sys_connect(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
             block_current_and_run_next(BlockReason::TcpConnect(unsafe { core::mem::transmute(handle) }));
         }
     }
-    0
+
+    let connected = crate::net::with_net_iface(|iface| {
+        let sock: &TcpSocket = iface.sockets.get(handle);
+        sock.is_active()
+    }).unwrap_or(false);
+    if connected { 0 } else { -115 } // EINPROGRESS
 }
 
 pub fn sys_listen(sockfd: usize, _backlog: usize) -> isize {
@@ -311,6 +316,8 @@ pub fn sys_accept(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
     let handle = sock.get_handle();
     let nonblock = sock.get_nonblock();
     drop(inner);
+
+    crate::net::net_poll();
 
     if !nonblock {
         let mut prev_listening = true;
@@ -770,7 +777,7 @@ pub fn sys_getsockname(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isi
     }
 }
 
-// ---- Internal helpers ----
+    // ---- Internal helpers ----
 
 pub(crate) fn tcp_send(handle: SocketHandle, nonblock: bool, data: &[u8]) -> isize {
     if data.is_empty() {
