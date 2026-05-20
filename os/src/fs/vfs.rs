@@ -267,21 +267,7 @@ impl VfsSuperBlock {
                 let c_path = CString::new(full_path.as_bytes()).ok()?;
                 let rc = unsafe { ext4_dir_mk(c_path.as_ptr() as *const c_char) };
                 if rc == EOK as i32 {
-                    let c_path2 = CString::new(full_path.as_bytes()).ok()?;
-                    let c_path2 = c_path2.into_raw();
-                    let flags = CString::new("rb").ok()?;
-                    let flags_ptr = flags.into_raw();
-                    let mut file: ext4_file = unsafe { core::mem::zeroed() };
-                    let rc2 = unsafe { ext4_fopen(&mut file, c_path2, flags_ptr) };
-                    unsafe {
-                        drop(CString::from_raw(c_path2));
-                        drop(CString::from_raw(flags_ptr));
-                    }
-                    if rc2 == EOK as i32 {
-                        let inode = file.inode;
-                        unsafe { ext4_fclose(&mut file); }
-                        return Some(inode);
-                    }
+                    return Some(0);
                 }
                 None
             } else {
@@ -299,9 +285,10 @@ impl VfsSuperBlock {
                 if rc == EOK as i32 {
                     let inode = file.inode;
                     unsafe { ext4_fclose(&mut file); }
-                    return Some(inode);
+                    Some(inode)
+                } else {
+                    None
                 }
-                None
             }
         })
     }
