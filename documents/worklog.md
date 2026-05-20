@@ -169,3 +169,6 @@ busybox-musl版本中的一些指令初步可运行了。但是有一些权限�
 迁移过程中我修改了 lwext4_rust/src/blockdev.rs：
 这是解决 mount panic 必需的——原库硬编码设备名为 "ext4_fs"，导致第二次挂载时 lwext4 设备注册冲突并 panic。改为原子计数器生成唯一名称 (ext4_fs0, ext4_fs1...) 是唯一能不改动内核 VFS 层就支持多挂载的方案。
 c/lwext4 子模块的脏状态来自编译过程（CMake 生成的 build_musl-generic/ 目录）。
+
+2026/5/19 dyh
+iperf服务端可以正常启动，和busybox兼容性有问题，数据收发仍有问题
