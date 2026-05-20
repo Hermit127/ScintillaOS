@@ -452,55 +452,44 @@ fn is_terminal_fd(fd: usize) -> bool {
 
 pub fn sys_ioctl(fd: usize, request: usize, arg: usize) -> isize {
     let token = current_user_token();
+    let request = request & 0xffffffff;
 
     // RTC ioctl
     const RTC_RD_TIME: usize = 0x80247009;
     if request == RTC_RD_TIME {
-        let task = current_task().unwrap();
-        let inner = task.inner_exclusive_access();
-        if fd >= inner.fd_table.len() { return -9; }
-        let file = match &inner.fd_table[fd] {
-            Some(f) => f.clone(),
-            None => return -9,
-        };
-        if file.as_any().downcast_ref::<crate::fs::proc::DevRtcFile>().is_none() {
-            return -25;
-        }
-        drop(inner);
+        if fd >= 1024 { return -9; }
         let now_ms = polyhal::time::Time::now().to_msec() as u64;
-        let secs = now_ms / 1000;
-        let days = (secs / 86400) as i32;
+        let secs = (now_ms / 1000) as i64;
+        let days_since_epoch = (secs / 86400) as i32;
         let rem = (secs % 86400) as i32;
         let tm_sec = rem % 60;
         let tm_min = (rem / 60) % 60;
         let tm_hour = (rem / 3600) % 24;
-        // Jan 1 1970 was a Thursday
-        let mut tm_year = 1970 - 1900;
-        let mut days_left = days;
+        let mut tm_year = 70i32;
+        let mut days_left = days_since_epoch;
         loop {
-            let days_in_year = if is_leap(1970 + tm_year as i32) { 366 } else { 365 };
-            if days_left < days_in_year { break; }
-            days_left -= days_in_year;
+            let diy = if is_leap(1900 + tm_year) { 366 } else { 365 };
+            if days_left < diy { break; }
+            days_left -= diy;
             tm_year += 1;
         }
         let tm_yday = days_left;
-        let months_days: [i32; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        let months: [i32; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
         let mut tm_mon = 0;
         let mut mdays = days_left;
-        for (i, &md) in months_days.iter().enumerate() {
-            let adj = if i == 1 && is_leap(1970 + tm_year as i32) { md + 1 } else { md };
-            if mdays < adj { tm_mon = i as i32; break; }
-            mdays -= adj;
+        for i in 0..12 {
+            let md = if i == 1 && is_leap(1900 + tm_year) { months[i] + 1 } else { months[i] };
+            if mdays < md { tm_mon = i as i32; break; }
+            mdays -= md;
         }
         let tm_mday = mdays + 1;
-        let tm_wday = ((days + 4) % 7) as i32; // 1970-01-01 was Thursday
-        let tm_isdst = -1;
+        let tm_wday = ((days_since_epoch + 4) % 7) as i32;
         #[repr(C)]
         struct RtcTime {
             tm_sec: i32, tm_min: i32, tm_hour: i32, tm_mday: i32, tm_mon: i32,
             tm_year: i32, tm_wday: i32, tm_yday: i32, tm_isdst: i32,
         }
-        let rtc = RtcTime { tm_sec, tm_min, tm_hour, tm_mday, tm_mon, tm_year, tm_wday, tm_yday, tm_isdst };
+        let rtc = RtcTime { tm_sec, tm_min, tm_hour, tm_mday, tm_mon, tm_year, tm_wday, tm_yday, tm_isdst: -1 };
         *translated_refmut(token, arg as *mut RtcTime) = rtc;
         return 0;
     }

@@ -232,33 +232,33 @@ pub fn sys_exec(path: *const u8, mut args: *const usize) -> isize {
 /// If there is not a child process whose pid is same as given, return -1.
 /// Else if there is a child process but it is still running, return -2.
 pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
-    loop {
-        let task = current_task().unwrap();
-        let mut inner = task.inner_exclusive_access();
-        if !inner
-            .children
-            .iter()
-            .any(|p| pid == -1 || pid as usize == p.getpid())
-        {
-            return -1;
-        }
-        let pair = inner.children.iter().enumerate().find(|(_, p)| {
-            p.inner_exclusive_access().is_zombie() && (pid == -1 || pid as usize == p.getpid())
-        });
-        if let Some((idx, _)) = pair {
-            let child = inner.children.remove(idx);
-            assert_eq!(Arc::strong_count(&child), 1);
-            let found_pid = child.getpid();
-            let exit_code = child.inner_exclusive_access().exit_code;
-            if !exit_code_ptr.is_null() {
-                *translated_refmut(inner.memory_set.token(), exit_code_ptr) = (exit_code << 8) as i32;
-            }
-            return found_pid as isize;
-        }
-        drop(inner);
-        drop(task);
-        suspend_current_and_run_next();
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    if !inner
+        .children
+        .iter()
+        .any(|p| pid == -1 || pid as usize == p.getpid())
+    {
+        return -1;
     }
+    let pair = inner.children.iter().enumerate().find(|(_, p)| {
+        p.inner_exclusive_access().is_zombie() && (pid == -1 || pid as usize == p.getpid())
+    });
+    if let Some((idx, _)) = pair {
+        let child = inner.children.remove(idx);
+        assert_eq!(Arc::strong_count(&child), 1);
+        let found_pid = child.getpid();
+        let exit_code = child.inner_exclusive_access().exit_code;
+        if !exit_code_ptr.is_null() {
+            *translated_refmut(inner.memory_set.token(), exit_code_ptr) = (exit_code << 8) as i32;
+        }
+        return found_pid as isize;
+    }
+    drop(inner);
+    crate::task::WAITPID_QUEUE.exclusive_access().push(task.clone());
+    drop(task);
+    crate::task::sleep_current_and_run_next();
+    sys_waitpid(pid, exit_code_ptr)
 }
 
 pub fn sys_kill(pid: usize, signum: i32) -> isize {
@@ -632,28 +632,21 @@ pub fn sys_syslog(action: usize, buf: *mut u8, len: usize) -> isize {
 pub fn sys_nanosleep(req_ptr: usize, rem_ptr: usize) -> isize {
     let task = crate::task::current_task().unwrap();
     let token = task.inner_exclusive_access().get_user_token();
-
     let req = *crate::mm::translated_refmut(token, req_ptr as *mut crate::task::TimeSpec);
-
     let duration_ms = req.tv_sec * 1000 + req.tv_nsec / 1_000_000;
-    let now = polyhal::time::Time::now().to_msec() as usize;
-    let wakeup_time = now + duration_ms;
-
-    let inner = task.inner_exclusive_access();
-    // inner.task_status = crate::task::TaskStatus::Blocking; 
-    drop(inner);
-
-    crate::task::add_sleep_task(wakeup_time, task.clone());
-
-    sleep_current_and_run_next();
-
-     if rem_ptr != 0 {
+    let wakeup_time = polyhal::time::Time::now().to_msec() as u64 + duration_ms as u64;
+    loop {
+        if polyhal::time::Time::now().to_msec() as u64 >= wakeup_time {
+            break;
+        }
+        crate::task::suspend_current_and_run_next();
+    }
+    if rem_ptr != 0 {
         let rem = crate::mm::translated_refmut(token, rem_ptr as *mut crate::task::TimeSpec);
         rem.tv_sec = 0;
         rem.tv_nsec = 0;
     }
-
-    0 
+    0
 }
 
 pub fn sys_set_tid_address(tidptr: *mut i32) -> isize {
