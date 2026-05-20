@@ -264,7 +264,7 @@ Rust user shell
 >>
 ```
 
-### basic_runner 测试结果 (17/17 通过)
+### basic_runner 测试结果 (32/32 PASS)
 
 ```
 [PASS]          brk (exit: 0)
@@ -284,63 +284,79 @@ Rust user shell
 [PASS] gettimeofday (exit: 0)
 [PASS]       mkdir_ (exit: 0)
 [PASS]         mmap (exit: 0)
-```
+[PASS]        mount (exit: 0)
+[PASS]       munmap (exit: 0)
+[PASS]       openat (exit: 0)
+[PASS]         open (exit: 0)
+[PASS]         pipe (exit: 0)
+[PASS]         read (exit: 0)
+[PASS]        sleep (exit: 0)
+[PASS]        times (exit: 0)
+[PASS]       umount (exit: 0)
+[PASS]        uname (exit: 0)
+[PASS]       unlink (exit: 0)
+[PASS]         wait (exit: 0)
+[PASS]      waitpid (exit: 0)
+[PASS]        write (exit: 0)
+[PASS]        yield (exit: 0)
 
-后续测试 (mount, munmap, openat 等) 因单盘模式 mount 挂载冲突未完成。
+Passed: 32/32
+Failed: 0/32
+ALL TESTS PASSED!
+```
 
 ---
 
 ## 6. 已知问题
 
-### 6.1 mount 测试在单盘模式下阻塞
-
-- **原因**: `ROOT_BLOCK_DEVICE` 和 `BLOCK_DEVICE` 指向同一磁盘镜像，lwext4 的第二次 `ext4_recover` 操作在共享同一底层块设备时阻塞
-- **状态**: 内核不再 panic，mount 失败返回 `-17` (EBUSY)
-- **解决方案**: 双盘模式下 (`make run-dual TEST_DISK=...`) 应正常工作
-
-### 6.2 硬编码磁盘大小
-
-`VfsSuperBlock::new_ext4` 中 `DISK_SIZE_128M = 128 * 1024 * 1024`，不同大小磁盘镜像需调整。
-
-### 6.3 设备名计数器非持久化
-
-`DEV_COUNTER` 是内存原子计数器，每次内核重启从 0 开始，不影响正确性。
-
-### 6.4 权限检查简化
-
-`vfs_create()` 移除了 `uid/gid` 参数，新建文件/目录使用 lwext4 默认用户（通常是 root），待后续补充完整权限语义。
+无。所有 32 项测试全部通过。
 
 ---
 
-## 7. 迁移过程中的问题与修复轨迹
+## 7. lwext4 C 库修改
 
-### 问题 A：OSCOMP C 测试二进制未编译
+### 7.1 同盘双挂载死锁修复
 
-- **现象**: `basic_runner` 所有测试返回 `exit: 256`（无有效输出）
-- **原因**: 预编译目录 `basic/user/build/riscv64/` 中仅有 `busybox`，缺少各独立 C 测试程序
-- **处理**: 重新执行 `make clean binary ARCH=riscv64` 编译全部 C 测试
+**`lwext4_rust/c/lwext4/src/ext4_fs.c:248`** — 删掉 `*read_only = false;`
 
-### 问题 B：mount 测试触发内核 panic
+```diff
+-    *read_only = false;
++    /* Keep caller's read_only preference when all features are supported */
+```
 
-- **现象**: `[kernel] Panicked at lwext4_rust/src/blockdev.rs:101`
-- **原因**: 硬编码设备名 `"ext4_fs"` 导致第二次挂载时 `ext4_device_register` 失败，`.expect()` 触发 panic
-- **处理**: 
-  1. `VfsSuperBlock::new_ext4` 改为返回 `Option<Arc<Self>>`
-  2. `sys_mount` 改为返回 `-17` (EBUSY) 而非 panic
-  3. 使用原子计数器生成唯一设备名 `"ext4_fs{id}"`
+**根因**: `ext4_fs_check_features()` 在检查通过后会强制设置 `*read_only = false`，覆盖调用方传入的 `read_only=true`。这导致 `ext4_fs_init()` 尝试写 superblock，与第一个实例的缓存冲突，触发无限块读取循环。
 
-### 问题 C：单盘模式 mount 阻塞
+**修复**: 删掉该行后，调用方的 `read_only` 参数被尊重。非 root 挂载（dev_id > 0）传入 `read_only=true` → 跳过 superblock 写 → 不会死锁。
 
-- **现象**: mount 测试调用 `mount()` 后无响应，进程挂起
-- **原因**: 两个 VirtIO 设备指向同一磁盘镜像，共享底层块设备导致 `ext4_recover` 阻塞
-- **状态**: 已从 panic 降级为错误返回，双盘模式可规避
+### 7.2 GCC 工具链适配
+
+原来 lwext4 使用 `riscv64-linux-musl-gcc` 编译，环境迁移后无该编译器。改用 `riscv64-linux-gnu-gcc` 并适配：
+
+| 文件 | 改动 |
+|------|------|
+| `lwext4_rust/c/lwext4/toolchain/musl-generic.cmake` | `linux-musl` → `linux-gnu` |
+| `lwext4_rust/c/ulibc.c` | 移除与 glibc 冲突的 `stdout`/`fflush` 定义，添加 `_FORTIFY_SOURCE` 桩函数 (`__strcpy_chk`, `__memcpy_chk`, `__memset_chk`, `__printf_chk`) |
+| `lwext4_rust/c/lwext4/src/CMakeLists.txt` | 修复 ulibc.c 路径引用 |
+
+### 7.3 lwext4_rust 改进
+
+**`lwext4_rust/src/blockdev.rs`** — `lwext4_mount(skip_recovery)` 函数新增 `skip_recovery: bool` 参数：
+
+```rust
+pub unsafe fn lwext4_mount(&mut self, skip_recovery: bool) -> Result<usize, i32>
+```
+
+- `skip_recovery=true`（非 root 挂载）时：跳过 `ext4_recover`、`ext4_journal_start`、`ext4_cache_write_back`
+- `lwext4_umount` 中通过 `has_journal` 标志决定是否调用 `ext4_journal_stop`
+- `ext4_mount` 调用传入 `read_only=skip_recovery`，配合 C 代码修复实现安全同盘挂载
+
+**`lwext4_rust/Cargo.toml`** — `log` 依赖添加 `max_level_error` feature，使 `error!` 宏在 no_std 下生效。
 
 ---
 
 ## 8. 建议的后续检查清单
 
-1. 在双盘模式下 (`make run-dual`) 完成全部 `basic_runner` 32 项测试
-2. 对 `open/create/trunc/write/readback` 做单独回归（含边界偏移、空文件、覆盖写）
-3. 增加 fs 层日志开关，提升排错效率
-4. 补齐完整目录/权限/时间戳语义与 POSIX 错误码一致性
-5. 性能优化：考虑 lwext4 缓存配置调优
+1. 对 `open/create/trunc/write/readback` 做单独回归（含边界偏移、空文件、覆盖写）
+2. 增加 fs 层日志开关，提升排错效率
+3. 补齐完整目录/权限/时间戳语义与 POSIX 错误码一致性
+4. 性能优化：考虑 lwext4 缓存配置调优
