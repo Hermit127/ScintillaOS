@@ -160,7 +160,7 @@ pub fn sys_exec(path: *const u8, mut args: *const usize) -> isize {
 
 /// If there is not a child process whose pid is same as given, return -1.
 /// Else if there is a child process but it is still running, return -2.
-pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
+pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, _options: usize) -> isize {
     let task = current_task().unwrap();
     let mut inner = task.inner_exclusive_access();
     if !inner
@@ -187,7 +187,7 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
     crate::task::WAITPID_QUEUE.exclusive_access().push(task.clone());
     drop(task);
     crate::task::sleep_current_and_run_next();
-    sys_waitpid(pid, exit_code_ptr)
+    sys_waitpid(pid, exit_code_ptr, _options)
 }
 
 pub fn sys_kill(pid: usize, signum: i32) -> isize {
