@@ -1,4 +1,4 @@
-pub mod block_cache;
+pub mod block_device_stream;
 pub mod inode;
 mod pipe;
 pub mod proc;
@@ -85,5 +85,5 @@ pub trait File: Send + Sync {
 
 pub use inode::{mkdir_at, open_file, open_file_at, rename_at, symlink_at, unlink_at, OpenFlags};
 pub use pipe::make_pipe;
-pub use stdio::{Stdin, Stdout};
+pub use stdio::{Stdin, Stdout, Urandom, DevNull};
 pub use vfs::{list_apps, mount_root};

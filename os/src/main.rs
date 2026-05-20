@@ -75,6 +75,8 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             current_add_signal(SignalFlags::SIGILL);
         }
         Timer => {
+            static mut TICK: usize = 0;
+            unsafe { TICK += 1; }
             net::net_poll();
             net::wake_net_blocked_tasks();
             check_and_wake_up_tasks();

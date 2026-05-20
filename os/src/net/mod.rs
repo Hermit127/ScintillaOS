@@ -10,8 +10,6 @@ mod imp {
     use crate::sync::UPSafeCell;
     use lazy_static::lazy_static;
 
-    const DEFAULT_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
-
     pub static NET_INITED: AtomicBool = AtomicBool::new(false);
 
     pub struct NetworkState {
@@ -28,20 +26,18 @@ mod imp {
     pub fn new() -> Option<Self> {
         let mut device = VirtIONetAdapter::new()?;
         let mac_addr = device.mac_address();
-            let mac = if mac_addr == [0u8; 6] {
-                DEFAULT_MAC
-            } else {
-                mac_addr
-            };
-
-            let config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
+            let config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac_addr)));
             let now = Instant::from_millis(0);
             let mut iface = Interface::new(config, &mut device, now);
 
             // Register loopback as a local IP so 127.0.0.1 traffic stays within the stack
             iface.update_ip_addrs(|addrs| {
-                let loopback = IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::new(127, 0, 0, 1), 8));
-                let _ = addrs.push(loopback);
+                // Register 127.0.0.1/32 first (host address, used as source IP)
+                let loopback_host = IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::new(127, 0, 0, 1), 32));
+                let _ = addrs.push(loopback_host);
+                // Register loopback network for routing
+                let loopback_net = IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::new(127, 0, 0, 0), 8));
+                let _ = addrs.push(loopback_net);
                 // Static IP as fallback in case DHCP never completes
                 let static_ip = IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::new(10, 0, 2, 15), 24));
                 let _ = addrs.push(static_ip);
@@ -172,12 +168,10 @@ pub fn with_net_iface_tcp_connect(
     let mut guard = NET_IFACE.exclusive_access();
     if let Some(state) = guard.as_mut() {
         let sock: &mut smoltcp::socket::tcp::Socket = state.sockets.get_mut(handle);
-        // Interface has `inner` as its only field (sixlowpan disabled).
-        // Transmute &mut Interface → &mut Context (= InterfaceInner).
         let cx: &mut smoltcp::iface::Context = unsafe {
             core::mem::transmute(&mut state.iface)
         };
-        let _ = sock.connect(cx, remote, local);
+        let result = sock.connect(cx, remote, local);
     }
 }
 
@@ -246,12 +240,12 @@ pub fn wake_net_blocked_tasks() {
             }
         }
     }
-    for task in to_wake {
+    for task in &to_wake {
         let mut inner = task.inner_exclusive_access();
         inner.task_status = TaskStatus::Ready;
         inner.block_reason = None;
         drop(inner);
-        add_task(task);
+        add_task(task.clone());
     }
 }
 

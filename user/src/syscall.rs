@@ -319,3 +319,19 @@ pub fn sys_setuid(uid: u32) -> isize {
 pub fn sys_setgid(gid: u32) -> isize {
     syscall(SYSCALL_SETGID, [gid as usize, 0, 0, 0, 0, 0])
 }
+
+const SYS_SOCKET: usize = 198;
+const SYS_BIND: usize = 200;
+const SYS_LISTEN: usize = 201;
+
+pub fn sys_socket(domain: usize, sock_type: usize, protocol: usize) -> isize {
+    syscall(SYS_SOCKET, [domain, sock_type, protocol, 0, 0, 0])
+}
+
+pub fn sys_bind(fd: usize, addr: usize, addrlen: usize) -> isize {
+    syscall(SYS_BIND, [fd, addr, addrlen, 0, 0, 0])
+}
+
+pub fn sys_listen(fd: usize, backlog: usize) -> isize {
+    syscall(SYS_LISTEN, [fd, backlog, 0, 0, 0, 0])
+}

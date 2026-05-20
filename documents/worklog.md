@@ -162,3 +162,13 @@ busybox-musl版本中的一些指令初步可运行了。但是有一些权限�
 新增了/proc/mounts 内核虚拟文件，用来读取mount链表，从而支持ps.但是ps好像还有问题。我来修改一下。
 
 为支持 busybox 运行，新增了 /proc 虚拟文件系统（包括 getdents64 列出进程、/proc/mounts 挂载表、/proc/meminfo 内存信息、/proc/<pid>/stat 进程状态）、/dev/rtc 字符设备，以及 statfs/fstatfs（磁盘容量）、syslog（内核日志读取）、ioctl(RTC_RD_TIME)（硬件时钟）三个系统调用，同时将 waitpid 改为阻塞等待以避免过早返回导致忙等。
+
+2026/5/19 LYZ
+完成lwext4的适配
+已经完成了对于basic的验证
+迁移过程中我修改了 lwext4_rust/src/blockdev.rs：
+这是解决 mount panic 必需的——原库硬编码设备名为 "ext4_fs"，导致第二次挂载时 lwext4 设备注册冲突并 panic。改为原子计数器生成唯一名称 (ext4_fs0, ext4_fs1...) 是唯一能不改动内核 VFS 层就支持多挂载的方案。
+c/lwext4 子模块的脏状态来自编译过程（CMake 生成的 build_musl-generic/ 目录）。
+
+2026/5/19 dyh
+iperf服务端可以正常启动，和busybox兼容性有问题，数据收发仍有问题

@@ -3,13 +3,53 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use ext4_rs::{Ext4, InodeFileType};
+use alloc::vec;
+use alloc::ffi::CString;
+use core::ffi::c_char;
 use lazy_static::*;
+
+use lwext4_rust::Ext4BlockWrapper;
+use lwext4_rust::bindings::*;
+use super::block_device_stream::{BlockDeviceStream, BlockDeviceStreamOp, Ext4Wrapper};
+
+// ==================== DirEntry (local) ====================
+
+pub struct DirEntry {
+    pub inode: u32,
+    name_bytes: Vec<u8>,
+    pub de_type: u8,
+}
+
+impl DirEntry {
+    pub fn get_name(&self) -> String {
+        String::from_utf8_lossy(&self.name_bytes).into_owned()
+    }
+    pub fn get_de_type(&self) -> u8 {
+        self.de_type
+    }
+}
+
+// ==================== InodeInfo ====================
+
+pub struct InodeInfo {
+    pub inode_num: u32,
+    pub is_dir: bool,
+    pub is_link: bool,
+    pub mode: u32,
+    pub size: u64,
+    pub atime: u32,
+    pub mtime: u32,
+    pub ctime: u32,
+    pub blocks_count: u64,
+    pub links_count: u32,
+    pub uid: u32,
+    pub gid: u32,
+}
 
 // ==================== VfsSuperBlock ====================
 
 pub enum FsInner {
-    Ext4(Ext4),
+    Ext4(Ext4Wrapper),
 }
 
 pub struct VfsSuperBlock {
@@ -21,23 +61,313 @@ impl VfsSuperBlock {
     pub fn new_ext4(
         blk_device: Arc<dyn crate::drivers::BlockDevice>,
         fs_type: &'static str,
-    ) -> Arc<Self> {
-        let adapter = Arc::new(super::inode::Ext4BlockDeviceAdapter {
+    ) -> Option<Arc<Self>> {
+        const DISK_SIZE_128M: u64 = 128 * 1024 * 1024;
+        let stream = BlockDeviceStream {
             inner: blk_device,
-        });
-        let cache = Arc::new(super::block_cache::BlockCache::new(adapter));
-        let ext4 = Ext4::open(cache);
-        Arc::new(VfsSuperBlock {
+            pos: 0,
+            total_size: DISK_SIZE_128M,
+        };
+        let ext4 = Ext4BlockWrapper::<BlockDeviceStreamOp>::new(stream).ok()?;
+        Some(Arc::new(VfsSuperBlock {
             fs_type,
-            fs_data: unsafe { UPSafeCell::new(FsInner::Ext4(ext4)) },
+            fs_data: unsafe { UPSafeCell::new(FsInner::Ext4(Ext4Wrapper(ext4))) },
+        }))
+    }
+
+    fn with_fs<R>(&self, f: impl FnOnce(&Ext4Wrapper) -> R) -> R {
+        let data = self.fs_data.exclusive_access();
+        match &*data {
+            FsInner::Ext4(wrapper) => f(wrapper),
+        }
+    }
+
+    // ---------- path-based ext4 operations ----------
+
+    pub fn dir_get_entries(&self, fs_path: &str) -> Vec<DirEntry> {
+        self.with_fs(|_fs| {
+            let c_path = match CString::new(fs_path) {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
+            let mut d: ext4_dir = unsafe { core::mem::zeroed() };
+            let mut entries = Vec::new();
+
+            unsafe {
+                let rc = ext4_dir_open(&mut d, c_path.as_ptr() as *const c_char);
+                if rc != EOK as i32 {
+                    return entries;
+                }
+                loop {
+                    let de = ext4_dir_entry_next(&mut d);
+                    if de.is_null() {
+                        break;
+                    }
+                    let dentry = &*de;
+                    let name_len = dentry.name_length as usize;
+                    let name_bytes = dentry.name[..name_len].to_vec();
+                    entries.push(DirEntry {
+                        inode: dentry.inode,
+                        name_bytes,
+                        de_type: dentry.inode_type,
+                    });
+                }
+                ext4_dir_close(&mut d);
+            }
+            entries
         })
     }
 
-    pub fn with_ext4<R>(&self, f: impl FnOnce(&Ext4) -> R) -> R {
-        let data = self.fs_data.exclusive_access();
-        match &*data {
-            FsInner::Ext4(ext4) => f(ext4),
-        }
+    pub fn get_inode_info(&self, fs_path: &str) -> Option<InodeInfo> {
+        self.with_fs(|_fs| {
+            let c_path = CString::new(fs_path).ok()?;
+            let c_path = c_path.into_raw();
+
+            let mut file: ext4_file = unsafe { core::mem::zeroed() };
+            let flags = CString::new("rb").ok()?;
+            let flags_ptr = flags.into_raw();
+
+            let rc = unsafe { ext4_fopen(&mut file, c_path, flags_ptr) };
+            unsafe {
+                drop(CString::from_raw(c_path));
+                drop(CString::from_raw(flags_ptr));
+            }
+
+            if rc != EOK as i32 {
+                return None;
+            }
+
+            let inode_num = file.inode;
+            let size = unsafe { ext4_fsize(&mut file) };
+
+            let mut mode: u32 = 0;
+            let c_path2 = CString::new(fs_path).ok()?;
+            let _mode_rc = unsafe { ext4_mode_get(c_path2.as_ptr() as *const c_char, &mut mode) };
+
+            let mut uid: u32 = 0;
+            let mut gid: u32 = 0;
+            let c_path_owner = CString::new(fs_path).ok()?;
+            unsafe { ext4_owner_get(c_path_owner.as_ptr() as *const c_char, &mut uid, &mut gid); }
+
+            let is_link = mode & 0xA000 == 0xA000;
+
+            let mut atime: u32 = 0;
+            let mut mtime: u32 = 0;
+            let mut ctime: u32 = 0;
+            let c_path3 = CString::new(fs_path).ok()?;
+            unsafe {
+                ext4_atime_get(c_path3.as_ptr() as *const c_char, &mut atime);
+                ext4_mtime_get(c_path3.as_ptr() as *const c_char, &mut mtime);
+                ext4_ctime_get(c_path3.as_ptr() as *const c_char, &mut ctime);
+            }
+
+            unsafe { ext4_fclose(&mut file); }
+
+            let is_dir = (mode & 0x4000) != 0;
+            Some(InodeInfo {
+                inode_num,
+                is_dir,
+                is_link,
+                mode,
+                size,
+                atime,
+                mtime,
+                ctime,
+                blocks_count: 0,
+                links_count: 0,
+                uid,
+                gid,
+            })
+        })
+    }
+
+    pub fn read_at(&self, fs_path: &str, offset: usize, buf: &mut [u8]) -> usize {
+        self.with_fs(|_fs| {
+            let c_path = match CString::new(fs_path) {
+                Ok(s) => s,
+                Err(_) => return 0,
+            };
+            let c_path = c_path.into_raw();
+            let flags = CString::new("rb").ok().unwrap_or_else(|| CString::new("").unwrap());
+            let flags_ptr = flags.into_raw();
+
+            let mut file: ext4_file = unsafe { core::mem::zeroed() };
+            let rc = unsafe { ext4_fopen(&mut file, c_path, flags_ptr) };
+            unsafe {
+                drop(CString::from_raw(c_path));
+                drop(CString::from_raw(flags_ptr));
+            }
+            if rc != EOK as i32 {
+                return 0;
+            }
+
+            unsafe {
+                ext4_fseek(&mut file, offset as i64, SEEK_SET as u32);
+            }
+
+            let mut rw_count: usize = 0;
+            let read_rc = unsafe {
+                ext4_fread(&mut file, buf.as_mut_ptr() as *mut core::ffi::c_void, buf.len(), &mut rw_count)
+            };
+            unsafe { ext4_fclose(&mut file); }
+
+            if read_rc != EOK as i32 {
+                return 0;
+            }
+            rw_count
+        })
+    }
+
+    pub fn write_at(&self, fs_path: &str, offset: usize, buf: &[u8]) -> usize {
+        self.with_fs(|_fs| {
+            let c_path = match CString::new(fs_path) {
+                Ok(s) => s,
+                Err(_) => return 0,
+            };
+            let c_path = c_path.into_raw();
+            let flags = CString::new("r+").ok().unwrap_or_else(|| CString::new("").unwrap());
+            let flags_ptr = flags.into_raw();
+
+            let mut file: ext4_file = unsafe { core::mem::zeroed() };
+            let rc = unsafe { ext4_fopen(&mut file, c_path, flags_ptr) };
+            unsafe {
+                drop(CString::from_raw(c_path));
+                drop(CString::from_raw(flags_ptr));
+            }
+            if rc != EOK as i32 {
+                return 0;
+            }
+
+            unsafe {
+                ext4_fseek(&mut file, offset as i64, SEEK_SET as u32);
+            }
+
+            let mut rw_count: usize = 0;
+            let write_rc = unsafe {
+                ext4_fwrite(&mut file, buf.as_ptr() as *const core::ffi::c_void, buf.len(), &mut rw_count)
+            };
+            unsafe { ext4_fclose(&mut file); }
+
+            if write_rc != EOK as i32 {
+                return 0;
+            }
+            rw_count
+        })
+    }
+
+    pub fn create_file(&self, parent_path: &str, name: &str, is_dir: bool) -> Option<u32> {
+        let full_path = if parent_path == "/" {
+            format!("/{}", name)
+        } else {
+            format!("{}/{}", parent_path, name)
+        };
+
+        self.with_fs(|_fs| {
+            if is_dir {
+                let c_path = CString::new(full_path.as_bytes()).ok()?;
+                let rc = unsafe { ext4_dir_mk(c_path.as_ptr() as *const c_char) };
+                if rc == EOK as i32 {
+                    let c_path2 = CString::new(full_path.as_bytes()).ok()?;
+                    let c_path2 = c_path2.into_raw();
+                    let flags = CString::new("rb").ok()?;
+                    let flags_ptr = flags.into_raw();
+                    let mut file: ext4_file = unsafe { core::mem::zeroed() };
+                    let rc2 = unsafe { ext4_fopen(&mut file, c_path2, flags_ptr) };
+                    unsafe {
+                        drop(CString::from_raw(c_path2));
+                        drop(CString::from_raw(flags_ptr));
+                    }
+                    if rc2 == EOK as i32 {
+                        let inode = file.inode;
+                        unsafe { ext4_fclose(&mut file); }
+                        return Some(inode);
+                    }
+                }
+                None
+            } else {
+                let c_path = CString::new(full_path.as_bytes()).ok()?;
+                let c_path = c_path.into_raw();
+                let flags = CString::new("wb").ok()?;
+                let flags_ptr = flags.into_raw();
+
+                let mut file: ext4_file = unsafe { core::mem::zeroed() };
+                let rc = unsafe { ext4_fopen(&mut file, c_path, flags_ptr) };
+                unsafe {
+                    drop(CString::from_raw(c_path));
+                    drop(CString::from_raw(flags_ptr));
+                }
+                if rc == EOK as i32 {
+                    let inode = file.inode;
+                    unsafe { ext4_fclose(&mut file); }
+                    return Some(inode);
+                }
+                None
+            }
+        })
+    }
+
+    pub fn truncate_file(&self, fs_path: &str, size: u64) -> bool {
+        self.with_fs(|_fs| {
+            let c_path = match CString::new(fs_path) {
+                Ok(s) => s,
+                Err(_) => return false,
+            };
+            let c_path = c_path.into_raw();
+            let flags = CString::new("r+").ok().unwrap_or_else(|| CString::new("").unwrap());
+            let flags_ptr = flags.into_raw();
+
+            let mut file: ext4_file = unsafe { core::mem::zeroed() };
+            let rc = unsafe { ext4_fopen(&mut file, c_path, flags_ptr) };
+            unsafe {
+                drop(CString::from_raw(c_path));
+                drop(CString::from_raw(flags_ptr));
+            }
+            if rc != EOK as i32 {
+                return false;
+            }
+
+            let ok = unsafe { ext4_ftruncate(&mut file, size) } == EOK as i32;
+            unsafe { ext4_fclose(&mut file); }
+            ok
+        })
+    }
+
+    pub fn unlink_file(&self, fs_path: &str) -> bool {
+        self.with_fs(|_fs| {
+            let c_path = match CString::new(fs_path) {
+                Ok(s) => s,
+                Err(_) => return false,
+            };
+            unsafe { ext4_fremove(c_path.as_ptr() as *const c_char) == EOK as i32 }
+        })
+    }
+
+    pub fn set_atime(&self, fs_path: &str, atime: u32) {
+        self.with_fs(|_fs| {
+            if let Ok(c_path) = CString::new(fs_path) {
+                unsafe { ext4_atime_set(c_path.as_ptr() as *const c_char, atime); }
+            }
+        })
+    }
+
+    pub fn set_mtime(&self, fs_path: &str, mtime: u32) {
+        self.with_fs(|_fs| {
+            if let Ok(c_path) = CString::new(fs_path) {
+                unsafe { ext4_mtime_set(c_path.as_ptr() as *const c_char, mtime); }
+            }
+        })
+    }
+
+    pub fn set_ctime(&self, fs_path: &str, ctime: u32) {
+        self.with_fs(|_fs| {
+            if let Ok(c_path) = CString::new(fs_path) {
+                unsafe { ext4_ctime_set(c_path.as_ptr() as *const c_char, ctime); }
+            }
+        })
+    }
+
+    pub fn get_fs_stats(&self) -> ext4_mount_stats {
+        self.with_fs(|wrapper| wrapper.0.get_mount_stats())
     }
 }
 
@@ -171,12 +501,23 @@ pub fn vfs_lookup(parent: &Arc<Dentry>, name: &str) -> Option<Arc<Dentry>> {
         }
     }
 
-    let (child_inode, is_dir) = parent.super_block.with_ext4(|ext4| {
-        let entries = ext4.ext4_dir_get_entries(parent.inode_num);
+    let child_fs_path = if parent.fs_path == "/" {
+        format!("/{}", name)
+    } else {
+        format!("{}/{}", parent.fs_path, name)
+    };
+
+    let (child_inode, is_dir) = {
+        let entries = parent.super_block.dir_get_entries(&parent.fs_path);
         let found = entries.iter().find(|e| e.get_name() == name)?;
-        let inode_ref = ext4.get_inode_ref(found.inode as u32);
-        Some((found.inode as u32, inode_ref.inode.is_dir()))
-    })?;
+        let inode_num = found.inode;
+        let info = parent.super_block.get_inode_info(&child_fs_path);
+        let is_dir = match &info {
+            Some(info) => info.is_dir,
+            None => found.de_type == 2,
+        };
+        (inode_num, is_dir)
+    };
 
     let child = Dentry::new_child(parent, name, child_inode, is_dir);
 
@@ -185,7 +526,7 @@ pub fn vfs_lookup(parent: &Arc<Dentry>, name: &str) -> Option<Arc<Dentry>> {
         if let Some(list) = children.as_mut() {
             list.push(child.clone());
         } else {
-            *children = Some(alloc::vec![child.clone()]);
+            *children = Some(vec![child.clone()]);
         }
     }
 
@@ -273,25 +614,8 @@ pub fn vfs_resolve_parent_and_name(
 
 // ==================== File Creation ====================
 
-pub fn vfs_create(parent: &Arc<Dentry>, name: &str, is_dir: bool, uid: u32, gid: u32) -> Option<Arc<Dentry>> {
-    let file_type = if is_dir {
-        InodeFileType::S_IFDIR
-    } else {
-        InodeFileType::S_IFREG
-    };
-
-    let inode_num = parent.super_block.with_ext4(|ext4| {
-        ext4
-            .create_with_attr(
-                parent.inode_num,
-                name,
-                file_type.bits(),
-                uid as u16,
-                gid as u16,
-            )
-            .ok()
-            .map(|r| r.inode_num)
-    })?;
+pub fn vfs_create(parent: &Arc<Dentry>, name: &str, is_dir: bool) -> Option<Arc<Dentry>> {
+    let inode_num = parent.super_block.create_file(&parent.fs_path, name, is_dir)?;
 
     let child = Dentry::new_child(parent, name, inode_num, is_dir);
 
@@ -300,104 +624,11 @@ pub fn vfs_create(parent: &Arc<Dentry>, name: &str, is_dir: bool, uid: u32, gid:
         if let Some(list) = children.as_mut() {
             list.push(child.clone());
         } else {
-            *children = Some(alloc::vec![child.clone()]);
+            *children = Some(vec![child.clone()]);
         }
     }
 
     Some(child)
-}
-
-pub fn vfs_symlink(
-    parent: &Arc<Dentry>,
-    name: &str,
-    target: &str,
-    uid: u32,
-    gid: u32,
-) -> Option<Arc<Dentry>> {
-    let mode = ext4_rs::InodeFileType::S_IFLNK.bits() | 0o777;
-    let inode_num = parent.super_block.with_ext4(|ext4| {
-        ext4
-            .create_with_attr(parent.inode_num, name, mode, uid as u16, gid as u16)
-            .ok()
-            .map(|r| r.inode_num)
-    })?;
-
-    parent.super_block.with_ext4(|ext4| {
-        let _ = ext4.write_at(inode_num, 0, target.as_bytes());
-    });
-
-    let child = Dentry::new_child(parent, name, inode_num, false);
-
-    {
-        let mut children = parent.children.exclusive_access();
-        if let Some(list) = children.as_mut() {
-            list.push(child.clone());
-        } else {
-            *children = Some(alloc::vec![child.clone()]);
-        }
-    }
-
-    Some(child)
-}
-
-pub fn vfs_rename(old: &Arc<Dentry>, new_parent: &Arc<Dentry>, new_name: &str) -> bool {
-    if !Arc::ptr_eq(&old.super_block, &new_parent.super_block) {
-        return false;
-    }
-    let old_parent = match &old.parent {
-        Some(p) => p.clone(),
-        None => return false,
-    };
-
-    let ok = old.super_block.with_ext4(|ext4| {
-        let mut new_parent_inode = ext4.get_inode_ref(new_parent.inode_num);
-        let child_inode = ext4.get_inode_ref(old.inode_num);
-
-        if ext4
-            .dir_add_entry(&mut new_parent_inode, &child_inode, new_name)
-            .is_err()
-        {
-            return false;
-        }
-        ext4.write_back_inode(&mut new_parent_inode);
-
-        let mut old_parent_inode = ext4.get_inode_ref(old_parent.inode_num);
-        if ext4
-            .dir_remove_entry(&mut old_parent_inode, &old.name)
-            .is_err()
-        {
-            return false;
-        }
-        ext4.write_back_inode(&mut old_parent_inode);
-
-        true
-    });
-
-    if !ok {
-        return false;
-    }
-
-    // update old parent's children list
-    {
-        let mut children = old_parent.children.exclusive_access();
-        if let Some(list) = children.as_mut() {
-            list.retain(|c| c.name != old.name);
-        }
-    }
-
-    // update new parent's children list
-    let new_child = Dentry::new_child(new_parent, new_name, old.inode_num, old.is_dir);
-    {
-        let mut children = new_parent.children.exclusive_access();
-        if let Some(list) = children.as_mut() {
-            list.retain(|c| c.name != new_name);
-            list.push(new_child.clone());
-        } else {
-            *children = Some(alloc::vec![new_child.clone()]);
-        }
-    }
-
-    true
 }
 
 // ==================== Mount Operations ====================
@@ -439,6 +670,7 @@ use crate::drivers::{BLOCK_DEVICE, ROOT_BLOCK_DEVICE};
 lazy_static! {
     pub static ref ROOT_SB: Arc<VfsSuperBlock> = {
         VfsSuperBlock::new_ext4(ROOT_BLOCK_DEVICE.clone(), "ext4")
+            .expect("Failed to mount root ext4 filesystem")
     };
 
     pub static ref ROOT_DENTRY: Arc<Dentry> = Dentry::new_root(ROOT_SB.clone());
@@ -454,21 +686,21 @@ pub fn mount_root() {
 
 /// Mount the test disk (bus 0) at the specified mount point dentry.
 pub fn mount_test_disk_at(mnt_point: Arc<Dentry>) -> bool {
-    let test_sb = VfsSuperBlock::new_ext4(BLOCK_DEVICE.clone(), "ext4");
+    let test_sb = match VfsSuperBlock::new_ext4(BLOCK_DEVICE.clone(), "ext4") {
+        Some(sb) => sb,
+        None => return false,
+    };
     vfs_mount(mnt_point, test_sb)
 }
 
 pub fn list_apps() {
     println!("/**** APPS ****");
-    ROOT_SB.with_ext4(|ext4| {
-        if let Ok(bin_ino) = ext4.ext4_dir_open("/bin") {
-            for entry in ext4.ext4_dir_get_entries(bin_ino) {
-                let name = entry.get_name();
-                if name != "." && name != ".." && !name.is_empty() {
-                    println!("{}", name);
-                }
-            }
-        }
-    });
+    ROOT_SB.dir_get_entries("/bin")
+        .iter()
+        .filter(|e| {
+            let name = e.get_name();
+            name != "." && name != ".." && !name.is_empty()
+        })
+        .for_each(|e| println!("{}", e.get_name()));
     println!("**************/");
 }

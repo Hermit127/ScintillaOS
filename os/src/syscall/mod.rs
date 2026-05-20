@@ -40,7 +40,10 @@ const SYSCALL_SETUID: usize = 146;
 const SYSCALL_SETGID: usize = 144;
 const SYSCALL_BRK: usize = 214;
 const SYSCALL_MUNMAP: usize = 215;
+const SYSCALL_READV: usize = 65;
 const SYSCALL_MPROTECT: usize = 226;
+const SYSCALL_SETPGID: usize = 154;
+const SYSCALL_GETPGID: usize = 155;
 const SYSCALL_MADVISE: usize = 233;
 const SYSCALL_SET_ROBUST_LIST: usize = 99;
 const SYSCALL_GETRANDOM: usize = 278;
@@ -129,6 +132,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_LSEEK => sys_lseek(args[0], args[1] as i64, args[2] as i32),
         SYSCALL_READ => sys_read(args[0], args[1] as *mut u8, args[2]),
         SYSCALL_WRITE => sys_write(args[0], args[1] as *mut u8, args[2]),
+        SYSCALL_READV => sys_readv(args[0], args[1] as *const u8, args[2]),
         SYSCALL_WRITEV => sys_writev(args[0], args[1] as *const u8, args[2]),
         SYSCALL_FUTEX => sys_futex(args[0] as *mut u32, args[1], args[2], args[3], args[4] as *mut u32, args[5]),
         SYSCALL_EXIT => sys_exit(args[0] as i32),
@@ -158,7 +162,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_CLONE => sys_clone(args[0], args[1], args[2], args[3], args[4]),
         SYSCALL_FORK => sys_fork(),
         SYSCALL_EXEC => sys_exec(args[0] as *const u8, args[1] as *const usize),
-        SYSCALL_WAITPID => sys_waitpid(args[0] as isize, args[1] as *mut i32),
+        SYSCALL_WAITPID => sys_waitpid(args[0] as isize, args[1] as *mut i32, args[2]),
         //added
         SYSCALL_FSTAT => sys_fstat(args[0], args[1] as *mut u8),
         SYSCALL_FSTATAT => sys_fstatat(args[0] as isize, args[1] as *const u8, args[2] as *mut u8, args[3]),
@@ -189,6 +193,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETRANDOM => sys_getrandom(args[0] as *mut u8, args[1], args[2]),
         SYSCALL_PSELECT6 => sys_pselect6(args[0], args[1] as *mut u8, args[2] as *mut u8, args[3] as *mut u8, args[4] as *const u8, args[5] as *const u8),
         SYSCALL_PPOLL => sys_ppoll(args[0] as *mut u8, args[1], args[2] as *const u8, args[3] as *const u8, args[4]),
+        SYSCALL_SETPGID => 0,   // no-op: single process group
+        SYSCALL_GETPGID => 0,   // no-op: always pgid=0
         SYSCALL_MADVISE => sys_madvise(args[0], args[1], args[2]),
         SYSCALL_STATFS => sys_statfs(args[0] as *const u8, args[1] as *mut u8),
         SYSCALL_FSTATFS => sys_fstatfs(args[0], args[1] as *mut u8),
@@ -222,6 +228,6 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[2] as isize, args[3] as *const u8,
             args[4],
         ),
-        _ => -1,
+        _ => -38,
     }
 }

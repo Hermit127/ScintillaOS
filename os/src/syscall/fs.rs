@@ -1,5 +1,5 @@
 use crate::fs::vfs::{vfs_resolve_path, vfs_resolve_with_fallback, Dentry, VfsSuperBlock};
-use crate::fs::{make_pipe, mkdir_at, open_file_at, rename_at, symlink_at, unlink_at, File, Kstat, OpenFlags};
+use crate::fs::{make_pipe, mkdir_at, open_file_at, rename_at, symlink_at, unlink_at, File, Kstat, OpenFlags, Urandom, DevNull};
 use crate::mm::{translated_byte_buffer, translated_refmut, translated_str};
 use crate::task::{current_task, current_user_token};
 use alloc::sync::Arc;
@@ -85,6 +85,20 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
         let mut inner = task.inner_exclusive_access();
         let fd = inner.alloc_fd();
         inner.fd_table[fd] = Some(file);
+        return fd as isize;
+    }
+
+    if path == "/dev/urandom" || path == "/dev/random" {
+        let mut inner = task.inner_exclusive_access();
+        let fd = inner.alloc_fd();
+        inner.fd_table[fd] = Some(Arc::new(Urandom));
+        return fd as isize;
+    }
+
+    if path == "/dev/null" {
+        let mut inner = task.inner_exclusive_access();
+        let fd = inner.alloc_fd();
+        inner.fd_table[fd] = Some(Arc::new(DevNull));
         return fd as isize;
     }
 
@@ -241,19 +255,22 @@ pub fn sys_utimensat(
     };
 
     if euid != 0 {
-        let permitted = dentry.super_block.with_ext4(|ext4| {
-            let inode_ref = ext4.get_inode_ref(dentry.inode_num);
-            if inode_ref.inode.uid() as u32 == euid {
-                return true;
+        let fs_path = &dentry.fs_path;
+        let permitted = match dentry.super_block.get_inode_info(fs_path) {
+            Some(info) => {
+                if info.uid == euid {
+                    true
+                } else {
+                    let perm = if info.gid == egid {
+                        (info.mode >> 3) & 0o7
+                    } else {
+                        info.mode & 0o7
+                    };
+                    (perm & 0o2) != 0
+                }
             }
-            let mode = inode_ref.inode.mode();
-            let perm = if inode_ref.inode.gid() as u32 == egid {
-                (mode >> 3) & 0o7
-            } else {
-                mode & 0o7
-            };
-            (perm & 0o2) != 0
-        });
+            None => false,
+        };
         if !permitted {
             return -1; // EPERM
         }
@@ -294,19 +311,16 @@ pub fn sys_utimensat(
         (at, mt, true)
     };
 
-    dentry.super_block.with_ext4(|ext4| {
-        let mut inode_ref = ext4.get_inode_ref(dentry.inode_num);
-        if let Some(a) = new_atime {
-            inode_ref.inode.set_atime(a);
-        }
-        if let Some(m) = new_mtime {
-            inode_ref.inode.set_mtime(m);
-        }
-        if changed {
-            inode_ref.inode.set_ctime(now_sec);
-        }
-        ext4.write_back_inode(&mut inode_ref);
-    });
+    let fs_path = &dentry.fs_path;
+    if let Some(a) = new_atime {
+        dentry.super_block.set_atime(fs_path, a);
+    }
+    if let Some(m) = new_mtime {
+        dentry.super_block.set_mtime(fs_path, m);
+    }
+    if changed {
+        dentry.super_block.set_ctime(fs_path, now_sec);
+    }
 
     0
 }
@@ -342,24 +356,27 @@ pub fn sys_faccessat(dirfd: isize, path: *const u8, mode: usize, _flags: usize) 
         return 0;
     }
 
-    let allowed = dentry.super_block.with_ext4(|ext4| {
-        let inode_ref = ext4.get_inode_ref(dentry.inode_num);
-        let m = inode_ref.inode.mode();
-        let owner_perm = (m >> 6) & 0o7;
-        let group_perm = (m >> 3) & 0o7;
-        let other_perm = m & 0o7;
-        let perm = if inode_ref.inode.uid() as u32 == euid {
-            owner_perm
-        } else if inode_ref.inode.gid() as u32 == egid {
-            group_perm
-        } else {
-            other_perm
-        };
-        if (mode & R_OK) != 0 && (perm & 0o4) == 0 { return false; }
-        if (mode & W_OK) != 0 && (perm & 0o2) == 0 { return false; }
-        if (mode & X_OK) != 0 && (perm & 0o1) == 0 { return false; }
-        true
-    });
+    let fs_path = &dentry.fs_path;
+    let allowed = match dentry.super_block.get_inode_info(fs_path) {
+        Some(info) => {
+            let m = info.mode;
+            let owner_perm = (m >> 6) & 0o7;
+            let group_perm = (m >> 3) & 0o7;
+            let other_perm = m & 0o7;
+            let perm = if info.uid == euid {
+                owner_perm
+            } else if info.gid == egid {
+                group_perm
+            } else {
+                other_perm
+            };
+            if (mode & R_OK) != 0 && (perm & 0o4) == 0 { false }
+            else if (mode & W_OK) != 0 && (perm & 0o2) == 0 { false }
+            else if (mode & X_OK) != 0 && (perm & 0o1) == 0 { false }
+            else { true }
+        }
+        None => false,
+    };
 
     if allowed { 0 } else { -13 } // EACCES
 }
@@ -715,24 +732,21 @@ pub fn sys_readlinkat(dirfd: isize, path: *const u8, buf: *mut u8, bufsiz: usize
         None => return -2,
     };
 
-    let is_link = dentry.super_block.with_ext4(|ext4| {
-        let inode_ref = ext4.get_inode_ref(dentry.inode_num);
-        inode_ref.inode.is_link()
-    });
+    let is_link = match dentry.super_block.get_inode_info(&dentry.fs_path) {
+        Some(info) => info.is_link,
+        None => false,
+    };
 
     if !is_link {
         return -22; // EINVAL — not a symlink
     }
 
-    let link_target = dentry.super_block.with_ext4(|ext4| {
+    let link_target = {
         let mut link_data = vec![0u8; bufsiz.min(4096)];
-        let n = ext4
-            .read_at(dentry.inode_num, 0, &mut link_data)
-            .ok()
-            .unwrap_or(0);
+        let n = dentry.super_block.read_at(&dentry.fs_path, 0, &mut link_data);
         link_data.truncate(n);
         link_data
-    });
+    };
 
     let len = link_target.len().min(bufsiz);
     let user_buf = crate::mm::translated_byte_buffer(token, buf, len);
@@ -860,7 +874,10 @@ pub fn sys_mount(
         }
     }
 
-    let sb = VfsSuperBlock::new_ext4(BLOCK_DEVICE.clone(), "ext4");
+    let sb = match VfsSuperBlock::new_ext4(BLOCK_DEVICE.clone(), "ext4") {
+        Some(sb) => sb,
+        None => return -17, // EBUSY
+    };
 
     if vfs_mount(mnt_point, sb) {
         0
@@ -917,28 +934,26 @@ fn is_leap(year: i32) -> bool {
 }
 
 fn fill_statfs_from_dentry(dentry: &Arc<Dentry>, buf: &mut StatFs) {
-    dentry.super_block.with_ext4(|ext4| {
-        let sb = &ext4.super_block;
-        let block_size = (1024u64 << sb.log_block_size) as i64;
-        let blocks = sb.blocks_count_lo as i64;
-        let free_blocks = sb.free_blocks_count_lo as i64;
-        let inodes = sb.inodes_count as i64;
-        let free_inodes = sb.free_inodes_count as i64;
-        *buf = StatFs {
-            f_type: EXT4_SUPER_MAGIC,
-            f_bsize: block_size,
-            f_blocks: blocks,
-            f_bfree: free_blocks,
-            f_bavail: free_blocks,
-            f_files: inodes,
-            f_ffree: free_inodes,
-            f_fsid: [0, 0],
-            f_namelen: 255,
-            f_frsize: block_size,
-            f_flags: 0,
-            f_spare: [0; 4],
-        };
-    });
+    let stats = dentry.super_block.get_fs_stats();
+    let block_size = stats.block_size as i64;
+    let blocks = stats.blocks_count as i64;
+    let free_blocks = stats.free_blocks_count as i64;
+    let inodes = stats.inodes_count as i64;
+    let free_inodes = stats.free_inodes_count as i64;
+    *buf = StatFs {
+        f_type: EXT4_SUPER_MAGIC,
+        f_bsize: block_size,
+        f_blocks: blocks,
+        f_bfree: free_blocks,
+        f_bavail: free_blocks,
+        f_files: inodes,
+        f_ffree: free_inodes,
+        f_fsid: [0, 0],
+        f_namelen: 255,
+        f_frsize: block_size,
+        f_flags: 0,
+        f_spare: [0; 4],
+    };
 }
 
 pub fn sys_statfs(path: *const u8, buf: *mut u8) -> isize {

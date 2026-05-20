@@ -17,7 +17,6 @@ buddy_system_allocator = "0.11.0"
 bitflags = "1.2.1"
 xmas-elf = "0.7.0"
 virtio-drivers = { git = "https://github.com/rcore-os/virtio-drivers", rev = "61ece50" }
-ext4_rs = "1.3.3"
 log = "0.4"
 fdt = "0.1.5"
 smoltcp = { version = "0.11", default-features = false, features = [
@@ -32,6 +31,7 @@ smoltcp = { version = "0.11", default-features = false, features = [
     "proto-ipv4",
     "proto-dhcpv4",
 ] }
+lwext4_rust = { path = "../lwext4_rust" }
 
 [profile.release]
 debug = true

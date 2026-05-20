@@ -2,6 +2,9 @@ use core::ptr::NonNull;
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
 
+use alloc::collections::VecDeque;
+use alloc::vec::Vec;
+
 use crate::drivers::block::VirtioHal;
 use crate::sync::UPSafeCell;
 use polyhal::PhysAddr;
@@ -29,6 +32,9 @@ pub struct VirtIONetAdapter {
     rx_buf: [u8; NET_BUF_SIZE],
     rx_len: usize,
     tx_buf: [u8; NET_BUF_SIZE],
+    // Software hairpin loopback queue for 127.0.0.1 traffic
+    loopback_queue: UPSafeCell<VecDeque<Vec<u8>>>,
+    mac_addr: [u8; 6],
 }
 
 impl VirtIONetAdapter {
@@ -49,7 +55,14 @@ impl VirtIONetAdapter {
                 return None;
             }
         };
-        println!("[net] VirtIONetAdapter initialized successfully");
+
+        // Extract MAC address; use default if all zeros
+        let mut mac = net.mac_address();
+        if mac == [0u8; 6] {
+            mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+        }
+
+        println!("[net] VirtIONetAdapter initialized successfully, MAC={:02x?}", mac);
         Some(Self {
             inner: unsafe {
                 UPSafeCell::new(VirtIONetInner { net })
@@ -57,6 +70,8 @@ impl VirtIONetAdapter {
             rx_buf: [0u8; NET_BUF_SIZE],
             rx_len: 0,
             tx_buf: [0u8; NET_BUF_SIZE],
+            loopback_queue: unsafe { UPSafeCell::new(VecDeque::new()) },
+            mac_addr: mac,
         })
     }
 
@@ -65,7 +80,7 @@ impl VirtIONetAdapter {
     }
 
     pub fn mac_address(&self) -> [u8; 6] {
-        self.inner.exclusive_access().net.mac_address()
+        self.mac_addr
     }
 }
 
@@ -88,6 +103,8 @@ impl RxToken for VirtioRxToken<'_> {
 pub struct VirtioTxToken<'a> {
     buf: &'a mut [u8],
     device: &'a UPSafeCell<VirtIONetInner>,
+    loopback_queue: &'a UPSafeCell<VecDeque<Vec<u8>>>,
+    mac_addr: [u8; 6],
 }
 
 impl TxToken for VirtioTxToken<'_> {
@@ -96,10 +113,35 @@ impl TxToken for VirtioTxToken<'_> {
         F: FnOnce(&mut [u8]) -> R,
     {
         let result = f(&mut self.buf[..len]);
+        let frame = &self.buf[..len];
+
+        let mut looped_back = false;
+
+        // Parse Ethernet frame header (dst MAC = first 6 bytes)
+        if len >= 14 {
+            let dst_mac = &frame[0..6];
+            let is_broadcast = dst_mac == [0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+            let is_self = dst_mac == self.mac_addr;
+
+            // ARP broadcasts or packets to our own MAC → push into loopback queue
+            if is_broadcast || is_self {
+                let mut queue = self.loopback_queue.exclusive_access();
+                if queue.len() < 256 {
+                    queue.push_back(frame.to_vec());
+                }
+                looped_back = true;
+            }
+        }
+
+        // Still send to hardware, UNLESS it was a unicast to ourselves
+        // (broadcasts like ARP need to go out too for potential external responses)
         let mut inner = self.device.exclusive_access();
-        let mut tx_buf = inner.net.new_tx_buffer(len);
-        tx_buf.packet_mut().copy_from_slice(&self.buf[..len]);
-        inner.net.send(tx_buf).ok();
+        if !looped_back || frame[0..6] == [0xff, 0xff, 0xff, 0xff, 0xff, 0xff] {
+            let mut tx_buf = inner.net.new_tx_buffer(len);
+            tx_buf.packet_mut().copy_from_slice(frame);
+            inner.net.send(tx_buf).ok();
+        }
+
         result
     }
 }
@@ -109,6 +151,23 @@ impl Device for VirtIONetAdapter {
     type TxToken<'a> = VirtioTxToken<'a>;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        // Priority 1: drain software loopback queue first
+        if let Some(frame) = self.loopback_queue.exclusive_access().pop_front() {
+            let len = frame.len().min(NET_BUF_SIZE);
+            self.rx_buf[..len].copy_from_slice(&frame[..len]);
+            self.rx_len = len;
+            return Some((
+                VirtioRxToken { buf: &mut self.rx_buf[..self.rx_len] },
+                VirtioTxToken {
+                    buf: &mut self.tx_buf,
+                    device: &self.inner,
+                    loopback_queue: &self.loopback_queue,
+                    mac_addr: self.mac_addr,
+                },
+            ));
+        }
+
+        // Priority 2: real VirtIO hardware receive queue
         {
             let mut inner = self.inner.exclusive_access();
             match inner.net.receive() {
@@ -129,6 +188,8 @@ impl Device for VirtIONetAdapter {
             VirtioTxToken {
                 buf: &mut self.tx_buf,
                 device: &self.inner,
+                loopback_queue: &self.loopback_queue,
+                mac_addr: self.mac_addr,
             },
         ))
     }
@@ -137,6 +198,8 @@ impl Device for VirtIONetAdapter {
         Some(VirtioTxToken {
             buf: &mut self.tx_buf,
             device: &self.inner,
+            loopback_queue: &self.loopback_queue,
+            mac_addr: self.mac_addr,
         })
     }
 
