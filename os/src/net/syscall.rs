@@ -239,14 +239,28 @@ pub fn sys_connect(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
         Some(v) => v,
         None => return -9,
     };
-    if st != SocketType::Tcp {
-        return -95;
-    }
 
     let remote = IpEndpoint::new(
         IpAddress::from(Ipv4Address::from_bytes(&ip.to_be_bytes())),
         port,
     );
+
+    if st == SocketType::Udp {
+        let task = current_task().unwrap();
+        let inner = task.inner_exclusive_access();
+        if sockfd < inner.fd_table.len() {
+            if let Some(file) = &inner.fd_table[sockfd] {
+                if let Some(s) = file.as_any().downcast_ref::<SocketFile>() {
+                    s.set_peer_endpoint(remote);
+                }
+            }
+        }
+        return 0;
+    }
+
+    if st != SocketType::Tcp {
+        return -95;
+    }
 
     let local = IpListenEndpoint {
         addr: None,
@@ -258,6 +272,7 @@ pub fn sys_connect(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
 
     if !nonblock {
         loop {
+            crate::net::net_poll();
             let connected = crate::net::with_net_iface(|iface| {
                 let sock: &TcpSocket = iface.sockets.get(handle);
                 sock.is_active()
@@ -366,7 +381,7 @@ pub fn sys_accept(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
         let h = iface.sockets.add(new_sock);
         if let Some(local_ep) = &old_local {
             let listen_endpoint = IpListenEndpoint {
-                addr: Some(local_ep.addr),
+                addr: None,
                 port: local_ep.port,
             };
             let sock: &mut TcpSocket = iface.sockets.get_mut(h);
@@ -387,6 +402,12 @@ pub fn sys_accept(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
     // The new fd gets the old (now active) handle
     let new_fd = inner.alloc_fd();
     inner.fd_table[new_fd] = Some(Arc::new(SocketFile::new(handle, SocketType::Tcp, nonblock)));
+
+    // Release inner lock before writing peer address (avoids holding lock during net_poll)
+    drop(inner);
+
+    // Ensure any pending data from client is delivered to the accepted socket
+    crate::net::net_poll();
 
     if !addr.is_null() && !addrlen.is_null() {
         let token = current_user_token();
@@ -879,25 +900,20 @@ pub(crate) fn udp_send(handle: SocketHandle, data: &[u8], dest: IpEndpoint) -> i
     }).unwrap_or(-1)
 }
 
-pub(crate) fn udp_write(handle: SocketHandle, data: &[u8]) -> isize {
+pub(crate) fn udp_write(handle: SocketHandle, data: &[u8], peer: Option<IpEndpoint>) -> isize {
     crate::net::net_poll();
-    crate::net::with_net_iface(|iface| {
-        let dest = {
-            let sock: &UdpSocket = iface.sockets.get(handle);
-            let ep = sock.endpoint();
-            ep.addr.map(|a| IpEndpoint::new(a, ep.port))
-        };
-        match dest {
-            Some(dest) => {
+    match peer {
+        Some(dest) => {
+            crate::net::with_net_iface(|iface| {
                 let sock: &mut UdpSocket = iface.sockets.get_mut(handle);
                 match sock.send_slice(data, dest) {
                     Ok(()) => data.len() as isize,
                     Err(_) => -11,
                 }
-            }
-            None => -89, // EDESTADDRREQ
+            }).unwrap_or(-1)
         }
-    }).unwrap_or(-1)
+        None => -89, // EDESTADDRREQ
+    }
 }
 
 pub(crate) fn udp_recv(handle: SocketHandle, nonblock: bool, buf: &mut [u8]) -> isize {

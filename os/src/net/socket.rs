@@ -1,5 +1,6 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 use smoltcp::iface::SocketHandle;
+use smoltcp::wire::IpEndpoint;
 
 use crate::fs::{File, Kstat};
 use crate::sync::UPSafeCell;
@@ -16,6 +17,7 @@ pub struct SocketFile {
     pub handle: UPSafeCell<SocketHandle>,
     pub socket_type: SocketType,
     pub nonblock: AtomicBool,
+    pub peer_endpoint: UPSafeCell<Option<IpEndpoint>>,
 }
 
 impl SocketFile {
@@ -24,6 +26,7 @@ impl SocketFile {
             handle: unsafe { UPSafeCell::new(handle) },
             socket_type,
             nonblock: AtomicBool::new(nonblock),
+            peer_endpoint: unsafe { UPSafeCell::new(None) },
         }
     }
 
@@ -37,6 +40,14 @@ impl SocketFile {
 
     pub fn get_nonblock(&self) -> bool {
         self.nonblock.load(Ordering::Relaxed)
+    }
+
+    pub fn get_peer_endpoint(&self) -> Option<IpEndpoint> {
+        *self.peer_endpoint.exclusive_access()
+    }
+
+    pub fn set_peer_endpoint(&self, ep: IpEndpoint) {
+        *self.peer_endpoint.exclusive_access() = Some(ep);
     }
 }
 
@@ -64,7 +75,7 @@ impl File for SocketFile {
         let data: &[u8] = buf;
         match self.socket_type {
             SocketType::Tcp => super::syscall::tcp_send(handle, nonblock, data),
-            SocketType::Udp => super::syscall::udp_write(handle, data),
+            SocketType::Udp => super::syscall::udp_write(handle, data, self.get_peer_endpoint()),
         }
     }
 

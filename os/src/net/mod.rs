@@ -96,7 +96,7 @@ pub mod syscall {
     pub(crate) fn tcp_send(_handle: smoltcp::iface::SocketHandle, _nonblock: bool, _data: &[u8]) -> isize { -38 }
     pub(crate) fn tcp_recv(_handle: smoltcp::iface::SocketHandle, _nonblock: bool, _buf: &mut [u8]) -> isize { -38 }
     pub(crate) fn udp_send(_handle: smoltcp::iface::SocketHandle, _data: &[u8], _dest: smoltcp::wire::IpEndpoint) -> isize { -38 }
-    pub(crate) fn udp_write(_handle: smoltcp::iface::SocketHandle, _data: &[u8]) -> isize { -38 }
+    pub(crate) fn udp_write(_handle: smoltcp::iface::SocketHandle, _data: &[u8], _peer: Option<smoltcp::wire::IpEndpoint>) -> isize { -38 }
     pub(crate) fn udp_recv(_handle: smoltcp::iface::SocketHandle, _nonblock: bool, _buf: &mut [u8]) -> isize { -38 }
 }
 
@@ -147,6 +147,7 @@ pub fn net_poll() {
                 }
             }
         }
+        wake_net_blocked_tasks();
     }
 }
 

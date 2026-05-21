@@ -266,6 +266,23 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: usize) -> isize
     }
 }
 
+pub fn sys_getrusage(who: usize, rusage: *mut u8) -> isize {
+    const RUSAGE_SELF: usize = 0;
+    if who != RUSAGE_SELF || rusage.is_null() {
+        return -22; // EINVAL
+    }
+    // Return zeroed rusage structure (64 bytes on 64-bit)
+    let token = current_user_token();
+    let buf = crate::mm::translated_byte_buffer(token, rusage, 64);
+    buf.fill(0);
+    // Set ru_maxrss to a small non-zero value
+    // ru_maxrss is at offset 32 (bytes) in struct rusage on 64-bit
+    if buf.len() >= 40 {
+        buf[32..40].copy_from_slice(&1024u64.to_ne_bytes());
+    }
+    0
+}
+
 pub fn sys_kill(pid: usize, signum: i32) -> isize {
     if let Some(task) = pid2task(pid) {
         if let Some(flag) = SignalFlags::from_bits(1 << signum) {
