@@ -1,4 +1,3 @@
-#![cfg(target_arch = "riscv64")]
 #![no_std]
 #![no_main]
 
@@ -104,3 +103,5 @@ pub fn main() -> i32 {
     println!("net_test: PASSED");
     0
 }
+#[cfg(target_arch = "riscv64")]
+fn main() {}
