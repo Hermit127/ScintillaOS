@@ -14,6 +14,7 @@ const SYSCALL_PIPE2: usize = 59;
 const SYSCALL_LSEEK: usize = 62;
 const SYSCALL_READ: usize = 63;
 const SYSCALL_WRITE: usize = 64;
+const SYSCALL_SENDFILE: usize = 71;
 const SYSCALL_WRITEV: usize = 66;
 const SYSCALL_EXIT: usize = 93;
 const SYSCALL_FUTEX: usize = 98;
@@ -135,6 +136,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_WRITE => sys_write(args[0], args[1] as *mut u8, args[2]),
         SYSCALL_READV => sys_readv(args[0], args[1] as *const u8, args[2]),
         SYSCALL_WRITEV => sys_writev(args[0], args[1] as *const u8, args[2]),
+        SYSCALL_SENDFILE => sys_sendfile(args[0], args[1], args[2] as *mut usize, args[3]),
         SYSCALL_FUTEX => sys_futex(args[0] as *mut u32, args[1], args[2], args[3], args[4] as *mut u32, args[5]),
         SYSCALL_EXIT => sys_exit(args[0] as i32),
         SYSCALL_EXIT_GROUP => sys_exit_group(args[0] as i32),

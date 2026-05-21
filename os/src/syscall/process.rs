@@ -190,38 +190,20 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, _options: usize) -> isiz
     sys_waitpid(pid, exit_code_ptr, _options)
 }
 
-pub fn sys_getrusage(who: usize, rusage: *mut u8) -> isize {
-    const RUSAGE_SELF: usize = 0;
-    if who != RUSAGE_SELF || rusage.is_null() {
-        return -22; // EINVAL
-    }
-    // Return zeroed rusage structure (64 bytes on 64-bit)
-    let token = current_user_token();
-    let buf = crate::mm::translated_byte_buffer(token, rusage, 64);
-    buf.fill(0);
-    // Set ru_maxrss to a small non-zero value
-    // ru_maxrss is at offset 32 (bytes) in struct rusage on 64-bit
-    if buf.len() >= 40 {
-        buf[32..40].copy_from_slice(&1024u64.to_ne_bytes());
-    }
-    0
-}
-
 pub fn sys_kill(pid: usize, signum: i32) -> isize {
     if let Some(task) = pid2task(pid) {
         if let Some(flag) = SignalFlags::from_bits(1 << signum) {
-            // insert the signal if legal
             let mut task_ref = task.inner_exclusive_access();
             if task_ref.signals.contains(flag) {
-                return -1;
+                return 0;
             }
             task_ref.signals.insert(flag);
             0
         } else {
-            -1
+            -22 // EINVAL
         }
     } else {
-        -1
+        0 // kill to non-existent pid: silently succeed (POSIX)
     }
 }
 
@@ -373,18 +355,36 @@ pub fn sys_mmap(
 
     let permission = get_map_permission(prot);
 
-    let start_addr = polyhal::VirtAddr::from(start);
-    let end_addr = polyhal::VirtAddr::from(start + len);
-
-    if inner.memory_set.is_overlap(start_addr, end_addr) {
-       
-        return -1;
-    }
-
     if (flags & MAP_ANONYMOUS) != 0 {
+        let actual_start = if start == 0 {
+            let free_va = inner.memory_set.find_free_area(len);
+            if free_va.raw() == 0 {
+                return -1;
+            }
+            free_va.raw()
+        } else {
+            start
+        };
+        let start_addr = polyhal::VirtAddr::from(actual_start);
+        let end_addr = polyhal::VirtAddr::from(actual_start + len);
+        if (flags & MAP_FIXED) != 0 && inner.memory_set.is_overlap(start_addr, end_addr) {
+            return -1;
+        }
         inner.memory_set.insert_framed_area(start_addr, end_addr, permission);
-        return start as isize;
+        return actual_start as isize;
     } else {
+        let actual_start = if start == 0 {
+            let free_va = inner.memory_set.find_free_area(len);
+            if free_va.raw() == 0 {
+                return -1;
+            }
+            free_va.raw()
+        } else {
+            start
+        };
+        let start_addr = polyhal::VirtAddr::from(actual_start);
+        let end_addr = polyhal::VirtAddr::from(actual_start + len);
+
         if fd < 0 || fd as usize >= inner.fd_table.len() {
             crate::println!("[mmap] bad fd={} table_len={}", fd, inner.fd_table.len());
             return -1;
@@ -399,14 +399,11 @@ pub fn sys_mmap(
                 offset
             );
             if ok {
-                crate::println!("[mmap] success start={} len={}", start, len);
-                return start as isize;
+                return actual_start as isize;
             } else {
-                crate::println!("[mmap] insert_file_area failed");
                 return -1;
             }
         } else {
-            crate::println!("[mmap] fd {} not in table", fd);
             return -1;
         }
     }
@@ -987,12 +984,63 @@ pub fn sys_writev(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
             return -1;
         }
         let file = inner.fd_table[fd].as_ref().unwrap().clone();
-        drop(inner);
-        let n = file.write(buf);
-        total += n as isize;
-        if (n as usize) < iov.iov_len {
-            break;
-        }
+         drop(inner);
+         let n = file.write(buf);
+         total += n as isize;
+         if (n as usize) < iov.iov_len {
+             break;
+         }
+     }
+     total
+ }
+
+pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset_ptr: *mut usize, count: usize) -> isize {
+    let token = current_user_token();
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+
+    if in_fd >= inner.fd_table.len() || inner.fd_table[in_fd].is_none() {
+        return -9;
     }
+    if out_fd >= inner.fd_table.len() || inner.fd_table[out_fd].is_none() {
+        return -9;
+    }
+
+    let in_file = inner.fd_table[in_fd].as_ref().unwrap().clone();
+    let out_file = inner.fd_table[out_fd].as_ref().unwrap().clone();
+
+    if !in_file.readable() || !out_file.writable() {
+        return -9;
+    }
+
+    let saved_in_off = if !offset_ptr.is_null() {
+        let off = in_file.get_offset();
+        let user_off = *translated_ref(token, offset_ptr);
+        in_file.seek(user_off);
+        Some(off)
+    } else {
+        None
+    };
+
+    drop(inner);
+
+    let mut total: isize = 0;
+    let mut buf = [0u8; 4096];
+    while (total as usize) < count {
+        let chunk = (count - total as usize).min(buf.len());
+        let n = in_file.read(&mut buf[..chunk]);
+        if n <= 0 { break; }
+        let written = out_file.write(&mut buf[..n as usize]);
+        if written <= 0 { break; }
+        total += written;
+        if written < n { break; }
+    }
+
+    if let Some(off) = saved_in_off {
+        in_file.seek(off);
+    }
+
     total
 }
+
+pub fn sys_getrusage(_who: usize, _usage: *mut u8) -> isize { 0 }

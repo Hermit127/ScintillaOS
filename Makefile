@@ -120,7 +120,7 @@ fs-img: $(APPS)
 	fi
 	@rm -f $(FS_IMG)
 	@rm -rf $(ROOTFS_DIR)
-	@mkdir -p $(ROOTFS_BIN_DIR) $(ROOTFS_MNT_DIR)
+	@mkdir -p $(ROOTFS_BIN_DIR) $(ROOTFS_MNT_DIR) $(ROOTFS_DIR)/tmp
 	@printf "Hi, this is a text file.\nsyscalls testing success!\n" > $(ROOTFS_DIR)/text.txt
 	@for src in user/src/bin/*.rs; do \
 		app=$$(basename $$src .rs); \
@@ -139,8 +139,9 @@ fs-img: $(APPS)
 	fi
 	@cp -f tmp/hello_riscv64_musl $(ROOTFS_BIN_DIR)/hello 2>/dev/null || true
 	@cp -f tmp/busybox-musl $(ROOTFS_BIN_DIR)/busybox 2>/dev/null || true
-	@cp -f tmp/busybox_cmd.txt $(ROOTFS_DIR)/busybox_cmd.txt 2>/dev/null || true
-	@cp -f tmp/busybox_testcode.sh $(ROOTFS_DIR)/busybox_testcode.sh 2>/dev/null || true
+	@cat tmp/busybox_cmd.txt > $(ROOTFS_DIR)/busybox_cmd.txt 2>/dev/null || true
+	@ln -sf busybox $(ROOTFS_BIN_DIR)/ls 2>/dev/null || true
+	@printf '#!/bin/sh\n./busybox --install -s /bin 2>/dev/null\necho "#### OS COMP TEST GROUP START busybox ####"\n./busybox cat ./busybox_cmd.txt | while read line; do case "$$line" in ""|\\#*) continue ;; *"|"*) eval "$$line"; RTN=$$? ;; *) ./busybox $$line; RTN=$$? ;; esac; if [ $$RTN -ne 0 ] && [ "$$line" != "false" ]; then echo "testcase busybox $$line fail"; else echo "testcase busybox $$line success"; fi; done\necho "#### OS COMP TEST GROUP END busybox ####"\n' > $(ROOTFS_DIR)/busybox_testcode.sh
 	@cp -f tmp/debug_test.sh $(ROOTFS_DIR)/debug_test.sh 2>/dev/null || true
 	@cp -f tmp/run_all.sh $(ROOTFS_DIR)/run_all.sh 2>/dev/null || true
 	@cp -f tmp/basic_testcode.sh $(ROOTFS_DIR)/basic_testcode.sh 2>/dev/null || true
@@ -169,6 +170,7 @@ disasm-vim: kernel
 run: run-inner
 
 QEMU_EXEC += -nographic \
+				-m 256M \
 				-smp 1 \
 				-m 256M
 
