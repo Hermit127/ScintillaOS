@@ -47,12 +47,15 @@ lazy_static! {
     pub static ref NET_BLOCK_QUEUE: UPSafeCell<Vec<Arc<TaskControlBlock>>> = unsafe {
         UPSafeCell::new(Vec::new())
     };
+    pub static ref WAITPID_QUEUE: UPSafeCell<Vec<Arc<TaskControlBlock>>> = unsafe {
+        UPSafeCell::new(Vec::new())
+    };
 }
 
 pub fn suspend_current_and_run_next() {
     //trace!("os::task::suspend_current_and_run_next");
     // There must be an application running.
-    let task = take_current_task().unwrap();
+    let task = current_task().unwrap();
 
     //added for kernel time accounting
     task.record_time_suspend();
@@ -65,8 +68,10 @@ pub fn suspend_current_and_run_next() {
     drop(task_inner);
     // ---- release current PCB
 
-    // push back to ready queue.
+    // push back to ready queue BEFORE clearing processor
     add_task(task.clone());
+    // now safe to clear processor (window from here to schedule is minimal)
+    take_current_task();
     // jump to scheduling cycle
     schedule(task_cx_ptr);
     //added fot reset time accounting
@@ -74,46 +79,35 @@ pub fn suspend_current_and_run_next() {
 }
 
 pub fn sleep_current_and_run_next() {
-    let task = take_current_task().unwrap();
+    let task = current_task().unwrap();
     task.record_time_suspend();
-
     let mut task_inner = task.inner_exclusive_access();
     let task_cx_ptr = &mut task_inner.task_cx as *mut KContext;
     drop(task_inner);
-
+    take_current_task();
     schedule(task_cx_ptr);
-
     task.record_time_resume();
 }
 
 pub fn block_current_and_run_next(block_reason: BlockReason) {
-    let task = take_current_task().unwrap();
+    let task = current_task().unwrap();
     task.record_time_suspend();
-
     let mut task_inner = task.inner_exclusive_access();
     task_inner.block_reason = Some(block_reason);
     let task_cx_ptr = &mut task_inner.task_cx as *mut KContext;
     drop(task_inner);
-
-    NET_BLOCK_QUEUE.exclusive_access().push(task.clone());
-
+    take_current_task();
     schedule(task_cx_ptr);
-
-    let mut task_inner = task.inner_exclusive_access();
-    task_inner.block_reason = None;
-    drop(task_inner);
-
     task.record_time_resume();
 }
 
-/// pid of usertests app in make run TEST=1
 pub const IDLE_PID: usize = 0;
 
 /// Exit the current 'Running' task and run the next task in task list.
 pub fn exit_current_and_run_next(exit_code: i32) {
     trace!("os::task::exit_current_and_run_next");
     // take from Processor
-    let task = take_current_task().unwrap();
+    let task = current_task().unwrap();
 
     let pid = task.getpid();
     if pid == IDLE_PID {
@@ -133,6 +127,19 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     // Record exit code
     inner.exit_code = exit_code;
     // do not move to its parent but under initproc
+
+    // wake parent waiting in waitpid
+    if let Some(parent) = inner.parent.as_ref().and_then(|w| w.upgrade()) {
+        let mut queue = WAITPID_QUEUE.exclusive_access();
+        if let Some(idx) = queue.iter().position(|t| t.getpid() == parent.getpid()) {
+            let parent_task = queue.remove(idx);
+            drop(queue);
+            let mut pinner = parent_task.inner_exclusive_access();
+            pinner.task_status = TaskStatus::Ready;
+            drop(pinner);
+            add_task(parent_task);
+        }
+    }
 
     // ++++++ access initproc TCB exclusively
     {
@@ -154,6 +161,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     // drop task manually to maintain rc correctly
     drop(task);
     // we do not have to save task context
+    take_current_task();
     let mut _unused = KContext::blank();
     schedule(&mut _unused as *mut _);
 }
@@ -173,7 +181,7 @@ pub fn add_initproc() {
 
 pub fn check_signals_error_of_current() -> Option<(i32, &'static str)> {
     trace!("os::task::check_signals_error_of_current");
-    let task = current_task().unwrap();
+    let task = current_task()?;
     let task_inner = task.inner_exclusive_access();
     // println!(
     //     "[K] check_signals_error_of_current {:?}",

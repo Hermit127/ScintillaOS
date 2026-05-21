@@ -255,19 +255,22 @@ pub fn sys_utimensat(
     };
 
     if euid != 0 {
-        let permitted = dentry.super_block.with_ext4(|ext4| {
-            let inode_ref = ext4.get_inode_ref(dentry.inode_num);
-            if inode_ref.inode.uid() as u32 == euid {
-                return true;
+        let fs_path = &dentry.fs_path;
+        let permitted = match dentry.super_block.get_inode_info(fs_path) {
+            Some(info) => {
+                if info.uid == euid {
+                    true
+                } else {
+                    let perm = if info.gid == egid {
+                        (info.mode >> 3) & 0o7
+                    } else {
+                        info.mode & 0o7
+                    };
+                    (perm & 0o2) != 0
+                }
             }
-            let mode = inode_ref.inode.mode();
-            let perm = if inode_ref.inode.gid() as u32 == egid {
-                (mode >> 3) & 0o7
-            } else {
-                mode & 0o7
-            };
-            (perm & 0o2) != 0
-        });
+            None => false,
+        };
         if !permitted {
             return -1; // EPERM
         }
@@ -308,19 +311,16 @@ pub fn sys_utimensat(
         (at, mt, true)
     };
 
-    dentry.super_block.with_ext4(|ext4| {
-        let mut inode_ref = ext4.get_inode_ref(dentry.inode_num);
-        if let Some(a) = new_atime {
-            inode_ref.inode.set_atime(a);
-        }
-        if let Some(m) = new_mtime {
-            inode_ref.inode.set_mtime(m);
-        }
-        if changed {
-            inode_ref.inode.set_ctime(now_sec);
-        }
-        ext4.write_back_inode(&mut inode_ref);
-    });
+    let fs_path = &dentry.fs_path;
+    if let Some(a) = new_atime {
+        dentry.super_block.set_atime(fs_path, a);
+    }
+    if let Some(m) = new_mtime {
+        dentry.super_block.set_mtime(fs_path, m);
+    }
+    if changed {
+        dentry.super_block.set_ctime(fs_path, now_sec);
+    }
 
     0
 }
@@ -356,24 +356,27 @@ pub fn sys_faccessat(dirfd: isize, path: *const u8, mode: usize, _flags: usize) 
         return 0;
     }
 
-    let allowed = dentry.super_block.with_ext4(|ext4| {
-        let inode_ref = ext4.get_inode_ref(dentry.inode_num);
-        let m = inode_ref.inode.mode();
-        let owner_perm = (m >> 6) & 0o7;
-        let group_perm = (m >> 3) & 0o7;
-        let other_perm = m & 0o7;
-        let perm = if inode_ref.inode.uid() as u32 == euid {
-            owner_perm
-        } else if inode_ref.inode.gid() as u32 == egid {
-            group_perm
-        } else {
-            other_perm
-        };
-        if (mode & R_OK) != 0 && (perm & 0o4) == 0 { return false; }
-        if (mode & W_OK) != 0 && (perm & 0o2) == 0 { return false; }
-        if (mode & X_OK) != 0 && (perm & 0o1) == 0 { return false; }
-        true
-    });
+    let fs_path = &dentry.fs_path;
+    let allowed = match dentry.super_block.get_inode_info(fs_path) {
+        Some(info) => {
+            let m = info.mode;
+            let owner_perm = (m >> 6) & 0o7;
+            let group_perm = (m >> 3) & 0o7;
+            let other_perm = m & 0o7;
+            let perm = if info.uid == euid {
+                owner_perm
+            } else if info.gid == egid {
+                group_perm
+            } else {
+                other_perm
+            };
+            if (mode & R_OK) != 0 && (perm & 0o4) == 0 { false }
+            else if (mode & W_OK) != 0 && (perm & 0o2) == 0 { false }
+            else if (mode & X_OK) != 0 && (perm & 0o1) == 0 { false }
+            else { true }
+        }
+        None => false,
+    };
 
     if allowed { 0 } else { -13 } // EACCES
 }
@@ -466,55 +469,44 @@ fn is_terminal_fd(fd: usize) -> bool {
 
 pub fn sys_ioctl(fd: usize, request: usize, arg: usize) -> isize {
     let token = current_user_token();
+    let request = request & 0xffffffff;
 
     // RTC ioctl
     const RTC_RD_TIME: usize = 0x80247009;
     if request == RTC_RD_TIME {
-        let task = current_task().unwrap();
-        let inner = task.inner_exclusive_access();
-        if fd >= inner.fd_table.len() { return -9; }
-        let file = match &inner.fd_table[fd] {
-            Some(f) => f.clone(),
-            None => return -9,
-        };
-        if file.as_any().downcast_ref::<crate::fs::proc::DevRtcFile>().is_none() {
-            return -25;
-        }
-        drop(inner);
+        if fd >= 1024 { return -9; }
         let now_ms = polyhal::time::Time::now().to_msec() as u64;
-        let secs = now_ms / 1000;
-        let days = (secs / 86400) as i32;
+        let secs = (now_ms / 1000) as i64;
+        let days_since_epoch = (secs / 86400) as i32;
         let rem = (secs % 86400) as i32;
         let tm_sec = rem % 60;
         let tm_min = (rem / 60) % 60;
         let tm_hour = (rem / 3600) % 24;
-        // Jan 1 1970 was a Thursday
-        let mut tm_year = 1970 - 1900;
-        let mut days_left = days;
+        let mut tm_year = 70i32;
+        let mut days_left = days_since_epoch;
         loop {
-            let days_in_year = if is_leap(1970 + tm_year as i32) { 366 } else { 365 };
-            if days_left < days_in_year { break; }
-            days_left -= days_in_year;
+            let diy = if is_leap(1900 + tm_year) { 366 } else { 365 };
+            if days_left < diy { break; }
+            days_left -= diy;
             tm_year += 1;
         }
         let tm_yday = days_left;
-        let months_days: [i32; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        let months: [i32; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
         let mut tm_mon = 0;
         let mut mdays = days_left;
-        for (i, &md) in months_days.iter().enumerate() {
-            let adj = if i == 1 && is_leap(1970 + tm_year as i32) { md + 1 } else { md };
-            if mdays < adj { tm_mon = i as i32; break; }
-            mdays -= adj;
+        for i in 0..12 {
+            let md = if i == 1 && is_leap(1900 + tm_year) { months[i] + 1 } else { months[i] };
+            if mdays < md { tm_mon = i as i32; break; }
+            mdays -= md;
         }
         let tm_mday = mdays + 1;
-        let tm_wday = ((days + 4) % 7) as i32; // 1970-01-01 was Thursday
-        let tm_isdst = -1;
+        let tm_wday = ((days_since_epoch + 4) % 7) as i32;
         #[repr(C)]
         struct RtcTime {
             tm_sec: i32, tm_min: i32, tm_hour: i32, tm_mday: i32, tm_mon: i32,
             tm_year: i32, tm_wday: i32, tm_yday: i32, tm_isdst: i32,
         }
-        let rtc = RtcTime { tm_sec, tm_min, tm_hour, tm_mday, tm_mon, tm_year, tm_wday, tm_yday, tm_isdst };
+        let rtc = RtcTime { tm_sec, tm_min, tm_hour, tm_mday, tm_mon, tm_year, tm_wday, tm_yday, tm_isdst: -1 };
         *translated_refmut(token, arg as *mut RtcTime) = rtc;
         return 0;
     }
@@ -740,24 +732,21 @@ pub fn sys_readlinkat(dirfd: isize, path: *const u8, buf: *mut u8, bufsiz: usize
         None => return -2,
     };
 
-    let is_link = dentry.super_block.with_ext4(|ext4| {
-        let inode_ref = ext4.get_inode_ref(dentry.inode_num);
-        inode_ref.inode.is_link()
-    });
+    let is_link = match dentry.super_block.get_inode_info(&dentry.fs_path) {
+        Some(info) => info.is_link,
+        None => false,
+    };
 
     if !is_link {
         return -22; // EINVAL — not a symlink
     }
 
-    let link_target = dentry.super_block.with_ext4(|ext4| {
+    let link_target = {
         let mut link_data = vec![0u8; bufsiz.min(4096)];
-        let n = ext4
-            .read_at(dentry.inode_num, 0, &mut link_data)
-            .ok()
-            .unwrap_or(0);
+        let n = dentry.super_block.read_at(&dentry.fs_path, 0, &mut link_data);
         link_data.truncate(n);
         link_data
-    });
+    };
 
     let len = link_target.len().min(bufsiz);
     let user_buf = crate::mm::translated_byte_buffer(token, buf, len);
@@ -885,7 +874,10 @@ pub fn sys_mount(
         }
     }
 
-    let sb = VfsSuperBlock::new_ext4(BLOCK_DEVICE.clone(), "ext4");
+    let sb = match VfsSuperBlock::new_ext4(BLOCK_DEVICE.clone(), "ext4") {
+        Some(sb) => sb,
+        None => return -17, // EBUSY
+    };
 
     if vfs_mount(mnt_point, sb) {
         0
@@ -942,28 +934,26 @@ fn is_leap(year: i32) -> bool {
 }
 
 fn fill_statfs_from_dentry(dentry: &Arc<Dentry>, buf: &mut StatFs) {
-    dentry.super_block.with_ext4(|ext4| {
-        let sb = &ext4.super_block;
-        let block_size = (1024u64 << sb.log_block_size) as i64;
-        let blocks = sb.blocks_count_lo as i64;
-        let free_blocks = sb.free_blocks_count_lo as i64;
-        let inodes = sb.inodes_count as i64;
-        let free_inodes = sb.free_inodes_count as i64;
-        *buf = StatFs {
-            f_type: EXT4_SUPER_MAGIC,
-            f_bsize: block_size,
-            f_blocks: blocks,
-            f_bfree: free_blocks,
-            f_bavail: free_blocks,
-            f_files: inodes,
-            f_ffree: free_inodes,
-            f_fsid: [0, 0],
-            f_namelen: 255,
-            f_frsize: block_size,
-            f_flags: 0,
-            f_spare: [0; 4],
-        };
-    });
+    let stats = dentry.super_block.get_fs_stats();
+    let block_size = stats.block_size as i64;
+    let blocks = stats.blocks_count as i64;
+    let free_blocks = stats.free_blocks_count as i64;
+    let inodes = stats.inodes_count as i64;
+    let free_inodes = stats.free_inodes_count as i64;
+    *buf = StatFs {
+        f_type: EXT4_SUPER_MAGIC,
+        f_bsize: block_size,
+        f_blocks: blocks,
+        f_bfree: free_blocks,
+        f_bavail: free_blocks,
+        f_files: inodes,
+        f_ffree: free_inodes,
+        f_fsid: [0, 0],
+        f_namelen: 255,
+        f_frsize: block_size,
+        f_flags: 0,
+        f_spare: [0; 4],
+    };
 }
 
 pub fn sys_statfs(path: *const u8, buf: *mut u8) -> isize {

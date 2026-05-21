@@ -142,6 +142,9 @@ fs-img: $(APPS)
 	@cp -f tmp/busybox_cmd.txt $(ROOTFS_DIR)/busybox_cmd.txt 2>/dev/null || true
 	@cp -f tmp/busybox_testcode.sh $(ROOTFS_DIR)/busybox_testcode.sh 2>/dev/null || true
 	@cp -f tmp/debug_test.sh $(ROOTFS_DIR)/debug_test.sh 2>/dev/null || true
+	@cp -f tmp/run_all.sh $(ROOTFS_DIR)/run_all.sh 2>/dev/null || true
+	@cp -f tmp/basic_testcode.sh $(ROOTFS_DIR)/basic_testcode.sh 2>/dev/null || true
+	@cp -f tmp/busybox-musl $(ROOTFS_DIR)/busybox 2>/dev/null || true
 	@dd if=/dev/zero of=$(FS_IMG) bs=1M count=128
 	@mke2fs -t ext4 -b 4096 -F -d $(ROOTFS_DIR) $(FS_IMG)
 	cp target/$(TARGET)/$(MODE)/fs.img fs-img.img
@@ -179,14 +182,14 @@ QEMU_ARGS_SINGLE := -drive file=$(FS_IMG),if=none,format=raw,id=x0,file.locking=
 			-drive file=$(FS_IMG),if=none,format=raw,id=x1,file.locking=off \
 			-device $(VIRTIO_BLK_DEVICE),drive=x1,bus=virtio-mmio-bus.1
 
+# Test disk path (user can override)
+TEST_DISK ?= fs-img.img
+
 # Dual-disk mode (test disk bus 0, disk.img bus 1, for contest)
 QEMU_ARGS_DUAL := -drive file=$(TEST_DISK),if=none,format=raw,id=x0 \
 			-device $(VIRTIO_BLK_DEVICE),drive=x0,bus=$(VIRTIO_BLK_BUS) \
 			-drive file=disk.img,if=none,format=raw,id=x1 \
 			-device $(VIRTIO_BLK_DEVICE),drive=x1,bus=virtio-mmio-bus.1
-
-# Test disk path (user can override)
-TEST_DISK ?= fs-img.img
 
 # virtio-net network configuration (SLIRP user-mode, riscv64/aarch64)
 ifeq ($(ARCH), riscv64)

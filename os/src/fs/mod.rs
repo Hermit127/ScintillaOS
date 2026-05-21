@@ -1,4 +1,4 @@
-pub mod block_cache;
+pub mod block_device_stream;
 pub mod inode;
 mod pipe;
 pub mod proc;
