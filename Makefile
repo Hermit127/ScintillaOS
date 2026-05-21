@@ -146,6 +146,8 @@ fs-img: $(APPS)
 	@cp -f tmp/run_all.sh $(ROOTFS_DIR)/run_all.sh 2>/dev/null || true
 	@cp -f tmp/basic_testcode.sh $(ROOTFS_DIR)/basic_testcode.sh 2>/dev/null || true
 	@cp -f tmp/busybox-musl $(ROOTFS_DIR)/busybox 2>/dev/null || true
+	@mkdir -p $(ROOTFS_DIR)/etc 2>/dev/null || true
+	@cp -f tmp/init.sh $(ROOTFS_DIR)/etc/init.sh 2>/dev/null || true
 	@dd if=/dev/zero of=$(FS_IMG) bs=1M count=128
 	@mke2fs -t ext4 -b 4096 -F -d $(ROOTFS_DIR) $(FS_IMG)
 	cp target/$(TARGET)/$(MODE)/fs.img fs-img.img
