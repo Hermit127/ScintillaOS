@@ -116,6 +116,8 @@ $(KERNEL_BIN): kernel
 	@$(OBJCOPY) $(KERNEL_ELF) --strip-all -O binary $@
 
 fs-img: $(APPS)
+	@mkdir -p .cargo 2>/dev/null || true
+	@cp -f cargo_config/config.toml .cargo/config.toml 2>/dev/null || true
 	@cd user && make build TARGET=$(TARGET) TEST=$(TEST)
 	@if [ -d "$(OSCOMP_DIR)" ]; then \
 		if [ ! -d "$(OSCOMP_BIN_DIR)" ] || [ -z "$$(ls -A $(OSCOMP_BIN_DIR) 2>/dev/null)" ]; then \
@@ -166,6 +168,8 @@ $(APPS):
 
 kernel:
 	@echo Platform: $(BOARD)
+	@mkdir -p .cargo 2>/dev/null || true
+	@cp -f cargo_config/config.toml .cargo/config.toml 2>/dev/null || true
 	@cargo build --release --target $(TARGET)
 
 clean:

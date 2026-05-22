@@ -44,4 +44,5 @@ tmp/
 lwext4_rust/c/lwext4/
 lwext4_rust/c/ext_images.7z
 
-
+# vendored crate dependencies (keep for offline contest builds)
+vendor/
