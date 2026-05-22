@@ -12,7 +12,7 @@ use core::ptr::NonNull;
 const QUEUE_RECEIVEQ_PORT_0: u16 = 0;
 const QUEUE_TRANSMITQ_PORT_0: u16 = 1;
 const QUEUE_SIZE: usize = 2;
-const SUPPORTED_FEATURES: Features = Features::RING_EVENT_IDX;
+const SUPPORTED_FEATURES: Features = Features::RING_EVENT_IDX.union(Features::RING_INDIRECT_DESC);
 
 /// Driver for a VirtIO console device.
 ///
@@ -51,6 +51,18 @@ pub struct VirtIOConsole<H: Hal, T: Transport> {
     receive_token: Option<u16>,
 }
 
+// SAFETY: The config space can be accessed from any thread.
+unsafe impl<H: Hal, T: Transport + Send> Send for VirtIOConsole<H, T> where
+    VirtQueue<H, QUEUE_SIZE>: Send
+{
+}
+
+// SAFETY: A `&VirtIOConsole` only allows reading the config space.
+unsafe impl<H: Hal, T: Transport + Sync> Sync for VirtIOConsole<H, T> where
+    VirtQueue<H, QUEUE_SIZE>: Sync
+{
+}
+
 /// Information about a console device, read from its configuration space.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConsoleInfo {
@@ -70,13 +82,13 @@ impl<H: Hal, T: Transport> VirtIOConsole<H, T> {
         let receiveq = VirtQueue::new(
             &mut transport,
             QUEUE_RECEIVEQ_PORT_0,
-            false,
+            negotiated_features.contains(Features::RING_INDIRECT_DESC),
             negotiated_features.contains(Features::RING_EVENT_IDX),
         )?;
         let transmitq = VirtQueue::new(
             &mut transport,
             QUEUE_TRANSMITQ_PORT_0,
-            false,
+            negotiated_features.contains(Features::RING_INDIRECT_DESC),
             negotiated_features.contains(Features::RING_EVENT_IDX),
         )?;
 
