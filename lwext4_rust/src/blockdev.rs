@@ -5,9 +5,11 @@ use core::ffi::{c_char, c_void};
 use core::ptr::null_mut;
 use core::slice::{from_raw_parts, from_raw_parts_mut};
 use core::str;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 static FIRST_MOUNT: AtomicBool = AtomicBool::new(true);
+static DEV_COUNTER: AtomicU32 = AtomicU32::new(1);
+const MAX_DEVICES: u32 = 8;
 
 /// Device block size.
 const EXT4_DEV_BSIZE: u32 = 512;
@@ -74,11 +76,18 @@ impl<K: KernelDevOp> Ext4BlockWrapper<K> {
         };
 
         let is_root = FIRST_MOUNT.swap(false, Ordering::Relaxed);
-        let dev_name_str = if is_root {
-            "ext4_root"
+        let (dev_name_str, is_readonly) = if is_root {
+            ("ext4_root", false)
         } else {
-            unsafe { ext4_device_unregister(b"ext4_mnt\0".as_ptr() as *const c_char); }
-            "ext4_mnt"
+            let id = DEV_COUNTER.fetch_add(1, Ordering::Relaxed) % MAX_DEVICES;
+            let name = alloc::format!("ext4_mnt{}", id);
+            // try to free stale entry from previous mount with same id
+            unsafe {
+                let c = CString::new(name.as_bytes()).unwrap();
+                ext4_device_unregister(c.as_ptr() as *const c_char);
+            }
+            let leaked: &'static str = Box::leak(name.into_boxed_str());
+            (leaked, true)
         };
         let c_name = CString::new(dev_name_str).expect("CString::new ext4_fs failed");
         let c_name = c_name.as_bytes_with_nul();
@@ -105,7 +114,7 @@ impl<K: KernelDevOp> Ext4BlockWrapper<K> {
         info!("New an Ext4 Block Device");
         ext4bd.ext4_set_debug();
 
-        let skip_recovery = dev_name_str != "ext4_root";
+        let skip_recovery = is_readonly;
         unsafe {
             ext4bd.lwext4_mount(skip_recovery)?;
         }
