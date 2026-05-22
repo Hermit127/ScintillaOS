@@ -107,8 +107,6 @@ disk-la.img:
 build: env fs-img $(KERNEL_BIN) 
 
 env:
-	@mkdir -p .cargo 2>/dev/null || true
-	@cp -f cargo_config/config.toml .cargo/config.toml 2>/dev/null || true
 	(rustup target list | grep "$(TARGET) (installed)") || rustup target add $(TARGET)
 	cargo install cargo-binutils
 	rustup component add rust-src
