@@ -3,9 +3,6 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
-
-static EXT4_DEV_COUNTER: AtomicUsize = AtomicUsize::new(0);
 use alloc::vec;
 use alloc::ffi::CString;
 use core::ffi::c_char;
@@ -71,10 +68,7 @@ impl VfsSuperBlock {
             pos: 0,
             total_size: DISK_SIZE_128M,
         };
-        let id = EXT4_DEV_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dev_name = alloc::format!("ext4_fs{}", id);
-        let mnt_pt = if id == 0 { alloc::format!("/") } else { alloc::format!("/mp{}/", id) };
-        let ext4 = Ext4BlockWrapper::<BlockDeviceStreamOp>::new_with_name(stream, &dev_name, &mnt_pt).ok()?;
+        let ext4 = Ext4BlockWrapper::<BlockDeviceStreamOp>::new(stream).ok()?;
         Some(Arc::new(VfsSuperBlock {
             fs_type,
             fs_data: unsafe { UPSafeCell::new(FsInner::Ext4(Ext4Wrapper(ext4))) },
