@@ -906,7 +906,8 @@ pub fn sys_umount2(target: *const u8, _flags: usize) -> isize {
     let path = &dentry.path;
     let mut table = MOUNT_TABLE.exclusive_access();
     if let Some(idx) = table.iter().position(|m| &m.mnt_point.path == path) {
-        table.remove(idx);
+        let mount = table.remove(idx);
+        mount.mnt_root.super_block.force_umount();
     }
     0
 }

@@ -82,6 +82,13 @@ impl VfsSuperBlock {
         }
     }
 
+    pub fn force_umount(&self) {
+        let mut data = self.fs_data.exclusive_access();
+        if let FsInner::Ext4(ref mut wrapper) = *data {
+            unsafe { wrapper.0.lwext4_umount().ok(); }
+        }
+    }
+
     // ---------- path-based ext4 operations ----------
 
     pub fn dir_get_entries(&self, fs_path: &str) -> Vec<DirEntry> {
