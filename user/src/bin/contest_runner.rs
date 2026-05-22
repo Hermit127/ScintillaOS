@@ -28,21 +28,13 @@ fn run_test(name: &str) {
 
 #[no_mangle]
 pub fn main() -> i32 {
-    println!("#### OS COMP TEST GROUP START basic-musl-rv ####");
+    println!("#### OS COMP TEST GROUP START basic-musl ####");
     for test in TEST_LIST { run_test(test); }
-    println!("#### OS COMP TEST GROUP END basic-musl-rv ####");
+    println!("#### OS COMP TEST GROUP END basic-musl ####");
 
-    println!("#### OS COMP TEST GROUP START basic-glibc-rv ####");
+    println!("#### OS COMP TEST GROUP START basic-glibc ####");
     for test in TEST_LIST { run_test(test); }
-    println!("#### OS COMP TEST GROUP END basic-glibc-rv ####");
-
-    println!("#### OS COMP TEST GROUP START basic-musl-la ####");
-    for test in TEST_LIST { run_test(test); }
-    println!("#### OS COMP TEST GROUP END basic-musl-la ####");
-
-    println!("#### OS COMP TEST GROUP START basic-glibc-la ####");
-    for test in TEST_LIST { run_test(test); }
-    println!("#### OS COMP TEST GROUP END basic-glibc-la ####");
+    println!("#### OS COMP TEST GROUP END basic-glibc ####");
 
     0
 }
