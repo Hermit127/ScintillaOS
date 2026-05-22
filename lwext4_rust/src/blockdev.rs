@@ -383,7 +383,7 @@ impl<K: KernelDevOp> Ext4BlockWrapper<K> {
 impl<K: KernelDevOp> Drop for Ext4BlockWrapper<K> {
     fn drop(&mut self) {
         info!("Drop struct Ext4BlockWrapper");
-        self.lwext4_umount().unwrap();
+        let _ = self.lwext4_umount();
         let devtype = unsafe { Box::from_raw((*(&self.value).bdif).p_user as *mut K::DevType) };
         drop(devtype);
     }
