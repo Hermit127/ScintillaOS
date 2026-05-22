@@ -134,6 +134,9 @@ extern "C" {
 #ifndef CONFIG_EXT4_MAX_BLOCKDEV_NAME
 #define CONFIG_EXT4_MAX_BLOCKDEV_NAME 32
 #endif
+#ifndef CONFIG_EXT4_MAX_MP_NAME
+#define CONFIG_EXT4_MAX_MP_NAME 32
+#endif
 
 
 /**@brief   Maximum block device count*/
