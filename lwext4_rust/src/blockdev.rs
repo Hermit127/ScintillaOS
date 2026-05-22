@@ -296,8 +296,7 @@ impl<K: KernelDevOp> Ext4BlockWrapper<K> {
 
             let r = ext4_device_unregister(c_name);
             if r != EOK as i32 {
-                error!("ext4_device_unregister: fail {}", r);
-                return Err(r);
+                debug!("ext4_device_unregister: fail {}", r);
             }
         }
 
