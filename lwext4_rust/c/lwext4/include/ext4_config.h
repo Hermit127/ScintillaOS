@@ -41,9 +41,10 @@
 extern "C" {
 #endif
 
-#if !CONFIG_USE_DEFAULT_CFG
-#include "generated/ext4_config.h"
-#endif
+// Generated config disabled — use definitions in this file
+// #if !CONFIG_USE_DEFAULT_CFG
+// #include "generated/ext4_config.h"
+// #endif
 
 /*****************************************************************************/
 
