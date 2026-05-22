@@ -73,9 +73,9 @@ TEST ?=
 
 # ==================== Contest Submission Targets ====================
 
-all: kernel-rv disk.img kernel-la
+all: kernel-rv disk.img kernel-la disk-la.img
 	@echo "===== Build complete ====="
-	@ls -lh kernel-rv kernel-la disk.img 2>/dev/null || true
+	@ls -lh kernel-rv kernel-la disk.img disk-la.img 2>/dev/null || true
 
 kernel-rv:
 	@echo "===== Building kernel-rv (riscv64) ====="
@@ -95,6 +95,12 @@ disk.img: fs-img
 		cp $(FS_IMG) disk.img; \
 		echo "disk.img ready ($(FS_IMG))"; \
 	fi
+
+disk-la.img:
+	@echo "===== Building disk-la.img (loongarch64) ====="
+	@$(MAKE) fs-img ARCH=loongarch64
+	@cp target/loongarch64-unknown-none/release/fs.img disk-la.img
+	@echo "disk-la.img ready"
 
 # ==================== Local Development Targets ====================
 
@@ -138,10 +144,13 @@ fs-img: $(APPS)
 		mkdir -p "$(ROOTFS_MNT_DIR)"; \
 	fi
 	@cp -f tmp/hello_riscv64_musl $(ROOTFS_BIN_DIR)/hello 2>/dev/null || true
-	@cp -f tmp/busybox-musl $(ROOTFS_BIN_DIR)/busybox 2>/dev/null || true
-	@cat tmp/busybox_cmd.txt > $(ROOTFS_DIR)/busybox_cmd.txt 2>/dev/null || true
-	@ln -sf busybox $(ROOTFS_BIN_DIR)/ls 2>/dev/null || true
-	@printf '#!/bin/sh\n./busybox --install -s /bin 2>/dev/null\necho "#### OS COMP TEST GROUP START busybox ####"\n./busybox cat ./busybox_cmd.txt | while read line; do case "$$line" in ""|\\#*) continue ;; *"|"*) eval "$$line"; RTN=$$? ;; *) ./busybox $$line; RTN=$$? ;; esac; if [ $$RTN -ne 0 ] && [ "$$line" != "false" ]; then echo "testcase busybox $$line fail"; else echo "testcase busybox $$line success"; fi; done\necho "#### OS COMP TEST GROUP END busybox ####"\n' > $(ROOTFS_DIR)/busybox_testcode.sh
+	@if [ "$(ARCH)" = "riscv64" ]; then \
+		cp -f tmp/busybox-musl $(ROOTFS_BIN_DIR)/busybox 2>/dev/null || true; \
+		cp -f tmp/busybox-musl $(ROOTFS_DIR)/busybox 2>/dev/null || true; \
+		cat tmp/busybox_cmd.txt > $(ROOTFS_DIR)/busybox_cmd.txt 2>/dev/null || true; \
+		ln -sf busybox $(ROOTFS_BIN_DIR)/ls 2>/dev/null || true; \
+		printf '#!/bin/sh\n./busybox --install -s /bin 2>/dev/null\necho "#### OS COMP TEST GROUP START busybox ####"\n./busybox cat ./busybox_cmd.txt | while read line; do case "$$line" in ""|\\#*) continue ;; *"|"*) eval "$$line"; RTN=$$? ;; *) ./busybox $$line; RTN=$$? ;; esac; if [ $$RTN -ne 0 ] && [ "$$line" != "false" ]; then echo "testcase busybox $$line fail"; else echo "testcase busybox $$line success"; fi; done\necho "#### OS COMP TEST GROUP END busybox ####"\n' > $(ROOTFS_DIR)/busybox_testcode.sh; \
+	fi
 	@cp -f tmp/debug_test.sh $(ROOTFS_DIR)/debug_test.sh 2>/dev/null || true
 	@cp -f tmp/run_all.sh $(ROOTFS_DIR)/run_all.sh 2>/dev/null || true
 	@cp -f tmp/basic_testcode.sh $(ROOTFS_DIR)/basic_testcode.sh 2>/dev/null || true
