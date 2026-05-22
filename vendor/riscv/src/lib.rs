@@ -1,3 +1,4 @@
+#![allow(unexpected_cfgs)]
 //! Low level access to RISC-V processors
 //!
 //! # Minimum Supported Rust Version (MSRV)
