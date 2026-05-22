@@ -102,9 +102,7 @@ impl<K: KernelDevOp> Ext4BlockWrapper<K> {
 
         let skip_recovery = dev_id > 0;
         unsafe {
-            ext4bd
-                .lwext4_mount(skip_recovery)
-                .expect("Failed to mount the ext4 file system, perhaps the disk is not an EXT4 file system.");
+            ext4bd.lwext4_mount(skip_recovery)?;
         }
 
         if !skip_recovery {
