@@ -1,7 +1,10 @@
 use polyhal::debug_console::DebugConsole;
 
 use super::{File, Kstat, S_IFCHR};
+use core::sync::atomic::{AtomicBool, Ordering};
 use crate::task::suspend_current_and_run_next;
+
+static STDOUT_BUSY: AtomicBool = AtomicBool::new(false);
 
 pub struct Stdin;
 
@@ -47,10 +50,11 @@ impl File for Stdout {
         panic!("Cannot read from stdout!");
     }
     fn write(&self, user_buf: &mut [u8]) -> isize {
-        // for buffer in user_buf.buffers.iter() {
-        //     print!("{}", core::str::from_utf8(*buffer).unwrap());
-        // }
+        while STDOUT_BUSY.swap(true, Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
         print!("{}", core::str::from_utf8(user_buf).unwrap());
+        STDOUT_BUSY.store(false, Ordering::Release);
         user_buf.len() as isize
     }
     fn stat(&self) -> Kstat {
