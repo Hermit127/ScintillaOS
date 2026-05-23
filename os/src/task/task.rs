@@ -335,16 +335,10 @@ impl TaskControlBlock {
         let mut inner = self.inner_exclusive_access();
         inner.memory_set = memory_set;
         inner.heap_bottom = heap_bottom;
-        // Pre-allocate 16MB heap for iperf3 (needs 128KB stream buffers)
-        let pre_brk = heap_bottom + 0x100_0000;
-        let start_va = polyhal::VirtAddr::from(heap_bottom);
-        let end_va = polyhal::VirtAddr::from((pre_brk + crate::config::PAGE_SIZE - 1) / crate::config::PAGE_SIZE * crate::config::PAGE_SIZE);
-        if end_va > start_va {
-            let heap_area = MapArea::new(start_va, end_va, MapType::Framed,
-                MapPermission::R | MapPermission::W | MapPermission::U);
-            inner.memory_set.push(heap_area, None, 0);
-        }
-        inner.program_brk = pre_brk;
+        // Pre-allocate 16MB so musl iperf3 has enough space for startup.
+        // Musl's brk(0) returns program_brk; first malloc triggers brk(program_brk+N)
+        // which maps pages at that address via the sys_brk expansion.
+        inner.program_brk = heap_bottom + 0x100_0000;
         inner.trap_cx = TrapFrame::new();
 
         let mut trap_cx = TrapFrame::new();

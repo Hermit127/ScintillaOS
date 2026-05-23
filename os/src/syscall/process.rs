@@ -296,8 +296,9 @@ pub fn sys_brk(brk_addr: usize) -> isize {
     let new_brk_page = (brk_addr + crate::config::PAGE_SIZE - 1) / crate::config::PAGE_SIZE;
 
     if new_brk_page > old_brk_page {
+        let effective_new = (old_brk_page + 256).max(new_brk_page);
         let start_va = polyhal::VirtAddr::new(old_brk_page * crate::config::PAGE_SIZE);
-        let end_va = polyhal::VirtAddr::new(new_brk_page * crate::config::PAGE_SIZE);
+        let end_va = polyhal::VirtAddr::new(effective_new * crate::config::PAGE_SIZE);
 
         let map_area = crate::mm::MapArea::new(
             start_va,
@@ -306,12 +307,12 @@ pub fn sys_brk(brk_addr: usize) -> isize {
             crate::mm::MapPermission::R | crate::mm::MapPermission::W | crate::mm::MapPermission::U,
         );
         inner.memory_set.push(map_area, None, 0);
+        inner.program_brk = brk_addr;
     }else if new_brk_page < old_brk_page {
         let limit_va = polyhal::VirtAddr::new(new_brk_page * crate::config::PAGE_SIZE);
         inner.memory_set.shrink_to(limit_va);
+        inner.program_brk = brk_addr;
     }
-
-    inner.program_brk = brk_addr;
     brk_addr as isize
 }
 
@@ -358,35 +359,24 @@ pub fn sys_mmap(
 
     let permission = get_map_permission(prot);
 
+    let real_start = if start == 0 {
+        let max_end: usize = inner.memory_set.max_end_vaddr().into();
+        (max_end + crate::config::PAGE_SIZE - 1) / crate::config::PAGE_SIZE * crate::config::PAGE_SIZE
+    } else {
+        start
+    };
+
     if (flags & MAP_ANONYMOUS) != 0 {
-        let actual_start = if start == 0 {
-            let free_va = inner.memory_set.find_free_area(len);
-            if free_va.raw() == 0 {
-                return -1;
-            }
-            free_va.raw()
-        } else {
-            start
-        };
-        let start_addr = polyhal::VirtAddr::from(actual_start);
-        let end_addr = polyhal::VirtAddr::from(actual_start + len);
+        let start_addr = polyhal::VirtAddr::from(real_start);
+        let end_addr = polyhal::VirtAddr::from(real_start + len);
         if (flags & MAP_FIXED) != 0 && inner.memory_set.is_overlap(start_addr, end_addr) {
             return -1;
         }
         inner.memory_set.insert_framed_area(start_addr, end_addr, permission);
-        return actual_start as isize;
+        return real_start as isize;
     } else {
-        let actual_start = if start == 0 {
-            let free_va = inner.memory_set.find_free_area(len);
-            if free_va.raw() == 0 {
-                return -1;
-            }
-            free_va.raw()
-        } else {
-            start
-        };
-        let start_addr = polyhal::VirtAddr::from(actual_start);
-        let end_addr = polyhal::VirtAddr::from(actual_start + len);
+        let start_addr = polyhal::VirtAddr::from(real_start);
+        let end_addr = polyhal::VirtAddr::from(real_start + len);
 
         if fd < 0 || fd as usize >= inner.fd_table.len() {
             return -1;
@@ -401,7 +391,7 @@ pub fn sys_mmap(
                 offset
             );
             if ok {
-                return actual_start as isize;
+                return real_start as isize;
             } else {
                 return -1;
             }
@@ -734,7 +724,7 @@ pub fn sys_ppoll(fds: *mut u8, nfds: usize, tmo_p: *const u8, _sigmask: *const u
         }
 
         stdout_release_if_owner();
-        suspend_current_and_run_next();
+        block_current_and_run_next(BlockReason::PollWait);
     }
 }
 
@@ -927,15 +917,21 @@ pub fn sys_pselect6(
         }
 
         stdout_release_if_owner();
-        suspend_current_and_run_next();
+        block_current_and_run_next(BlockReason::PollWait);
     }
 }
 
-pub fn sys_futex(_uaddr: *mut u32, futex_op: usize, _val: usize, _val2: usize, _uaddr2: *mut u32, _val3: usize) -> isize {
+pub fn sys_futex(uaddr: *mut u32, futex_op: usize, val: usize, _val2: usize, _uaddr2: *mut u32, _val3: usize) -> isize {
     match futex_op & 0x0F {
         0 | 9 => {
-            suspend_current_and_run_next();
-            0
+            let token = current_user_token();
+            let uval = *translated_ref(token, uaddr);
+            if uval == val as u32 {
+                suspend_current_and_run_next();
+                0
+            } else {
+                -11
+            }
         }
         1 | 10 => 0,
         6..=8 | 11..=13 => 0,

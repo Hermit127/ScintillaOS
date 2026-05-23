@@ -300,6 +300,18 @@ pub fn sys_listen(sockfd: usize, _backlog: usize) -> isize {
         return -95;
     }
 
+    {
+        let task = current_task().unwrap();
+        let inner = task.inner_exclusive_access();
+        if sockfd < inner.fd_table.len() {
+            if let Some(file) = &inner.fd_table[sockfd] {
+                if let Some(s) = file.as_any().downcast_ref::<SocketFile>() {
+                    s.was_listening.store(true, core::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
     let listening = crate::net::with_net_iface(|iface| {
         let sock: &TcpSocket = iface.sockets.get(handle);
         sock.is_listening()
