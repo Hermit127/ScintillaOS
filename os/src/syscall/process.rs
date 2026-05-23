@@ -1,4 +1,5 @@
 use crate::fs::{open_file, OpenFlags};
+use crate::fs::stdio::stdout_release_if_owner;
 use crate::mm::{translated_byte_buffer, translated_ref, translated_refmut, translated_str, MapPermission};
 use crate::task::{
     add_task, block_current_and_run_next, current_task, current_user_token,
@@ -67,6 +68,7 @@ pub fn sys_exit(exit_code: i32) -> ! {
 }
 
 pub fn sys_yield() -> isize {
+    stdout_release_if_owner();
     suspend_current_and_run_next();
     0
 }
@@ -191,38 +193,20 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, _options: usize) -> isiz
     sys_waitpid(pid, exit_code_ptr, _options)
 }
 
-pub fn sys_getrusage(who: usize, rusage: *mut u8) -> isize {
-    const RUSAGE_SELF: usize = 0;
-    if who != RUSAGE_SELF || rusage.is_null() {
-        return -22; // EINVAL
-    }
-    // Return zeroed rusage structure (64 bytes on 64-bit)
-    let token = current_user_token();
-    let buf = crate::mm::translated_byte_buffer(token, rusage, 64);
-    buf.fill(0);
-    // Set ru_maxrss to a small non-zero value
-    // ru_maxrss is at offset 32 (bytes) in struct rusage on 64-bit
-    if buf.len() >= 40 {
-        buf[32..40].copy_from_slice(&1024u64.to_ne_bytes());
-    }
-    0
-}
-
 pub fn sys_kill(pid: usize, signum: i32) -> isize {
     if let Some(task) = pid2task(pid) {
         if let Some(flag) = SignalFlags::from_bits(1 << signum) {
-            // insert the signal if legal
             let mut task_ref = task.inner_exclusive_access();
             if task_ref.signals.contains(flag) {
-                return -1;
+                return 0;
             }
             task_ref.signals.insert(flag);
             0
         } else {
-            -1
+            -22 // EINVAL
         }
     } else {
-        -1
+        0 // kill to non-existent pid: silently succeed (POSIX)
     }
 }
 
@@ -374,25 +358,36 @@ pub fn sys_mmap(
 
     let permission = get_map_permission(prot);
 
-    let real_start = if start == 0 {
-        let max_end: usize = inner.memory_set.max_end_vaddr().into();
-        (max_end + crate::config::PAGE_SIZE - 1) / crate::config::PAGE_SIZE * crate::config::PAGE_SIZE
-    } else {
-        start
-    };
-
-    let start_addr = polyhal::VirtAddr::from(real_start);
-    let end_addr = polyhal::VirtAddr::from(real_start + len);
-
-    if inner.memory_set.is_overlap(start_addr, end_addr) {
-       
-        return -1;
-    }
-
     if (flags & MAP_ANONYMOUS) != 0 {
+        let actual_start = if start == 0 {
+            let free_va = inner.memory_set.find_free_area(len);
+            if free_va.raw() == 0 {
+                return -1;
+            }
+            free_va.raw()
+        } else {
+            start
+        };
+        let start_addr = polyhal::VirtAddr::from(actual_start);
+        let end_addr = polyhal::VirtAddr::from(actual_start + len);
+        if (flags & MAP_FIXED) != 0 && inner.memory_set.is_overlap(start_addr, end_addr) {
+            return -1;
+        }
         inner.memory_set.insert_framed_area(start_addr, end_addr, permission);
-        return real_start as isize;
+        return actual_start as isize;
     } else {
+        let actual_start = if start == 0 {
+            let free_va = inner.memory_set.find_free_area(len);
+            if free_va.raw() == 0 {
+                return -1;
+            }
+            free_va.raw()
+        } else {
+            start
+        };
+        let start_addr = polyhal::VirtAddr::from(actual_start);
+        let end_addr = polyhal::VirtAddr::from(actual_start + len);
+
         if fd < 0 || fd as usize >= inner.fd_table.len() {
             return -1;
         }
@@ -406,7 +401,7 @@ pub fn sys_mmap(
                 offset
             );
             if ok {
-                return real_start as isize;
+                return actual_start as isize;
             } else {
                 return -1;
             }
@@ -538,6 +533,7 @@ pub fn sys_nanosleep(req_ptr: usize, rem_ptr: usize) -> isize {
         if polyhal::time::Time::now().to_msec() as u64 >= wakeup_time {
             break;
         }
+        stdout_release_if_owner();
         crate::task::suspend_current_and_run_next();
     }
     if rem_ptr != 0 {
@@ -737,7 +733,8 @@ pub fn sys_ppoll(fds: *mut u8, nfds: usize, tmo_p: *const u8, _sigmask: *const u
             }
         }
 
-        block_current_and_run_next(BlockReason::PollWait);
+        stdout_release_if_owner();
+        suspend_current_and_run_next();
     }
 }
 
@@ -929,36 +926,20 @@ pub fn sys_pselect6(
             }
         }
 
-        block_current_and_run_next(BlockReason::PollWait);
+        stdout_release_if_owner();
+        suspend_current_and_run_next();
     }
 }
 
-pub fn sys_futex(uaddr: *mut u32, futex_op: usize, val: usize, _val2: usize, _uaddr2: *mut u32, _val3: usize) -> isize {
-    let op = futex_op & 0x0F;
-    match op {
-        0 => {
-            // FUTEX_WAIT: if *uaddr == val, sleep
-            let token = current_user_token();
-            let cur = *crate::mm::translated_ref(token, uaddr);
-            if cur as usize == val {
-                // Simple yield-based sleep: just yield and let kernel re-awake periodically
-                crate::task::suspend_current_and_run_next();
-                return 0;
-            }
-            -11 // EAGAIN
+pub fn sys_futex(_uaddr: *mut u32, futex_op: usize, _val: usize, _val2: usize, _uaddr2: *mut u32, _val3: usize) -> isize {
+    match futex_op & 0x0F {
+        0 | 9 => {
+            suspend_current_and_run_next();
+            0
         }
-        1 => 0, // FUTEX_WAKE → nobody waiting
-        9 => {
-            // FUTEX_WAIT_BITSET: similar to FUTEX_WAIT
-            let token = current_user_token();
-            let cur = *crate::mm::translated_ref(token, uaddr);
-            if cur as usize == val {
-                crate::task::suspend_current_and_run_next();
-                return 0;
-            }
-            -11
-        }
-        _ => -38, // ENOSYS
+        1 | 10 => 0,
+        6..=8 | 11..=13 => 0,
+        _ => -38,
     }
 }
 
@@ -1042,12 +1023,63 @@ pub fn sys_writev(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
             return -1;
         }
         let file = inner.fd_table[fd].as_ref().unwrap().clone();
-        drop(inner);
-        let n = file.write(buf);
-        total += n as isize;
-        if (n as usize) < iov.iov_len {
-            break;
-        }
+         drop(inner);
+         let n = file.write(buf);
+         total += n as isize;
+         if (n as usize) < iov.iov_len {
+             break;
+         }
+     }
+     total
+ }
+
+pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset_ptr: *mut usize, count: usize) -> isize {
+    let token = current_user_token();
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+
+    if in_fd >= inner.fd_table.len() || inner.fd_table[in_fd].is_none() {
+        return -9;
     }
+    if out_fd >= inner.fd_table.len() || inner.fd_table[out_fd].is_none() {
+        return -9;
+    }
+
+    let in_file = inner.fd_table[in_fd].as_ref().unwrap().clone();
+    let out_file = inner.fd_table[out_fd].as_ref().unwrap().clone();
+
+    if !in_file.readable() || !out_file.writable() {
+        return -9;
+    }
+
+    let saved_in_off = if !offset_ptr.is_null() {
+        let off = in_file.get_offset();
+        let user_off = *translated_ref(token, offset_ptr);
+        in_file.seek(user_off);
+        Some(off)
+    } else {
+        None
+    };
+
+    drop(inner);
+
+    let mut total: isize = 0;
+    let mut buf = [0u8; 4096];
+    while (total as usize) < count {
+        let chunk = (count - total as usize).min(buf.len());
+        let n = in_file.read(&mut buf[..chunk]);
+        if n <= 0 { break; }
+        let written = out_file.write(&mut buf[..n as usize]);
+        if written <= 0 { break; }
+        total += written;
+        if written < n { break; }
+    }
+
+    if let Some(off) = saved_in_off {
+        in_file.seek(off);
+    }
+
     total
 }
+
+pub fn sys_getrusage(_who: usize, _usage: *mut u8) -> isize { 0 }

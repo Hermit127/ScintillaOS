@@ -82,6 +82,13 @@ impl VfsSuperBlock {
         }
     }
 
+    pub fn force_umount(&self) {
+        let mut data = self.fs_data.exclusive_access();
+        if let FsInner::Ext4(ref mut wrapper) = *data {
+            unsafe { wrapper.0.lwext4_umount().ok(); }
+        }
+    }
+
     // ---------- path-based ext4 operations ----------
 
     pub fn dir_get_entries(&self, fs_path: &str) -> Vec<DirEntry> {
@@ -326,6 +333,16 @@ impl VfsSuperBlock {
                 Err(_) => return false,
             };
             unsafe { ext4_fremove(c_path.as_ptr() as *const c_char) == EOK as i32 }
+        })
+    }
+
+    pub fn unlink_dir(&self, fs_path: &str) -> bool {
+        self.with_fs(|_fs| {
+            let c_path = match CString::new(fs_path) {
+                Ok(s) => s,
+                Err(_) => return false,
+            };
+            unsafe { ext4_dir_rm(c_path.as_ptr() as *const c_char) == EOK as i32 }
         })
     }
 

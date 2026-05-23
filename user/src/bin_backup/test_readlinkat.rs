@@ -66,3 +66,5 @@ pub fn main() -> i32 {
         0
     }
 }
+#[cfg(target_arch = "riscv64")]
+fn main() {}

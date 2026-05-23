@@ -2,7 +2,7 @@ pub mod block_device_stream;
 pub mod inode;
 mod pipe;
 pub mod proc;
-mod stdio;
+pub mod stdio;
 pub mod vfs;
 
 use alloc::string::String;
