@@ -919,10 +919,17 @@ pub fn sys_pselect6(
     }
 }
 
-pub fn sys_futex(_uaddr: *mut u32, futex_op: usize, _val: usize, _val2: usize, _uaddr2: *mut u32, _val3: usize) -> isize {
+pub fn sys_futex(uaddr: *mut u32, futex_op: usize, val: usize, _val2: usize, _uaddr2: *mut u32, _val3: usize) -> isize {
+    let token = current_user_token();
     match futex_op & 0x0F {
-        0 | 9 => -38, // FUTEX_WAIT / FUTEX_WAIT_BITSET → ENOSYS (musl fallback to busy-wait)
-        1 => 0,       // FUTEX_WAKE → nobody waiting
+        0 | 9 => {
+            let cur = *translated_ref(token, uaddr as *const u32);
+            if cur as usize == val {
+                suspend_current_and_run_next();
+            }
+            0
+        }
+        1 => 0,
         _ => -38,
     }
 }
