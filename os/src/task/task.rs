@@ -3,7 +3,7 @@ use super::{pid_alloc, PidHandle, SignalFlags};
 use crate::config::KERNEL_STACK_SIZE;
 use crate::fs::vfs::{Dentry, ROOT_DENTRY};
 use crate::fs::{File, Stdin, Stdout};
-use crate::mm::{translated_refmut, LoadedElf, MemorySet};
+use crate::mm::{translated_refmut, LoadedElf, MapArea, MapPermission, MapType, MemorySet};
 use crate::sync::UPSafeCell;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -319,7 +319,16 @@ impl TaskControlBlock {
         let mut inner = self.inner_exclusive_access();
         inner.memory_set = memory_set;
         inner.heap_bottom = heap_bottom;
-        inner.program_brk = heap_bottom;
+        // Pre-allocate 16MB heap for iperf3 (needs 128KB stream buffers)
+        let pre_brk = heap_bottom + 0x100_0000;
+        let start_va = polyhal::VirtAddr::from(heap_bottom);
+        let end_va = polyhal::VirtAddr::from((pre_brk + crate::config::PAGE_SIZE - 1) / crate::config::PAGE_SIZE * crate::config::PAGE_SIZE);
+        if end_va > start_va {
+            let heap_area = MapArea::new(start_va, end_va, MapType::Framed,
+                MapPermission::R | MapPermission::W | MapPermission::U);
+            inner.memory_set.push(heap_area, None, 0);
+        }
+        inner.program_brk = pre_brk;
         inner.trap_cx = TrapFrame::new();
 
         let mut trap_cx = TrapFrame::new();
@@ -433,6 +442,7 @@ pub enum BlockReason {
     TcpAccept(usize),
     TcpConnect(usize),
     UdpRecv(usize),
+    PollWait,
 }
 
 #[derive(Copy, Clone, PartialEq)]

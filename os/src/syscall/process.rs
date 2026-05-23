@@ -1,8 +1,9 @@
 use crate::fs::{open_file, OpenFlags};
 use crate::mm::{translated_byte_buffer, translated_ref, translated_refmut, translated_str, MapPermission};
 use crate::task::{
-    add_task, current_task, current_user_token, exit_current_and_run_next, pid2task,
-    sleep_current_and_run_next, suspend_current_and_run_next, SignalAction, SignalFlags, MAX_SIG,
+    add_task, block_current_and_run_next, current_task, current_user_token,
+    exit_current_and_run_next, pid2task,
+    sleep_current_and_run_next, suspend_current_and_run_next, BlockReason, SignalAction, SignalFlags, MAX_SIG,
 };
 use alloc::format;
 use alloc::string::String;
@@ -373,8 +374,15 @@ pub fn sys_mmap(
 
     let permission = get_map_permission(prot);
 
-    let start_addr = polyhal::VirtAddr::from(start);
-    let end_addr = polyhal::VirtAddr::from(start + len);
+    let real_start = if start == 0 {
+        let max_end: usize = inner.memory_set.max_end_vaddr().into();
+        (max_end + crate::config::PAGE_SIZE - 1) / crate::config::PAGE_SIZE * crate::config::PAGE_SIZE
+    } else {
+        start
+    };
+
+    let start_addr = polyhal::VirtAddr::from(real_start);
+    let end_addr = polyhal::VirtAddr::from(real_start + len);
 
     if inner.memory_set.is_overlap(start_addr, end_addr) {
        
@@ -383,13 +391,12 @@ pub fn sys_mmap(
 
     if (flags & MAP_ANONYMOUS) != 0 {
         inner.memory_set.insert_framed_area(start_addr, end_addr, permission);
-        return start as isize;
+        return real_start as isize;
     } else {
         if fd < 0 || fd as usize >= inner.fd_table.len() {
-            crate::println!("[mmap] bad fd={} table_len={}", fd, inner.fd_table.len());
             return -1;
         }
-        
+    
         if let Some(file) = inner.fd_table[fd as usize].clone() {
             let ok = inner.memory_set.insert_file_area(
                 start_addr, 
@@ -399,14 +406,11 @@ pub fn sys_mmap(
                 offset
             );
             if ok {
-                crate::println!("[mmap] success start={} len={}", start, len);
-                return start as isize;
+                return real_start as isize;
             } else {
-                crate::println!("[mmap] insert_file_area failed");
                 return -1;
             }
         } else {
-            crate::println!("[mmap] fd {} not in table", fd);
             return -1;
         }
     }
@@ -682,6 +686,8 @@ pub fn sys_ppoll(fds: *mut u8, nfds: usize, tmo_p: *const u8, _sigmask: *const u
     let start_ms = polyhal::time::Time::now().to_msec() as usize;
 
     loop {
+        crate::net::net_poll();
+        crate::net::net_poll();
         let mut ready = 0i32;
         let task = current_task().unwrap();
         let mut inner = task.inner_exclusive_access();
@@ -731,7 +737,7 @@ pub fn sys_ppoll(fds: *mut u8, nfds: usize, tmo_p: *const u8, _sigmask: *const u
             }
         }
 
-        suspend_current_and_run_next();
+        block_current_and_run_next(BlockReason::PollWait);
     }
 }
 
@@ -789,6 +795,7 @@ pub fn sys_pselect6(
     let mut wfds = [0u64; FD_SET_LONGS];
     let mut efds = [0u64; FD_SET_LONGS];
 
+    // Save original fd_sets for resetting each iteration
     if !readfds.is_null() {
         copy_fdset(&mut rfds, readfds);
     }
@@ -798,6 +805,9 @@ pub fn sys_pselect6(
     if !exceptfds.is_null() {
         copy_fdset(&mut efds, exceptfds);
     }
+    let orig_rfds = rfds;
+    let orig_wfds = wfds;
+    let orig_efds = efds;
 
     let timeout_ms = if !timeout.is_null() {
         let ts: &crate::task::TimeSpec = translated_ref(token, timeout as *const crate::task::TimeSpec);
@@ -809,6 +819,12 @@ pub fn sys_pselect6(
     let start_ms = polyhal::time::Time::now().to_msec() as usize;
 
     loop {
+        // Reset fd_sets from saved originals (user-space buffer is modified by write-back)
+        rfds = orig_rfds;
+        wfds = orig_wfds;
+        efds = orig_efds;
+        crate::net::net_poll();
+        crate::net::net_poll();
         let mut ready = 0i32;
         let n = nfds.min(FD_SETSIZE);
 
@@ -913,15 +929,36 @@ pub fn sys_pselect6(
             }
         }
 
-        suspend_current_and_run_next();
+        block_current_and_run_next(BlockReason::PollWait);
     }
 }
 
-pub fn sys_futex(_uaddr: *mut u32, futex_op: usize, _val: usize, _val2: usize, _uaddr2: *mut u32, _val3: usize) -> isize {
-    match futex_op & 0x0F {
-        0 | 9 => -38, // FUTEX_WAIT / FUTEX_WAIT_BITSET → ENOSYS (musl fallback to busy-wait)
-        1 => 0,       // FUTEX_WAKE → nobody waiting
-        _ => -38,
+pub fn sys_futex(uaddr: *mut u32, futex_op: usize, val: usize, _val2: usize, _uaddr2: *mut u32, _val3: usize) -> isize {
+    let op = futex_op & 0x0F;
+    match op {
+        0 => {
+            // FUTEX_WAIT: if *uaddr == val, sleep
+            let token = current_user_token();
+            let cur = *crate::mm::translated_ref(token, uaddr);
+            if cur as usize == val {
+                // Simple yield-based sleep: just yield and let kernel re-awake periodically
+                crate::task::suspend_current_and_run_next();
+                return 0;
+            }
+            -11 // EAGAIN
+        }
+        1 => 0, // FUTEX_WAKE → nobody waiting
+        9 => {
+            // FUTEX_WAIT_BITSET: similar to FUTEX_WAIT
+            let token = current_user_token();
+            let cur = *crate::mm::translated_ref(token, uaddr);
+            if cur as usize == val {
+                crate::task::suspend_current_and_run_next();
+                return 0;
+            }
+            -11
+        }
+        _ => -38, // ENOSYS
     }
 }
 
@@ -929,8 +966,26 @@ pub fn sys_madvise(_start: usize, _len: usize, _advice: usize) -> isize {
     0
 }
 
-pub fn sys_clock_gettime(_clk_id: usize, _ts: *mut u8) -> isize {
-    -38
+pub fn sys_clock_gettime(clk_id: usize, ts: *mut u8) -> isize {
+    const CLOCK_REALTIME: usize = 0;
+    const CLOCK_MONOTONIC: usize = 1;
+
+    if clk_id != CLOCK_REALTIME && clk_id != CLOCK_MONOTONIC {
+        return -22; // EINVAL
+    }
+
+    #[repr(C)]
+    struct TimeSpec {
+        tv_sec: u64,
+        tv_nsec: u64,
+    }
+
+    let now_ns = polyhal::time::Time::now().to_nsec() as u64;
+    let token = current_user_token();
+    let ts_ref = crate::mm::translated_refmut(token, ts as *mut TimeSpec);
+    ts_ref.tv_sec = now_ns / 1_000_000_000;
+    ts_ref.tv_nsec = now_ns % 1_000_000_000;
+    0
 }
 
 pub fn sys_readv(fd: usize, iov: *const u8, iovcnt: usize) -> isize {

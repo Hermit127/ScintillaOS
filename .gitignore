@@ -43,3 +43,5 @@ zig-macos-*/
 # temporary build/test artifacts
 tmp/
 !tmp/hello.c
+riscv64-linux-musl-cross/
+tmp-musl-cross.tgz

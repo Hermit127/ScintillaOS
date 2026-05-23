@@ -18,6 +18,9 @@ impl TaskManager {
     pub fn add(&mut self, task: Arc<TaskControlBlock>) {
         self.ready_queue.push_back(task);
     }
+    pub fn add_priority(&mut self, task: Arc<TaskControlBlock>) {
+        self.ready_queue.push_front(task);
+    }
     pub fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
         self.ready_queue.pop_front()
     }
@@ -38,9 +41,17 @@ pub fn add_task(task: Arc<TaskControlBlock>) {
     TASK_MANAGER.exclusive_access().add(task);
 }
 
+pub fn add_priority_task(task: Arc<TaskControlBlock>) {
+    TASK_MANAGER.exclusive_access().add_priority(task);
+}
+
 pub fn fetch_task() -> Option<Arc<TaskControlBlock>> {
     //trace!("os::task::manager::fetch_task");
     TASK_MANAGER.exclusive_access().fetch()
+}
+
+pub fn ready_queue_len() -> usize {
+    TASK_MANAGER.exclusive_access().ready_queue.len()
 }
 
 pub fn pid2task(pid: usize) -> Option<Arc<TaskControlBlock>> {

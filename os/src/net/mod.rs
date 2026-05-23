@@ -181,7 +181,7 @@ pub fn wake_net_blocked_tasks() {
     use smoltcp::iface::SocketHandle;
     use smoltcp::socket::tcp::Socket as TcpSocket;
     use smoltcp::socket::udp::Socket as UdpSocket;
-    use crate::task::{add_task, BlockReason, TaskStatus, NET_BLOCK_QUEUE};
+    use crate::task::{add_task, add_priority_task, BlockReason, TaskStatus, NET_BLOCK_QUEUE};
 
     let inited = NET_INITED.load(core::sync::atomic::Ordering::Relaxed);
     if !inited {
@@ -231,6 +231,7 @@ pub fn wake_net_blocked_tasks() {
                             sock.can_recv()
                         }).unwrap_or(true)
                     }
+                    Some(BlockReason::PollWait) => true,
                     None => true, // block_reason cleared, should be woken
                 }
             };
@@ -246,7 +247,7 @@ pub fn wake_net_blocked_tasks() {
         inner.task_status = TaskStatus::Ready;
         inner.block_reason = None;
         drop(inner);
-        add_task(task.clone());
+        add_priority_task(task.clone());
     }
 }
 

@@ -19,7 +19,7 @@ use crate::sync::UPSafeCell;
 use alloc::vec::Vec;
 
 pub use action::{SignalAction, SignalActions};
-pub use manager::{add_task, pid2task, PID2TCB};
+pub use manager::{add_task, pid2task, PID2TCB, ready_queue_len, add_priority_task};
 pub use pid::{pid_alloc, PidHandle};
 pub use processor::{
     current_task, current_user_token, init_kernel_page, run_tasks, schedule, take_current_task,
@@ -97,6 +97,7 @@ pub fn block_current_and_run_next(block_reason: BlockReason) {
     let task_cx_ptr = &mut task_inner.task_cx as *mut KContext;
     drop(task_inner);
     take_current_task();
+    NET_BLOCK_QUEUE.exclusive_access().push(task.clone());
     schedule(task_cx_ptr);
     task.record_time_resume();
 }
