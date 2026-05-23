@@ -1,4 +1,5 @@
 use crate::fs::{open_file, OpenFlags};
+use crate::fs::stdio::stdout_release_if_owner;
 use crate::mm::{translated_byte_buffer, translated_ref, translated_refmut, translated_str, MapPermission};
 use crate::task::{
     add_task, current_task, current_user_token, exit_current_and_run_next, pid2task,
@@ -66,6 +67,7 @@ pub fn sys_exit(exit_code: i32) -> ! {
 }
 
 pub fn sys_yield() -> isize {
+    stdout_release_if_owner();
     suspend_current_and_run_next();
     0
 }
@@ -531,6 +533,7 @@ pub fn sys_nanosleep(req_ptr: usize, rem_ptr: usize) -> isize {
         if polyhal::time::Time::now().to_msec() as u64 >= wakeup_time {
             break;
         }
+        stdout_release_if_owner();
         crate::task::suspend_current_and_run_next();
     }
     if rem_ptr != 0 {
@@ -728,6 +731,7 @@ pub fn sys_ppoll(fds: *mut u8, nfds: usize, tmo_p: *const u8, _sigmask: *const u
             }
         }
 
+        stdout_release_if_owner();
         suspend_current_and_run_next();
     }
 }
@@ -910,6 +914,7 @@ pub fn sys_pselect6(
             }
         }
 
+        stdout_release_if_owner();
         suspend_current_and_run_next();
     }
 }

@@ -1,10 +1,36 @@
 use polyhal::debug_console::DebugConsole;
 
 use super::{File, Kstat, S_IFCHR};
-use core::sync::atomic::{AtomicBool, Ordering};
-use crate::task::suspend_current_and_run_next;
+use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use crate::task::{current_task, suspend_current_and_run_next};
 
 static STDOUT_BUSY: AtomicBool = AtomicBool::new(false);
+static STDOUT_OWNER: AtomicI32 = AtomicI32::new(0);
+
+fn stdout_acquire() {
+    let pid = current_task().unwrap().getpid() as i32;
+    loop {
+        let owner = STDOUT_OWNER.load(Ordering::Acquire);
+        if owner == pid {
+            return;
+        }
+        if owner == 0
+            && STDOUT_OWNER
+                .compare_exchange(0, pid, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+        {
+            return;
+        }
+        suspend_current_and_run_next();
+    }
+}
+
+pub fn stdout_release_if_owner() {
+    if let Some(task) = current_task() {
+        let pid = task.getpid() as i32;
+        STDOUT_OWNER.compare_exchange(pid, 0, Ordering::Release, Ordering::Relaxed).ok();
+    }
+}
 
 pub struct Stdin;
 
@@ -25,6 +51,7 @@ impl File for Stdin {
                 c = ch;
                 break;
             }
+            stdout_release_if_owner();
             suspend_current_and_run_next();
         }
         user_buf[0] = c as u8;
@@ -50,6 +77,7 @@ impl File for Stdout {
         panic!("Cannot read from stdout!");
     }
     fn write(&self, user_buf: &mut [u8]) -> isize {
+        stdout_acquire();
         while STDOUT_BUSY.swap(true, Ordering::Acquire) {
             core::hint::spin_loop();
         }
