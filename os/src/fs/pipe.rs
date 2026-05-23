@@ -4,6 +4,8 @@ use alloc::sync::{Arc, Weak};
 
 use crate::task::suspend_current_and_run_next;
 
+use crate::fs::stdio::stdout_release_if_owner;
+
 pub struct Pipe {
     readable: bool,
     writable: bool,
@@ -124,6 +126,7 @@ impl File for Pipe {
                     return already_read as isize;
                 }
                 drop(ring_buffer);
+                stdout_release_if_owner();
                 suspend_current_and_run_next();
                 continue;
             }
@@ -150,6 +153,7 @@ impl File for Pipe {
             let loop_write = ring_buffer.available_write();
             if loop_write == 0 {
                 drop(ring_buffer);
+                stdout_release_if_owner();
                 suspend_current_and_run_next();
                 continue;
             }

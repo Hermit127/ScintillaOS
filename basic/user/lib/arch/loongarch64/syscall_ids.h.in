@@ -310,6 +310,7 @@
 #define __NR_fcntl __NR3264_fcntl
 #define __NR_statfs __NR3264_statfs
 #define __NR_fstatfs __NR3264_fstatfs
+#define __NR_fstat 80
 #define __NR_truncate __NR3264_truncate
 #define __NR_ftruncate __NR3264_ftruncate
 #define __NR_lseek __NR3264_lseek

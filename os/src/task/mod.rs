@@ -79,6 +79,7 @@ pub fn suspend_current_and_run_next() {
 }
 
 pub fn sleep_current_and_run_next() {
+    crate::fs::stdio::stdout_release_if_owner();
     let task = current_task().unwrap();
     task.record_time_suspend();
     let mut task_inner = task.inner_exclusive_access();
@@ -90,6 +91,7 @@ pub fn sleep_current_and_run_next() {
 }
 
 pub fn block_current_and_run_next(block_reason: BlockReason) {
+    crate::fs::stdio::stdout_release_if_owner();
     let task = current_task().unwrap();
     task.record_time_suspend();
     let mut task_inner = task.inner_exclusive_access();
@@ -105,6 +107,7 @@ pub const IDLE_PID: usize = 0;
 
 /// Exit the current 'Running' task and run the next task in task list.
 pub fn exit_current_and_run_next(exit_code: i32) {
+    crate::fs::stdio::stdout_release_if_owner();
     trace!("os::task::exit_current_and_run_next");
     // take from Processor
     let task = current_task().unwrap();
@@ -317,6 +320,7 @@ pub fn handle_signals() {
         if !frozen || killed {
             break;
         }
+        crate::fs::stdio::stdout_release_if_owner();
         suspend_current_and_run_next();
     }
 }

@@ -126,7 +126,7 @@ impl TxToken for VirtioTxToken<'_> {
             // ARP broadcasts or packets to our own MAC → push into loopback queue
             if is_broadcast || is_self {
                 let mut queue = self.loopback_queue.exclusive_access();
-                if queue.len() < 256 {
+                if queue.len() < 2048 {
                     queue.push_back(frame.to_vec());
                 }
                 looped_back = true;
