@@ -205,14 +205,14 @@ pub fn mkdir_at(base: Option<Arc<Dentry>>, path: &str) -> bool {
     vfs_create(&parent, &name, true).is_some()
 }
 
-pub fn unlink_at(base: Option<Arc<Dentry>>, path: &str) -> bool {
+pub fn unlink_at(base: Option<Arc<Dentry>>, path: &str, is_dir: bool) -> bool {
     let start = base.unwrap_or_else(|| crate::fs::vfs::ROOT_DENTRY.clone());
     let dentry = match vfs_resolve_path(&start, path) {
         Some(d) => d,
         None => return false,
     };
 
-    if dentry.is_dir {
+    if dentry.is_dir != is_dir {
         return false;
     }
 
@@ -221,7 +221,11 @@ pub fn unlink_at(base: Option<Arc<Dentry>>, path: &str) -> bool {
         None => return false,
     };
 
-    let ok = dentry.super_block.unlink_file(&dentry.fs_path);
+    let ok = if is_dir {
+        dentry.super_block.unlink_dir(&dentry.fs_path)
+    } else {
+        dentry.super_block.unlink_file(&dentry.fs_path)
+    };
 
     if ok {
         let mut children = parent.children.exclusive_access();

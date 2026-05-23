@@ -163,8 +163,14 @@ pub fn sys_unlink(path: *const u8) -> isize {
     sys_unlinkat(AT_FDCWD, path, 0)
 }
 
+const AT_REMOVEDIR: u32 = 0x200;
+
 pub fn sys_unlinkat(dirfd: isize, path: *const u8, flags: u32) -> isize {
-    if flags != 0 || path.is_null() {
+    if path.is_null() {
+        return -1;
+    }
+    let is_dir = (flags & AT_REMOVEDIR) != 0;
+    if flags != 0 && !is_dir {
         return -1;
     }
     let token = current_user_token();
@@ -173,7 +179,7 @@ pub fn sys_unlinkat(dirfd: isize, path: *const u8, flags: u32) -> isize {
         Some(base) => base,
         None => return -1,
     };
-    if unlink_at(Some(base_dir), path.as_str()) {
+    if unlink_at(Some(base_dir), path.as_str(), is_dir) {
         0
     } else {
         -1

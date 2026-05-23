@@ -336,6 +336,16 @@ impl VfsSuperBlock {
         })
     }
 
+    pub fn unlink_dir(&self, fs_path: &str) -> bool {
+        self.with_fs(|_fs| {
+            let c_path = match CString::new(fs_path) {
+                Ok(s) => s,
+                Err(_) => return false,
+            };
+            unsafe { ext4_dir_rm(c_path.as_ptr() as *const c_char) == EOK as i32 }
+        })
+    }
+
     pub fn set_atime(&self, fs_path: &str, atime: u32) {
         self.with_fs(|_fs| {
             if let Ok(c_path) = CString::new(fs_path) {
