@@ -925,7 +925,8 @@ pub fn sys_futex(_uaddr: *mut u32, futex_op: usize, _val: usize, _val2: usize, _
             suspend_current_and_run_next();
             0
         }
-        1 => 0,
+        1 | 10 => 0,
+        6..=8 | 11..=13 => 0,
         _ => -38,
     }
 }
