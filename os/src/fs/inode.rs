@@ -16,6 +16,7 @@ const EXT4_BLOCK_SIZE: u32 = 4096;
 pub struct OSInode {
     readable: bool,
     writable: bool,
+    append: bool,
     dentry: Arc<Dentry>,
     inner: UPSafeCell<OSInodeInner>,
 }
@@ -25,12 +26,20 @@ pub struct OSInodeInner {
 }
 
 impl OSInode {
-    pub fn new(readable: bool, writable: bool, dentry: Arc<Dentry>) -> Self {
+    pub fn new(readable: bool, writable: bool, append: bool, dentry: Arc<Dentry>) -> Self {
+        let offset = if append {
+            dentry.super_block.get_inode_info(&dentry.fs_path)
+                .map(|i| i.size as usize)
+                .unwrap_or(0)
+        } else {
+            0
+        };
         Self {
             readable,
             writable,
+            append,
             dentry,
-            inner: unsafe { UPSafeCell::new(OSInodeInner { offset: 0 }) },
+            inner: unsafe { UPSafeCell::new(OSInodeInner { offset }) },
         }
     }
     pub fn dentry(&self) -> &Arc<Dentry> {
@@ -97,6 +106,7 @@ bitflags! {
         const RDWR = 1 << 1;
         const CREATE = 0x40;
         const TRUNC = 0x200;
+        const APPEND = 0x400;
         const DIRECTORY = 0x10000;
     }
 }
@@ -159,7 +169,8 @@ pub fn open_file_at(
                     }
                 }
                 let (readable, writable) = flags.read_write();
-                return Some(Arc::new(OSInode::new(readable, writable, dentry)));
+                let append = flags.contains(OpenFlags::APPEND);
+                return Some(Arc::new(OSInode::new(readable, writable, append, dentry)));
             }
         }
 
@@ -167,7 +178,7 @@ pub fn open_file_at(
             vfs_resolve_parent_and_name(&start, path)?;
         let dentry = vfs_create(&parent, &name, false)?;
         let (readable, writable) = flags.read_write();
-        return Some(Arc::new(OSInode::new(readable, writable, dentry)));
+        return Some(Arc::new(OSInode::new(readable, writable, flags.contains(OpenFlags::APPEND), dentry)));
     }
 
     let dentry = vfs_resolve_with_fallback(&start, path)?;
@@ -187,7 +198,8 @@ pub fn open_file_at(
     } else {
         flags.read_write()
     };
-    Some(Arc::new(OSInode::new(readable, writable, dentry)))
+    let append = !dentry.is_dir && flags.contains(OpenFlags::APPEND);
+    Some(Arc::new(OSInode::new(readable, writable, append, dentry)))
 }
 
 pub fn mkdir_at(base: Option<Arc<Dentry>>, path: &str) -> bool {
@@ -260,6 +272,11 @@ impl File for OSInode {
 
     fn write(&self, buf: &mut [u8]) -> isize {
         let mut inner = self.inner.exclusive_access();
+        if self.append {
+            inner.offset = self.dentry.super_block.get_inode_info(&self.dentry.fs_path)
+                .map(|i| i.size as usize)
+                .unwrap_or(inner.offset);
+        }
         let write_size = self.dentry.super_block.write_at(
             &self.dentry.fs_path,
             inner.offset,

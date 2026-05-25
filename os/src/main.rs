@@ -61,15 +61,7 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             ctx[TrapFrameArgs::RET] = result as usize;
         }
         StorePageFault(_paddr) | LoadPageFault(_paddr) | InstructionPageFault(_paddr) => {
-            /*
-            println!(
-                "[kernel] {:?} in application, bad addr = {:#x}, bad instruction = {:#x}, kernel killed it.",
-                scause.cause(),
-                stval,
-                current_trap_cx().sepc,
-            );
-            */
-            current_add_signal(SignalFlags::SIGSEGV);
+            exit_current_and_run_next(-11);
         }
         IllegalInstruction(_) => {
             current_add_signal(SignalFlags::SIGILL);

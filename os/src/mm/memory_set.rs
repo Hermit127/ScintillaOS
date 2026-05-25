@@ -72,13 +72,22 @@ impl MemorySet {
                     map_perm |= MapPermission::X;
                 }
                 let map_area = MapArea::new(start_va, end_va, MapType::Framed, map_perm);
-                max_end_va = map_area.vaddr_range.get_end();
+                max_end_va = max_end_va.max(map_area.vaddr_range.get_end());
                 let page_off = start_va.raw() % PAGE_SIZE;
-                memory_set.push(
-                    map_area,
-                    Some(&elf.input[ph.offset() as usize..(ph.offset() + ph.file_size()) as usize]),
-                    page_off,
-                );
+                if page_off > 0 {
+                    let aligned_va = start_va.raw() - page_off;
+                    let file_start = ph.offset() as usize - page_off;
+                    let file_end = (ph.offset() + ph.file_size()) as usize;
+                    let aligned_data = &elf.input[file_start..file_end];
+                    let aligned_map = MapArea::new(aligned_va.into(), end_va, MapType::Framed, map_perm);
+                    memory_set.push(aligned_map, Some(aligned_data), 0);
+                } else {
+                    memory_set.push(
+                        map_area,
+                        Some(&elf.input[ph.offset() as usize..(ph.offset() + ph.file_size()) as usize]),
+                        0,
+                    );
+                }
             }
         }
         // map user stack with U flags

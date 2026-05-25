@@ -152,10 +152,8 @@ pub fn sys_exec(path: *const u8, mut args: *const usize) -> isize {
     if let Some(app_inode) = app_inode {
         let all_data = app_inode.read_all();
         let task = current_task().unwrap();
-        let argc = args_vec.len();
         task.exec(all_data.as_slice(), args_vec);
-        // return argc because cx.x[10] will be covered with it later
-        argc as isize
+        0
     } else {
         -1
     }
@@ -924,6 +922,7 @@ pub fn sys_pselect6(
 pub fn sys_futex(uaddr: *mut u32, futex_op: usize, val: usize, _val2: usize, _uaddr2: *mut u32, _val3: usize) -> isize {
     match futex_op & 0x0F {
         0 | 9 => {
+<<<<<<< HEAD
             let token = current_user_token();
             let uval = *translated_ref(token, uaddr);
             if uval == val as u32 {
@@ -932,6 +931,10 @@ pub fn sys_futex(uaddr: *mut u32, futex_op: usize, val: usize, _val2: usize, _ua
             } else {
                 -11
             }
+=======
+            crate::task::suspend_current_and_run_next();
+            0
+>>>>>>> 1fd9b0ec (support glibc busybox tests)
         }
         1 | 10 => 0,
         6..=8 | 11..=13 => 0,

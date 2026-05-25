@@ -267,8 +267,10 @@ impl TaskControlBlock {
         }
         string_addrs.reverse();
 
-        // Step 2: 16-byte alignment
-        sp -= sp % 16;
+        // Step 2: pad so the final initial stack pointer still points at argc and is 16-byte aligned.
+        let target_mod = if argc % 2 == 0 { 8 } else { 0 };
+        let sp_mod = sp % 16;
+        sp -= (sp_mod + 16 - target_mod) % 16;
 
         // Step 3: AT_RANDOM data (16 bytes below string area)
         sp -= 16;
@@ -327,10 +329,7 @@ impl TaskControlBlock {
         // Step 8: argc
         sp -= 8;
         *translated_refmut(token, sp as *mut u64) = argc as u64;
-        let mut crt_sp = sp;
-
-        // 16-byte align crt_sp for ABI requirement
-        crt_sp -= crt_sp % 16;
+        let crt_sp = sp;
 
         let mut inner = self.inner_exclusive_access();
         inner.memory_set = memory_set;
@@ -344,7 +343,7 @@ impl TaskControlBlock {
         let mut trap_cx = TrapFrame::new();
         trap_cx[TrapFrameArgs::SEPC] = entry_point;
         trap_cx[TrapFrameArgs::SP] = crt_sp;
-        trap_cx[TrapFrameArgs::ARG0] = argc;
+        trap_cx[TrapFrameArgs::ARG0] = 0; // a0 = 0: argc on stack only, so rtld_fini=NULL for glibc
         trap_cx[TrapFrameArgs::ARG1] = argv_base;
         *inner.get_trap_cx() = trap_cx;
     }

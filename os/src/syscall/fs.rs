@@ -786,7 +786,7 @@ pub fn sys_fstatat(dirfd: isize, path: *const u8, stat_buf: *mut u8, flags: usiz
         None => return -2,
     };
 
-    let inode = crate::fs::inode::OSInode::new(false, false, dentry);
+    let inode = crate::fs::inode::OSInode::new(false, false, false, dentry);
     let st = inode.stat();
     *translated_refmut(token, stat_buf as *mut Kstat) = st;
     0

@@ -150,17 +150,27 @@ fs-img: $(APPS)
 		cp -f tmp/busybox-musl $(ROOTFS_BIN_DIR)/busybox 2>/dev/null || true; \
 		cp -f tmp/busybox-musl $(ROOTFS_DIR)/busybox 2>/dev/null || true; \
 		cp -f tmp/busybox-glibc-riscv64 $(ROOTFS_BIN_DIR)/busybox-glibc 2>/dev/null || true; \
-		cat tmp/busybox_cmd.txt > $(ROOTFS_DIR)/busybox_cmd.txt 2>/dev/null || true; \
+		cp -f tmp/busybox-glibc-riscv64 $(ROOTFS_DIR)/busybox-glibc 2>/dev/null || true; \
+		cat testsuits-for-oskernel/scripts/busybox/busybox_cmd.txt > $(ROOTFS_DIR)/busybox_cmd.txt 2>/dev/null || cat tmp/busybox_cmd.txt > $(ROOTFS_DIR)/busybox_cmd.txt 2>/dev/null || true; \
+		sed 's#\./busybox#./busybox-glibc#g' testsuits-for-oskernel/scripts/busybox/busybox_cmd.txt > $(ROOTFS_DIR)/busybox_glibc_cmd.txt 2>/dev/null || true; \
+		cp -f tmp/busybox_glibc_testcode.sh $(ROOTFS_DIR)/busybox_glibc_testcode.sh 2>/dev/null || true; \
 		ln -sf busybox $(ROOTFS_BIN_DIR)/ls 2>/dev/null || true; \
 		printf '#!/bin/sh\n./busybox --install -s /bin 2>/dev/null\necho "#### OS COMP TEST GROUP START busybox-musl ####"\n./busybox cat ./busybox_cmd.txt | while read line; do case "$$line" in ""|\\#*) continue ;; *"|"*) eval "$$line"; RTN=$$? ;; *) ./busybox $$line; RTN=$$? ;; esac; if [ $$RTN -ne 0 ] && [ "$$line" != "false" ]; then echo "testcase busybox $$line fail"; else echo "testcase busybox $$line success"; fi; done\necho "#### OS COMP TEST GROUP END busybox-musl ####"\n' > $(ROOTFS_DIR)/busybox_testcode.sh; \
 	fi
 	@if [ "$(ARCH)" = "loongarch64" ]; then \
+		cp -f tmp/busybox-musl-loongarch64 $(ROOTFS_BIN_DIR)/busybox 2>/dev/null || true; \
+		cp -f tmp/busybox-musl-loongarch64 $(ROOTFS_DIR)/busybox 2>/dev/null || true; \
 		cp -f tmp/busybox-glibc-loongarch64 $(ROOTFS_BIN_DIR)/busybox-glibc 2>/dev/null || true; \
+		cp -f tmp/busybox-glibc-loongarch64 $(ROOTFS_DIR)/busybox-glibc 2>/dev/null || true; \
+		cat testsuits-for-oskernel/scripts/busybox/busybox_cmd.txt > $(ROOTFS_DIR)/busybox_cmd.txt 2>/dev/null || cat tmp/busybox_cmd.txt > $(ROOTFS_DIR)/busybox_cmd.txt 2>/dev/null || true; \
+		sed 's#\./busybox#./busybox-glibc#g' testsuits-for-oskernel/scripts/busybox/busybox_cmd.txt > $(ROOTFS_DIR)/busybox_glibc_cmd.txt 2>/dev/null || true; \
+		cp -f tmp/busybox_glibc_testcode.sh $(ROOTFS_DIR)/busybox_glibc_testcode.sh 2>/dev/null || true; \
+		ln -sf busybox $(ROOTFS_BIN_DIR)/ls 2>/dev/null || true; \
+		printf '#!/bin/sh\n./busybox --install -s /bin 2>/dev/null\necho "#### OS COMP TEST GROUP START busybox-musl ####"\n./busybox cat ./busybox_cmd.txt | while read line; do case "$$line" in ""|\\#*) continue ;; *"|"*) eval "$$line"; RTN=$$? ;; *) ./busybox $$line; RTN=$$? ;; esac; if [ $$RTN -ne 0 ] && [ "$$line" != "false" ]; then echo "testcase busybox $$line fail"; else echo "testcase busybox $$line success"; fi; done\necho "#### OS COMP TEST GROUP END busybox-musl ####"\n' > $(ROOTFS_DIR)/busybox_testcode.sh; \
 	fi
 	@cp -f tmp/debug_test.sh $(ROOTFS_DIR)/debug_test.sh 2>/dev/null || true
 	@cp -f tmp/run_all.sh $(ROOTFS_DIR)/run_all.sh 2>/dev/null || true
 	@cp -f tmp/basic_testcode.sh $(ROOTFS_DIR)/basic_testcode.sh 2>/dev/null || true
-	@cp -f tmp/busybox-musl $(ROOTFS_DIR)/busybox 2>/dev/null || true
 	@mkdir -p $(ROOTFS_DIR)/etc $(ROOTFS_DIR)/sbin 2>/dev/null || true
 	@cp -f tmp/init.sh $(ROOTFS_DIR)/etc/init.sh 2>/dev/null || true
 	@cp -f target/$(TARGET)/release/contest_runner $(ROOTFS_DIR)/contest_runner 2>/dev/null || true
