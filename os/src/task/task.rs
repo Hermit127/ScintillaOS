@@ -3,7 +3,7 @@ use super::{pid_alloc, PidHandle, SignalFlags};
 use crate::config::KERNEL_STACK_SIZE;
 use crate::fs::vfs::{Dentry, ROOT_DENTRY};
 use crate::fs::{File, Stdin, Stdout};
-use crate::mm::{translated_refmut, LoadedElf, MemorySet};
+use crate::mm::{translated_refmut, LoadedElf, MapArea, MapPermission, MapType, MemorySet};
 use crate::sync::UPSafeCell;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -232,12 +232,27 @@ impl TaskControlBlock {
         const AT_SECURE: u64 = 23;
         const AT_RANDOM: u64 = 25;
         const AT_HWCAP: u64 = 16;
+        const AT_PLATFORM: u64 = 15;
 
         // Stack layout (high to low):
-        //   [arg strings] [16-align] [random 16B] [auxv entries][AT_NULL] [envp NULL] [argv NULL] [argv ptrs] [argc]
+        //   [platform str] [arg strings] [16-align] [random 16B] [auxv entries][AT_NULL] [envp NULL] [argv NULL] [argv ptrs] [argc]
         //   sp -> argc
 
         let mut sp = stack_top;
+
+        // Step 0: write AT_PLATFORM string at top of stack
+        let platform_str = if cfg!(target_arch = "riscv64") {
+            "riscv64\0"
+        } else if cfg!(target_arch = "loongarch64") {
+            "loongarch64\0"
+        } else {
+            "unknown\0"
+        };
+        sp -= platform_str.len();
+        let platform_addr = sp;
+        for (i, &b) in platform_str.as_bytes().iter().enumerate() {
+            *translated_refmut(token, (platform_addr + i) as *mut u8) = b;
+        }
 
         // Step 1: write arg strings at top of stack
         let mut string_addrs: Vec<usize> = Vec::with_capacity(argc);
@@ -252,8 +267,10 @@ impl TaskControlBlock {
         }
         string_addrs.reverse();
 
-        // Step 2: 16-byte alignment
-        sp -= sp % 16;
+        // Step 2: pad so the final initial stack pointer still points at argc and is 16-byte aligned.
+        let target_mod = if argc % 2 == 0 { 8 } else { 0 };
+        let sp_mod = sp % 16;
+        sp -= (sp_mod + 16 - target_mod) % 16;
 
         // Step 3: AT_RANDOM data (16 bytes below string area)
         sp -= 16;
@@ -264,7 +281,7 @@ impl TaskControlBlock {
         *translated_refmut(token, (random_addr + 8) as *mut u64) = rand2;
 
         // Step 4: auxv entries (each 16 bytes = 2*u64)
-        const AUXV_COUNT: usize = 16;
+        const AUXV_COUNT: usize = 17;
         sp -= AUXV_COUNT * 16;
         let mut a = sp;
         macro_rules! auxv_write {
@@ -290,6 +307,7 @@ impl TaskControlBlock {
         auxv_write!(AT_CLKTCK, 100u64);
         auxv_write!(AT_SECURE, 0u64);
         auxv_write!(AT_HWCAP, 0u64);
+        auxv_write!(AT_PLATFORM, platform_addr as u64);
         auxv_write!(AT_RANDOM, random_addr as u64);
         auxv_write!(AT_NULL, 0u64);
 
@@ -313,9 +331,6 @@ impl TaskControlBlock {
         *translated_refmut(token, sp as *mut u64) = argc as u64;
         let crt_sp = sp;
 
-        // 16-byte align crt_sp for riscv64 ABI (final alignment after all writes)
-        memory_set.activate();
-
         let mut inner = self.inner_exclusive_access();
         inner.memory_set = memory_set;
         inner.heap_bottom = heap_bottom;
@@ -325,7 +340,7 @@ impl TaskControlBlock {
         let mut trap_cx = TrapFrame::new();
         trap_cx[TrapFrameArgs::SEPC] = entry_point;
         trap_cx[TrapFrameArgs::SP] = crt_sp;
-        trap_cx[TrapFrameArgs::ARG0] = argc;
+        trap_cx[TrapFrameArgs::ARG0] = 0; // a0 = 0: argc on stack only, so rtld_fini=NULL for glibc
         trap_cx[TrapFrameArgs::ARG1] = argv_base;
         *inner.get_trap_cx() = trap_cx;
     }
@@ -433,6 +448,7 @@ pub enum BlockReason {
     TcpAccept(usize),
     TcpConnect(usize),
     UdpRecv(usize),
+    PollWait,
 }
 
 #[derive(Copy, Clone, PartialEq)]

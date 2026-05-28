@@ -1,4 +1,5 @@
 use crate::config::PAGE_SIZE;
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use buddy_system_allocator::FrameAllocator;
 use core::{
@@ -9,28 +10,65 @@ use core::{
 use log::trace;
 use polyhal::{pa, utils::MutexNoIrq, PhysAddr};
 
+/// COW refcount: only tracks shared (refcount > 1) pages.
+/// Single-owner pages (refcount=1) don't appear in the map.
+type RefMap = BTreeMap<usize, u8>;
+static FRAME_REFS: MutexNoIrq<RefMap> = MutexNoIrq::new(BTreeMap::new());
+
+fn ref_key(paddr: PhysAddr) -> usize { paddr.raw() / PAGE_SIZE }
+
+fn ref_get(paddr: PhysAddr) -> u8 {
+    FRAME_REFS.lock().get(&ref_key(paddr)).copied().unwrap_or(1)
+}
+
+fn ref_inc(paddr: PhysAddr) -> u8 {
+    let mut map = FRAME_REFS.lock();
+    let e = map.entry(ref_key(paddr)).or_insert(1);
+    *e = e.saturating_add(1);
+    *e
+}
+
+/// Frame tracker. Default refcount=1. Only shared pages (refcount>1) are in the map.
 pub struct FrameTracker {
     pub paddr: PhysAddr,
 }
 
 impl FrameTracker {
     pub fn new(paddr: PhysAddr) -> Self {
-        // page cleaning
         paddr.clear_len(PAGE_SIZE);
         Self { paddr }
+    }
+    pub fn cow_clone(&self) -> Self {
+        ref_inc(self.paddr);
+        Self { paddr: self.paddr }
+    }
+    pub fn ref_count(&self) -> usize {
+        ref_get(self.paddr) as usize
+    }
+}
+
+impl Drop for FrameTracker {
+    fn drop(&mut self) {
+        let mut map = FRAME_REFS.lock();
+        let key = ref_key(self.paddr);
+        let cur = map.get(&key).copied().unwrap_or(0);
+        if cur == 0 {
+            // Single owner: not in map, free directly
+            drop(map);
+            frame_dealloc(self.paddr);
+        } else if cur <= 2 {
+            // Shared by 2, now down to 1 (single owner): remove from map, don't free
+            map.remove(&key);
+        } else {
+            // Shared by >2: decrement
+            map.insert(key, cur - 1);
+        }
     }
 }
 
 impl Debug for FrameTracker {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.write_fmt(format_args!("FrameTracker:PA={:?}", self.paddr))
-    }
-}
-
-impl Drop for FrameTracker {
-    fn drop(&mut self) {
-        trace!("drop frame tracker: {:?}", self.paddr);
-        frame_dealloc(self.paddr);
     }
 }
 
@@ -57,8 +95,7 @@ pub fn frame_alloc() -> Option<FrameTracker> {
         .lock()
         .alloc(1)
         .map(|x| pa!(x * PAGE_SIZE))
-        .map(FrameTracker::new)
-        .inspect(|x| x.paddr.clear_len(PAGE_SIZE));
+        .map(FrameTracker::new);
     if ret.is_some() {
         ALLOCATED_FRAMES.fetch_add(1, Ordering::Relaxed);
     }
@@ -75,21 +112,8 @@ pub fn frames_alloc(count: usize) -> Option<Vec<FrameTracker>> {
         .into_iter()
         .map(|idx| (start + idx * PAGE_SIZE))
         .map(FrameTracker::new)
-        .inspect(|x| x.paddr.clear_len(PAGE_SIZE))
         .collect();
     Some(ret)
-}
-
-pub fn frame_alloc_persist() -> Option<PhysAddr> {
-    let ret = FRAME_ALLOCATOR
-        .lock()
-        .alloc(1)
-        .map(|x| pa!(x * PAGE_SIZE))
-        .inspect(|x| x.clear_len(PAGE_SIZE));
-    if ret.is_some() {
-        ALLOCATED_FRAMES.fetch_add(1, Ordering::Relaxed);
-    }
-    ret
 }
 
 pub fn frame_dealloc(paddr: PhysAddr) {
@@ -103,4 +127,15 @@ pub fn total_frames() -> usize {
 
 pub fn available_frames() -> usize {
     total_frames().saturating_sub(ALLOCATED_FRAMES.load(Ordering::Relaxed))
+}
+
+pub fn frame_alloc_persist() -> Option<PhysAddr> {
+    FRAME_ALLOCATOR
+        .lock()
+        .alloc(1)
+        .map(|x| pa!(x * PAGE_SIZE))
+        .inspect(|x| {
+            x.clear_len(PAGE_SIZE);
+            ALLOCATED_FRAMES.fetch_add(1, Ordering::Relaxed);
+        })
 }

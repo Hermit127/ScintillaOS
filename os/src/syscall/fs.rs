@@ -786,10 +786,117 @@ pub fn sys_fstatat(dirfd: isize, path: *const u8, stat_buf: *mut u8, flags: usiz
         None => return -2,
     };
 
-    let inode = crate::fs::inode::OSInode::new(false, false, dentry);
+    let inode = crate::fs::inode::OSInode::new(false, false, false, dentry);
     let st = inode.stat();
     *translated_refmut(token, stat_buf as *mut Kstat) = st;
     0
+}
+
+pub fn sys_statx(dirfd: isize, path: *const u8, flags: u32, mask: u32, statx_buf: *mut u8) -> isize {
+    const AT_EMPTY_PATH: u32 = 0x1000;
+
+    if statx_buf.is_null() {
+        return -22;
+    }
+
+    if flags & AT_EMPTY_PATH != 0 {
+        let task = current_task().unwrap();
+        let fd = dirfd as usize;
+        let inner = task.inner_exclusive_access();
+        if fd >= inner.fd_table.len() || inner.fd_table[fd].is_none() {
+            return -9;
+        }
+        let file = inner.fd_table[fd].as_ref().unwrap().clone();
+        drop(inner);
+        let st = file.stat();
+        let token = current_user_token();
+        write_statx(statx_buf, &st, mask);
+        return 0;
+    }
+
+    let token = current_user_token();
+    let path_str = translated_str(token, path);
+    if path_str.is_empty() {
+        return -2;
+    }
+
+    let base = match resolve_base_dir(dirfd) {
+        Some(b) => b,
+        None => return -2,
+    };
+    let dentry = match vfs_resolve_path(&base, &path_str) {
+        Some(d) => d,
+        None => return -2,
+    };
+
+    let inode = crate::fs::inode::OSInode::new(false, false, false, dentry);
+    let st = inode.stat();
+    write_statx(statx_buf, &st, mask);
+    0
+}
+
+fn write_statx(buf: *mut u8, st: &Kstat, mask: u32) {
+    let token = current_user_token();
+    let statx = translated_refmut(token, buf as *mut Statx);
+    statx.stx_mask = mask & 0x7ff; // STATX_BASIC_STATS
+    statx.stx_blksize = st.st_blksize;
+    statx.stx_attributes = 0;
+    statx.stx_nlink = st.st_nlink;
+    statx.stx_uid = st.st_uid;
+    statx.stx_gid = st.st_gid;
+    statx.stx_mode = st.st_mode as u16;
+    statx.pad1 = 0;
+    statx.stx_ino = st.st_ino;
+    statx.stx_size = st.st_size as u64;
+    statx.stx_blocks = st.st_blocks as u64;
+    statx.stx_attributes_mask = 0;
+    statx.stx_atime.tv_sec = st.st_atime_sec;
+    statx.stx_atime.tv_nsec = st.st_atime_nsec as u32;
+    statx.stx_atime.pad = 0;
+    statx.stx_btime.tv_sec = 0;
+    statx.stx_btime.tv_nsec = 0;
+    statx.stx_btime.pad = 0;
+    statx.stx_ctime.tv_sec = st.st_ctime_sec;
+    statx.stx_ctime.tv_nsec = st.st_ctime_nsec as u32;
+    statx.stx_ctime.pad = 0;
+    statx.stx_mtime.tv_sec = st.st_mtime_sec;
+    statx.stx_mtime.tv_nsec = st.st_mtime_nsec as u32;
+    statx.stx_mtime.pad = 0;
+    statx.stx_rdev_major = 0;
+    statx.stx_rdev_minor = 0;
+    statx.stx_dev_major = 0;
+    statx.stx_dev_minor = 0;
+}
+
+#[repr(C)]
+struct StatxTime {
+    tv_sec: i64,
+    tv_nsec: u32,
+    pad: i32,
+}
+
+#[repr(C)]
+struct Statx {
+    stx_mask: u32,
+    stx_blksize: u32,
+    stx_attributes: u64,
+    stx_nlink: u32,
+    stx_uid: u32,
+    stx_gid: u32,
+    stx_mode: u16,
+    pad1: u16,
+    stx_ino: u64,
+    stx_size: u64,
+    stx_blocks: u64,
+    stx_attributes_mask: u64,
+    stx_atime: StatxTime,
+    stx_btime: StatxTime,
+    stx_ctime: StatxTime,
+    stx_mtime: StatxTime,
+    stx_rdev_major: u32,
+    stx_rdev_minor: u32,
+    stx_dev_major: u32,
+    stx_dev_minor: u32,
 }
 
 pub fn sys_fstat(fd: usize, stat_buf: *mut u8) -> isize {

@@ -11,6 +11,7 @@ ifeq ($(ARCH), x86_64)
   BUS := pci
   VIRTIO_BLK_BUS := virtio-mmio-bus.0
   VIRTIO_BLK_DEVICE := virtio-blk-device
+  QEMU_MEM := 256M
 else ifeq ($(ARCH), riscv64)
   TARGET := riscv64gc-unknown-none-elf
   QEMU_EXEC += qemu-system-$(ARCH) \
@@ -18,6 +19,7 @@ else ifeq ($(ARCH), riscv64)
 				-kernel $(KERNEL_BIN)
   VIRTIO_BLK_BUS := virtio-mmio-bus.0
   VIRTIO_BLK_DEVICE := virtio-blk-device
+  QEMU_MEM := 256M
 else ifeq ($(ARCH), aarch64)
   TARGET := aarch64-unknown-none-softfloat
   QEMU_EXEC += qemu-system-$(ARCH) \
@@ -26,12 +28,13 @@ else ifeq ($(ARCH), aarch64)
 				-kernel $(KERNEL_BIN)
   VIRTIO_BLK_BUS := virtio-mmio-bus.0
   VIRTIO_BLK_DEVICE := virtio-blk-device
+  QEMU_MEM := 256M
 else ifeq ($(ARCH), loongarch64)
   TARGET := loongarch64-unknown-none
-  QEMU_EXEC += qemu-system-$(ARCH) -kernel $(KERNEL_ELF) -m 1G
-  BUS := pci
-  VIRTIO_BLK_BUS := virtio-mmio-bus.0
+  QEMU_EXEC += qemu-system-$(ARCH) -kernel $(KERNEL_ELF)
+  VIRTIO_BLK_BUS := pcie.0
   VIRTIO_BLK_DEVICE := virtio-blk-pci
+  QEMU_MEM := 2G
 else
   $(error "ARCH" must be one of "x86_64", "riscv64", "aarch64" or "loongarch64")
 endif
@@ -149,19 +152,33 @@ fs-img: $(APPS)
 	@if [ "$(ARCH)" = "riscv64" ]; then \
 		cp -f tmp/busybox-musl $(ROOTFS_BIN_DIR)/busybox 2>/dev/null || true; \
 		cp -f tmp/busybox-musl $(ROOTFS_DIR)/busybox 2>/dev/null || true; \
-		cat tmp/busybox_cmd.txt > $(ROOTFS_DIR)/busybox_cmd.txt 2>/dev/null || true; \
+		cp -f tmp/busybox-glibc-riscv64 $(ROOTFS_BIN_DIR)/busybox-glibc 2>/dev/null || true; \
+		cp -f tmp/busybox-glibc-riscv64 $(ROOTFS_DIR)/busybox-glibc 2>/dev/null || true; \
+		cat testsuits-for-oskernel/scripts/busybox/busybox_cmd.txt > $(ROOTFS_DIR)/busybox_cmd.txt 2>/dev/null || cat tmp/busybox_cmd.txt > $(ROOTFS_DIR)/busybox_cmd.txt 2>/dev/null || true; \
+		cp $(ROOTFS_DIR)/busybox_cmd.txt $(ROOTFS_DIR)/busybox_glibc_cmd.txt 2>/dev/null || true; \
+		printf '#!/bin/sh\n./busybox-glibc --install -s /bin 2>/dev/null\necho "#### OS COMP TEST GROUP START busybox-glibc ####"\nwhile IFS= read -r line; do case "$$line" in ""|\\#*) continue ;; esac; cmd=$$(printf "%%s" "$$line" | ./busybox-glibc sed "s#\\./busybox#./busybox-glibc#g"); eval "./busybox-glibc $$cmd"; RTN=$$?; if [ $$RTN -ne 0 ] && [ "$$line" != "false" ]; then echo "testcase busybox $$line fail"; else echo "testcase busybox $$line success"; fi; done < ./busybox_glibc_cmd.txt\necho "#### OS COMP TEST GROUP END busybox-glibc ####"\n' > $(ROOTFS_DIR)/busybox_glibc_testcode.sh; \
 		ln -sf busybox $(ROOTFS_BIN_DIR)/ls 2>/dev/null || true; \
-		printf '#!/bin/sh\n./busybox --install -s /bin 2>/dev/null\necho "#### OS COMP TEST GROUP START busybox-musl ####"\n./busybox cat ./busybox_cmd.txt | while read line; do case "$$line" in ""|\\#*) continue ;; *"|"*) eval "$$line"; RTN=$$? ;; *) ./busybox $$line; RTN=$$? ;; esac; if [ $$RTN -ne 0 ] && [ "$$line" != "false" ]; then echo "testcase busybox $$line fail"; else echo "testcase busybox $$line success"; fi; done\necho "#### OS COMP TEST GROUP END busybox-musl ####"\n' > $(ROOTFS_DIR)/busybox_testcode.sh; \
+		printf '#!/bin/sh\n./busybox --install -s /bin 2>/dev/null\necho "#### OS COMP TEST GROUP START busybox ####"\nwhile IFS= read -r line; do case "$$line" in ""|\\#*) continue ;; esac; eval "./busybox $$line"; RTN=$$?; if [ $$RTN -ne 0 ] && [ "$$line" != "false" ]; then echo "testcase busybox $$line fail"; else echo "testcase busybox $$line success"; fi; done < ./busybox_cmd.txt\necho "#### OS COMP TEST GROUP END busybox ####"\n' > $(ROOTFS_DIR)/busybox_testcode.sh; \
+	fi
+	@if [ "$(ARCH)" = "loongarch64" ]; then \
+		cp -f tmp/busybox-musl-loongarch64 $(ROOTFS_BIN_DIR)/busybox 2>/dev/null || true; \
+		cp -f tmp/busybox-musl-loongarch64 $(ROOTFS_DIR)/busybox 2>/dev/null || true; \
+		cp -f tmp/busybox-glibc-loongarch64 $(ROOTFS_BIN_DIR)/busybox-glibc 2>/dev/null || true; \
+		cp -f tmp/busybox-glibc-loongarch64 $(ROOTFS_DIR)/busybox-glibc 2>/dev/null || true; \
+		cat testsuits-for-oskernel/scripts/busybox/busybox_cmd.txt > $(ROOTFS_DIR)/busybox_cmd.txt 2>/dev/null || cat tmp/busybox_cmd.txt > $(ROOTFS_DIR)/busybox_cmd.txt 2>/dev/null || true; \
+		cp $(ROOTFS_DIR)/busybox_cmd.txt $(ROOTFS_DIR)/busybox_glibc_cmd.txt 2>/dev/null || true; \
+		printf '#!/bin/sh\n./busybox-glibc --install -s /bin 2>/dev/null\necho "#### OS COMP TEST GROUP START busybox-glibc ####"\nwhile IFS= read -r line; do case "$$line" in ""|\\#*) continue ;; esac; cmd=$$(printf "%%s" "$$line" | ./busybox-glibc sed "s#\\./busybox#./busybox-glibc#g"); eval "./busybox-glibc $$cmd"; RTN=$$?; if [ $$RTN -ne 0 ] && [ "$$line" != "false" ]; then echo "testcase busybox $$line fail"; else echo "testcase busybox $$line success"; fi; done < ./busybox_glibc_cmd.txt\necho "#### OS COMP TEST GROUP END busybox-glibc ####"\n' > $(ROOTFS_DIR)/busybox_glibc_testcode.sh; \
+		ln -sf busybox $(ROOTFS_BIN_DIR)/ls 2>/dev/null || true; \
+		printf '#!/bin/sh\n./busybox --install -s /bin 2>/dev/null\necho "#### OS COMP TEST GROUP START busybox ####"\nwhile IFS= read -r line; do case "$$line" in ""|\\#*) continue ;; esac; eval "./busybox $$line"; RTN=$$?; if [ $$RTN -ne 0 ] && [ "$$line" != "false" ]; then echo "testcase busybox $$line fail"; else echo "testcase busybox $$line success"; fi; done < ./busybox_cmd.txt\necho "#### OS COMP TEST GROUP END busybox ####"\n' > $(ROOTFS_DIR)/busybox_testcode.sh; \
 	fi
 	@cp -f tmp/debug_test.sh $(ROOTFS_DIR)/debug_test.sh 2>/dev/null || true
 	@cp -f tmp/run_all.sh $(ROOTFS_DIR)/run_all.sh 2>/dev/null || true
 	@cp -f tmp/basic_testcode.sh $(ROOTFS_DIR)/basic_testcode.sh 2>/dev/null || true
-	@cp -f tmp/busybox-musl $(ROOTFS_DIR)/busybox 2>/dev/null || true
 	@mkdir -p $(ROOTFS_DIR)/etc $(ROOTFS_DIR)/sbin 2>/dev/null || true
 	@cp -f tmp/init.sh $(ROOTFS_DIR)/etc/init.sh 2>/dev/null || true
 	@cp -f target/$(TARGET)/release/contest_runner $(ROOTFS_DIR)/contest_runner 2>/dev/null || true
 	@dd if=/dev/zero of=$(FS_IMG) bs=1M count=128
-	@mke2fs -t ext4 -b 4096 -F -d $(ROOTFS_DIR) $(FS_IMG)
+	@mke2fs -t ext4 -b 4096 -F -O ^metadata_csum,^64bit,^orphan_file -d $(ROOTFS_DIR) $(FS_IMG)
 	cp target/$(TARGET)/$(MODE)/fs.img fs-img.img
 
 $(APPS):
@@ -186,9 +203,8 @@ disasm-vim: kernel
 run: run-inner
 
 QEMU_EXEC += -nographic \
-				-m 256M \
-				-smp 1 \
-				-m 256M
+				-m $(QEMU_MEM) \
+				-smp 1
 
 # Uncomment for QEMU debug log:
 # 				-D qemu.log -d in_asm,int,pcall,cpu_reset,guest_errors
@@ -196,18 +212,18 @@ QEMU_EXEC += -nographic \
 # Single-disk mode (same disk on both bus 0 and bus 1, for local dev)
 # ROOT_BLOCK_DEVICE uses bus 1, mount test & contest use bus 0
 QEMU_ARGS_SINGLE := -drive file=$(FS_IMG),if=none,format=raw,id=x0,file.locking=off \
-			-device $(VIRTIO_BLK_DEVICE),drive=x0,bus=$(VIRTIO_BLK_BUS) \
+			-device $(VIRTIO_BLK_DEVICE),drive=x0$(if $(filter loongarch64,$(ARCH)),,bus=$(VIRTIO_BLK_BUS)) \
 			-drive file=$(FS_IMG),if=none,format=raw,id=x1,file.locking=off \
-			-device $(VIRTIO_BLK_DEVICE),drive=x1,bus=virtio-mmio-bus.1
+			-device $(VIRTIO_BLK_DEVICE),drive=x1$(if $(filter loongarch64,$(ARCH)),,bus=virtio-mmio-bus.1)
 
 # Test disk path (user can override)
 TEST_DISK ?= fs-img.img
 
 # Dual-disk mode (test disk bus 0, disk.img bus 1, for contest)
 QEMU_ARGS_DUAL := -drive file=$(TEST_DISK),if=none,format=raw,id=x0 \
-			-device $(VIRTIO_BLK_DEVICE),drive=x0,bus=$(VIRTIO_BLK_BUS) \
+			-device $(VIRTIO_BLK_DEVICE),drive=x0$(if $(filter loongarch64,$(ARCH)),,bus=$(VIRTIO_BLK_BUS)) \
 			-drive file=disk.img,if=none,format=raw,id=x1 \
-			-device $(VIRTIO_BLK_DEVICE),drive=x1,bus=virtio-mmio-bus.1
+			-device $(VIRTIO_BLK_DEVICE),drive=x1$(if $(filter loongarch64,$(ARCH)),,bus=virtio-mmio-bus.1)
 
 # virtio-net network configuration (SLIRP user-mode, riscv64/aarch64)
 ifeq ($(ARCH), riscv64)

@@ -31,12 +31,15 @@ impl MemorySet {
     pub fn token(&self) -> PageTable {
         self.page_table.0
     }
-    pub fn push(&mut self, mut map_area: MapArea, data: Option<&[u8]>, page_off: usize) {
-        map_area.map(&self.page_table);
+    pub fn push(&mut self, mut map_area: MapArea, data: Option<&[u8]>, page_off: usize) -> bool {
+        if map_area.map(&self.page_table).is_err() {
+            return false;
+        }
         if let Some(data) = data {
             map_area.copy_data(&self.page_table, data, page_off);
         }
         self.areas.push(map_area);
+        true
     }
     pub fn from_elf(elf_data: &[u8]) -> LoadedElf {
         trace!("os::mm::MemorySet::from_elf");
@@ -72,13 +75,22 @@ impl MemorySet {
                     map_perm |= MapPermission::X;
                 }
                 let map_area = MapArea::new(start_va, end_va, MapType::Framed, map_perm);
-                max_end_va = map_area.vaddr_range.get_end();
+                max_end_va = max_end_va.max(map_area.vaddr_range.get_end());
                 let page_off = start_va.raw() % PAGE_SIZE;
-                memory_set.push(
-                    map_area,
-                    Some(&elf.input[ph.offset() as usize..(ph.offset() + ph.file_size()) as usize]),
-                    page_off,
-                );
+                if page_off > 0 {
+                    let aligned_va = start_va.raw() - page_off;
+                    let file_start = ph.offset() as usize - page_off;
+                    let file_end = (ph.offset() + ph.file_size()) as usize;
+                    let aligned_data = &elf.input[file_start..file_end];
+                    let aligned_map = MapArea::new(aligned_va.into(), end_va, MapType::Framed, map_perm);
+                    memory_set.push(aligned_map, Some(aligned_data), 0);
+                } else {
+                    memory_set.push(
+                        map_area,
+                        Some(&elf.input[ph.offset() as usize..(ph.offset() + ph.file_size()) as usize]),
+                        0,
+                    );
+                }
             }
         }
         // map user stack with U flags
@@ -106,25 +118,35 @@ impl MemorySet {
         }
     }
     pub fn from_existed_user(user_space: &MemorySet) -> MemorySet {
-        trace!("os::mm::MemorySet::from_existed_user");
+        trace!("os::mm::MemorySet::from_existed_user (COW)");
         let mut memory_set = Self::new_bare();
-        // copy data sections/trap_context/user_stack
         for area in user_space.areas.iter() {
-            let new_area = MapArea::from_another(area);
-            memory_set.push(new_area, None, 0);
-            // copy data from another space
+            let mut new_area = MapArea::from_another(area);
             for vpn in area.vaddr_range {
-                let src = user_space.translate(vpn).unwrap().0;
-                let dst = memory_set.translate(vpn).unwrap().0;
-                // dst_ppn.get_buffer().copy_from_slice(src_ppn.get_buffer())
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        src.get_ptr::<u8>(),
-                        dst.get_mut_ptr(),
-                        PAGE_SIZE,
+                if let Some(frame) = area.data_frames.get(&vpn) {
+                    let shared = frame.cow_clone();
+                    let mut flags: MappingFlags = area.map_perm.into();
+                    if area.map_perm.contains(MapPermission::W) {
+                        flags.remove(MappingFlags::W);
+                        let mut parent_flags: MappingFlags = area.map_perm.into();
+                        parent_flags.remove(MappingFlags::W);
+                        user_space.page_table.map_page(
+                            vpn,
+                            frame.paddr,
+                            parent_flags,
+                            MappingSize::Page4KB,
+                        );
+                    }
+                    memory_set.page_table.map_page(
+                        vpn,
+                        shared.paddr,
+                        flags,
+                        MappingSize::Page4KB,
                     );
+                    new_area.data_frames.insert(vpn, shared);
                 }
             }
+            memory_set.areas.push(new_area);
         }
         memory_set
     }
@@ -289,6 +311,56 @@ impl MemorySet {
     }
 }
 
+pub fn handle_cow_fault(bad_addr: usize) -> bool {
+    use crate::task::current_task;
+    use crate::mm::frame_alloc;
+    let task = match current_task() {
+        Some(t) => t,
+        None => return false,
+    };
+    let mut inner = task.inner_exclusive_access();
+    let vaddr: VirtAddr = bad_addr.into();
+    let mem = &mut inner.memory_set;
+
+    for area in mem.areas.iter_mut() {
+        if vaddr < area.vaddr_range.get_start() || vaddr >= area.vaddr_range.get_end() {
+            continue;
+        }
+        let vpn = vaddr.floor();
+        if !area.map_perm.contains(MapPermission::W) {
+            continue;
+        }
+        if let Some(frame) = area.data_frames.get(&vpn) {
+            let refs = frame.ref_count();
+            if refs == 0 {
+                panic!("COW refcount=0 at paddr={:#x} vpn={:#x}", frame.paddr.raw(), vpn.raw());
+            }
+            if refs <= 1 {
+                let flags: MappingFlags = area.map_perm.into();
+                mem.page_table.map_page(vpn, frame.paddr, flags, MappingSize::Page4KB);
+                return true;
+            }
+            let new_frame = match frame_alloc() {
+                Some(f) => f,
+                None => return false,
+            };
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    frame.paddr.get_ptr::<u8>(),
+                    new_frame.paddr.get_mut_ptr(),
+                    PAGE_SIZE,
+                );
+            }
+            let flags: MappingFlags = area.map_perm.into();
+            mem.page_table.map_page(vpn, new_frame.paddr, flags, MappingSize::Page4KB);
+            area.data_frames.insert(vpn, new_frame);
+            return true;
+        }
+        continue;
+    }
+    false
+}
+
 pub struct MapArea {
     pub vaddr_range: VAddrRange,
     data_frames: BTreeMap<VirtAddr, FrameTracker>,
@@ -326,11 +398,10 @@ impl MapArea {
             map_perm: another.map_perm,
         }
     }
-    pub fn map(&mut self, page_table: &Arc<PageTableWrapper>) {
+    pub fn map(&mut self, page_table: &Arc<PageTableWrapper>) -> Result<(), ()> {
         trace!("os::mm::memory_set::MapArea::map");
         for vaddr in self.vaddr_range {
-            // self.map_one(page_table, vpn);
-            let p_tracker = frame_alloc().expect("can't allocate frame");
+            let p_tracker = frame_alloc().ok_or(())?;
             page_table.map_page(
                 vaddr,
                 p_tracker.paddr,
@@ -339,6 +410,7 @@ impl MapArea {
             );
             self.data_frames.insert(vaddr, p_tracker);
         }
+        Ok(())
     }
 
     /// Unmap page area

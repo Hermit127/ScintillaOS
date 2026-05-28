@@ -172,3 +172,6 @@ c/lwext4 子模块的脏状态来自编译过程（CMake 生成的 build_musl-ge
 
 2026/5/19 dyh
 iperf服务端可以正常启动，和busybox兼容性有问题，数据收发仍有问题
+
+2026/5/23 hermit
+write的输出有进程冲突问题，增加了进城所有权锁
