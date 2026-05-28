@@ -48,8 +48,15 @@ impl OSInode {
 
     pub fn read_all(&self) -> alloc::vec::Vec<u8> {
         let mut inner = self.inner.exclusive_access();
-        let mut buffer = [0u8; 512];
-        let mut out = alloc::vec::Vec::new();
+        let size = self.dentry.super_block.get_inode_info(&self.dentry.fs_path)
+            .map(|i| i.size as usize)
+            .unwrap_or(0);
+        let mut out = if size > 0 {
+            alloc::vec::Vec::with_capacity(size)
+        } else {
+            alloc::vec::Vec::new()
+        };
+        let mut buffer = [0u8; 4096];
         loop {
             let len = self.dentry.super_block.read_at(
                 &self.dentry.fs_path,

@@ -334,10 +334,7 @@ impl TaskControlBlock {
         let mut inner = self.inner_exclusive_access();
         inner.memory_set = memory_set;
         inner.heap_bottom = heap_bottom;
-        // Pre-allocate 16MB so musl iperf3 has enough space for startup.
-        // Musl's brk(0) returns program_brk; first malloc triggers brk(program_brk+N)
-        // which maps pages at that address via the sys_brk expansion.
-        inner.program_brk = heap_bottom + 0x100_0000;
+        inner.program_brk = heap_bottom;
         inner.trap_cx = TrapFrame::new();
 
         let mut trap_cx = TrapFrame::new();

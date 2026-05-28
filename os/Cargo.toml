@@ -33,5 +33,8 @@ smoltcp = { version = "0.11", default-features = false, features = [
 ] }
 lwext4_rust = { path = "../lwext4_rust", default-features = false }
 
+[target.'cfg(target_arch = "loongarch64")'.dependencies]
+loongArch64 = "0.2.6"
+
 [profile.release]
 debug = true

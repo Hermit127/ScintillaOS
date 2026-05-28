@@ -1,28 +1,26 @@
 mod device;
-#[cfg(any(target_arch = "x86_64", target_arch = "loongarch64"))]
+#[cfg(target_arch = "x86_64")]
 mod ram_blk;
 
-#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+#[cfg(any(target_arch = "riscv64", target_arch = "aarch64", target_arch = "loongarch64"))]
 mod virtio_blk;
-#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
-pub use virtio_blk::VirtIOBlock;
-#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
-pub use virtio_blk::VirtioHal;
+#[cfg(any(target_arch = "riscv64", target_arch = "aarch64", target_arch = "loongarch64"))]
+pub use virtio_blk::{VirtIOBlock, VirtioHal};
 
 use alloc::sync::Arc;
 use lazy_static::*;
 pub use device::BlockDevice;
 
-#[cfg(any(target_arch = "x86_64", target_arch = "loongarch64"))]
+#[cfg(target_arch = "x86_64")]
 use ram_blk::RamDiskBlock;
 
-#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+#[cfg(any(target_arch = "riscv64", target_arch = "aarch64", target_arch = "loongarch64"))]
 lazy_static! {
     /// Test disk on virtio bus 0 (provided by evaluation system)
     pub static ref BLOCK_DEVICE: Arc<dyn BlockDevice> = Arc::new(VirtIOBlock::new());
 }
 
-#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+#[cfg(any(target_arch = "riscv64", target_arch = "aarch64", target_arch = "loongarch64"))]
 lazy_static! {
     /// Root filesystem disk on virtio bus 1 (user's disk.img)
     pub static ref ROOT_BLOCK_DEVICE: Arc<dyn BlockDevice> = {
@@ -35,12 +33,12 @@ lazy_static! {
     };
 }
 
-#[cfg(any(target_arch = "x86_64", target_arch = "loongarch64"))]
+#[cfg(target_arch = "x86_64")]
 lazy_static! {
     pub static ref BLOCK_DEVICE: Arc<dyn BlockDevice> = Arc::new(RamDiskBlock::new());
 }
 
-#[cfg(any(target_arch = "x86_64", target_arch = "loongarch64"))]
+#[cfg(target_arch = "x86_64")]
 lazy_static! {
     pub static ref ROOT_BLOCK_DEVICE: Arc<dyn BlockDevice> = Arc::new(RamDiskBlock::new());
 }

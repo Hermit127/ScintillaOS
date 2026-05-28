@@ -11,6 +11,7 @@ use crate::{
 // use polyhal::api::ArchInterface;
 use log::*;
 use polyhal::{common::PageAlloc, irq::IRQ, mem::get_mem_areas, PhysAddr};
+#[cfg(not(target_arch = "loongarch64"))]
 use polyhal_boot::define_entry;
 use polyhal_trap::{
     trap::TrapType::{self, *},
@@ -60,7 +61,13 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             // cx is changed during sys_exec, so we have to call it again
             ctx[TrapFrameArgs::RET] = result as usize;
         }
-        StorePageFault(_paddr) | LoadPageFault(_paddr) | InstructionPageFault(_paddr) => {
+        StorePageFault(bad_addr) => {
+            // Try COW (Copy-On-Write) first
+            if !crate::mm::handle_cow_fault(bad_addr) {
+                exit_current_and_run_next(-11);
+            }
+        }
+        LoadPageFault(_paddr) | InstructionPageFault(_paddr) => {
             exit_current_and_run_next(-11);
         }
         IllegalInstruction(_) => {
@@ -117,7 +124,70 @@ fn main(hartid: usize) {
     panic!("Unreachable in main function of rCore Tutorial kernel!");
 }
 
+#[cfg(not(target_arch = "loongarch64"))]
 define_entry!(main);
+
+#[cfg(target_arch = "loongarch64")]
+core::arch::global_asm!(
+    r#"
+    .section .bss.bstack
+    .global bstack
+    .global bstack_top
+    bstack:
+    .fill 0x80000
+    .size bstack, . - bstack
+    bstack_top:
+
+    .section .text.entry
+    .global _start
+    _start:
+        ori         $t0, $zero, 0x1
+        lu52i.d     $t0, $t0, -2048
+        csrwr       $t0, 0x180
+        ori         $t0, $zero, 0x11
+        lu52i.d     $t0, $t0, -1792
+        csrwr       $t0, 0x181
+
+        li.d        $t0, 0x9000000000200028
+        jirl        $zero, $t0, 0
+    1:
+        li.w        $t0, 0xb0
+        csrwr       $t0, 0x0
+        li.w        $t0, 0x00
+        csrwr       $t0, 0x1
+        li.w        $t0, 0x00
+        csrwr       $t0, 0x2
+
+        la.global   $sp, bstack_top
+        csrrd       $a0, 0x20
+        la.global   $t0, {entry}
+        jirl        $zero, $t0, 0
+    "#,
+    entry = sym loongarch64_rust_tmp_main,
+);
+
+#[cfg(target_arch = "loongarch64")]
+#[no_mangle]
+extern "C" fn loongarch64_rust_tmp_main(hart_id: usize) -> ! {
+    unsafe {
+        extern "C" {
+            fn _sbss();
+            fn _ebss();
+        }
+        core::ptr::write_bytes(_sbss as *mut u8, 0, _ebss as usize - _sbss as usize);
+    }
+    let _ = polyhal::mem::init_dtb_once(polyhal::consts::QEMU_DTB_ADDR);
+    polyhal::percpu::set_local_thread_pointer(hart_id);
+    loongArch64::register::euen::set_fpe(true);
+    polyhal::ctor::ph_init_iter(polyhal::ctor::CtorType::Cpu).for_each(|x| (x.func)());
+    polyhal::mem::parse_system_info();
+    polyhal::ctor::ph_init_iter(polyhal::ctor::CtorType::Platform).for_each(|x| (x.func)());
+    polyhal::ctor::ph_init_iter(polyhal::ctor::CtorType::HALDriver).for_each(|x| (x.func)());
+    main(hart_id);
+    loop {
+        core::hint::spin_loop();
+    }
+}
 
 pub struct PageAllocImpl;
 

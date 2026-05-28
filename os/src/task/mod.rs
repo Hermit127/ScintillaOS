@@ -220,6 +220,10 @@ fn call_kernel_signal_handler(signal: SignalFlags) {
                 task_inner.frozen = false;
             }
         }
+        SignalFlags::SIGTERM | SignalFlags::SIGKILL => {
+            task_inner.killed = true;
+            task_inner.signals ^= signal;
+        }
         _ => {
             // println!(
             //     "[K] call_kernel_signal_handler:: current task sigflag {:?}",
@@ -293,6 +297,7 @@ fn check_pending_signals() {
                 drop(task_inner);
                 drop(task);
                 if signal == SignalFlags::SIGKILL
+                    || signal == SignalFlags::SIGTERM
                     || signal == SignalFlags::SIGSTOP
                     || signal == SignalFlags::SIGCONT
                     || signal == SignalFlags::SIGDEF
@@ -318,7 +323,10 @@ pub fn handle_signals() {
             let task_inner = task.inner_exclusive_access();
             (task_inner.frozen, task_inner.killed)
         };
-        if !frozen || killed {
+        if killed {
+            exit_current_and_run_next(-9); // SIGKILL
+        }
+        if !frozen {
             break;
         }
         crate::fs::stdio::stdout_release_if_owner();

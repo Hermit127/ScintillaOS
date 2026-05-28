@@ -57,7 +57,8 @@ const SYSCALL_PRCTL: usize = 167;
 const SYSCALL_PRLIMIT64: usize = 261;
 const SYSCALL_SYSINFO: usize = 179;
 const SYSCALL_SCHED_GETAFFINITY: usize = 123;
-const SYSCALL_EPOLL_CREATE1: usize = 291;
+const SYSCALL_EPOLL_CREATE1: usize = 20;
+const SYSCALL_STATX: usize = 291;
 const SYSCALL_EVENTFD2: usize = 290;
 const SYSCALL_RSEQ: usize = 293;
 const SYSCALL_RISCV_HWPROBE: usize = 258;
@@ -208,6 +209,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SYSINFO => -38,
         SYSCALL_SCHED_GETAFFINITY => -38,
         SYSCALL_EPOLL_CREATE1 => -38,
+        SYSCALL_STATX => sys_statx(args[0] as isize, args[1] as *const u8, args[2] as u32, args[3] as u32, args[4] as *mut u8),
         SYSCALL_EVENTFD2 => -38,
         SYSCALL_RSEQ => -38,
         SYSCALL_RISCV_HWPROBE => -38,
