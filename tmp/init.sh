@@ -45,3 +45,5 @@ if [ "$ran_tests" = "0" ] && [ -f /mnt/run_all.sh ]; then
 elif [ "$ran_tests" = "0" ] && [ -f /run_all.sh ]; then
     busybox sh /run_all.sh
 fi
+
+/bin/shutdown
