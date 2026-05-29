@@ -9,11 +9,38 @@ use alloc::format;
 use user_lib::{exec, fork, waitpid};
 
 const TEST_LIST: &[&str] = &[
-    "brk", "chdir", "clone", "close", "dup", "dup2", "execve", "exit", "fork",
-    "fstat", "getcwd", "getdents", "getpid", "getppid", "gettimeofday",
-    "mkdir_", "mmap", "mount", "munmap", "openat", "open", "pipe", "read",
-    "sleep", "times", "umount", "uname", "unlink", "wait", "waitpid",
-    "write", "yield",
+    "brk",
+    "chdir",
+    "clone",
+    "close",
+    "dup",
+    "dup2",
+    "execve",
+    "exit",
+    "fork",
+    "fstat",
+    "getcwd",
+    "getdents",
+    "getpid",
+    "getppid",
+    "gettimeofday",
+    "mkdir_",
+    "mmap",
+    "mount",
+    "munmap",
+    "openat",
+    "open",
+    "pipe",
+    "read",
+    "sleep",
+    "times",
+    "umount",
+    "uname",
+    "unlink",
+    "wait",
+    "waitpid",
+    "write",
+    "yield",
 ];
 
 fn run_test(name: &str) {
@@ -29,11 +56,15 @@ fn run_test(name: &str) {
 #[no_mangle]
 pub fn main() -> i32 {
     println!("#### OS COMP TEST GROUP START basic-musl ####");
-    for test in TEST_LIST { run_test(test); }
+    for test in TEST_LIST {
+        run_test(test);
+    }
     println!("#### OS COMP TEST GROUP END basic-musl ####");
 
     println!("#### OS COMP TEST GROUP START basic-glibc ####");
-    for test in TEST_LIST { run_test(test); }
+    for test in TEST_LIST {
+        run_test(test);
+    }
     println!("#### OS COMP TEST GROUP END basic-glibc ####");
 
     0

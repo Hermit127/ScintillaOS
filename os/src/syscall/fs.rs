@@ -1,5 +1,8 @@
 use crate::fs::vfs::{vfs_resolve_path, vfs_resolve_with_fallback, Dentry, VfsSuperBlock};
-use crate::fs::{make_pipe, mkdir_at, open_file_at, rename_at, symlink_at, unlink_at, File, Kstat, OpenFlags, Urandom, DevNull};
+use crate::fs::{
+    make_pipe, mkdir_at, open_file_at, rename_at, symlink_at, unlink_at, DevNull, File, Kstat,
+    OpenFlags, Urandom,
+};
 use crate::mm::{translated_byte_buffer, translated_refmut, translated_str};
 use crate::task::{current_task, current_user_token};
 use alloc::sync::Arc;
@@ -117,7 +120,9 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
 }
 
 fn open_proc(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
-    use crate::fs::proc::{DevRtcFile, ProcDirFile, ProcMeminfoFile, ProcMountsFile, ProcPidStatFile};
+    use crate::fs::proc::{
+        DevRtcFile, ProcDirFile, ProcMeminfoFile, ProcMountsFile, ProcPidStatFile,
+    };
     if path == "/proc" {
         return Some(Arc::new(ProcDirFile::new()));
     }
@@ -130,7 +135,10 @@ fn open_proc(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
     if path == "/dev/rtc" || path == "/dev/misc/rtc" {
         return Some(Arc::new(DevRtcFile));
     }
-    if let Some(pid_str) = path.strip_prefix("/proc/").and_then(|s| s.strip_suffix("/stat")) {
+    if let Some(pid_str) = path
+        .strip_prefix("/proc/")
+        .and_then(|s| s.strip_suffix("/stat"))
+    {
         if let Ok(pid) = pid_str.parse::<usize>() {
             return Some(Arc::new(ProcPidStatFile::new(pid)));
         }
@@ -228,12 +236,7 @@ pub fn sys_getcwd(buf: *mut u8, size: usize) -> isize {
     buf as isize
 }
 
-pub fn sys_utimensat(
-    dirfd: isize,
-    path: *const u8,
-    times: *const u8,
-    _flags: usize,
-) -> isize {
+pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const u8, _flags: usize) -> isize {
     const UTIME_NOW: i64 = (1i64 << 30) - 1;
     const UTIME_OMIT: i64 = (1i64 << 30) - 2;
 
@@ -376,15 +379,24 @@ pub fn sys_faccessat(dirfd: isize, path: *const u8, mode: usize, _flags: usize) 
             } else {
                 other_perm
             };
-            if (mode & R_OK) != 0 && (perm & 0o4) == 0 { false }
-            else if (mode & W_OK) != 0 && (perm & 0o2) == 0 { false }
-            else if (mode & X_OK) != 0 && (perm & 0o1) == 0 { false }
-            else { true }
+            if (mode & R_OK) != 0 && (perm & 0o4) == 0 {
+                false
+            } else if (mode & W_OK) != 0 && (perm & 0o2) == 0 {
+                false
+            } else if (mode & X_OK) != 0 && (perm & 0o1) == 0 {
+                false
+            } else {
+                true
+            }
         }
         None => false,
     };
 
-    if allowed { 0 } else { -13 } // EACCES
+    if allowed {
+        0
+    } else {
+        -13
+    } // EACCES
 }
 
 pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
@@ -424,7 +436,11 @@ pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             new_fd as isize
         }
         F_GETFD => {
-            if inner.fd_cloexec[fd] { FD_CLOEXEC as isize } else { 0 }
+            if inner.fd_cloexec[fd] {
+                FD_CLOEXEC as isize
+            } else {
+                0
+            }
         }
         F_SETFD => {
             inner.fd_cloexec[fd] = (arg & FD_CLOEXEC) != 0;
@@ -439,7 +455,11 @@ pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
         }
         F_SETFL => {
             if let Some(file) = &inner.fd_table[fd] {
-                if file.set_flags(arg) { 0 } else { -22 }
+                if file.set_flags(arg) {
+                    0
+                } else {
+                    -22
+                }
             } else {
                 -9
             }
@@ -470,7 +490,7 @@ struct Winsize {
 }
 
 fn is_terminal_fd(fd: usize) -> bool {
-    fd == 0 || fd == 1  // stdin/stdout
+    fd == 0 || fd == 1 // stdin/stdout
 }
 
 pub fn sys_ioctl(fd: usize, request: usize, arg: usize) -> isize {
@@ -480,7 +500,9 @@ pub fn sys_ioctl(fd: usize, request: usize, arg: usize) -> isize {
     // RTC ioctl
     const RTC_RD_TIME: usize = 0x80247009;
     if request == RTC_RD_TIME {
-        if fd >= 1024 { return -9; }
+        if fd >= 1024 {
+            return -9;
+        }
         let now_ms = polyhal::time::Time::now().to_msec() as u64;
         let secs = (now_ms / 1000) as i64;
         let days_since_epoch = (secs / 86400) as i32;
@@ -492,7 +514,9 @@ pub fn sys_ioctl(fd: usize, request: usize, arg: usize) -> isize {
         let mut days_left = days_since_epoch;
         loop {
             let diy = if is_leap(1900 + tm_year) { 366 } else { 365 };
-            if days_left < diy { break; }
+            if days_left < diy {
+                break;
+            }
             days_left -= diy;
             tm_year += 1;
         }
@@ -501,18 +525,42 @@ pub fn sys_ioctl(fd: usize, request: usize, arg: usize) -> isize {
         let mut tm_mon = 0;
         let mut mdays = days_left;
         for i in 0..12 {
-            let md = if i == 1 && is_leap(1900 + tm_year) { months[i] + 1 } else { months[i] };
-            if mdays < md { tm_mon = i as i32; break; }
+            let md = if i == 1 && is_leap(1900 + tm_year) {
+                months[i] + 1
+            } else {
+                months[i]
+            };
+            if mdays < md {
+                tm_mon = i as i32;
+                break;
+            }
             mdays -= md;
         }
         let tm_mday = mdays + 1;
         let tm_wday = ((days_since_epoch + 4) % 7) as i32;
         #[repr(C)]
         struct RtcTime {
-            tm_sec: i32, tm_min: i32, tm_hour: i32, tm_mday: i32, tm_mon: i32,
-            tm_year: i32, tm_wday: i32, tm_yday: i32, tm_isdst: i32,
+            tm_sec: i32,
+            tm_min: i32,
+            tm_hour: i32,
+            tm_mday: i32,
+            tm_mon: i32,
+            tm_year: i32,
+            tm_wday: i32,
+            tm_yday: i32,
+            tm_isdst: i32,
         }
-        let rtc = RtcTime { tm_sec, tm_min, tm_hour, tm_mday, tm_mon, tm_year, tm_wday, tm_yday, tm_isdst: -1 };
+        let rtc = RtcTime {
+            tm_sec,
+            tm_min,
+            tm_hour,
+            tm_mday,
+            tm_mon,
+            tm_year,
+            tm_wday,
+            tm_yday,
+            tm_isdst: -1,
+        };
         *translated_refmut(token, arg as *mut RtcTime) = rtc;
         return 0;
     }
@@ -526,10 +574,10 @@ pub fn sys_ioctl(fd: usize, request: usize, arg: usize) -> isize {
                 return -14; // EFAULT
             }
             let term = Termios {
-                c_iflag: 0x0500,  // ICRNL | IXON
-                c_oflag: 0x0005,  // OPOST | ONLCR
-                c_cflag: 0x04bf,  // CREAD | CS8 | B38400 | ...
-                c_lflag: 0x8a3b,  // ISIG | ICANON | ECHO | ECHOE | ECHOK | ...
+                c_iflag: 0x0500, // ICRNL | IXON
+                c_oflag: 0x0005, // OPOST | ONLCR
+                c_cflag: 0x04bf, // CREAD | CS8 | B38400 | ...
+                c_lflag: 0x8a3b, // ISIG | ICANON | ECHO | ECHOE | ECHOK | ...
                 c_line: 0,
                 c_cc: [0; 19],
             };
@@ -749,7 +797,9 @@ pub fn sys_readlinkat(dirfd: isize, path: *const u8, buf: *mut u8, bufsiz: usize
 
     let link_target = {
         let mut link_data = vec![0u8; bufsiz.min(4096)];
-        let n = dentry.super_block.read_at(&dentry.fs_path, 0, &mut link_data);
+        let n = dentry
+            .super_block
+            .read_at(&dentry.fs_path, 0, &mut link_data);
         link_data.truncate(n);
         link_data
     };
@@ -792,7 +842,13 @@ pub fn sys_fstatat(dirfd: isize, path: *const u8, stat_buf: *mut u8, flags: usiz
     0
 }
 
-pub fn sys_statx(dirfd: isize, path: *const u8, flags: u32, mask: u32, statx_buf: *mut u8) -> isize {
+pub fn sys_statx(
+    dirfd: isize,
+    path: *const u8,
+    flags: u32,
+    mask: u32,
+    statx_buf: *mut u8,
+) -> isize {
     const AT_EMPTY_PATH: u32 = 0x1000;
 
     if statx_buf.is_null() {
@@ -1098,7 +1154,9 @@ pub fn sys_fstatfs(fd: usize, buf: *mut u8) -> isize {
         Some(f) => f.clone(),
         None => return -1,
     };
-    let dentry = file.as_any().downcast_ref::<crate::fs::inode::OSInode>()
+    let dentry = file
+        .as_any()
+        .downcast_ref::<crate::fs::inode::OSInode>()
         .map(|inode| inode.dentry());
     match dentry {
         Some(d) => {

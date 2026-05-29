@@ -82,12 +82,16 @@ impl MemorySet {
                     let file_start = ph.offset() as usize - page_off;
                     let file_end = (ph.offset() + ph.file_size()) as usize;
                     let aligned_data = &elf.input[file_start..file_end];
-                    let aligned_map = MapArea::new(aligned_va.into(), end_va, MapType::Framed, map_perm);
+                    let aligned_map =
+                        MapArea::new(aligned_va.into(), end_va, MapType::Framed, map_perm);
                     memory_set.push(aligned_map, Some(aligned_data), 0);
                 } else {
                     memory_set.push(
                         map_area,
-                        Some(&elf.input[ph.offset() as usize..(ph.offset() + ph.file_size()) as usize]),
+                        Some(
+                            &elf.input
+                                [ph.offset() as usize..(ph.offset() + ph.file_size()) as usize],
+                        ),
                         0,
                     );
                 }
@@ -137,12 +141,9 @@ impl MemorySet {
                             MappingSize::Page4KB,
                         );
                     }
-                    memory_set.page_table.map_page(
-                        vpn,
-                        shared.paddr,
-                        flags,
-                        MappingSize::Page4KB,
-                    );
+                    memory_set
+                        .page_table
+                        .map_page(vpn, shared.paddr, flags, MappingSize::Page4KB);
                     new_area.data_frames.insert(vpn, shared);
                 }
             }
@@ -217,10 +218,10 @@ impl MemorySet {
 
     /// 插入匿名映射
     pub fn insert_framed_area(
-        &mut self, 
-        start_addr: polyhal::VirtAddr, 
-        end_addr: polyhal::VirtAddr, 
-        permission: MapPermission
+        &mut self,
+        start_addr: polyhal::VirtAddr,
+        end_addr: polyhal::VirtAddr,
+        permission: MapPermission,
     ) {
         let mut map_area = MapArea::new(start_addr, end_addr, MapType::Framed, permission);
         map_area.map(&self.page_table);
@@ -232,14 +233,14 @@ impl MemorySet {
         start_addr: polyhal::VirtAddr,
         end_addr: polyhal::VirtAddr,
         permission: MapPermission,
-        file: alloc::sync::Arc<dyn crate::fs::File>, 
-        offset: usize 
+        file: alloc::sync::Arc<dyn crate::fs::File>,
+        offset: usize,
     ) -> bool {
         self.insert_framed_area(start_addr, end_addr, permission);
-        
+
         file.seek(offset);
         let area = self.areas.last().unwrap();
-        
+
         for vaddr in area.vaddr_range.clone() {
             let (paddr, _flags) = self.page_table.translate(vaddr).unwrap();
 
@@ -296,10 +297,8 @@ impl MemorySet {
                 } else {
                     let min_vaddr = *self.areas[i].data_frames.keys().min().unwrap();
                     let max_vaddr = *self.areas[i].data_frames.keys().max().unwrap();
-                    self.areas[i].vaddr_range = VAddrRange::new(
-                        min_vaddr,
-                        max_vaddr + crate::config::PAGE_SIZE,
-                    );
+                    self.areas[i].vaddr_range =
+                        VAddrRange::new(min_vaddr, max_vaddr + crate::config::PAGE_SIZE);
                     i += 1;
                 }
             } else {
@@ -312,8 +311,8 @@ impl MemorySet {
 }
 
 pub fn handle_cow_fault(bad_addr: usize) -> bool {
-    use crate::task::current_task;
     use crate::mm::frame_alloc;
+    use crate::task::current_task;
     let task = match current_task() {
         Some(t) => t,
         None => return false,
@@ -333,11 +332,16 @@ pub fn handle_cow_fault(bad_addr: usize) -> bool {
         if let Some(frame) = area.data_frames.get(&vpn) {
             let refs = frame.ref_count();
             if refs == 0 {
-                panic!("COW refcount=0 at paddr={:#x} vpn={:#x}", frame.paddr.raw(), vpn.raw());
+                panic!(
+                    "COW refcount=0 at paddr={:#x} vpn={:#x}",
+                    frame.paddr.raw(),
+                    vpn.raw()
+                );
             }
             if refs <= 1 {
                 let flags: MappingFlags = area.map_perm.into();
-                mem.page_table.map_page(vpn, frame.paddr, flags, MappingSize::Page4KB);
+                mem.page_table
+                    .map_page(vpn, frame.paddr, flags, MappingSize::Page4KB);
                 return true;
             }
             let new_frame = match frame_alloc() {
@@ -352,7 +356,8 @@ pub fn handle_cow_fault(bad_addr: usize) -> bool {
                 );
             }
             let flags: MappingFlags = area.map_perm.into();
-            mem.page_table.map_page(vpn, new_frame.paddr, flags, MappingSize::Page4KB);
+            mem.page_table
+                .map_page(vpn, new_frame.paddr, flags, MappingSize::Page4KB);
             area.data_frames.insert(vpn, new_frame);
             return true;
         }

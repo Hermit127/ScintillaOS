@@ -12,5 +12,9 @@ pub fn main() -> i32 {
     let ret = sys_umount2("/", 0);
     println!("umount returned: {}", ret);
     println!("========== END umount ==========");
-    if ret >= 0 { 0 } else { 1 }
+    if ret >= 0 {
+        0
+    } else {
+        1
+    }
 }

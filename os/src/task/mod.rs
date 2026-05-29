@@ -7,7 +7,9 @@ mod signal;
 mod task;
 
 use crate::fs::{open_file, OpenFlags};
+use crate::sync::UPSafeCell;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use lazy_static::*;
 use log::*;
 use manager::fetch_task;
@@ -15,11 +17,9 @@ use manager::remove_from_pid2task;
 use polyhal::instruction::shutdown;
 use polyhal::kcontext::KContext;
 use polyhal_trap::trapframe::TrapFrameArgs;
-use crate::sync::UPSafeCell;
-use alloc::vec::Vec;
 
 pub use action::{SignalAction, SignalActions};
-pub use manager::{add_task, pid2task, PID2TCB, ready_queue_len, add_priority_task};
+pub use manager::{add_priority_task, add_task, pid2task, ready_queue_len, PID2TCB};
 pub use pid::{pid_alloc, PidHandle};
 pub use processor::{
     current_task, current_user_token, init_kernel_page, run_tasks, schedule, take_current_task,
@@ -30,12 +30,12 @@ pub use task::{BlockReason, TaskControlBlock, TaskStatus};
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct TimeSpec {
-    pub tv_sec: usize,   
-    pub tv_nsec: usize,  
+    pub tv_sec: usize,
+    pub tv_nsec: usize,
 }
 
 pub struct SleepTask {
-    pub wakeup_time: usize, 
+    pub wakeup_time: usize,
     pub task: Arc<TaskControlBlock>,
 }
 
@@ -187,18 +187,19 @@ pub fn add_initproc() {
 pub fn check_signals_error_of_current() -> Option<(i32, &'static str)> {
     trace!("os::task::check_signals_error_of_current");
     let task = current_task()?;
-    let task_inner = task.inner_exclusive_access();
-    // println!(
-    //     "[K] check_signals_error_of_current {:?}",
-    //     task_inner.signals
-    // );
+    let task_inner = task.try_inner_exclusive_access()?;
     task_inner.signals.check_error()
 }
 
 pub fn current_add_signal(signal: SignalFlags) {
     trace!("os::task::current_add_signal");
-    let task = current_task().unwrap();
-    let mut task_inner = task.inner_exclusive_access();
+    let task = match current_task() {
+        Some(t) => t,
+        None => return,
+    };
+    let Some(mut task_inner) = task.try_inner_exclusive_access() else {
+        return;
+    };
     task_inner.signals |= signal;
     // println!(
     //     "[K] current_add_signal:: current task sigflag {:?}",
@@ -276,41 +277,43 @@ fn call_user_signal_handler(sig: usize, signal: SignalFlags) {
 
 fn check_pending_signals() {
     trace!("os::task::check_pending_signals");
+    let task = match current_task() {
+        Some(t) => t,
+        None => return,
+    };
     for sig in 0..(MAX_SIG + 1) {
-        let task = current_task().unwrap();
-        let task_inner = task.inner_exclusive_access();
         let signal = SignalFlags::from_bits(1 << sig).unwrap();
-        if task_inner.signals.contains(signal) && (!task_inner.signal_mask.contains(signal)) {
-            let mut masked = true;
-            let handling_sig = task_inner.handling_sig;
-            if handling_sig == -1 {
-                masked = false;
+        let (masked, kernel_signal) = {
+            let Some(mut task_inner) = task.try_inner_exclusive_access() else {
+                return;
+            };
+            if !task_inner.signals.contains(signal) || task_inner.signal_mask.contains(signal) {
+                continue;
+            }
+            let mut m = true;
+            if task_inner.handling_sig == -1 {
+                m = false;
             } else {
-                let handling_sig = handling_sig as usize;
-                if !task_inner.signal_actions.table[handling_sig]
-                    .mask
-                    .contains(signal)
-                {
-                    masked = false;
+                let hs = task_inner.handling_sig as usize;
+                if !task_inner.signal_actions.table[hs].mask.contains(signal) {
+                    m = false;
                 }
             }
-            if !masked {
-                drop(task_inner);
-                drop(task);
-                if signal == SignalFlags::SIGKILL
-                    || signal == SignalFlags::SIGTERM
-                    || signal == SignalFlags::SIGSTOP
-                    || signal == SignalFlags::SIGCONT
-                    || signal == SignalFlags::SIGDEF
-                {
-                    // signal is a kernel signal
-                    call_kernel_signal_handler(signal);
-                } else {
-                    // signal is a user signal
-                    call_user_signal_handler(sig, signal);
-                    return;
-                }
+            if m {
+                continue;
             }
+            let is_kernel = signal == SignalFlags::SIGKILL
+                || signal == SignalFlags::SIGTERM
+                || signal == SignalFlags::SIGSTOP
+                || signal == SignalFlags::SIGCONT
+                || signal == SignalFlags::SIGDEF;
+            (false, is_kernel)
+        };
+        if kernel_signal {
+            call_kernel_signal_handler(signal);
+        } else {
+            call_user_signal_handler(sig, signal);
+            return;
         }
     }
 }
@@ -319,14 +322,29 @@ pub fn handle_signals() {
     trace!("os::task::handle_signals");
     loop {
         check_pending_signals();
-        let (frozen, killed) = {
-            let task = current_task().unwrap();
-            let task_inner = task.inner_exclusive_access();
-            (task_inner.frozen, task_inner.killed)
+        let killed = {
+            let task = match current_task() {
+                Some(t) => t,
+                None => break,
+            };
+            let Some(task_inner) = task.try_inner_borrow() else {
+                break;
+            };
+            task_inner.killed
         };
         if killed {
-            exit_current_and_run_next(-9); // SIGKILL
+            exit_current_and_run_next(-9);
         }
+        let frozen = {
+            let task = match current_task() {
+                Some(t) => t,
+                None => break,
+            };
+            let Some(task_inner) = task.try_inner_borrow() else {
+                break;
+            };
+            task_inner.frozen
+        };
         if !frozen {
             break;
         }
@@ -336,24 +354,25 @@ pub fn handle_signals() {
 }
 
 pub fn add_sleep_task(wakeup_time: usize, task: Arc<TaskControlBlock>) {
-    SLEEP_QUEUE.exclusive_access().push(SleepTask { wakeup_time, task });
+    SLEEP_QUEUE
+        .exclusive_access()
+        .push(SleepTask { wakeup_time, task });
 }
 
 pub fn check_and_wake_up_tasks() {
     let now = polyhal::time::Time::now().to_msec() as usize;
     let mut queue = SLEEP_QUEUE.exclusive_access();
-    
+
     let mut i = 0;
     while i < queue.len() {
         if queue[i].wakeup_time <= now {
-            
             let sleep_task = queue.remove(i);
 
             //wake up the task by changing its status to Ready and adding it back to the scheduler
             let mut inner = sleep_task.task.inner_exclusive_access();
-            inner.task_status = TaskStatus::Ready; 
+            inner.task_status = TaskStatus::Ready;
             drop(inner);
-            add_task(sleep_task.task); 
+            add_task(sleep_task.task);
         } else {
             i += 1;
         }

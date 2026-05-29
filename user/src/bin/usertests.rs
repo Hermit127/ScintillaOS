@@ -99,7 +99,7 @@ fn run_tests(tests: &[(&str, &str, &str, &str, i32)]) -> i32 {
             );
         }
     }
-    
+
     println!("passed: {}", passed.len());
     passed.iter().for_each(|x| {
         println!("    {}", x);

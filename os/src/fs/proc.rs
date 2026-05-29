@@ -17,11 +17,21 @@ impl ProcDirFile {
 }
 
 impl File for ProcDirFile {
-    fn readable(&self) -> bool { true }
-    fn writable(&self) -> bool { false }
-    fn read(&self, _buf: &mut [u8]) -> isize { -1 }
-    fn write(&self, _buf: &mut [u8]) -> isize { -1 }
-    fn is_dir(&self) -> bool { true }
+    fn readable(&self) -> bool {
+        true
+    }
+    fn writable(&self) -> bool {
+        false
+    }
+    fn read(&self, _buf: &mut [u8]) -> isize {
+        -1
+    }
+    fn write(&self, _buf: &mut [u8]) -> isize {
+        -1
+    }
+    fn is_dir(&self) -> bool {
+        true
+    }
     fn stat(&self) -> Kstat {
         let mut st = Kstat::new(0x4000);
         st.st_mode = 0o555 | 0x4000;
@@ -49,9 +59,12 @@ impl File for ProcDirFile {
         while idx < entries.len() {
             let (name, inode) = &entries[idx];
             let name_bytes = name.as_bytes();
-            let record_size = crate::fs::inode::OSInode::align_up(DIRENT64_FIXED_SIZE + name_bytes.len() + 1, 8);
+            let record_size =
+                crate::fs::inode::OSInode::align_up(DIRENT64_FIXED_SIZE + name_bytes.len() + 1, 8);
             if written + record_size > buf.len() {
-                if written == 0 { return -1; }
+                if written == 0 {
+                    return -1;
+                }
                 break;
             }
             let record = &mut buf[written..written + record_size];
@@ -71,7 +84,9 @@ impl File for ProcDirFile {
         *inner = idx;
         written as isize
     }
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
 pub struct ProcPidStatFile {
@@ -101,7 +116,9 @@ impl ProcPidStatFile {
             } else {
                 String::from("initproc")
             };
-            let ppid = inner.parent.as_ref()
+            let ppid = inner
+                .parent
+                .as_ref()
                 .and_then(|w| w.upgrade())
                 .map(|p| p.getpid())
                 .unwrap_or(0);
@@ -114,26 +131,36 @@ impl ProcPidStatFile {
 }
 
 impl File for ProcPidStatFile {
-    fn readable(&self) -> bool { true }
-    fn writable(&self) -> bool { false }
+    fn readable(&self) -> bool {
+        true
+    }
+    fn writable(&self) -> bool {
+        false
+    }
     fn read(&self, buf: &mut [u8]) -> isize {
         let mut off = self.offset.exclusive_access();
         let content = self.build_content();
         let bytes = content.as_bytes();
-        if *off >= bytes.len() { return 0; }
+        if *off >= bytes.len() {
+            return 0;
+        }
         let len = buf.len().min(bytes.len() - *off);
         buf[..len].copy_from_slice(&bytes[*off..*off + len]);
         *off += len;
         len as isize
     }
-    fn write(&self, _buf: &mut [u8]) -> isize { -1 }
+    fn write(&self, _buf: &mut [u8]) -> isize {
+        -1
+    }
     fn stat(&self) -> Kstat {
         let mut st = Kstat::new(super::S_IFREG);
         st.st_size = self.build_content().len() as i64;
         st.st_mode = super::S_IFREG | 0o444;
         st
     }
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
 pub struct ProcMountsFile {
@@ -151,30 +178,43 @@ impl ProcMountsFile {
             let mp = &m.mnt_point.path;
             content.push_str(&alloc::format!("{device} {mp} {fstype} rw,relatime 0 0\n"));
         }
-        Self { offset: unsafe { UPSafeCell::new(0) }, content }
+        Self {
+            offset: unsafe { UPSafeCell::new(0) },
+            content,
+        }
     }
 }
 
 impl File for ProcMountsFile {
-    fn readable(&self) -> bool { true }
-    fn writable(&self) -> bool { false }
+    fn readable(&self) -> bool {
+        true
+    }
+    fn writable(&self) -> bool {
+        false
+    }
     fn read(&self, buf: &mut [u8]) -> isize {
         let mut offset = self.offset.exclusive_access();
         let bytes = self.content.as_bytes();
-        if *offset >= bytes.len() { return 0; }
+        if *offset >= bytes.len() {
+            return 0;
+        }
         let len = buf.len().min(bytes.len() - *offset);
         buf[..len].copy_from_slice(&bytes[*offset..*offset + len]);
         *offset += len;
         len as isize
     }
-    fn write(&self, _buf: &mut [u8]) -> isize { -1 }
+    fn write(&self, _buf: &mut [u8]) -> isize {
+        -1
+    }
     fn stat(&self) -> Kstat {
         let mut st = Kstat::new(super::S_IFREG);
         st.st_size = self.content.len() as i64;
         st.st_mode = super::S_IFREG | 0o444;
         st
     }
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
 pub struct ProcMeminfoFile {
@@ -193,46 +233,71 @@ impl ProcMeminfoFile {
             "MemTotal:       {} kB\nMemFree:        {} kB\nMemAvailable:   {} kB\n\
              Buffers:        0 kB\nCached:         0 kB\nSwapCached:     0 kB\n\
              SwapTotal:      0 kB\nSwapFree:       0 kB\n",
-            total_kb, free_kb, free_kb
+            total_kb,
+            free_kb,
+            free_kb
         );
-        Self { offset: unsafe { UPSafeCell::new(0) }, content }
+        Self {
+            offset: unsafe { UPSafeCell::new(0) },
+            content,
+        }
     }
 }
 
 impl File for ProcMeminfoFile {
-    fn readable(&self) -> bool { true }
-    fn writable(&self) -> bool { false }
+    fn readable(&self) -> bool {
+        true
+    }
+    fn writable(&self) -> bool {
+        false
+    }
     fn read(&self, buf: &mut [u8]) -> isize {
         let mut offset = self.offset.exclusive_access();
         let bytes = self.content.as_bytes();
-        if *offset >= bytes.len() { return 0; }
+        if *offset >= bytes.len() {
+            return 0;
+        }
         let len = buf.len().min(bytes.len() - *offset);
         buf[..len].copy_from_slice(&bytes[*offset..*offset + len]);
         *offset += len;
         len as isize
     }
-    fn write(&self, _buf: &mut [u8]) -> isize { -1 }
+    fn write(&self, _buf: &mut [u8]) -> isize {
+        -1
+    }
     fn stat(&self) -> Kstat {
         let mut st = Kstat::new(super::S_IFREG);
         st.st_size = self.content.len() as i64;
         st.st_mode = super::S_IFREG | 0o444;
         st
     }
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
 pub struct DevRtcFile;
 
 impl File for DevRtcFile {
-    fn readable(&self) -> bool { true }
-    fn writable(&self) -> bool { false }
-    fn read(&self, _buf: &mut [u8]) -> isize { 0 }
-    fn write(&self, _buf: &mut [u8]) -> isize { -1 }
+    fn readable(&self) -> bool {
+        true
+    }
+    fn writable(&self) -> bool {
+        false
+    }
+    fn read(&self, _buf: &mut [u8]) -> isize {
+        0
+    }
+    fn write(&self, _buf: &mut [u8]) -> isize {
+        -1
+    }
     fn stat(&self) -> Kstat {
         let mut st = Kstat::new(0x2000);
         st.st_mode = 0o444 | 0x2000;
         st.st_rdev = 0x0a00;
         st
     }
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }

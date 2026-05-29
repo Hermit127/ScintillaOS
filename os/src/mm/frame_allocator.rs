@@ -15,7 +15,9 @@ use polyhal::{pa, utils::MutexNoIrq, PhysAddr};
 type RefMap = BTreeMap<usize, u8>;
 static FRAME_REFS: MutexNoIrq<RefMap> = MutexNoIrq::new(BTreeMap::new());
 
-fn ref_key(paddr: PhysAddr) -> usize { paddr.raw() / PAGE_SIZE }
+fn ref_key(paddr: PhysAddr) -> usize {
+    paddr.raw() / PAGE_SIZE
+}
 
 fn ref_get(paddr: PhysAddr) -> u8 {
     FRAME_REFS.lock().get(&ref_key(paddr)).copied().unwrap_or(1)

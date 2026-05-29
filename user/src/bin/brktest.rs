@@ -19,9 +19,12 @@ pub fn main() -> i32 {
     let page_size = 4096;
     let new_brk_target = start_brk + page_size;
     let new_brk_actual = brk(new_brk_target) as usize;
-    
+
     println!("Allocated 1 page. New brk: {:#x}", new_brk_actual);
-    assert_eq!(new_brk_actual, new_brk_target, "brk failed to allocate memory");
+    assert_eq!(
+        new_brk_actual, new_brk_target,
+        "brk failed to allocate memory"
+    );
 
     // 3. 内存映射验证（核心！）
     // 如果你在内核里的 MapArea 和页表映射写错了，这里写内存时就会触发 StorePageFault 崩溃。
@@ -32,11 +35,14 @@ pub fn main() -> i32 {
         *ptr = 0x42;
         // 读出来校验
         assert_eq!(*ptr, 0x42, "Memory write/read validation failed");
-        
+
         // 顺便测试一下页面末尾
         let ptr_end = (new_brk_actual - 1) as *mut u8;
         *ptr_end = 0x99;
-        assert_eq!(*ptr_end, 0x99, "Memory write/read validation failed at page end");
+        assert_eq!(
+            *ptr_end, 0x99,
+            "Memory write/read validation failed at page end"
+        );
     }
     println!("Memory R/W works perfectly!");
 

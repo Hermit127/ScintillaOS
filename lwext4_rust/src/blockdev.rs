@@ -40,7 +40,11 @@ impl<K: KernelDevOp> Ext4BlockWrapper<K> {
         Self::new_with_name(block_dev, "ext4_fs", "/mp/")
     }
 
-    pub fn new_with_name(block_dev: K::DevType, dev_name: &str, mount_point: &str) -> Result<Self, i32> {
+    pub fn new_with_name(
+        block_dev: K::DevType,
+        dev_name: &str,
+        mount_point: &str,
+    ) -> Result<Self, i32> {
         // note this ownership
         let devt_user = Box::into_raw(Box::new(block_dev)) as *mut c_void;
         //let devt_user = devt.as_mut() as *mut _ as *mut c_void;
