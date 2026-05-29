@@ -1,7 +1,7 @@
 #!/bin/sh
 
 ./busybox-glibc --install -s /bin 2>/dev/null
-./busybox-glibc echo "#### OS COMP TEST GROUP START busybox ####"
+./busybox-glibc echo "#### OS COMP TEST GROUP START busybox-glibc ####"
 
 ./busybox-glibc cat ./busybox_cmd.txt | while read line
 do
@@ -15,4 +15,4 @@ do
 	fi
 done
 
-./busybox-glibc echo "#### OS COMP TEST GROUP END busybox ####"
+./busybox-glibc echo "#### OS COMP TEST GROUP END busybox-glibc ####"
