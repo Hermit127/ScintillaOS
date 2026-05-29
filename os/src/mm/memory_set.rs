@@ -122,32 +122,22 @@ impl MemorySet {
         }
     }
     pub fn from_existed_user(user_space: &MemorySet) -> MemorySet {
-        trace!("os::mm::MemorySet::from_existed_user (COW)");
+        trace!("os::mm::MemorySet::from_existed_user");
         let mut memory_set = Self::new_bare();
         for area in user_space.areas.iter() {
-            let mut new_area = MapArea::from_another(area);
+            let new_area = MapArea::from_another(area);
+            memory_set.push(new_area, None, 0);
             for vpn in area.vaddr_range {
-                if let Some(frame) = area.data_frames.get(&vpn) {
-                    let shared = frame.cow_clone();
-                    let mut flags: MappingFlags = area.map_perm.into();
-                    if area.map_perm.contains(MapPermission::W) {
-                        flags.remove(MappingFlags::W);
-                        let mut parent_flags: MappingFlags = area.map_perm.into();
-                        parent_flags.remove(MappingFlags::W);
-                        user_space.page_table.map_page(
-                            vpn,
-                            frame.paddr,
-                            parent_flags,
-                            MappingSize::Page4KB,
-                        );
-                    }
-                    memory_set
-                        .page_table
-                        .map_page(vpn, shared.paddr, flags, MappingSize::Page4KB);
-                    new_area.data_frames.insert(vpn, shared);
+                let src = user_space.translate(vpn).unwrap().0;
+                let dst = memory_set.translate(vpn).unwrap().0;
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        src.get_ptr::<u8>(),
+                        dst.get_mut_ptr(),
+                        PAGE_SIZE,
+                    );
                 }
             }
-            memory_set.areas.push(new_area);
         }
         memory_set
     }
@@ -308,62 +298,6 @@ impl MemorySet {
 
         unmapped_any
     }
-}
-
-pub fn handle_cow_fault(bad_addr: usize) -> bool {
-    use crate::mm::frame_alloc;
-    use crate::task::current_task;
-    let task = match current_task() {
-        Some(t) => t,
-        None => return false,
-    };
-    let mut inner = task.inner_exclusive_access();
-    let vaddr: VirtAddr = bad_addr.into();
-    let mem = &mut inner.memory_set;
-
-    for area in mem.areas.iter_mut() {
-        if vaddr < area.vaddr_range.get_start() || vaddr >= area.vaddr_range.get_end() {
-            continue;
-        }
-        let vpn = vaddr.floor();
-        if !area.map_perm.contains(MapPermission::W) {
-            continue;
-        }
-        if let Some(frame) = area.data_frames.get(&vpn) {
-            let refs = frame.ref_count();
-            if refs == 0 {
-                panic!(
-                    "COW refcount=0 at paddr={:#x} vpn={:#x}",
-                    frame.paddr.raw(),
-                    vpn.raw()
-                );
-            }
-            if refs <= 1 {
-                let flags: MappingFlags = area.map_perm.into();
-                mem.page_table
-                    .map_page(vpn, frame.paddr, flags, MappingSize::Page4KB);
-                return true;
-            }
-            let new_frame = match frame_alloc() {
-                Some(f) => f,
-                None => return false,
-            };
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    frame.paddr.get_ptr::<u8>(),
-                    new_frame.paddr.get_mut_ptr(),
-                    PAGE_SIZE,
-                );
-            }
-            let flags: MappingFlags = area.map_perm.into();
-            mem.page_table
-                .map_page(vpn, new_frame.paddr, flags, MappingSize::Page4KB);
-            area.data_frames.insert(vpn, new_frame);
-            return true;
-        }
-        continue;
-    }
-    false
 }
 
 pub struct MapArea {

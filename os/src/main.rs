@@ -62,11 +62,8 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             // cx is changed during sys_exec, so we have to call it again
             ctx[TrapFrameArgs::RET] = result as usize;
         }
-        StorePageFault(bad_addr) => {
-            // Try COW (Copy-On-Write) first
-            if !crate::mm::handle_cow_fault(bad_addr) {
-                exit_current_and_run_next(-11);
-            }
+        StorePageFault(_bad_addr) => {
+            exit_current_and_run_next(-11);
         }
         LoadPageFault(_paddr) | InstructionPageFault(_paddr) => {
             exit_current_and_run_next(-11);

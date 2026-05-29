@@ -374,8 +374,7 @@ impl TaskControlBlock {
     }
     pub fn fork(self: &Arc<TaskControlBlock>) -> Arc<TaskControlBlock> {
         trace!("os::task::TaskControlBlock::fork");
-        // Get a reference to the memory_set first, then release the lock
-        // so that COW (slow) runs without holding the inner borrow
+        // Copy the user address space before collecting the remaining task state.
         let memory_set = {
             let parent_inner = self.inner_exclusive_access();
             MemorySet::from_existed_user(&parent_inner.memory_set)

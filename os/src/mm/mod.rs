@@ -10,5 +10,5 @@ pub use frame_allocator::{
     FrameTracker,
 };
 pub use heap_allocator::init_heap;
-pub use memory_set::{handle_cow_fault, LoadedElf, MapArea, MapPermission, MapType, MemorySet};
+pub use memory_set::{LoadedElf, MapArea, MapPermission, MapType, MemorySet};
 pub use page_table::{translated_byte_buffer, translated_ref, translated_refmut, translated_str};
