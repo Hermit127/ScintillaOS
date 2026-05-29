@@ -1,6 +1,7 @@
 # Building
 export LOG ?= error
 ARCH ?= riscv64
+COMMA := ,
 
 ifeq ($(ARCH), x86_64)
   TARGET := x86_64-unknown-none
@@ -76,9 +77,9 @@ TEST ?=
 
 # ==================== Contest Submission Targets ====================
 
-all: kernel-rv disk.img kernel-la disk-la.img
+all: kernel-rv disk.img disk-rv.img kernel-la disk-la.img
 	@echo "===== Build complete ====="
-	@ls -lh kernel-rv kernel-la disk.img disk-la.img 2>/dev/null || true
+	@ls -lh kernel-rv kernel-la disk.img disk-rv.img disk-la.img 2>/dev/null || true
 
 kernel-rv:
 	@echo "===== Building kernel-rv (riscv64) ====="
@@ -98,6 +99,13 @@ disk.img: fs-img
 		cp $(FS_IMG) disk.img; \
 		echo "disk.img ready ($(FS_IMG))"; \
 	fi
+
+disk-rv.img:
+	@echo "===== Building disk-rv.img (riscv64) ====="
+	@make fs-img ARCH=riscv64
+	@cp target/riscv64gc-unknown-none-elf/release/fs.img disk-rv.img
+	@echo "disk-rv.img ready"
+
 
 disk-la.img:
 	@echo "===== Building disk-la.img (loongarch64) ====="
@@ -212,19 +220,19 @@ QEMU_EXEC += -nographic \
 # Single-disk mode (same disk on both bus 0 and bus 1, for local dev)
 # ROOT_BLOCK_DEVICE uses bus 1, mount test & contest use bus 0
 QEMU_ARGS_SINGLE := -drive file=$(FS_IMG),if=none,format=raw,id=x0,file.locking=off \
-			-device $(VIRTIO_BLK_DEVICE),drive=x0$(if $(filter loongarch64,$(ARCH)),,bus=$(VIRTIO_BLK_BUS)) \
+			-device $(VIRTIO_BLK_DEVICE),drive=x0$(if $(filter loongarch64,$(ARCH)),,$(COMMA)bus=$(VIRTIO_BLK_BUS)) \
 			-drive file=$(FS_IMG),if=none,format=raw,id=x1,file.locking=off \
-			-device $(VIRTIO_BLK_DEVICE),drive=x1$(if $(filter loongarch64,$(ARCH)),,bus=virtio-mmio-bus.1)
+			-device $(VIRTIO_BLK_DEVICE),drive=x1$(if $(filter loongarch64,$(ARCH)),,$(COMMA)bus=virtio-mmio-bus.1)
 
 # Test disk path (user can override)
-ROOT_DISK := $(if $(filter loongarch64,$(ARCH)),disk-la.img,disk.img)
+ROOT_DISK := $(if $(filter loongarch64,$(ARCH)),disk-la.img,disk-rv.img)
 TEST_DISK ?= fs-img.img
 
 # Dual-disk mode (test disk bus 0, disk.img bus 1, for contest)
 QEMU_ARGS_DUAL := -drive file=$(TEST_DISK),if=none,format=raw,id=x0 \
-			-device $(VIRTIO_BLK_DEVICE),drive=x0$(if $(filter loongarch64,$(ARCH)),,bus=$(VIRTIO_BLK_BUS)) \
+			-device $(VIRTIO_BLK_DEVICE),drive=x0$(if $(filter loongarch64,$(ARCH)),,$(COMMA)bus=$(VIRTIO_BLK_BUS)) \
 			-drive file=$(ROOT_DISK),if=none,format=raw,id=x1 \
-			-device $(VIRTIO_BLK_DEVICE),drive=x1$(if $(filter loongarch64,$(ARCH)),,bus=virtio-mmio-bus.1)
+			-device $(VIRTIO_BLK_DEVICE),drive=x1$(if $(filter loongarch64,$(ARCH)),,$(COMMA)bus=virtio-mmio-bus.1)
 
 # virtio-net network configuration (SLIRP user-mode, riscv64/aarch64)
 ifeq ($(ARCH), riscv64)
@@ -257,4 +265,4 @@ gdbserver: build
 gdbclient:
 	@gdb -ex 'file $(KERNEL_ELF)' -ex 'set arch riscv:rv64' -ex 'target remote localhost:1234'
 
-.PHONY: all kernel-rv kernel-la disk.img build env kernel clean disasm disasm-vim run-inner run-dual fs-img gdbserver gdbclient
+.PHONY: all kernel-rv kernel-la disk.img disk-rv.img build env kernel clean disasm disasm-vim run-inner run-dual fs-img gdbserver gdbclient

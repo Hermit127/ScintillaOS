@@ -124,16 +124,25 @@ pub fn exit_current_and_run_next(exit_code: i32) {
 
     // remove from pid2task
     remove_from_pid2task(task.getpid());
-    // **** access current TCB exclusively
-    let mut inner = task.inner_exclusive_access();
-    // Change status to Zombie
-    inner.task_status = TaskStatus::Zombie;
-    // Record exit code
-    inner.exit_code = exit_code;
-    // do not move to its parent but under initproc
+    let (parent, orphan_children) = {
+        // **** access current TCB exclusively
+        let mut inner = task.inner_exclusive_access();
+        // Change status to Zombie
+        inner.task_status = TaskStatus::Zombie;
+        // Record exit code
+        inner.exit_code = exit_code;
+        let parent = inner.parent.as_ref().and_then(|w| w.upgrade());
+        let orphan_children = core::mem::take(&mut inner.children);
+        // deallocate user space
+        inner.memory_set.recycle_data_pages();
+        // drop file descriptors
+        inner.fd_table.clear();
+        (parent, orphan_children)
+    };
+    // **** release current PCB before touching parent/initproc
 
     // wake parent waiting in waitpid
-    if let Some(parent) = inner.parent.as_ref().and_then(|w| w.upgrade()) {
+    if let Some(parent) = parent {
         let mut queue = WAITPID_QUEUE.exclusive_access();
         if let Some(idx) = queue.iter().position(|t| t.getpid() == parent.getpid()) {
             let parent_task = queue.remove(idx);
@@ -146,22 +155,14 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     }
 
     // ++++++ access initproc TCB exclusively
-    {
+    if !orphan_children.is_empty() {
         let mut initproc_inner = INITPROC.inner_exclusive_access();
-        for child in inner.children.iter() {
+        for child in orphan_children.iter() {
             child.inner_exclusive_access().parent = Some(Arc::downgrade(&INITPROC));
             initproc_inner.children.push(child.clone());
         }
     }
     // ++++++ release parent PCB
-
-    inner.children.clear();
-    // deallocate user space
-    inner.memory_set.recycle_data_pages();
-    // drop file descriptors
-    inner.fd_table.clear();
-    drop(inner);
-    // **** release current PCB
     // drop task manually to maintain rc correctly
     drop(task);
     // we do not have to save task context
