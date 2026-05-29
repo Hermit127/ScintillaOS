@@ -53,19 +53,29 @@ fn run_test(name: &str) {
     waitpid(pid as usize, &mut exit_code);
 }
 
-#[no_mangle]
-pub fn main() -> i32 {
-    println!("#### OS COMP TEST GROUP START basic-musl ####");
+fn run_group(name: &str) {
+    println!("#### OS COMP TEST GROUP START {} ####", name);
     for test in TEST_LIST {
         run_test(test);
     }
-    println!("#### OS COMP TEST GROUP END basic-musl ####");
+    println!("#### OS COMP TEST GROUP END {} ####", name);
+}
 
-    println!("#### OS COMP TEST GROUP START basic-glibc ####");
-    for test in TEST_LIST {
-        run_test(test);
+#[no_mangle]
+pub fn main(argc: usize, argv: &[&str]) -> i32 {
+    if argc > 1 {
+        if argv[1] == "musl" {
+            run_group("basic-musl");
+            return 0;
+        }
+        if argv[1] == "glibc" {
+            run_group("basic-glibc");
+            return 0;
+        }
     }
-    println!("#### OS COMP TEST GROUP END basic-glibc ####");
+
+    run_group("basic-musl");
+    run_group("basic-glibc");
 
     0
 }
