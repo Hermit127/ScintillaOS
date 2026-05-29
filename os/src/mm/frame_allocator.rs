@@ -1,4 +1,5 @@
 use crate::config::PAGE_SIZE;
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use buddy_system_allocator::FrameAllocator;
 use core::{
@@ -6,8 +7,20 @@ use core::{
     mem::size_of,
     sync::atomic::{AtomicUsize, Ordering},
 };
-use log::trace;
 use polyhal::{pa, utils::MutexNoIrq, PhysAddr};
+
+type RefMap = BTreeMap<usize, usize>;
+static FRAME_REFS: MutexNoIrq<RefMap> = MutexNoIrq::new(BTreeMap::new());
+
+fn ref_key(paddr: PhysAddr) -> usize {
+    paddr.raw() / PAGE_SIZE
+}
+
+fn ref_inc(paddr: PhysAddr) {
+    let mut refs = FRAME_REFS.lock();
+    let entry = refs.entry(ref_key(paddr)).or_insert(1);
+    *entry += 1;
+}
 
 pub struct FrameTracker {
     pub paddr: PhysAddr,
@@ -18,10 +31,25 @@ impl FrameTracker {
         paddr.clear_len(PAGE_SIZE);
         Self { paddr }
     }
+    pub fn shared_clone(&self) -> Self {
+        ref_inc(self.paddr);
+        Self { paddr: self.paddr }
+    }
 }
 
 impl Drop for FrameTracker {
     fn drop(&mut self) {
+        let mut refs = FRAME_REFS.lock();
+        let key = ref_key(self.paddr);
+        if let Some(count) = refs.get_mut(&key) {
+            if *count > 2 {
+                *count -= 1;
+            } else {
+                refs.remove(&key);
+            }
+            return;
+        }
+        drop(refs);
         frame_dealloc(self.paddr);
     }
 }

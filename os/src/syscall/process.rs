@@ -108,7 +108,9 @@ pub fn sys_clone(flags: usize, stack: usize, ptid: usize, ctid: usize, tls: usiz
     const CLONE_CHILD_CLEARTID: usize = 0x00200000;
 
     let current_task = current_task().unwrap();
-    let new_task = current_task.fork();
+    let Some(new_task) = current_task.fork() else {
+        return -12;
+    };
     let new_pid = new_task.pid.0;
 
     let child_token = {
@@ -133,7 +135,9 @@ pub fn sys_clone(flags: usize, stack: usize, ptid: usize, ctid: usize, tls: usiz
 
 pub fn sys_fork() -> isize {
     let current_task = current_task().unwrap();
-    let new_task = current_task.fork();
+    let Some(new_task) = current_task.fork() else {
+        return -12;
+    };
     let new_pid = new_task.pid.0;
     {
         let mut inner = new_task.inner_exclusive_access();

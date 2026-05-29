@@ -121,13 +121,24 @@ impl MemorySet {
             ph_num: ph_count as usize,
         }
     }
-    pub fn from_existed_user(user_space: &MemorySet) -> MemorySet {
+    pub fn from_existed_user(user_space: &MemorySet) -> Option<MemorySet> {
         trace!("os::mm::MemorySet::from_existed_user");
         let mut memory_set = Self::new_bare();
         for area in user_space.areas.iter() {
             let mut new_area = MapArea::from_another(area);
             for (&vpn, frame) in area.data_frames.iter() {
-                let new_frame = frame_alloc().expect("failed to allocate frame while forking");
+                if !area.map_perm.contains(MapPermission::W) {
+                    let shared_frame = frame.shared_clone();
+                    memory_set.page_table.map_page(
+                        vpn,
+                        shared_frame.paddr,
+                        area.map_perm.into(),
+                        MappingSize::Page4KB,
+                    );
+                    new_area.data_frames.insert(vpn, shared_frame);
+                    continue;
+                }
+                let new_frame = frame_alloc()?;
                 memory_set.page_table.map_page(
                     vpn,
                     new_frame.paddr,
@@ -145,7 +156,7 @@ impl MemorySet {
             }
             memory_set.areas.push(new_area);
         }
-        memory_set
+        Some(memory_set)
     }
     pub fn activate(&self) {
         self.page_table.change();

@@ -372,12 +372,12 @@ impl TaskControlBlock {
         trap_cx[TrapFrameArgs::ARG1] = argv_base;
         *inner.get_trap_cx() = trap_cx;
     }
-    pub fn fork(self: &Arc<TaskControlBlock>) -> Arc<TaskControlBlock> {
+    pub fn fork(self: &Arc<TaskControlBlock>) -> Option<Arc<TaskControlBlock>> {
         trace!("os::task::TaskControlBlock::fork");
         // Copy the user address space before collecting the remaining task state.
         let memory_set = {
             let parent_inner = self.inner_exclusive_access();
-            MemorySet::from_existed_user(&parent_inner.memory_set)
+            MemorySet::from_existed_user(&parent_inner.memory_set)?
         };
 
         let (
@@ -472,7 +472,7 @@ impl TaskControlBlock {
             let mut parent_inner = self.inner_exclusive_access();
             parent_inner.children.push(task_control_block.clone());
         }
-        task_control_block
+        Some(task_control_block)
     }
     pub fn getpid(&self) -> usize {
         self.pid.0
