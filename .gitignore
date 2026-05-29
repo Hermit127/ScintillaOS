@@ -55,7 +55,13 @@ tmp-musl-cross.tgz
 tmp/*
 !tmp/
 !tmp/hello.c
+!tmp/busybox-musl
+!tmp/busybox-musl-loongarch64
+!tmp/busybox-glibc-riscv64
+!tmp/busybox-glibc-loongarch64
+!tmp/busybox_cmd.txt
 !tmp/busybox_glibc_testcode.sh
+!tmp/busybox_testcode.sh
 
 # lwext4 build artifacts
 lwext4_rust/c/lwext4/liblwext4-*.a
