@@ -265,4 +265,4 @@ gdbserver: build
 gdbclient:
 	@gdb -ex 'file $(KERNEL_ELF)' -ex 'set arch riscv:rv64' -ex 'target remote localhost:1234'
 
-.PHONY: all kernel-rv kernel-la disk.img disk-rv.img build env kernel clean disasm disasm-vim run-inner run-dual fs-img gdbserver gdbclient
+.PHONY: all kernel-rv kernel-la disk.img disk-rv.img disk-la.img build env kernel clean disasm disasm-vim run-inner run-dual fs-img gdbserver gdbclient
