@@ -125,19 +125,25 @@ impl MemorySet {
         trace!("os::mm::MemorySet::from_existed_user");
         let mut memory_set = Self::new_bare();
         for area in user_space.areas.iter() {
-            let new_area = MapArea::from_another(area);
-            memory_set.push(new_area, None, 0);
-            for vpn in area.vaddr_range {
-                let src = user_space.translate(vpn).unwrap().0;
-                let dst = memory_set.translate(vpn).unwrap().0;
+            let mut new_area = MapArea::from_another(area);
+            for (&vpn, frame) in area.data_frames.iter() {
+                let new_frame = frame_alloc().expect("failed to allocate frame while forking");
+                memory_set.page_table.map_page(
+                    vpn,
+                    new_frame.paddr,
+                    area.map_perm.into(),
+                    MappingSize::Page4KB,
+                );
                 unsafe {
                     core::ptr::copy_nonoverlapping(
-                        src.get_ptr::<u8>(),
-                        dst.get_mut_ptr(),
+                        frame.paddr.get_ptr::<u8>(),
+                        new_frame.paddr.get_mut_ptr(),
                         PAGE_SIZE,
                     );
                 }
+                new_area.data_frames.insert(vpn, new_frame);
             }
+            memory_set.areas.push(new_area);
         }
         memory_set
     }
