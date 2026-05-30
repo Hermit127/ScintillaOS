@@ -847,6 +847,7 @@ pub fn sys_pselect6(
         crate::net::net_poll();
         crate::net::net_poll();
         let mut ready = 0i32;
+        let mut has_read_ready = false;
         let n = nfds.min(FD_SETSIZE);
 
         let task = current_task().unwrap();
@@ -884,6 +885,7 @@ pub fn sys_pselect6(
             if check_read && readable {
                 fd_set(&mut rfds, fd);
                 ready += 1;
+                has_read_ready = true;
             } else {
                 fd_clr(&mut rfds, fd);
             }
@@ -907,6 +909,12 @@ pub fn sys_pselect6(
         drop(task);
 
         if ready > 0 {
+            if !has_read_ready {
+                if !readfds.is_null() { write_fdset(readfds, &rfds); }
+                if !writefds.is_null() { write_fdset(writefds, &wfds); }
+                if !exceptfds.is_null() { write_fdset(exceptfds, &efds); }
+                return 0;
+            }
             // Write back modified fd_sets
             if !readfds.is_null() {
                 write_fdset(readfds, &rfds);
