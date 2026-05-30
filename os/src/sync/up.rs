@@ -30,11 +30,7 @@ impl<T> UPSafeCell<T> {
             Ok(g) => g,
             Err(_) => {
                 let caller = Location::caller();
-                panic!(
-                    "already borrowed at {}:{}",
-                    caller.file(),
-                    caller.line()
-                )
+                panic!("already borrowed at {}:{}", caller.file(), caller.line())
             }
         }
     }

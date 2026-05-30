@@ -54,7 +54,11 @@ fn run_root_fallback() {
         "/bin/contest_runner_musl\0",
         &[b"contest_runner_musl\0".as_ptr(), NULL],
     );
-    run_exec("/\0", "/busybox\0", &[SH, b"/busybox_testcode.sh\0".as_ptr(), NULL]);
+    run_exec(
+        "/\0",
+        "/busybox\0",
+        &[SH, b"/busybox_testcode.sh\0".as_ptr(), NULL],
+    );
     run_exec(
         "/\0",
         "/bin/contest_runner_glibc\0",

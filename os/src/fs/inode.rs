@@ -423,7 +423,21 @@ pub fn rename_at(
         )
     };
 
-    rc == EOK as i32
+    if rc == EOK as i32 {
+        if let Some(old_parent) = old_dentry.parent.clone() {
+            let mut children = old_parent.children.exclusive_access();
+            if let Some(list) = children.as_mut() {
+                list.retain(|c| c.name != old_dentry.name);
+            }
+        }
+        let mut children = new_parent.children.exclusive_access();
+        if let Some(list) = children.as_mut() {
+            list.retain(|c| c.name != new_name);
+        }
+        true
+    } else {
+        false
+    }
 }
 
 // ==================== symlink_at ====================
