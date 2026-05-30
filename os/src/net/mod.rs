@@ -128,22 +128,24 @@ pub fn net_poll() {
         if !NET_INITED.load(core::sync::atomic::Ordering::Relaxed) {
             return;
         }
-        let mut state = NET_IFACE.exclusive_access();
-        if let Some(state) = state.as_mut() {
-            if !state.inited {
-                return;
-            }
-            state.clock_ms += 10;
-            let clock = state.clock_ms;
-            let timestamp = smoltcp::time::Instant::from_millis(clock as i64);
-            let NetworkState { ref mut iface, ref mut device, ref mut sockets, ref mut dhcp_handle, ref mut dhcp_logged, .. } = state;
-            iface.poll(timestamp, device, sockets);
+        {
+            let mut state = NET_IFACE.exclusive_access();
+            if let Some(state) = state.as_mut() {
+                if !state.inited {
+                    return;
+                }
+                state.clock_ms += 10;
+                let clock = state.clock_ms;
+                let timestamp = smoltcp::time::Instant::from_millis(clock as i64);
+                let NetworkState { ref mut iface, ref mut device, ref mut sockets, ref mut dhcp_handle, ref mut dhcp_logged, .. } = state;
+                iface.poll(timestamp, device, sockets);
 
-            if !*dhcp_logged && iface.ip_addrs().len() > 2 {
-                *dhcp_logged = true;
-                println!("[net] DHCP assigned additional IP, total IPs:");
-                for addr in iface.ip_addrs() {
-                    println!("[net]   {}", addr);
+                if !*dhcp_logged && iface.ip_addrs().len() > 2 {
+                    *dhcp_logged = true;
+                    println!("[net] DHCP assigned additional IP, total IPs:");
+                    for addr in iface.ip_addrs() {
+                        println!("[net]   {}", addr);
+                    }
                 }
             }
         }

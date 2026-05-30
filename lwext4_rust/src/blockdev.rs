@@ -36,6 +36,10 @@ pub struct Ext4BlockWrapper<K: KernelDevOp> {
 }
 
 impl<K: KernelDevOp> Ext4BlockWrapper<K> {
+    pub fn get_fs_ptr(&self) -> *mut ext4_fs {
+        self.value.fs
+    }
+
     pub fn new(block_dev: K::DevType) -> Result<Self, i32> {
         Self::new_with_name(block_dev, "ext4_fs", "/mp/")
     }

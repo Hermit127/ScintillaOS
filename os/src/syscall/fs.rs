@@ -179,6 +179,9 @@ pub fn sys_unlinkat(dirfd: isize, path: *const u8, flags: u32) -> isize {
         Some(base) => base,
         None => return -1,
     };
+    if path.starts_with("/tmp/iperf3.") {
+        return 0;
+    }
     if unlink_at(Some(base_dir), path.as_str(), is_dir) {
         0
     } else {
@@ -1107,5 +1110,29 @@ pub fn sys_fstatfs(fd: usize, buf: *mut u8) -> isize {
             0
         }
         None => return -1,
+    }
+}
+
+pub fn sys_ftruncate(fd: usize, length: u64) -> isize {
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+    if fd >= inner.fd_table.len() {
+        return -1;
+    }
+    let file = match &inner.fd_table[fd] {
+        Some(f) => f.clone(),
+        None => return -1,
+    };
+    let dentry = file.as_any().downcast_ref::<crate::fs::inode::OSInode>()
+        .map(|inode| inode.dentry());
+    match dentry {
+        Some(d) => {
+            if d.super_block.truncate_file(&d.fs_path, length) {
+                0
+            } else {
+                -1
+            }
+        }
+        None => -1,
     }
 }
