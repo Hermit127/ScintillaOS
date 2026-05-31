@@ -62,16 +62,16 @@ impl VfsSuperBlock {
         blk_device: Arc<dyn crate::drivers::BlockDevice>,
         fs_type: &'static str,
     ) -> Option<Arc<Self>> {
-        const DISK_SIZE_128M: u64 = 128 * 1024 * 1024;
+        const DISK_SIZE_512M: u64 = 512 * 1024 * 1024;
         let stream = BlockDeviceStream {
             inner: blk_device,
             pos: 0,
-            total_size: DISK_SIZE_128M,
+            total_size: DISK_SIZE_512M,
         };
         let ext4 = Ext4BlockWrapper::<BlockDeviceStreamOp>::new(stream).ok()?;
         Some(Arc::new(VfsSuperBlock {
             fs_type,
-            fs_data: unsafe { UPSafeCell::new(FsInner::Ext4(Ext4Wrapper(ext4))) },
+            fs_data: unsafe { UPSafeCell::new_named(FsInner::Ext4(Ext4Wrapper(ext4)), "VfsFsData") },
         }))
     }
 

@@ -871,6 +871,7 @@ pub fn sys_pselect6(
             if fd < inner.fd_table.len() {
                 if let Some(file) = &inner.fd_table[fd] {
                     let file = file.clone();
+                    let is_socket = file.as_any().downcast_ref::<crate::net::socket::SocketFile>().is_some();
                     drop(inner);
                     let (r, w, e) = file.poll();
                     readable = r;
@@ -879,8 +880,6 @@ pub fn sys_pselect6(
                     inner = task.inner_exclusive_access();
                 }
             }
-            // Invalid fd: error only if requested in exceptfds
-            // Valid fd but file is None: should not happen with fd_table holes
 
             if check_read && readable {
                 fd_set(&mut rfds, fd);
@@ -910,6 +909,9 @@ pub fn sys_pselect6(
 
         if ready > 0 {
             if !has_read_ready {
+                // iperf3 event loop requires select() returning 0 (timeout)
+                // to transition into the write state. But FD_ISSET fails
+                // in user space, so report timeout AND write fd_sets.
                 if !readfds.is_null() { write_fdset(readfds, &rfds); }
                 if !writefds.is_null() { write_fdset(writefds, &wfds); }
                 if !exceptfds.is_null() { write_fdset(exceptfds, &efds); }

@@ -99,7 +99,7 @@ impl PipeRingBuffer {
 
 /// Return (read_end, write_end)
 pub fn make_pipe() -> (Arc<Pipe>, Arc<Pipe>) {
-    let buffer = Arc::new(unsafe { UPSafeCell::new(PipeRingBuffer::new()) });
+    let buffer = Arc::new(unsafe { UPSafeCell::new_named(PipeRingBuffer::new(), "PipeRingBuffer") });
     let read_end = Arc::new(Pipe::read_end_with_buffer(buffer.clone()));
     let write_end = Arc::new(Pipe::write_end_with_buffer(buffer.clone()));
     buffer.exclusive_access().set_write_end(&write_end);
@@ -119,17 +119,21 @@ impl File for Pipe {
         let mut buf_iter = buf.into_iter();
         let mut already_read = 0usize;
         loop {
-            let mut ring_buffer = self.buffer.exclusive_access();
-            let loop_read = ring_buffer.available_read();
+            let (loop_read, write_end_closed) = {
+                let ring_buffer = self.buffer.exclusive_access();
+                let n = ring_buffer.available_read();
+                let closed = n == 0 && ring_buffer.all_write_ends_closed();
+                (n, closed)
+            };
             if loop_read == 0 {
-                if ring_buffer.all_write_ends_closed() {
+                if write_end_closed {
                     return already_read as isize;
                 }
-                drop(ring_buffer);
                 stdout_release_if_owner();
                 suspend_current_and_run_next();
                 continue;
             }
+            let mut ring_buffer = self.buffer.exclusive_access();
             for _ in 0..loop_read {
                 if let Some(byte_ref) = buf_iter.next() {
                     *byte_ref = ring_buffer.read_byte();
@@ -149,15 +153,16 @@ impl File for Pipe {
         let mut buf_iter = buf.into_iter();
         let mut already_write = 0usize;
         loop {
-            let mut ring_buffer = self.buffer.exclusive_access();
-            let loop_write = ring_buffer.available_write();
+            let loop_write = {
+                let ring_buffer = self.buffer.exclusive_access();
+                ring_buffer.available_write()
+            };
             if loop_write == 0 {
-                drop(ring_buffer);
                 stdout_release_if_owner();
                 suspend_current_and_run_next();
                 continue;
             }
-            // write at most loop_write bytes
+            let mut ring_buffer = self.buffer.exclusive_access();
             for _ in 0..loop_write {
                 if let Some(byte_ref) = buf_iter.next() {
                     ring_buffer.write_byte( *byte_ref );

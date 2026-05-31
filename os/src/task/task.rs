@@ -154,7 +154,7 @@ impl TaskControlBlock {
         let task_control_block = Self {
             pid: pid_handle,
             inner: unsafe {
-                UPSafeCell::new(TaskControlBlockInner {
+                UPSafeCell::new_named(TaskControlBlockInner {
                     trap_cx: TrapFrame::new(),
                     base_size: user_sp,
                     task_cx: blank_kcontext(kstack.get_position().1), // Set task_cx's Kernel Stack Top
@@ -198,7 +198,7 @@ impl TaskControlBlock {
                     cstime: 0,
                     last_time: polyhal::time::Time::now().to_msec() as usize,
                     block_reason: None,
-                })
+                }, "TaskInner")
             },
         };
         // prepare TrapContext in user space
@@ -366,7 +366,7 @@ impl TaskControlBlock {
         let task_control_block = Arc::new(TaskControlBlock {
             pid: pid_handle,
             inner: unsafe {
-                UPSafeCell::new(TaskControlBlockInner {
+                UPSafeCell::new_named(TaskControlBlockInner {
                     trap_cx: parent_inner.trap_cx.clone(),
                     base_size: parent_inner.base_size,
                     task_cx: blank_kcontext(kstack.get_position().1), // Set task_cx's Kernel Stack Top
@@ -403,10 +403,9 @@ impl TaskControlBlock {
                     cstime: 0,
                     last_time: polyhal::time::Time::now().to_msec() as usize,
                     block_reason: None,
-                })
+                }, "TaskInner")
             },
         });
-        // add child
         parent_inner.children.push(task_control_block.clone());
         // modify kernel_sp in trap_cx
         // **** access child PCB exclusively

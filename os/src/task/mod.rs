@@ -42,13 +42,13 @@ pub struct SleepTask {
 lazy_static! {
     // public sleep queue for timer interrupt handler to access
     pub static ref SLEEP_QUEUE: UPSafeCell<Vec<SleepTask>> = unsafe {
-        UPSafeCell::new(Vec::new())
+        UPSafeCell::new_named(Vec::new(), "SleepQueue")
     };
     pub static ref NET_BLOCK_QUEUE: UPSafeCell<Vec<Arc<TaskControlBlock>>> = unsafe {
-        UPSafeCell::new(Vec::new())
+        UPSafeCell::new_named(Vec::new(), "NetBlockQueue")
     };
     pub static ref WAITPID_QUEUE: UPSafeCell<Vec<Arc<TaskControlBlock>>> = unsafe {
-        UPSafeCell::new(Vec::new())
+        UPSafeCell::new_named(Vec::new(), "WaitpidQueue")
     };
 }
 

@@ -390,6 +390,14 @@ pub fn sys_faccessat(dirfd: isize, path: *const u8, mode: usize, _flags: usize) 
     if allowed { 0 } else { -13 } // EACCES
 }
 
+pub fn sys_fchmodat(_dirfd: isize, _path: *const u8, _mode: u32) -> isize {
+    0 // no-op: no permission tracking
+}
+
+pub fn sys_fchownat(_dirfd: isize, _path: *const u8, _owner: u32, _group: u32, _flags: u32) -> isize {
+    0 // no-op: no ownership tracking
+}
+
 pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
     const F_DUPFD: usize = 0;
     const F_GETFD: usize = 1;
@@ -576,12 +584,15 @@ pub fn sys_pipe2(pipe: *mut usize, flags: usize) -> isize {
     }
     let task = current_task().unwrap();
     let token = current_user_token();
-    let mut inner = task.inner_exclusive_access();
-    let (pipe_read, pipe_write) = make_pipe();
-    let read_fd = inner.alloc_fd();
-    inner.fd_table[read_fd] = Some(pipe_read);
-    let write_fd = inner.alloc_fd();
-    inner.fd_table[write_fd] = Some(pipe_write);
+    let (read_fd, write_fd) = {
+        let mut inner = task.inner_exclusive_access();
+        let (pipe_read, pipe_write) = make_pipe();
+        let read_fd = inner.alloc_fd();
+        inner.fd_table[read_fd] = Some(pipe_read);
+        let write_fd = inner.alloc_fd();
+        inner.fd_table[write_fd] = Some(pipe_write);
+        (read_fd, write_fd)
+    };
     let p = pipe as *mut u8;
     *translated_refmut(token, p as *mut u32) = read_fd as u32;
     *translated_refmut(token, unsafe { p.add(4) } as *mut u32) = write_fd as u32;

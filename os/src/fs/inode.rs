@@ -39,7 +39,7 @@ impl OSInode {
             writable,
             append,
             dentry,
-            inner: unsafe { UPSafeCell::new(OSInodeInner { offset }) },
+            inner: unsafe { UPSafeCell::new_named(OSInodeInner { offset }, "OSInodeInner") },
         }
     }
     pub fn dentry(&self) -> &Arc<Dentry> {

@@ -74,6 +74,12 @@ DISASM ?= -x
 # Run usertests or usershell
 TEST ?=
 
+# LTP 集成
+#   LTP_BIN_DIR: LTP 静态编译产物根目录 (testsuits-for-oskernel/sdcard/riscv/musl)
+#   LTP_MODE: subset | full
+LTP_BIN_DIR ?=
+LTP_MODE ?= subset
+
 # ==================== Contest Submission Targets ====================
 
 all: kernel-rv disk.img kernel-la disk-la.img
@@ -177,8 +183,32 @@ fs-img: $(APPS)
 	@mkdir -p $(ROOTFS_DIR)/etc $(ROOTFS_DIR)/sbin 2>/dev/null || true
 	@cp -f tmp/init.sh $(ROOTFS_DIR)/etc/init.sh 2>/dev/null || true
 	@cp -f target/$(TARGET)/release/contest_runner $(ROOTFS_DIR)/contest_runner 2>/dev/null || true
-	@dd if=/dev/zero of=$(FS_IMG) bs=1M count=128
+ifneq ($(LTP_BIN_DIR),)
+	@echo "===== LTP integration (mode: $(LTP_MODE)) ====="
+ifeq ($(LTP_MODE), full)
+	@touch $(ROOTFS_DIR)/ltp_full
+endif
+	@cp -f tmp/ltp_testcode.sh $(ROOTFS_DIR)/ltp_testcode.sh
+ifeq ($(LTP_MODE), subset)
+	@cp -f tmp/ltp_testcode_subset.sh $(ROOTFS_DIR)/ltp_testcode.sh
+endif
+	@mkdir -p $(ROOTFS_DIR)/ltp/testcases/bin
+	@if [ -d "$(LTP_BIN_DIR)/ltp/testcases/bin" ]; then \
+		for f in $(LTP_BIN_DIR)/ltp/testcases/bin/*; do \
+			if [ -f "$$f" ] && [ -x "$$f" ]; then \
+				cp "$$f" $(ROOTFS_DIR)/ltp/testcases/bin/; \
+			fi; \
+		done; \
+		echo "  LTP binaries copied: $$(ls $(ROOTFS_DIR)/ltp/testcases/bin/ | wc -l) files"; \
+	else \
+		echo "  ERROR: LTP_BIN_DIR not found: $(LTP_BIN_DIR)/ltp/testcases/bin"; \
+	fi
+	@cp -f target/$(TARGET)/release/ltp_runner $(ROOTFS_BIN_DIR)/initproc
+	@echo "  ltp_runner set as initproc"
+endif
+	@dd if=/dev/zero of=$(FS_IMG) bs=1M count=512
 	@mke2fs -t ext4 -b 4096 -F -O ^metadata_csum,^64bit,^orphan_file -d $(ROOTFS_DIR) $(FS_IMG)
+	@e2fsck -fy $(FS_IMG) 2>/dev/null || true
 	cp target/$(TARGET)/$(MODE)/fs.img fs-img.img
 
 $(APPS):
@@ -212,18 +242,18 @@ QEMU_EXEC += -nographic \
 # Single-disk mode (same disk on both bus 0 and bus 1, for local dev)
 # ROOT_BLOCK_DEVICE uses bus 1, mount test & contest use bus 0
 QEMU_ARGS_SINGLE := -drive file=$(FS_IMG),if=none,format=raw,id=x0,file.locking=off \
-			-device $(VIRTIO_BLK_DEVICE),drive=x0$(if $(filter loongarch64,$(ARCH)),,bus=$(VIRTIO_BLK_BUS)) \
+			-device $(VIRTIO_BLK_DEVICE),drive=x0$(if $(filter loongarch64,$(ARCH)),,,bus=$(VIRTIO_BLK_BUS)) \
 			-drive file=$(FS_IMG),if=none,format=raw,id=x1,file.locking=off \
-			-device $(VIRTIO_BLK_DEVICE),drive=x1$(if $(filter loongarch64,$(ARCH)),,bus=virtio-mmio-bus.1)
+			-device $(VIRTIO_BLK_DEVICE),drive=x1$(if $(filter loongarch64,$(ARCH)),,,bus=virtio-mmio-bus.1)
 
 # Test disk path (user can override)
 TEST_DISK ?= fs-img.img
 
 # Dual-disk mode (test disk bus 0, disk.img bus 1, for contest)
 QEMU_ARGS_DUAL := -drive file=$(TEST_DISK),if=none,format=raw,id=x0 \
-			-device $(VIRTIO_BLK_DEVICE),drive=x0$(if $(filter loongarch64,$(ARCH)),,bus=$(VIRTIO_BLK_BUS)) \
+			-device $(VIRTIO_BLK_DEVICE),drive=x0$(if $(filter loongarch64,$(ARCH)),,,bus=$(VIRTIO_BLK_BUS)) \
 			-drive file=disk.img,if=none,format=raw,id=x1 \
-			-device $(VIRTIO_BLK_DEVICE),drive=x1$(if $(filter loongarch64,$(ARCH)),,bus=virtio-mmio-bus.1)
+			-device $(VIRTIO_BLK_DEVICE),drive=x1$(if $(filter loongarch64,$(ARCH)),,,bus=virtio-mmio-bus.1)
 
 # virtio-net network configuration (SLIRP user-mode, riscv64/aarch64)
 ifeq ($(ARCH), riscv64)

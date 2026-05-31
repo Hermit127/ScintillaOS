@@ -259,7 +259,7 @@ impl<K: KernelDevOp> Ext4BlockWrapper<K> {
         }
         if !skip_recovery {
             let r = ext4_recover(c_mountpoint);
-            if (r != EOK as i32) && (r != ENOTSUP as i32) {
+            if (r != EOK as i32) && (r != ENOTSUP as i32) && (r != EINVAL as i32) {
                 error!("ext4_recover: rc = {:?}\n", r);
                 return Err(r);
             }
