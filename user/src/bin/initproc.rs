@@ -8,7 +8,7 @@ use user_lib::{exec, fork, wait, yield_};
 #[no_mangle]
 fn main() -> i32 {
     if fork() == 0 {
-        exec("user_shell\0", &[core::ptr::null::<u8>()]);
+        exec("iperf_test\0", &[core::ptr::null::<u8>()]);
     } else {
         loop {
             let mut exit_code: i32 = 0;
@@ -17,13 +17,6 @@ fn main() -> i32 {
                 yield_();
                 continue;
             }
-            /*
-            println!(
-                "[initproc] Released a zombie process, pid={}, exit_code={}",
-                pid,
-                exit_code,
-            );
-            */
         }
     }
     0

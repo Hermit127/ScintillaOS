@@ -3,43 +3,62 @@
 !.vscode/settings.json
 !.devcontainer/devcontainer.json
 
+.DS_Store
 .idea
+
+# Rust and Cargo build outputs
 **/Cargo.lock
 **/target/
-
-os/src/link_app.S
-os/src/linker.ld
-os/last-*
+target/
 os/Cargo.lock
 os/.gdb_history
-user/build
-user/target/*
-user/.idea/*
-user/Cargo.lock
 easy-fs/Cargo.lock
 easy-fs/target/*
 easy-fs-fuse/Cargo.lock
 easy-fs-fuse/target/*
-tools/
-pushall.sh
+
+# Generated kernel/user build files
+os/src/link_app.S
+os/src/linker.ld
+os/last-*
+user/build
+user/target/*
+user/.idea/*
+user/Cargo.lock
+basic/user/build/
+kernel-rv
+kernel-la
+
+# Disk images and emulator logs
+*.img
 *.log
 fs-img.img
+disk.img
+disk-la.img
+test_disk.img
 virt.out
+qemu.log
 
+# Local contest/test suites
 testsuits-for-oskernel
 oskernel-testsuits-cooperation
 
-# build artifacts
-basic/user/build/
-disk.img
-kernel-rv
-kernel-la
-ext4_rs_patched/target/
-ext4_rs_patched/Cargo.lock
-
-# zig cross-compiler (dev tool)
+# Local tools and downloaded toolchains
+tools/
+pushall.sh
+vendor/
+riscv64-linux-musl-cross/
 zig-macos-*/
+tmp-musl-cross.tgz
 
-# temporary build/test artifacts
-tmp/
+# Temporary build/test artifacts
+tmp/*
+!tmp/
 !tmp/hello.c
+!tmp/busybox_glibc_testcode.sh
+
+# lwext4 build artifacts
+lwext4_rust/c/lwext4/liblwext4-*.a
+lwext4_rust/c/lwext4/*.o
+lwext4_rust/c/lwext4/*.d
+lwext4_rust/c/ext_images.7z

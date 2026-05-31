@@ -98,7 +98,8 @@ Core per-process state including:
 stat/fstat return struct, C repr. Fields: `st_dev, st_ino, st_mode, st_nlink, st_uid, st_gid, st_rdev, st_size, st_blksize, st_blocks, st_atime_sec/nsec, st_mtime_sec/nsec, st_ctime_sec/nsec`
 
 ### VfsSuperBlock + Dentry (`fs/vfs.rs`)
-- `VfsSuperBlock` wraps `FsInner::Ext4(Ext4)` via `UPSafeCell`. Access via `with_ext4(|ext4| ...)`.
+- `VfsSuperBlock` wraps `FsInner::Ext4(Ext4Wrapper)` via `UPSafeCell`. Access via `with_fs(|fs| ...)`.
+- `Ext4Wrapper` wraps `lwext4_rust::Ext4BlockWrapper`, which is backed by the `lwext4` C library.
 - `Dentry` is a directory entry cache node: `name, path, inode_num, is_dir, parent: Weak<Dentry>, children: UPSafeCell<Option<Vec<Arc<Dentry>>>>, super_block: Arc<VfsSuperBlock>`
 - `ROOT_DENTRY` + `ROOT_SB` are lazy_static globals
 
@@ -113,7 +114,7 @@ stat/fstat return struct, C repr. Fields: `st_dev, st_ino, st_mode, st_nlink, st
 
 2. **File trait** — All file-like objects (OSInode, Pipe, Stdin, Stdout) implement `File: Send + Sync`. fd_table stores `Arc<dyn File + Send + Sync>`.
 
-3. **with_ext4 closure pattern** — All ext4 access goes through `VfsSuperBlock::with_ext4(|ext4: &Ext4| -> R)`. The closure runs while holding the UPSafeCell lock. Be careful not to hold outer locks across with_ext4 calls (potential deadlock).
+3. **with_fs closure pattern** — All ext4 access goes through `VfsSuperBlock::with_fs(|fs: &Ext4Wrapper| -> R)`. The closure runs while holding the UPSafeCell lock. Be careful not to hold outer locks across with_fs calls (potential deadlock).
 
 4. **Credential flow**:
    - `open_file_at` → gets current task's `euid/egid` → passes to `vfs_create(parent, name, is_dir, uid, gid)` → writes uid/gid to new ext4 inode
@@ -123,7 +124,7 @@ stat/fstat return struct, C repr. Fields: `st_dev, st_ino, st_mode, st_nlink, st
 
 5. **BlockDevice stack**:
    ```
-   VirtIOBlock (drivers) → Ext4BlockDeviceAdapter (sector→ext4-block) → BlockCache (64-entry LRU) → ext4_rs::Ext4
+   VirtIOBlock (drivers) → BlockDeviceStream → Ext4BlockWrapper → lwext4 C library
    ```
 
 ---
@@ -138,10 +139,10 @@ All syscalls in `syscall/mod.rs:61-123`. 6-arg calling convention. Syscall numbe
 
 ---
 
-## ext4_rs Patched
+## lwext4_rust
 
-`ext4_rs_patched/` — local fork, fixed via `[patch.crates-io]` in workspace Cargo.toml.
-Critical fix: `balloc.rs` `bgid = 1 → 0`. Single-block-group filesystems were skipping group 0, always ENOSPC.
+`lwext4_rust/` — local embedded ext4 filesystem (C library `lwext4` with Rust bindings). Used via `lwext4_rust = { path = "../lwext4_rust", default-features = false }` in os/Cargo.toml.
+The `VfsSuperBlock` wraps `FsInner::Lwext4(RwLock<lwext4_rust::Ext4>)`.
 
 ---
 

@@ -7,6 +7,7 @@ const SYSCALL_GETCWD: usize = 17;
 const SYSCALL_MKDIRAT: usize = 34;
 const SYSCALL_UNLINKAT: usize = 35;
 const SYSCALL_SYMLINKAT: usize = 36;
+const SYSCALL_FTRUNCATE: usize = 46;
 const SYSCALL_CHDIR: usize = 49;
 const SYSCALL_OPENAT: usize = 56;
 const SYSCALL_CLOSE: usize = 57;
@@ -14,6 +15,7 @@ const SYSCALL_PIPE2: usize = 59;
 const SYSCALL_LSEEK: usize = 62;
 const SYSCALL_READ: usize = 63;
 const SYSCALL_WRITE: usize = 64;
+const SYSCALL_SENDFILE: usize = 71;
 const SYSCALL_WRITEV: usize = 66;
 const SYSCALL_PREAD64: usize = 67;
 const SYSCALL_PWRITE64: usize = 68;
@@ -62,7 +64,8 @@ const SYSCALL_PRCTL: usize = 167;
 const SYSCALL_PRLIMIT64: usize = 261;
 const SYSCALL_SYSINFO: usize = 179;
 const SYSCALL_SCHED_GETAFFINITY: usize = 123;
-const SYSCALL_EPOLL_CREATE1: usize = 291;
+const SYSCALL_EPOLL_CREATE1: usize = 20;
+const SYSCALL_STATX: usize = 291;
 const SYSCALL_EVENTFD2: usize = 290;
 const SYSCALL_RSEQ: usize = 293;
 const SYSCALL_RISCV_HWPROBE: usize = 258;
@@ -99,6 +102,7 @@ const SYSCALL_RECVFROM: usize = 207;
 const SYSCALL_SETSOCKOPT: usize = 208;
 const SYSCALL_GETSOCKOPT: usize = 209;
 const SYSCALL_SOCK_SHUTDOWN: usize = 210;
+const SYSCALL_SHUTDOWN: usize = 403;
 const SYSCALL_SENDMSG: usize = 211;
 const SYSCALL_RECVMSG: usize = 212;
 
@@ -151,6 +155,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_PWRITE64 => sys_pwrite64(args[0], args[1] as *mut u8, args[2], args[3]),
         SYSCALL_PREADV => sys_preadv(args[0], args[1] as *const u8, args[2], args[3]),
         SYSCALL_PWRITEV => sys_pwritev(args[0], args[1] as *const u8, args[2], args[3]),
+        SYSCALL_SENDFILE => sys_sendfile(args[0], args[1], args[2] as *mut usize, args[3]),
         SYSCALL_FUTEX => sys_futex(args[0] as *mut u32, args[1], args[2], args[3], args[4] as *mut u32, args[5]),
         SYSCALL_EXIT => sys_exit(args[0] as i32),
         SYSCALL_EXIT_GROUP => sys_exit_group(args[0] as i32),
@@ -224,6 +229,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SYSINFO => -38,
         SYSCALL_SCHED_GETAFFINITY => -38,
         SYSCALL_EPOLL_CREATE1 => -38,
+        SYSCALL_STATX => sys_statx(args[0] as isize, args[1] as *const u8, args[2] as u32, args[3] as u32, args[4] as *mut u8),
         SYSCALL_EVENTFD2 => -38,
         SYSCALL_RSEQ => -38,
         SYSCALL_RISCV_HWPROBE => -38,
@@ -248,6 +254,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[2] as isize, args[3] as *const u8,
             args[4],
         ),
+        SYSCALL_FTRUNCATE => sys_ftruncate(args[0], args[1] as u64),
         _ => -38,
     }
 }

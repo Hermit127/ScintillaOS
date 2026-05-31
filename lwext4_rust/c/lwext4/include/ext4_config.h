@@ -41,9 +41,10 @@
 extern "C" {
 #endif
 
-#if !CONFIG_USE_DEFAULT_CFG
-#include "generated/ext4_config.h"
-#endif
+// Generated config disabled — use definitions in this file
+// #if !CONFIG_USE_DEFAULT_CFG
+// #include "generated/ext4_config.h"
+// #endif
 
 /*****************************************************************************/
 
@@ -133,21 +134,17 @@ extern "C" {
 #ifndef CONFIG_EXT4_MAX_BLOCKDEV_NAME
 #define CONFIG_EXT4_MAX_BLOCKDEV_NAME 32
 #endif
-
-
-/**@brief   Maximum block device count*/
-#ifndef CONFIG_EXT4_BLOCKDEVS_COUNT
-#define CONFIG_EXT4_BLOCKDEVS_COUNT 2
-#endif
-
-/**@brief   Maximum mountpoint name*/
 #ifndef CONFIG_EXT4_MAX_MP_NAME
 #define CONFIG_EXT4_MAX_MP_NAME 32
 #endif
 
-/**@brief   Maximum mountpoint count*/
+
+/**@brief   Maximum block device count*/
+#ifndef CONFIG_EXT4_BLOCKDEVS_COUNT
+#define CONFIG_EXT4_BLOCKDEVS_COUNT 8
+#endif
 #ifndef CONFIG_EXT4_MOUNTPOINTS_COUNT
-#define CONFIG_EXT4_MOUNTPOINTS_COUNT 2
+#define CONFIG_EXT4_MOUNTPOINTS_COUNT 8
 #endif
 
 /**@brief   Include open flags from ext4_errno or standard library.*/

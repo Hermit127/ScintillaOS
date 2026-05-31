@@ -20,7 +20,7 @@ use crate::sync::UPSafeCell;
 use alloc::vec::Vec;
 
 pub use action::{SignalAction, SignalActions};
-pub use manager::{add_task, pid2task, PID2TCB};
+pub use manager::{add_task, pid2task, PID2TCB, ready_queue_len, add_priority_task};
 pub use pid::{pid_alloc, PidHandle};
 pub use processor::{
     current_task, current_user_token, init_kernel_page, run_tasks, schedule, take_current_task,
@@ -80,6 +80,7 @@ pub fn suspend_current_and_run_next() {
 }
 
 pub fn sleep_current_and_run_next() {
+    crate::fs::stdio::stdout_release_if_owner();
     let task = current_task().unwrap();
     task.record_time_suspend();
     let mut task_inner = task.inner_exclusive_access();
@@ -91,6 +92,7 @@ pub fn sleep_current_and_run_next() {
 }
 
 pub fn block_current_and_run_next(block_reason: BlockReason) {
+    crate::fs::stdio::stdout_release_if_owner();
     let task = current_task().unwrap();
     task.record_time_suspend();
     let mut task_inner = task.inner_exclusive_access();
@@ -98,6 +100,7 @@ pub fn block_current_and_run_next(block_reason: BlockReason) {
     let task_cx_ptr = &mut task_inner.task_cx as *mut KContext;
     drop(task_inner);
     take_current_task();
+    NET_BLOCK_QUEUE.exclusive_access().push(task.clone());
     schedule(task_cx_ptr);
     task.record_time_resume();
 }
@@ -106,6 +109,7 @@ pub const IDLE_PID: usize = 0;
 
 /// Exit the current 'Running' task and run the next task in task list.
 pub fn exit_current_and_run_next(exit_code: i32) {
+    crate::fs::stdio::stdout_release_if_owner();
     trace!("os::task::exit_current_and_run_next");
     // take from Processor
     let task = current_task().unwrap();
@@ -226,6 +230,10 @@ fn call_kernel_signal_handler(signal: SignalFlags) {
                 task_inner.frozen = false;
             }
         }
+        SignalFlags::SIGTERM | SignalFlags::SIGKILL => {
+            task_inner.killed = true;
+            task_inner.signals ^= signal;
+        }
         _ => {
             // println!(
             //     "[K] call_kernel_signal_handler:: current task sigflag {:?}",
@@ -299,6 +307,7 @@ fn check_pending_signals() {
                 drop(task_inner);
                 drop(task);
                 if signal == SignalFlags::SIGKILL
+                    || signal == SignalFlags::SIGTERM
                     || signal == SignalFlags::SIGSTOP
                     || signal == SignalFlags::SIGCONT
                     || signal == SignalFlags::SIGDEF
@@ -324,9 +333,13 @@ pub fn handle_signals() {
             let task_inner = task.inner_exclusive_access();
             (task_inner.frozen, task_inner.killed)
         };
-        if !frozen || killed {
+        if killed {
+            exit_current_and_run_next(-9); // SIGKILL
+        }
+        if !frozen {
             break;
         }
+        crate::fs::stdio::stdout_release_if_owner();
         suspend_current_and_run_next();
     }
 }

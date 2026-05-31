@@ -38,3 +38,5 @@ pub fn main() -> i32 {
     if failed { println!("\n!!! FAILED !!!"); -1 }
     else { println!("\n=== UMASK PASSED ==="); 0 }
 }
+#[cfg(target_arch = "riscv64")]
+fn main() {}

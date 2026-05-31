@@ -300,6 +300,18 @@ pub fn sys_listen(sockfd: usize, _backlog: usize) -> isize {
         return -95;
     }
 
+    {
+        let task = current_task().unwrap();
+        let inner = task.inner_exclusive_access();
+        if sockfd < inner.fd_table.len() {
+            if let Some(file) = &inner.fd_table[sockfd] {
+                if let Some(s) = file.as_any().downcast_ref::<SocketFile>() {
+                    s.was_listening.store(true, core::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
     let listening = crate::net::with_net_iface(|iface| {
         let sock: &TcpSocket = iface.sockets.get(handle);
         sock.is_listening()
@@ -338,6 +350,7 @@ pub fn sys_accept(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
         let mut prev_listening = true;
         loop {
             crate::net::net_poll();
+            crate::net::net_poll();
             let active = crate::net::with_net_iface(|iface| {
                 let sock: &TcpSocket = iface.sockets.get(handle);
                 let listening = sock.is_listening();
@@ -345,7 +358,9 @@ pub fn sys_accept(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
                 if !listening && prev_listening && active {
                     return true;
                 }
-                prev_listening = listening;
+                if listening {
+                    prev_listening = true;
+                }
                 false
             }).unwrap_or(false);
 
@@ -407,6 +422,7 @@ pub fn sys_accept(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
     drop(inner);
 
     // Ensure any pending data from client is delivered to the accepted socket
+    crate::net::net_poll();
     crate::net::net_poll();
 
     if !addr.is_null() && !addrlen.is_null() {

@@ -9,23 +9,18 @@ static KLOG_BUF: [u8; KLOG_SIZE] = [0u8; KLOG_SIZE];
 static KLOG_WRITE: AtomicUsize = AtomicUsize::new(0);
 
 pub fn klog_bytes() -> (&'static [u8], &'static [u8]) {
-    let w = KLOG_WRITE.load(Ordering::Relaxed) % KLOG_SIZE;
-    if w == 0 {
-        (&KLOG_BUF[..], &[])
+    let w = KLOG_WRITE.load(Ordering::Relaxed);
+    let pos = w % KLOG_SIZE;
+    if w < KLOG_SIZE {
+        // Buffer hasn't wrapped yet: data is [0..pos], no second part
+        (&KLOG_BUF[..pos], &[])
     } else {
-        (&KLOG_BUF[..w], &KLOG_BUF[w..])
+        // Buffer wrapped: oldest data is [pos..KLOG_SIZE], newest is [0..pos]
+        (&KLOG_BUF[pos..], &KLOG_BUF[..pos])
     }
 }
 
 pub fn klog_clear() {
-    let w = KLOG_WRITE.load(Ordering::Relaxed) % KLOG_SIZE;
-    let (part1, part2): (&[u8], &[u8]) = if w == 0 { (&KLOG_BUF[..], &[]) } else { (&KLOG_BUF[..w], &KLOG_BUF[w..]) };
-    unsafe {
-        let p1 = part1.as_ptr() as *mut u8;
-        let p2 = part2.as_ptr() as *mut u8;
-        core::ptr::write_bytes(p1, 0, part1.len());
-        core::ptr::write_bytes(p2, 0, part2.len());
-    }
     KLOG_WRITE.store(0, Ordering::Relaxed);
 }
 

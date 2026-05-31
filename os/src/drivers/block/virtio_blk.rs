@@ -1,16 +1,24 @@
 use core::ptr::NonNull;
 
 use super::BlockDevice;
-use crate::mm::{frame_alloc, frame_dealloc, frames_alloc, FrameTracker};
+use crate::mm::{frame_dealloc, frames_alloc, FrameTracker};
 use crate::sync::UPSafeCell;
 use alloc::vec::Vec;
 use lazy_static::*;
-use log::debug;
 use polyhal::consts::VIRT_ADDR_START;
 use polyhal::pagetable::PAGE_SIZE;
 use polyhal::PhysAddr;
 use virtio_drivers::device::blk::{SECTOR_SIZE, VirtIOBlk};
-use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
+#[cfg(not(target_arch = "loongarch64"))]
+use virtio_drivers::transport::mmio::MmioTransport;
+#[cfg(target_arch = "loongarch64")]
+use virtio_drivers::transport::{
+    pci::{
+        bus::{BarInfo, Cam, Command, MemoryBarType, PciRoot},
+        virtio_device_type, PciTransport,
+    },
+    DeviceType,
+};
 use virtio_drivers::{BufferDirection, Hal};
 
 #[allow(unused)]
@@ -24,7 +32,13 @@ const VIRTIO1: PhysAddr = polyhal::pa!(0x10002000);
 #[cfg(target_arch = "aarch64")]
 const VIRTIO0: PhysAddr = polyhal::pa!(0xa00_0000);
 
+#[cfg(target_arch = "loongarch64")]
+const PCI_ECAM_BASE: PhysAddr = polyhal::pa!(0x20000000);
+
+#[cfg(not(target_arch = "loongarch64"))]
 pub struct VirtIOBlock(UPSafeCell<VirtIOBlk<VirtioHal, MmioTransport>>);
+#[cfg(target_arch = "loongarch64")]
+pub struct VirtIOBlock(UPSafeCell<VirtIOBlk<VirtioHal, PciTransport>>);
 
 lazy_static! {
     static ref QUEUE_FRAMES: UPSafeCell<Vec<FrameTracker>> = unsafe { UPSafeCell::new(Vec::new()) };
@@ -57,6 +71,12 @@ impl VirtIOBlock {
     }
 
     pub fn new_at(addr: PhysAddr) -> Self {
+        #[cfg(target_arch = "loongarch64")]
+        {
+            let index = if addr == VIRTIO1 { 1 } else { 0 };
+            return Self::new_pci(index);
+        }
+        #[cfg(not(target_arch = "loongarch64"))]
         unsafe {
             Self(UPSafeCell::new(
                 VirtIOBlk::<VirtioHal, MmioTransport>::new(
@@ -65,6 +85,71 @@ impl VirtIOBlock {
                 )
                 .unwrap(),
             ))
+        }
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    fn new_pci(index: usize) -> Self {
+        let mut root = unsafe {
+            PciRoot::new(
+                (PCI_ECAM_BASE.raw() | VIRT_ADDR_START) as *mut u8,
+                Cam::Ecam,
+            )
+        };
+        let mut block_index = 0;
+        for (device_function, info) in root.enumerate_bus(0) {
+            if virtio_device_type(&info) != Some(DeviceType::Block) {
+                continue;
+            }
+            if block_index == index {
+                let (_, command) = root.get_status_command(device_function);
+                Self::alloc_pci_bars(&mut root, device_function, index);
+                root.set_command(
+                    device_function,
+                    command | Command::MEMORY_SPACE | Command::BUS_MASTER,
+                );
+                let transport = PciTransport::new::<VirtioHal>(&mut root, device_function)
+                    .expect("this is not a valid virtio pci block device");
+                return Self(unsafe {
+                    UPSafeCell::new(
+                        VirtIOBlk::<VirtioHal, PciTransport>::new(transport).unwrap(),
+                    )
+                });
+            }
+            block_index += 1;
+        }
+        panic!("virtio pci block device not found");
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    fn alloc_pci_bars(
+        root: &mut PciRoot,
+        device_function: virtio_drivers::transport::pci::bus::DeviceFunction,
+        index: usize,
+    ) {
+        let mut next = 0x4000_0000u64 + index as u64 * 0x10_0000;
+        let mut bar_index = 0u8;
+        while bar_index < 6 {
+            let info = root.bar_info(device_function, bar_index).unwrap();
+            let takes_two = info.takes_two_entries();
+            if let BarInfo::Memory {
+                address_type,
+                address,
+                size,
+                ..
+            } = info
+            {
+                if address == 0 && size != 0 {
+                    let align = size as u64;
+                    next = (next + align - 1) & !(align - 1);
+                    match address_type {
+                        MemoryBarType::Width64 => root.set_bar_64(device_function, bar_index, next),
+                        _ => root.set_bar_32(device_function, bar_index, next as u32),
+                    }
+                    next += align;
+                }
+            }
+            bar_index += if takes_two { 2 } else { 1 };
         }
     }
 }

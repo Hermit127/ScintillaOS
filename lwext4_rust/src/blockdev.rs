@@ -5,9 +5,11 @@ use core::ffi::{c_char, c_void};
 use core::ptr::null_mut;
 use core::slice::{from_raw_parts, from_raw_parts_mut};
 use core::str;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-static DEV_COUNTER: AtomicU32 = AtomicU32::new(0);
+static FIRST_MOUNT: AtomicBool = AtomicBool::new(true);
+static DEV_COUNTER: AtomicU32 = AtomicU32::new(1);
+const MAX_DEVICES: u32 = 8;
 
 /// Device block size.
 const EXT4_DEV_BSIZE: u32 = 512;
@@ -34,7 +36,15 @@ pub struct Ext4BlockWrapper<K: KernelDevOp> {
 }
 
 impl<K: KernelDevOp> Ext4BlockWrapper<K> {
+    pub fn get_fs_ptr(&self) -> *mut ext4_fs {
+        self.value.fs
+    }
+
     pub fn new(block_dev: K::DevType) -> Result<Self, i32> {
+        Self::new_with_name(block_dev, "ext4_fs", "/mp/")
+    }
+
+    pub fn new_with_name(block_dev: K::DevType, dev_name: &str, mount_point: &str) -> Result<Self, i32> {
         // note this ownership
         let devt_user = Box::into_raw(Box::new(block_dev)) as *mut c_void;
         //let devt_user = devt.as_mut() as *mut _ as *mut c_void;
@@ -73,11 +83,23 @@ impl<K: KernelDevOp> Ext4BlockWrapper<K> {
             journal: null_mut(),
         };
 
-        let dev_id = DEV_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dev_name_str = alloc::format!("ext4_fs{}", dev_id);
-        let c_name = CString::new(dev_name_str.as_bytes()).expect("CString::new ext4_fs failed");
+        let is_root = FIRST_MOUNT.swap(false, Ordering::Relaxed);
+        let (dev_name_str, is_readonly) = if is_root {
+            ("ext4_root", false)
+        } else {
+            let id = DEV_COUNTER.fetch_add(1, Ordering::Relaxed) % MAX_DEVICES;
+            let name = alloc::format!("ext4_mnt{}", id);
+            // try to free stale entry from previous mount with same id
+            unsafe {
+                let c = CString::new(name.as_bytes()).unwrap();
+                ext4_device_unregister(c.as_ptr() as *const c_char);
+            }
+            let leaked: &'static str = Box::leak(name.into_boxed_str());
+            (leaked, true)
+        };
+        let c_name = CString::new(dev_name_str).expect("CString::new ext4_fs failed");
         let c_name = c_name.as_bytes_with_nul();
-        let c_mountpoint = if dev_id == 0 {
+        let c_mountpoint = if dev_name_str == "ext4_root" {
             CString::new("/").unwrap()
         } else {
             CString::new("/mp/").unwrap()
@@ -100,11 +122,9 @@ impl<K: KernelDevOp> Ext4BlockWrapper<K> {
         info!("New an Ext4 Block Device");
         ext4bd.ext4_set_debug();
 
-        let skip_recovery = dev_id > 0;
+        let skip_recovery = is_readonly;
         unsafe {
-            ext4bd
-                .lwext4_mount(skip_recovery)
-                .expect("Failed to mount the ext4 file system, perhaps the disk is not an EXT4 file system.");
+            ext4bd.lwext4_mount(skip_recovery)?;
         }
 
         if !skip_recovery {
@@ -280,8 +300,7 @@ impl<K: KernelDevOp> Ext4BlockWrapper<K> {
 
             let r = ext4_device_unregister(c_name);
             if r != EOK as i32 {
-                error!("ext4_device_unregister: fail {}", r);
-                return Err(r);
+                debug!("ext4_device_unregister: fail {}", r);
             }
         }
 
@@ -385,7 +404,7 @@ impl<K: KernelDevOp> Ext4BlockWrapper<K> {
 impl<K: KernelDevOp> Drop for Ext4BlockWrapper<K> {
     fn drop(&mut self) {
         info!("Drop struct Ext4BlockWrapper");
-        self.lwext4_umount().unwrap();
+        let _ = self.lwext4_umount();
         let devtype = unsafe { Box::from_raw((*(&self.value).bdif).p_user as *mut K::DevType) };
         drop(devtype);
     }

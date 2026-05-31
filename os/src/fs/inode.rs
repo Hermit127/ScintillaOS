@@ -16,6 +16,7 @@ const EXT4_BLOCK_SIZE: u32 = 4096;
 pub struct OSInode {
     readable: bool,
     writable: bool,
+    append: bool,
     dentry: Arc<Dentry>,
     inner: UPSafeCell<OSInodeInner>,
 }
@@ -25,12 +26,20 @@ pub struct OSInodeInner {
 }
 
 impl OSInode {
-    pub fn new(readable: bool, writable: bool, dentry: Arc<Dentry>) -> Self {
+    pub fn new(readable: bool, writable: bool, append: bool, dentry: Arc<Dentry>) -> Self {
+        let offset = if append {
+            dentry.super_block.get_inode_info(&dentry.fs_path)
+                .map(|i| i.size as usize)
+                .unwrap_or(0)
+        } else {
+            0
+        };
         Self {
             readable,
             writable,
+            append,
             dentry,
-            inner: unsafe { UPSafeCell::new(OSInodeInner { offset: 0 }) },
+            inner: unsafe { UPSafeCell::new(OSInodeInner { offset }) },
         }
     }
     pub fn dentry(&self) -> &Arc<Dentry> {
@@ -39,8 +48,15 @@ impl OSInode {
 
     pub fn read_all(&self) -> alloc::vec::Vec<u8> {
         let mut inner = self.inner.exclusive_access();
-        let mut buffer = [0u8; 512];
-        let mut out = alloc::vec::Vec::new();
+        let size = self.dentry.super_block.get_inode_info(&self.dentry.fs_path)
+            .map(|i| i.size as usize)
+            .unwrap_or(0);
+        let mut out = if size > 0 {
+            alloc::vec::Vec::with_capacity(size)
+        } else {
+            alloc::vec::Vec::new()
+        };
+        let mut buffer = [0u8; 4096];
         loop {
             let len = self.dentry.super_block.read_at(
                 &self.dentry.fs_path,
@@ -97,6 +113,7 @@ bitflags! {
         const RDWR = 1 << 1;
         const CREATE = 0x40;
         const TRUNC = 0x200;
+        const APPEND = 0x400;
         const DIRECTORY = 0x10000;
     }
 }
@@ -159,7 +176,8 @@ pub fn open_file_at(
                     }
                 }
                 let (readable, writable) = flags.read_write();
-                return Some(Arc::new(OSInode::new(readable, writable, dentry)));
+                let append = flags.contains(OpenFlags::APPEND);
+                return Some(Arc::new(OSInode::new(readable, writable, append, dentry)));
             }
         }
 
@@ -167,7 +185,7 @@ pub fn open_file_at(
             vfs_resolve_parent_and_name(&start, path)?;
         let dentry = vfs_create(&parent, &name, false)?;
         let (readable, writable) = flags.read_write();
-        return Some(Arc::new(OSInode::new(readable, writable, dentry)));
+        return Some(Arc::new(OSInode::new(readable, writable, flags.contains(OpenFlags::APPEND), dentry)));
     }
 
     let dentry = vfs_resolve_with_fallback(&start, path)?;
@@ -187,7 +205,8 @@ pub fn open_file_at(
     } else {
         flags.read_write()
     };
-    Some(Arc::new(OSInode::new(readable, writable, dentry)))
+    let append = !dentry.is_dir && flags.contains(OpenFlags::APPEND);
+    Some(Arc::new(OSInode::new(readable, writable, append, dentry)))
 }
 
 pub fn mkdir_at(base: Option<Arc<Dentry>>, path: &str) -> bool {
@@ -205,14 +224,14 @@ pub fn mkdir_at(base: Option<Arc<Dentry>>, path: &str) -> bool {
     vfs_create(&parent, &name, true).is_some()
 }
 
-pub fn unlink_at(base: Option<Arc<Dentry>>, path: &str) -> bool {
+pub fn unlink_at(base: Option<Arc<Dentry>>, path: &str, is_dir: bool) -> bool {
     let start = base.unwrap_or_else(|| crate::fs::vfs::ROOT_DENTRY.clone());
     let dentry = match vfs_resolve_path(&start, path) {
         Some(d) => d,
         None => return false,
     };
 
-    if dentry.is_dir {
+    if dentry.is_dir != is_dir {
         return false;
     }
 
@@ -221,7 +240,11 @@ pub fn unlink_at(base: Option<Arc<Dentry>>, path: &str) -> bool {
         None => return false,
     };
 
-    let ok = dentry.super_block.unlink_file(&dentry.fs_path);
+    let ok = if is_dir {
+        dentry.super_block.unlink_dir(&dentry.fs_path)
+    } else {
+        dentry.super_block.unlink_file(&dentry.fs_path)
+    };
 
     if ok {
         let mut children = parent.children.exclusive_access();
@@ -256,6 +279,11 @@ impl File for OSInode {
 
     fn write(&self, buf: &mut [u8]) -> isize {
         let mut inner = self.inner.exclusive_access();
+        if self.append {
+            inner.offset = self.dentry.super_block.get_inode_info(&self.dentry.fs_path)
+                .map(|i| i.size as usize)
+                .unwrap_or(inner.offset);
+        }
         let write_size = self.dentry.super_block.write_at(
             &self.dentry.fs_path,
             inner.offset,

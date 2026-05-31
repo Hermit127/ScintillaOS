@@ -18,6 +18,7 @@ pub struct SocketFile {
     pub socket_type: SocketType,
     pub nonblock: AtomicBool,
     pub peer_endpoint: UPSafeCell<Option<IpEndpoint>>,
+    pub was_listening: AtomicBool,
 }
 
 impl SocketFile {
@@ -27,6 +28,7 @@ impl SocketFile {
             socket_type,
             nonblock: AtomicBool::new(nonblock),
             peer_endpoint: unsafe { UPSafeCell::new(None) },
+            was_listening: AtomicBool::new(false),
         }
     }
 
@@ -107,7 +109,9 @@ impl File for SocketFile {
             crate::net::with_net_iface(|iface| match self.socket_type {
                 SocketType::Tcp => {
                     let sock: &TcpSocket = iface.sockets.get(handle);
-                    (sock.can_recv() || !sock.may_recv(),
+                    let has_pending = sock.is_active() && !sock.is_listening()
+                        && self.was_listening.load(Ordering::Relaxed);
+                    (sock.can_recv() || !sock.may_recv() || has_pending,
                      sock.can_send() || !sock.is_active(),
                      !sock.is_active() && !sock.is_listening() && sock.recv_queue() == 0)
                 }
