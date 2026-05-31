@@ -1,6 +1,6 @@
 use smoltcp::iface::SocketHandle;
-use smoltcp::socket::tcp::SocketBuffer as TcpSocketBuffer;
 use smoltcp::socket::tcp::Socket as TcpSocket;
+use smoltcp::socket::tcp::SocketBuffer as TcpSocketBuffer;
 use smoltcp::socket::udp::PacketBuffer as UdpPacketBuffer;
 use smoltcp::socket::udp::PacketMetadata as UdpPacketMetadata;
 use smoltcp::socket::udp::Socket as UdpSocket;
@@ -8,7 +8,7 @@ use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
 
 use crate::mm::{translated_ref, translated_refmut};
 use crate::net::socket::{SocketFile, SocketType};
-use crate::task::{current_task, current_user_token, block_current_and_run_next, BlockReason};
+use crate::task::{block_current_and_run_next, current_task, current_user_token, BlockReason};
 use alloc::sync::Arc;
 
 const SOCKET_BUFFER_SIZE: usize = 65536;
@@ -211,18 +211,17 @@ pub fn sys_bind(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
         port,
     );
 
-    crate::net::with_net_iface(|iface| {
-        match st {
-            SocketType::Tcp => {
-                let sock: &mut TcpSocket = iface.sockets.get_mut(handle);
-                sock.listen(endpoint).map(|_| 0).unwrap_or(-22)
-            }
-            SocketType::Udp => {
-                let sock: &mut UdpSocket = iface.sockets.get_mut(handle);
-                sock.bind(endpoint).map(|_| 0).unwrap_or(-22)
-            }
+    crate::net::with_net_iface(|iface| match st {
+        SocketType::Tcp => {
+            let sock: &mut TcpSocket = iface.sockets.get_mut(handle);
+            sock.listen(endpoint).map(|_| 0).unwrap_or(-22)
         }
-    }).unwrap_or(-1)
+        SocketType::Udp => {
+            let sock: &mut UdpSocket = iface.sockets.get_mut(handle);
+            sock.bind(endpoint).map(|_| 0).unwrap_or(-22)
+        }
+    })
+    .unwrap_or(-1)
 }
 
 pub fn sys_connect(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
@@ -264,7 +263,7 @@ pub fn sys_connect(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
 
     let local = IpListenEndpoint {
         addr: None,
-        port: 32768 + ((sockfd as u16).wrapping_mul(7919) % 32767),  // non-zero ephemeral port
+        port: 32768 + ((sockfd as u16).wrapping_mul(7919) % 32767), // non-zero ephemeral port
     };
 
     crate::net::with_net_iface_tcp_connect(handle, remote, local);
@@ -276,19 +275,27 @@ pub fn sys_connect(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
             let connected = crate::net::with_net_iface(|iface| {
                 let sock: &TcpSocket = iface.sockets.get(handle);
                 sock.is_active()
-            }).unwrap_or(false);
+            })
+            .unwrap_or(false);
             if connected {
                 return 0;
             }
-            block_current_and_run_next(BlockReason::TcpConnect(unsafe { core::mem::transmute(handle) }));
+            block_current_and_run_next(BlockReason::TcpConnect(unsafe {
+                core::mem::transmute(handle)
+            }));
         }
     }
 
     let connected = crate::net::with_net_iface(|iface| {
         let sock: &TcpSocket = iface.sockets.get(handle);
         sock.is_active()
-    }).unwrap_or(false);
-    if connected { 0 } else { -115 } // EINPROGRESS
+    })
+    .unwrap_or(false);
+    if connected {
+        0
+    } else {
+        -115
+    } // EINPROGRESS
 }
 
 pub fn sys_listen(sockfd: usize, _backlog: usize) -> isize {
@@ -306,7 +313,8 @@ pub fn sys_listen(sockfd: usize, _backlog: usize) -> isize {
         if sockfd < inner.fd_table.len() {
             if let Some(file) = &inner.fd_table[sockfd] {
                 if let Some(s) = file.as_any().downcast_ref::<SocketFile>() {
-                    s.was_listening.store(true, core::sync::atomic::Ordering::Relaxed);
+                    s.was_listening
+                        .store(true, core::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
@@ -315,7 +323,8 @@ pub fn sys_listen(sockfd: usize, _backlog: usize) -> isize {
     let listening = crate::net::with_net_iface(|iface| {
         let sock: &TcpSocket = iface.sockets.get(handle);
         sock.is_listening()
-    }).unwrap_or(false);
+    })
+    .unwrap_or(false);
 
     if !listening {
         return -22;
@@ -362,19 +371,23 @@ pub fn sys_accept(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
                     prev_listening = true;
                 }
                 false
-            }).unwrap_or(false);
+            })
+            .unwrap_or(false);
 
             if active {
                 break;
             }
-            block_current_and_run_next(BlockReason::TcpAccept(unsafe { core::mem::transmute(handle) }));
+            block_current_and_run_next(BlockReason::TcpAccept(unsafe {
+                core::mem::transmute(handle)
+            }));
         }
     }
 
     let active = crate::net::with_net_iface(|iface| {
         let sock: &TcpSocket = iface.sockets.get(handle);
         sock.is_active()
-    }).unwrap_or(false);
+    })
+    .unwrap_or(false);
 
     if !active {
         return -11;
@@ -383,7 +396,8 @@ pub fn sys_accept(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
     let old_local = crate::net::with_net_iface(|iface| {
         let sock: &TcpSocket = iface.sockets.get(handle);
         sock.local_endpoint()
-    }).flatten();
+    })
+    .flatten();
 
     let task = current_task().unwrap();
     let mut inner = task.inner_exclusive_access();
@@ -403,7 +417,8 @@ pub fn sys_accept(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
             let _ = sock.listen(listen_endpoint);
         }
         h
-    }).expect("NET_IFACE");
+    })
+    .expect("NET_IFACE");
 
     // Update the server socket's handle to the new one
     if sockfd < inner.fd_table.len() {
@@ -430,10 +445,12 @@ pub fn sys_accept(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
         let peer = crate::net::with_net_iface(|iface| {
             let sock: &TcpSocket = iface.sockets.get(handle);
             sock.remote_endpoint()
-        }).flatten();
+        })
+        .flatten();
         if let Some(peer) = peer {
             if let IpAddress::Ipv4(ipv4) = peer.addr {
-                *translated_refmut(token, addrlen as *mut usize) = core::mem::size_of::<SockAddrIn>();
+                *translated_refmut(token, addrlen as *mut usize) =
+                    core::mem::size_of::<SockAddrIn>();
                 write_sockaddr_in(addr, u32::from_be_bytes(ipv4.0), peer.port);
             }
         }
@@ -442,8 +459,14 @@ pub fn sys_accept(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
     new_fd as isize
 }
 
-pub fn sys_sendto(sockfd: usize, buf: *const u8, len: usize, flags: usize,
-                   dest_addr: *const u8, addrlen: usize) -> isize {
+pub fn sys_sendto(
+    sockfd: usize,
+    buf: *const u8,
+    len: usize,
+    flags: usize,
+    dest_addr: *const u8,
+    addrlen: usize,
+) -> isize {
     let (handle, st, nonblock) = match sock_lookup(sockfd) {
         Some(v) => v,
         None => return -9,
@@ -475,8 +498,14 @@ pub fn sys_sendto(sockfd: usize, buf: *const u8, len: usize, flags: usize,
     }
 }
 
-pub fn sys_recvfrom(sockfd: usize, buf: *mut u8, len: usize, flags: usize,
-                    src_addr: *mut u8, addrlen: *mut usize) -> isize {
+pub fn sys_recvfrom(
+    sockfd: usize,
+    buf: *mut u8,
+    len: usize,
+    flags: usize,
+    src_addr: *mut u8,
+    addrlen: *mut usize,
+) -> isize {
     let (handle, st, nonblock) = match sock_lookup(sockfd) {
         Some(v) => v,
         None => return -9,
@@ -617,8 +646,13 @@ pub fn sys_recvmsg(sockfd: usize, msg: *mut u8, flags: usize) -> isize {
     result
 }
 
-pub fn sys_setsockopt(sockfd: usize, level: usize, optname: usize,
-                       optval: *const u8, optlen: usize) -> isize {
+pub fn sys_setsockopt(
+    sockfd: usize,
+    level: usize,
+    optname: usize,
+    optval: *const u8,
+    optlen: usize,
+) -> isize {
     let (handle, st, _nonblock) = match sock_lookup(sockfd) {
         Some(v) => v,
         None => return -9,
@@ -627,7 +661,7 @@ pub fn sys_setsockopt(sockfd: usize, level: usize, optname: usize,
     match level {
         SOL_SOCKET => {
             match optname {
-                SO_REUSEADDR => 0, // no-op: always allowed
+                SO_REUSEADDR => 0,          // no-op: always allowed
                 SO_RCVBUF | SO_SNDBUF => 0, // no-op: accept but ignore buffer size
                 SO_KEEPALIVE => {
                     if st == SocketType::Tcp {
@@ -652,34 +686,37 @@ pub fn sys_setsockopt(sockfd: usize, level: usize, optname: usize,
                 _ => 0, // silently ignore unknown options
             }
         }
-        IPPROTO_TCP => {
-            match optname {
-                TCP_NODELAY => {
-                    if st != SocketType::Tcp {
-                        return -95;
-                    }
-                    let val = if optlen >= 4 && !optval.is_null() {
-                        let token = current_user_token();
-                        let v: &i32 = translated_ref(token, optval as *const i32);
-                        *v != 0
-                    } else {
-                        false
-                    };
-                    crate::net::with_net_iface(|iface| {
-                        let sock: &mut TcpSocket = iface.sockets.get_mut(handle);
-                        sock.set_nagle_enabled(!val);
-                    });
-                    0
+        IPPROTO_TCP => match optname {
+            TCP_NODELAY => {
+                if st != SocketType::Tcp {
+                    return -95;
                 }
-                _ => 0,
+                let val = if optlen >= 4 && !optval.is_null() {
+                    let token = current_user_token();
+                    let v: &i32 = translated_ref(token, optval as *const i32);
+                    *v != 0
+                } else {
+                    false
+                };
+                crate::net::with_net_iface(|iface| {
+                    let sock: &mut TcpSocket = iface.sockets.get_mut(handle);
+                    sock.set_nagle_enabled(!val);
+                });
+                0
             }
-        }
+            _ => 0,
+        },
         _ => 0, // silently ignore unknown levels
     }
 }
 
-pub fn sys_getsockopt(sockfd: usize, level: usize, optname: usize,
-                       optval: *mut u8, optlen: *mut usize) -> isize {
+pub fn sys_getsockopt(
+    sockfd: usize,
+    level: usize,
+    optname: usize,
+    optval: *mut u8,
+    optlen: *mut usize,
+) -> isize {
     if optval.is_null() || optlen.is_null() {
         return -14;
     }
@@ -709,7 +746,8 @@ pub fn sys_getsockopt(sockfd: usize, level: usize, optname: usize,
             let nagle = crate::net::with_net_iface(|iface| {
                 let sock: &TcpSocket = iface.sockets.get(handle);
                 !sock.nagle_enabled()
-            }).unwrap_or(false);
+            })
+            .unwrap_or(false);
             *translated_refmut(token, optlen as *mut u32) = 4;
             *translated_refmut(token, optval as *mut i32) = if nagle { 1 } else { 0 };
             0
@@ -737,7 +775,8 @@ pub fn sys_sock_shutdown(sockfd: usize, how: usize) -> isize {
             _ => return -22,
         }
         0
-    }).unwrap_or(-1)
+    })
+    .unwrap_or(-1)
 }
 
 pub fn sys_getpeername(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
@@ -754,11 +793,13 @@ pub fn sys_getpeername(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isi
         SocketType::Tcp => crate::net::with_net_iface(|iface| {
             let sock: &TcpSocket = iface.sockets.get(handle);
             sock.remote_endpoint()
-        }).flatten(),
+        })
+        .flatten(),
         SocketType::Udp => crate::net::with_net_iface(|iface| {
             let sock: &UdpSocket = iface.sockets.get(handle);
             sock.endpoint()
-        }).and_then(|ep| ep.addr.map(|a| IpEndpoint::new(a, ep.port))),
+        })
+        .and_then(|ep| ep.addr.map(|a| IpEndpoint::new(a, ep.port))),
     };
 
     match peer {
@@ -791,11 +832,13 @@ pub fn sys_getsockname(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isi
         SocketType::Tcp => crate::net::with_net_iface(|iface| {
             let sock: &TcpSocket = iface.sockets.get(handle);
             sock.local_endpoint()
-        }).flatten(),
+        })
+        .flatten(),
         SocketType::Udp => crate::net::with_net_iface(|iface| {
             let sock: &UdpSocket = iface.sockets.get(handle);
             sock.endpoint()
-        }).and_then(|ep| ep.addr.map(|a| IpEndpoint::new(a, ep.port))),
+        })
+        .and_then(|ep| ep.addr.map(|a| IpEndpoint::new(a, ep.port))),
     };
 
     match local {
@@ -814,7 +857,7 @@ pub fn sys_getsockname(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isi
     }
 }
 
-    // ---- Internal helpers ----
+// ---- Internal helpers ----
 
 pub(crate) fn tcp_send(handle: SocketHandle, nonblock: bool, data: &[u8]) -> isize {
     if data.is_empty() {
@@ -832,7 +875,8 @@ pub(crate) fn tcp_send(handle: SocketHandle, nonblock: bool, data: &[u8]) -> isi
                 Ok(n) => n as isize,
                 Err(_) => -32,
             }
-        }).unwrap_or(-1);
+        })
+        .unwrap_or(-1);
     }
 
     let mut offset = 0usize;
@@ -847,12 +891,15 @@ pub(crate) fn tcp_send(handle: SocketHandle, nonblock: bool, data: &[u8]) -> isi
                 Ok(n) => n as isize,
                 Err(_) => -32,
             }
-        }).unwrap_or(-1);
+        })
+        .unwrap_or(-1);
         if sent > 0 {
             offset += sent as usize;
         } else if sent == 0 {
             if !sock_can_send_tcp(handle) {
-                block_current_and_run_next(BlockReason::TcpSend(unsafe { core::mem::transmute(handle) }));
+                block_current_and_run_next(BlockReason::TcpSend(unsafe {
+                    core::mem::transmute(handle)
+                }));
             }
         } else {
             return sent;
@@ -878,7 +925,8 @@ pub(crate) fn tcp_recv(handle: SocketHandle, nonblock: bool, buf: &mut [u8]) -> 
                 Ok(n) => n as isize,
                 Err(_) => -11,
             }
-        }).unwrap_or(-1);
+        })
+        .unwrap_or(-1);
     }
 
     loop {
@@ -898,7 +946,9 @@ pub(crate) fn tcp_recv(handle: SocketHandle, nonblock: bool, buf: &mut [u8]) -> 
                 if !sock_is_active_tcp(handle) && sock_recv_queue_tcp(handle) == 0 {
                     return 0;
                 }
-                block_current_and_run_next(BlockReason::TcpRecv(unsafe { core::mem::transmute(handle) }));
+                block_current_and_run_next(BlockReason::TcpRecv(unsafe {
+                    core::mem::transmute(handle)
+                }));
             }
             None => return -1,
         }
@@ -913,21 +963,21 @@ pub(crate) fn udp_send(handle: SocketHandle, data: &[u8], dest: IpEndpoint) -> i
             Ok(()) => data.len() as isize,
             Err(_) => -11,
         }
-    }).unwrap_or(-1)
+    })
+    .unwrap_or(-1)
 }
 
 pub(crate) fn udp_write(handle: SocketHandle, data: &[u8], peer: Option<IpEndpoint>) -> isize {
     crate::net::net_poll();
     match peer {
-        Some(dest) => {
-            crate::net::with_net_iface(|iface| {
-                let sock: &mut UdpSocket = iface.sockets.get_mut(handle);
-                match sock.send_slice(data, dest) {
-                    Ok(()) => data.len() as isize,
-                    Err(_) => -11,
-                }
-            }).unwrap_or(-1)
-        }
+        Some(dest) => crate::net::with_net_iface(|iface| {
+            let sock: &mut UdpSocket = iface.sockets.get_mut(handle);
+            match sock.send_slice(data, dest) {
+                Ok(()) => data.len() as isize,
+                Err(_) => -11,
+            }
+        })
+        .unwrap_or(-1),
         None => -89, // EDESTADDRREQ
     }
 }
@@ -941,7 +991,8 @@ pub(crate) fn udp_recv(handle: SocketHandle, nonblock: bool, buf: &mut [u8]) -> 
                 Ok((n, _)) => n as isize,
                 Err(_) => -11,
             }
-        }).unwrap_or(-1);
+        })
+        .unwrap_or(-1);
     }
 
     loop {
@@ -952,10 +1003,13 @@ pub(crate) fn udp_recv(handle: SocketHandle, nonblock: bool, buf: &mut [u8]) -> 
                 Ok((n, _)) => Some(n as isize),
                 Err(_) => None,
             }
-        }).flatten();
+        })
+        .flatten();
         match result {
             Some(n) => return n,
-            None => block_current_and_run_next(BlockReason::UdpRecv(unsafe { core::mem::transmute(handle) })),
+            None => block_current_and_run_next(BlockReason::UdpRecv(unsafe {
+                core::mem::transmute(handle)
+            })),
         }
     }
 }
@@ -964,19 +1018,22 @@ fn sock_is_active_tcp(handle: SocketHandle) -> bool {
     crate::net::with_net_iface(|iface| {
         let sock: &TcpSocket = iface.sockets.get(handle);
         sock.is_active()
-    }).unwrap_or(false)
+    })
+    .unwrap_or(false)
 }
 
 fn sock_can_send_tcp(handle: SocketHandle) -> bool {
     crate::net::with_net_iface(|iface| {
         let sock: &TcpSocket = iface.sockets.get(handle);
         sock.can_send()
-    }).unwrap_or(false)
+    })
+    .unwrap_or(false)
 }
 
 fn sock_recv_queue_tcp(handle: SocketHandle) -> usize {
     crate::net::with_net_iface(|iface| {
         let sock: &TcpSocket = iface.sockets.get(handle);
         sock.recv_queue()
-    }).unwrap_or(0)
+    })
+    .unwrap_or(0)
 }

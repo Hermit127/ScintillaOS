@@ -6,7 +6,6 @@ extern crate user_lib;
 
 use user_lib::{get_time, sys_nanosleep, TimeSpec};
 
-
 #[no_mangle]
 pub fn main() -> i32 {
     println!("========== START test_nanosleep ==========");
@@ -20,10 +19,7 @@ pub fn main() -> i32 {
     let ret = sys_nanosleep(&req, core::ptr::null_mut());
     let end = get_time();
     let delta = (end - start) as usize;
-    println!(
-        "test1: nanosleep 100ms, ret={}, delta={}ms",
-        ret, delta
-    );
+    println!("test1: nanosleep 100ms, ret={}, delta={}ms", ret, delta);
     assert!(ret == 0);
     assert!(delta >= 80 && delta <= 200, "delta={} out of range", delta);
 
@@ -36,12 +32,13 @@ pub fn main() -> i32 {
     let ret = sys_nanosleep(&req, core::ptr::null_mut());
     let end = get_time();
     let delta = (end - start) as usize;
-    println!(
-        "test2: nanosleep 1.5s, ret={}, delta={}ms",
-        ret, delta
-    );
+    println!("test2: nanosleep 1.5s, ret={}, delta={}ms", ret, delta);
     assert!(ret == 0);
-    assert!(delta >= 1400 && delta <= 1800, "delta={} out of range", delta);
+    assert!(
+        delta >= 1400 && delta <= 1800,
+        "delta={} out of range",
+        delta
+    );
 
     // test 3: sleep with rem pointer (verify rem is cleared)
     let mut rem = TimeSpec {

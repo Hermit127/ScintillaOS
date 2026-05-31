@@ -16,7 +16,7 @@ const LINE_START: &str = ">> ";
 use alloc::string::String;
 use alloc::vec::Vec;
 use user_lib::console::getchar;
-use user_lib::{close, dup, exec, fork, chdir, open, pipe, waitpid, OpenFlags};
+use user_lib::{chdir, close, dup, exec, fork, open, pipe, waitpid, OpenFlags};
 
 #[derive(Debug)]
 struct ProcessArguments {
@@ -186,7 +186,10 @@ pub fn main() -> i32 {
                                     }
                                     return 0;
                                 }
-                                if !exec_path.starts_with('/') && !exec_path.starts_with("./") && !exec_path.starts_with("../") {
+                                if !exec_path.starts_with('/')
+                                    && !exec_path.starts_with("./")
+                                    && !exec_path.starts_with("../")
+                                {
                                     let cmd = String::from(exec_path.trim_end_matches('\0'));
                                     exec_path = String::from("/bin/");
                                     exec_path.push_str(cmd.as_str());

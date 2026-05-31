@@ -1,16 +1,20 @@
-use crate::fs::{open_file, OpenFlags};
+use crate::fs::{open_file, OpenFlags, File};
 use crate::fs::stdio::stdout_release_if_owner;
-use crate::mm::{translated_byte_buffer, translated_ref, translated_refmut, translated_str, MapPermission};
+use crate::mm::{
+    translated_byte_buffer, translated_ref, translated_refmut, translated_str, MapPermission,
+};
 use crate::task::{
     add_task, block_current_and_run_next, current_task, current_user_token,
-    exit_current_and_run_next, pid2task,
-    sleep_current_and_run_next, suspend_current_and_run_next, BlockReason, SignalAction, SignalFlags, MAX_SIG,
+    exit_current_and_run_next, pid2task, pid_alloc, sleep_current_and_run_next, suspend_current_and_run_next,
+    BlockReason, SignalAction, SignalFlags, MAX_SIG,
+    blank_kcontext, KernelStack, TaskControlBlock, TaskControlBlockInner, TaskStatus,
 };
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use log::info;
+use polyhal::kcontext::KContextArgs;
 use polyhal::time::Time;
 use polyhal_trap::trapframe::TrapFrameArgs;
 
@@ -46,7 +50,6 @@ pub struct UtsName {
     pub domainname: [u8; UTSNAME_LEN],
 }
 
-
 impl UtsName {
     fn set_str(field: &mut [u8; UTSNAME_LEN], s: &str) {
         let bytes = s.as_bytes();
@@ -57,6 +60,7 @@ impl UtsName {
 }
 
 #[repr(C)]
+#[derive(Debug, Clone, Copy)]
 struct TimeVal {
     pub sec: u64,
     pub usec: u64,
@@ -68,7 +72,7 @@ pub fn sys_exit(exit_code: i32) -> ! {
 }
 
 pub fn sys_yield() -> isize {
-    stdout_release_if_owner();
+    // stdout_release_if_owner();
     suspend_current_and_run_next();
     0
 }
@@ -94,56 +98,69 @@ pub fn sys_getppid() -> isize {
     let task = current_task().unwrap();
     let inner = task.inner_exclusive_access();
     match &inner.parent {
-        Some(parent_weak) => parent_weak.upgrade().map(|p| p.getpid() as isize).unwrap_or(1),
+        Some(parent_weak) => parent_weak
+            .upgrade()
+            .map(|p| p.getpid() as isize)
+            .unwrap_or(1),
         None => 1,
     }
 }
 
-pub fn sys_clone(flags: usize, stack: usize, ptid: usize, ctid: usize, tls: usize) -> isize {
-    const CLONE_CHILD_SETTID: usize = 0x01000000;
-    const CLONE_CHILD_CLEARTID: usize = 0x00200000;
+const CLONE_VM: usize = 0x100;
+const CLONE_FS: usize = 0x200;
+const CLONE_FILES: usize = 0x400;
+const CLONE_SIGHAND: usize = 0x800;
+const CLONE_THREAD: usize = 0x10000;
+const CLONE_SETTLS: usize = 0x80000;
+const CLONE_PARENT_SETTID: usize = 0x100000;
+const CLONE_CHILD_CLEARTID: usize = 0x200000;
+const CLONE_CHILD_SETTID: usize = 0x01000000;
 
+pub fn sys_clone(flags: usize, stack: usize, ptid: usize, tls: usize, ctid: usize) -> isize {
     let current_task = current_task().unwrap();
-    let new_task = current_task.fork();
+    let Some(new_task) = current_task.fork() else {
+        return -12;
+    };
     let new_pid = new_task.pid.0;
-    let trap_cx = new_task.inner_exclusive_access().get_trap_cx();
-    trap_cx[TrapFrameArgs::RET] = 0;
-    trap_cx[TrapFrameArgs::RET] = 0;
-    if stack != 0 {
-        trap_cx[TrapFrameArgs::SP] = stack;
-    }
-    // CLONE_CHILD_SETTID: write child pid to ctid in child's address space
-    if flags & CLONE_CHILD_SETTID != 0 && ctid != 0 {
-        let token = new_task.inner_exclusive_access().memory_set.token();
-        *translated_refmut(token, ctid as *mut i32) = new_pid as i32;
-    }
-    // CLONE_CHILD_CLEARTID: store ctid for exit cleanup
-    if flags & CLONE_CHILD_CLEARTID != 0 && ctid != 0 {
+
+    let child_token = {
         let mut inner = new_task.inner_exclusive_access();
-        inner.tid_ptr = ctid;
+        inner.trap_cx[TrapFrameArgs::RET] = 0;
+        if stack != 0 {
+            inner.trap_cx[TrapFrameArgs::SP] = stack;
+        }
+        if flags & CLONE_CHILD_CLEARTID != 0 && ctid != 0 {
+            inner.tid_ptr = ctid;
+        }
+        inner.memory_set.token()
+    };
+
+    if flags & CLONE_CHILD_SETTID != 0 && ctid != 0 {
+        *translated_refmut(child_token, ctid as *mut i32) = new_pid as i32;
     }
+
     add_task(new_task);
     new_pid as isize
 }
 
 pub fn sys_fork() -> isize {
     let current_task = current_task().unwrap();
-    let new_task = current_task.fork();
+    let Some(new_task) = current_task.fork() else {
+        return -12;
+    };
     let new_pid = new_task.pid.0;
-    // modify trap context of new_task, because it returns immediately after switching
-    let trap_cx = new_task.inner_exclusive_access().get_trap_cx();
-    // we do not have to move to next instruction since we have done it before
-    // for child process, fork returns 0
-    trap_cx[TrapFrameArgs::RET] = 0;
-    // add new task to scheduler
+    {
+        let mut inner = new_task.inner_exclusive_access();
+        inner.trap_cx[TrapFrameArgs::RET] = 0;
+    }
     add_task(new_task);
     new_pid as isize
 }
 
 pub fn sys_exec(path: *const u8, mut args: *const usize) -> isize {
     let token = current_user_token();
-        let path = translated_str(token, path);
-        let mut args_vec: Vec<String> = Vec::new();
+    let path = translated_str(token, path);
+    let mut args_vec: Vec<String> = Vec::new();
     loop {
         let arg_str_ptr = *translated_ref(token, args);
         if arg_str_ptr == 0 {
@@ -177,21 +194,38 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: usize) -> isize
     const WNOHANG: usize = 1;
     loop {
         let task = current_task().unwrap();
-        let mut inner = task.inner_exclusive_access();
-        let has_child = inner.children.iter().any(|p| pid == -1 || pid as usize == p.getpid());
-        if !has_child {
-            return -1;
-        }
-        // Find zombie child
-        let pair = inner.children.iter().enumerate().find(|(_, p)| {
-            p.inner_exclusive_access().is_zombie() && (pid == -1 || pid as usize == p.getpid())
-        });
-        if let Some((idx, _)) = pair {
-            let child = inner.children.remove(idx);
+        let zombie = {
+            let mut inner = task.inner_exclusive_access();
+            let mut has_child = false;
+            let mut zombie_idx = None;
+            for (idx, child) in inner.children.iter().enumerate() {
+                if pid != -1 && pid as usize != child.getpid() {
+                    continue;
+                }
+                has_child = true;
+                if child
+                    .try_inner_borrow()
+                    .map(|inner| inner.is_zombie())
+                    .unwrap_or(false)
+                {
+                    zombie_idx = Some(idx);
+                    break;
+                }
+            }
+            if !has_child {
+                return -1;
+            }
+            zombie_idx.map(|idx| (inner.children.remove(idx), inner.memory_set.token()))
+        };
+
+        if let Some((child, token)) = zombie {
             let found_pid = child.getpid();
-            let exit_code = child.inner_exclusive_access().exit_code;
+            let exit_code = {
+                let inner = child.inner_exclusive_access();
+                inner.exit_code
+            };
             if !exit_code_ptr.is_null() {
-                *translated_refmut(inner.memory_set.token(), exit_code_ptr) = (exit_code << 8) as i32;
+                *translated_refmut(token, exit_code_ptr) = (exit_code << 8) as i32;
             }
             return found_pid as isize;
         }
@@ -199,7 +233,6 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: usize) -> isize
         if options & WNOHANG != 0 {
             return 0;
         }
-        drop(inner);
         let mut queue = crate::task::WAITPID_QUEUE.exclusive_access();
         if !queue.iter().any(|t| t.getpid() == task.getpid()) {
             queue.push(task.clone());
@@ -313,10 +346,10 @@ pub fn sys_brk(brk_addr: usize) -> isize {
     if brk_addr < heap_bottom {
         return -1;
     }
-    
+
     let old_brk = inner.program_brk;
 
-    let old_brk_page = (old_brk + crate::config::PAGE_SIZE - 1) /  crate::config::PAGE_SIZE;
+    let old_brk_page = (old_brk + crate::config::PAGE_SIZE - 1) / crate::config::PAGE_SIZE;
     let new_brk_page = (brk_addr + crate::config::PAGE_SIZE - 1) / crate::config::PAGE_SIZE;
 
     if new_brk_page > old_brk_page {
@@ -366,9 +399,15 @@ pub fn sys_shutdown() -> isize {
 
 fn get_map_permission(prot: usize) -> crate::mm::MapPermission {
     let mut perm = crate::mm::MapPermission::U;
-    if prot & PROT_READ != 0 { perm |= crate::mm::MapPermission::R; }
-    if prot & PROT_WRITE != 0 { perm |= crate::mm::MapPermission::W; }
-    if prot & PROT_EXEC != 0 { perm |= crate::mm::MapPermission::X; }
+    if prot & PROT_READ != 0 {
+        perm |= crate::mm::MapPermission::R;
+    }
+    if prot & PROT_WRITE != 0 {
+        perm |= crate::mm::MapPermission::W;
+    }
+    if prot & PROT_EXEC != 0 {
+        perm |= crate::mm::MapPermission::X;
+    }
     perm
 }
 
@@ -381,7 +420,6 @@ pub fn sys_mmap(
     offset: usize,
 ) -> isize {
     if start % crate::config::PAGE_SIZE != 0 || len == 0 {
-       
         return -1;
     }
 
@@ -392,7 +430,8 @@ pub fn sys_mmap(
 
     let real_start = if start == 0 {
         let max_end: usize = inner.memory_set.max_end_vaddr().into();
-        (max_end + crate::config::PAGE_SIZE - 1) / crate::config::PAGE_SIZE * crate::config::PAGE_SIZE
+        (max_end + crate::config::PAGE_SIZE - 1) / crate::config::PAGE_SIZE
+            * crate::config::PAGE_SIZE
     } else {
         start
     };
@@ -403,7 +442,9 @@ pub fn sys_mmap(
         if (flags & MAP_FIXED) != 0 && inner.memory_set.is_overlap(start_addr, end_addr) {
             return -1;
         }
-        inner.memory_set.insert_framed_area(start_addr, end_addr, permission);
+        inner
+            .memory_set
+            .insert_framed_area(start_addr, end_addr, permission);
         return real_start as isize;
     } else {
         let start_addr = polyhal::VirtAddr::from(real_start);
@@ -412,15 +453,11 @@ pub fn sys_mmap(
         if fd < 0 || fd as usize >= inner.fd_table.len() {
             return -1;
         }
-    
+
         if let Some(file) = inner.fd_table[fd as usize].clone() {
-            let ok = inner.memory_set.insert_file_area(
-                start_addr, 
-                end_addr, 
-                permission, 
-                file, 
-                offset
-            );
+            let ok = inner
+                .memory_set
+                .insert_file_area(start_addr, end_addr, permission, file, offset);
             if ok {
                 return real_start as isize;
             } else {
@@ -480,7 +517,7 @@ pub fn sys_uname(uts_ptr: usize) -> isize {
     let task = crate::task::current_task().unwrap();
     let token = task.inner_exclusive_access().get_user_token();
     let uts = crate::mm::translated_refmut(token, uts_ptr as *mut UtsName);
-    
+
     *uts = UtsName {
         sysname: [0; UTSNAME_LEN],
         nodename: [0; UTSNAME_LEN],
@@ -492,7 +529,7 @@ pub fn sys_uname(uts_ptr: usize) -> isize {
 
     UtsName::set_str(&mut uts.sysname, "Linux");
     UtsName::set_str(&mut uts.nodename, "rCore-Tutorial");
-    UtsName::set_str(&mut uts.release, "5.10.0"); 
+    UtsName::set_str(&mut uts.release, "5.10.0");
     UtsName::set_str(&mut uts.version, "v0.1.0");
 
     #[cfg(target_arch = "riscv64")]
@@ -501,7 +538,7 @@ pub fn sys_uname(uts_ptr: usize) -> isize {
     UtsName::set_str(&mut uts.machine, "x86_64");
     #[cfg(target_arch = "loongarch64")]
     UtsName::set_str(&mut uts.machine, "loongarch64");
-    
+
     UtsName::set_str(&mut uts.domainname, "localdomain");
 
     0
@@ -510,11 +547,13 @@ pub fn sys_uname(uts_ptr: usize) -> isize {
 pub fn sys_syslog(action: usize, buf: *mut u8, len: usize) -> isize {
     match action {
         0 | 1 => 0, // open/close log
-        5 => { // clear
+        5 => {
+            // clear
             crate::logging::klog_clear();
             0
         }
-        2 | 3 | 4 => { // read / read all / read+clear
+        2 | 3 | 4 => {
+            // read / read all / read+clear
             if buf.is_null() || len == 0 {
                 return 0;
             }
@@ -536,7 +575,8 @@ pub fn sys_syslog(action: usize, buf: *mut u8, len: usize) -> isize {
             }
             copy_len as isize
         }
-        9 => { // number of unread chars
+        9 => {
+            // number of unread chars
             let (part1, part2) = crate::logging::klog_bytes();
             (part1.len() + part2.len()) as isize
         }
@@ -614,9 +654,7 @@ pub fn sys_getegid() -> isize {
 }
 
 pub fn sys_gettid() -> isize {
-    current_task()
-        .map(|t| t.getpid() as isize)
-        .unwrap_or(-1)
+    current_task().map(|t| t.getpid() as isize).unwrap_or(-1)
 }
 
 pub fn sys_setuid(uid: u32) -> isize {
@@ -696,12 +734,17 @@ const POLLERR: i16 = 0x008;
 const POLLHUP: i16 = 0x010;
 const POLLNVAL: i16 = 0x020;
 
-pub fn sys_ppoll(fds: *mut u8, nfds: usize, tmo_p: *const u8, _sigmask: *const u8, _sigsetsize: usize) -> isize {
+pub fn sys_ppoll(
+    fds: *mut u8,
+    nfds: usize,
+    tmo_p: *const u8,
+    _sigmask: *const u8,
+    _sigsetsize: usize,
+) -> isize {
     let token = current_user_token();
     let buf = translated_byte_buffer(token, fds, nfds * core::mem::size_of::<PollFd>());
-    let pollfds: &mut [PollFd] = unsafe {
-        core::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut PollFd, nfds)
-    };
+    let pollfds: &mut [PollFd] =
+        unsafe { core::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut PollFd, nfds) };
 
     let start_ms = polyhal::time::Time::now().to_msec() as usize;
 
@@ -724,10 +767,18 @@ pub fn sys_ppoll(fds: *mut u8, nfds: usize, tmo_p: *const u8, _sigmask: *const u
                     let file = file.clone();
                     drop(inner);
                     let (readable, writable, error) = file.poll();
-                    if (pfd.events & POLLIN) != 0 && readable { pfd.revents |= POLLIN; }
-                    if (pfd.events & POLLOUT) != 0 && writable { pfd.revents |= POLLOUT; }
-                    if error { pfd.revents |= POLLHUP; }
-                    if pfd.revents != 0 { ready += 1; }
+                    if (pfd.events & POLLIN) != 0 && readable {
+                        pfd.revents |= POLLIN;
+                    }
+                    if (pfd.events & POLLOUT) != 0 && writable {
+                        pfd.revents |= POLLOUT;
+                    }
+                    if error {
+                        pfd.revents |= POLLHUP;
+                    }
+                    if pfd.revents != 0 {
+                        ready += 1;
+                    }
                     inner = task.inner_exclusive_access();
                     continue;
                 }
@@ -746,7 +797,8 @@ pub fn sys_ppoll(fds: *mut u8, nfds: usize, tmo_p: *const u8, _sigmask: *const u
 
         // Check timeout
         if !tmo_p.is_null() {
-            let tmo: &crate::task::TimeSpec = translated_ref(token, tmo_p as *const crate::task::TimeSpec);
+            let tmo: &crate::task::TimeSpec =
+                translated_ref(token, tmo_p as *const crate::task::TimeSpec);
             let timeout_ms = tmo.tv_sec * 1000 + tmo.tv_nsec / 1_000_000;
             if timeout_ms == 0 {
                 return 0;
@@ -831,7 +883,8 @@ pub fn sys_pselect6(
     let orig_efds = efds;
 
     let timeout_ms = if !timeout.is_null() {
-        let ts: &crate::task::TimeSpec = translated_ref(token, timeout as *const crate::task::TimeSpec);
+        let ts: &crate::task::TimeSpec =
+            translated_ref(token, timeout as *const crate::task::TimeSpec);
         ts.tv_sec * 1000 + ts.tv_nsec / 1_000_000
     } else {
         usize::MAX
@@ -965,7 +1018,14 @@ pub fn sys_pselect6(
     }
 }
 
-pub fn sys_futex(uaddr: *mut u32, futex_op: usize, val: usize, _val2: usize, _uaddr2: *mut u32, _val3: usize) -> isize {
+pub fn sys_futex(
+    uaddr: *mut u32,
+    futex_op: usize,
+    val: usize,
+    _val2: usize,
+    _uaddr2: *mut u32,
+    _val3: usize,
+) -> isize {
     let token = current_user_token();
     let cur = *translated_ref(token, uaddr);
     let op = futex_op & 0x0F;
@@ -988,25 +1048,120 @@ pub fn sys_madvise(_start: usize, _len: usize, _advice: usize) -> isize {
     0
 }
 
+const ITIMER_REAL: usize = 0;
+const ITIMER_VIRTUAL: usize = 1;
+const ITIMER_PROF: usize = 2;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct ITimerVal {
+    it_interval: TimeVal,
+    it_value: TimeVal,
+}
+
+pub fn sys_getitimer(which: usize, curr_value_ptr: *mut u8) -> isize {
+    if curr_value_ptr.is_null() {
+        return -1;
+    }
+    let task = current_task().unwrap();
+    let token = current_user_token();
+    let inner = task.inner_exclusive_access();
+
+    let now = polyhal::time::Time::now().to_msec() as u64;
+    let remaining_ms = if inner.itimer_expire > now {
+        inner.itimer_expire - now
+    } else {
+        0
+    };
+
+    let itv = if inner.itimer_expire == 0 {
+        ITimerVal {
+            it_interval: TimeVal { sec: 0, usec: 0 },
+            it_value: TimeVal { sec: 0, usec: 0 },
+        }
+    } else {
+        let rem_sec = remaining_ms / 1000;
+        let rem_usec = (remaining_ms % 1000) * 1000;
+        let interval_sec = inner.itimer_interval_ms / 1000;
+        let interval_usec = (inner.itimer_interval_ms % 1000) * 1000;
+        ITimerVal {
+            it_interval: TimeVal { sec: interval_sec, usec: interval_usec },
+            it_value: TimeVal { sec: rem_sec, usec: rem_usec },
+        }
+    };
+
+    drop(inner);
+    *translated_refmut(token, curr_value_ptr as *mut ITimerVal) = itv;
+    0
+}
+
+pub fn sys_setitimer(which: usize, new_value: *const u8, old_value: *mut u8) -> isize {
+    if which != ITIMER_REAL {
+        return 0;  // silently ignore non-ITIMER_REAL
+    }
+
+    let token = current_user_token();
+    let task = current_task().unwrap();
+    let now = polyhal::time::Time::now().to_msec() as u64;
+
+    // return old value regardless
+    if !old_value.is_null() {
+        let mut inner = task.inner_exclusive_access();
+        let remaining_ms = if inner.itimer_expire > now {
+            inner.itimer_expire - now
+        } else {
+            0
+        };
+        let old_interval_sec = inner.itimer_interval_ms / 1000;
+        let old_interval_usec = (inner.itimer_interval_ms % 1000) * 1000;
+        let old_rem_sec = remaining_ms / 1000;
+        let old_rem_usec = (remaining_ms % 1000) * 1000;
+        let old_itv = if inner.itimer_expire == 0 {
+            ITimerVal {
+                it_interval: TimeVal { sec: 0, usec: 0 },
+                it_value: TimeVal { sec: 0, usec: 0 },
+            }
+        } else {
+            ITimerVal {
+                it_interval: TimeVal { sec: old_interval_sec, usec: old_interval_usec },
+                it_value: TimeVal { sec: old_rem_sec, usec: old_rem_usec },
+            }
+        };
+        drop(inner);
+        *translated_refmut(token, old_value as *mut ITimerVal) = old_itv;
+    }
+
+    if new_value.is_null() {
+        return 0;  // only query old value, don't set new
+    }
+
+    let new_itv: &ITimerVal = translated_ref(token, new_value as *const ITimerVal);
+    let new_value_ms = new_itv.it_value.sec * 1000 + new_itv.it_value.usec / 1000;
+    let new_interval_ms = new_itv.it_interval.sec * 1000 + new_itv.it_interval.usec / 1000;
+
+    let mut inner = task.inner_exclusive_access();
+    if new_value_ms == 0 {
+        inner.itimer_expire = 0;
+    } else {
+        inner.itimer_expire = now + new_value_ms as u64;
+    }
+    inner.itimer_interval_ms = new_interval_ms as u64;
+    0
+}
+
 pub fn sys_clock_gettime(clk_id: usize, ts: *mut u8) -> isize {
     const CLOCK_REALTIME: usize = 0;
     const CLOCK_MONOTONIC: usize = 1;
 
-    if clk_id != CLOCK_REALTIME && clk_id != CLOCK_MONOTONIC {
+    if ts.is_null() || (clk_id != CLOCK_REALTIME && clk_id != CLOCK_MONOTONIC) {
         return -22; // EINVAL
     }
 
-    #[repr(C)]
-    struct TimeSpec {
-        tv_sec: u64,
-        tv_nsec: u64,
-    }
-
-    let now_ns = polyhal::time::Time::now().to_nsec() as u64;
     let token = current_user_token();
-    let ts_ref = crate::mm::translated_refmut(token, ts as *mut TimeSpec);
-    ts_ref.tv_sec = now_ns / 1_000_000_000;
-    ts_ref.tv_nsec = now_ns % 1_000_000_000;
+    let now_ms = polyhal::time::Time::now().to_msec() as u64;
+    let ts_out: &mut crate::task::TimeSpec = translated_refmut(token, ts as *mut crate::task::TimeSpec);
+    ts_out.tv_sec = (now_ms / 1000) as usize;
+    ts_out.tv_nsec = ((now_ms % 1000) * 1_000_000) as usize;
     0
 }
 
@@ -1064,15 +1219,15 @@ pub fn sys_writev(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
             return -1;
         }
         let file = inner.fd_table[fd].as_ref().unwrap().clone();
-         drop(inner);
-         let n = file.write(buf);
-         total += n as isize;
-         if (n as usize) < iov.iov_len {
-             break;
-         }
-     }
-     total
- }
+        drop(inner);
+        let n = file.write(buf);
+        total += n as isize;
+        if (n as usize) < iov.iov_len {
+            break;
+        }
+    }
+    total
+}
 
 pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset_ptr: *mut usize, count: usize) -> isize {
     let token = current_user_token();
@@ -1109,11 +1264,17 @@ pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset_ptr: *mut usize, count: 
     while (total as usize) < count {
         let chunk = (count - total as usize).min(buf.len());
         let n = in_file.read(&mut buf[..chunk]);
-        if n <= 0 { break; }
+        if n <= 0 {
+            break;
+        }
         let written = out_file.write(&mut buf[..n as usize]);
-        if written <= 0 { break; }
+        if written <= 0 {
+            break;
+        }
         total += written;
-        if written < n { break; }
+        if written < n {
+            break;
+        }
     }
 
     if let Some(off) = saved_in_off {
@@ -1123,4 +1284,6 @@ pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset_ptr: *mut usize, count: 
     total
 }
 
-pub fn sys_getrusage(_who: usize, _usage: *mut u8) -> isize { 0 }
+pub fn sys_getrusage(_who: usize, _usage: *mut u8) -> isize {
+    0
+}

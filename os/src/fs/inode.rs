@@ -1,6 +1,6 @@
 use super::vfs::{
-    vfs_create, vfs_resolve_parent_and_name, vfs_resolve_path,
-    vfs_resolve_with_fallback, Dentry, DirEntry,
+    vfs_create, vfs_resolve_parent_and_name, vfs_resolve_path, vfs_resolve_with_fallback, Dentry,
+    DirEntry,
 };
 use super::{File, Kstat};
 use crate::sync::UPSafeCell;
@@ -28,7 +28,9 @@ pub struct OSInodeInner {
 impl OSInode {
     pub fn new(readable: bool, writable: bool, append: bool, dentry: Arc<Dentry>) -> Self {
         let offset = if append {
-            dentry.super_block.get_inode_info(&dentry.fs_path)
+            dentry
+                .super_block
+                .get_inode_info(&dentry.fs_path)
                 .map(|i| i.size as usize)
                 .unwrap_or(0)
         } else {
@@ -48,7 +50,10 @@ impl OSInode {
 
     pub fn read_all(&self) -> alloc::vec::Vec<u8> {
         let mut inner = self.inner.exclusive_access();
-        let size = self.dentry.super_block.get_inode_info(&self.dentry.fs_path)
+        let size = self
+            .dentry
+            .super_block
+            .get_inode_info(&self.dentry.fs_path)
             .map(|i| i.size as usize)
             .unwrap_or(0);
         let mut out = if size > 0 {
@@ -58,11 +63,10 @@ impl OSInode {
         };
         let mut buffer = [0u8; 4096];
         loop {
-            let len = self.dentry.super_block.read_at(
-                &self.dentry.fs_path,
-                inner.offset,
-                &mut buffer,
-            );
+            let len =
+                self.dentry
+                    .super_block
+                    .read_at(&self.dentry.fs_path, inner.offset, &mut buffer);
             if len == 0 {
                 break;
             }
@@ -74,10 +78,7 @@ impl OSInode {
 
     fn stat_inner(&self) -> Kstat {
         let inner = self.inner.exclusive_access();
-        let info = self
-            .dentry
-            .super_block
-            .get_inode_info(&self.dentry.fs_path);
+        let info = self.dentry.super_block.get_inode_info(&self.dentry.fs_path);
         match info {
             Some(info) => {
                 let mut st = Kstat::new(info.mode);
@@ -181,11 +182,15 @@ pub fn open_file_at(
             }
         }
 
-        let (parent, name) =
-            vfs_resolve_parent_and_name(&start, path)?;
+        let (parent, name) = vfs_resolve_parent_and_name(&start, path)?;
         let dentry = vfs_create(&parent, &name, false)?;
         let (readable, writable) = flags.read_write();
-        return Some(Arc::new(OSInode::new(readable, writable, flags.contains(OpenFlags::APPEND), dentry)));
+        return Some(Arc::new(OSInode::new(
+            readable,
+            writable,
+            flags.contains(OpenFlags::APPEND),
+            dentry,
+        )));
     }
 
     let dentry = vfs_resolve_with_fallback(&start, path)?;
@@ -268,11 +273,10 @@ impl File for OSInode {
 
     fn read(&self, buf: &mut [u8]) -> isize {
         let mut inner = self.inner.exclusive_access();
-        let read_size = self.dentry.super_block.read_at(
-            &self.dentry.fs_path,
-            inner.offset,
-            buf,
-        );
+        let read_size = self
+            .dentry
+            .super_block
+            .read_at(&self.dentry.fs_path, inner.offset, buf);
         inner.offset += read_size;
         read_size as isize
     }
@@ -280,15 +284,17 @@ impl File for OSInode {
     fn write(&self, buf: &mut [u8]) -> isize {
         let mut inner = self.inner.exclusive_access();
         if self.append {
-            inner.offset = self.dentry.super_block.get_inode_info(&self.dentry.fs_path)
+            inner.offset = self
+                .dentry
+                .super_block
+                .get_inode_info(&self.dentry.fs_path)
                 .map(|i| i.size as usize)
                 .unwrap_or(inner.offset);
         }
-        let write_size = self.dentry.super_block.write_at(
-            &self.dentry.fs_path,
-            inner.offset,
-            buf,
-        );
+        let write_size = self
+            .dentry
+            .super_block
+            .write_at(&self.dentry.fs_path, inner.offset, buf);
         inner.offset += write_size;
         write_size as isize
     }
@@ -309,9 +315,10 @@ impl File for OSInode {
         const DIRENT64_FIXED_SIZE: usize = 8 + 8 + 2 + 1;
         let mut inner = self.inner.exclusive_access();
 
-        let entries: Vec<DirEntry> = self.dentry.super_block.dir_get_entries(
-            &self.dentry.fs_path,
-        );
+        let entries: Vec<DirEntry> = self
+            .dentry
+            .super_block
+            .dir_get_entries(&self.dentry.fs_path);
 
         let mut written = 0usize;
         let mut entry_index = inner.offset;
@@ -365,7 +372,9 @@ impl File for OSInode {
         self.inner.exclusive_access().offset
     }
 
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
 // ==================== rename_at ====================
@@ -376,8 +385,8 @@ pub fn rename_at(
     new_base: Option<Arc<Dentry>>,
     new_path: &str,
 ) -> bool {
-    use lwext4_rust::bindings::{ext4_frename, EOK};
     use alloc::ffi::CString;
+    use lwext4_rust::bindings::{ext4_frename, EOK};
 
     let start = old_base.unwrap_or_else(|| crate::fs::vfs::ROOT_DENTRY.clone());
     let old_dentry = match vfs_resolve_path(&start, old_path) {
@@ -414,18 +423,28 @@ pub fn rename_at(
         )
     };
 
-    rc == EOK as i32
+    if rc == EOK as i32 {
+        if let Some(old_parent) = old_dentry.parent.clone() {
+            let mut children = old_parent.children.exclusive_access();
+            if let Some(list) = children.as_mut() {
+                list.retain(|c| c.name != old_dentry.name);
+            }
+        }
+        let mut children = new_parent.children.exclusive_access();
+        if let Some(list) = children.as_mut() {
+            list.retain(|c| c.name != new_name);
+        }
+        true
+    } else {
+        false
+    }
 }
 
 // ==================== symlink_at ====================
 
-pub fn symlink_at(
-    base: Option<Arc<Dentry>>,
-    target: &str,
-    linkpath: &str,
-) -> bool {
-    use lwext4_rust::bindings::{ext4_fsymlink, EOK};
+pub fn symlink_at(base: Option<Arc<Dentry>>, target: &str, linkpath: &str) -> bool {
     use alloc::ffi::CString;
+    use lwext4_rust::bindings::{ext4_fsymlink, EOK};
 
     let start = base.unwrap_or_else(|| crate::fs::vfs::ROOT_DENTRY.clone());
     let (parent, name) = match vfs_resolve_parent_and_name(&start, linkpath) {

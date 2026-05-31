@@ -128,7 +128,9 @@ fn final_sig_test() {
         }
         write(pipe_fd[1] as usize, &[0u8]);
         close(pipe_fd[1] as usize);
-        loop {yield_();}
+        loop {
+            yield_();
+        }
     } else {
         close(pipe_fd[1] as usize);
         let mut buf = [0u8; 1];

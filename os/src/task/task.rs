@@ -9,7 +9,7 @@ use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
-use core::cell::RefMut;
+use core::cell::{Ref, RefMut};
 use core::mem::size_of;
 use polyhal::kcontext::{read_current_tp, KContext, KContextArgs};
 use polyhal::pagetable::PageTable;
@@ -80,13 +80,16 @@ pub struct TaskControlBlockInner {
     // record the stack
     pub heap_bottom: usize,
     pub program_brk: usize,
-    pub sleeping : Option<u64>,
+    pub sleeping: Option<u64>,
     pub utime: usize,
     pub stime: usize,
     pub cutime: usize,
     pub cstime: usize,
     pub last_time: usize,
     pub block_reason: Option<BlockReason>,
+    pub itimer_expire: u64,
+    pub itimer_interval_ms: u64,
+    pub child_tid: usize,
 }
 
 impl TaskControlBlockInner {
@@ -131,7 +134,7 @@ fn task_entry() {
     }
 }
 
-fn blank_kcontext(ksp: usize) -> KContext {
+pub fn blank_kcontext(ksp: usize) -> KContext {
     let mut kcx = KContext::blank();
     kcx[KContextArgs::KPC] = task_entry as usize;
     kcx[KContextArgs::KSP] = ksp;
@@ -143,9 +146,32 @@ impl TaskControlBlock {
     pub fn inner_exclusive_access(&self) -> RefMut<'_, TaskControlBlockInner> {
         self.inner.exclusive_access()
     }
+    pub fn from_raw(pid: PidHandle, inner: TaskControlBlockInner) -> Self {
+        Self {
+            pid,
+            inner: unsafe { UPSafeCell::new(inner) },
+        }
+    }
+    pub fn try_inner_exclusive_access(&self) -> Option<RefMut<'_, TaskControlBlockInner>> {
+        match self.inner.try_borrow_mut() {
+            Some(g) => Some(g),
+            None => None,
+        }
+    }
+    pub fn try_inner_borrow(&self) -> Option<core::cell::Ref<'_, TaskControlBlockInner>> {
+        match self.inner.try_borrow() {
+            Some(g) => Some(g),
+            None => None,
+        }
+    }
     pub fn new(elf_data: &[u8]) -> Self {
         trace!("os::task::TaskControlBlock::new");
-        let LoadedElf { memory_set, user_sp, entry_point, .. } = MemorySet::from_elf(elf_data);
+        let LoadedElf {
+            memory_set,
+            user_sp,
+            entry_point,
+            ..
+        } = MemorySet::from_elf(elf_data);
 
         let heap_bottom = user_sp;
         // alloc a pid and a kernel stack in kernel space
@@ -198,6 +224,9 @@ impl TaskControlBlock {
                     cstime: 0,
                     last_time: polyhal::time::Time::now().to_msec() as usize,
                     block_reason: None,
+                    itimer_expire: 0,
+                    itimer_interval_ms: 0,
+                    child_tid: 0,
                 }, "TaskInner")
             },
         };
@@ -209,7 +238,14 @@ impl TaskControlBlock {
     }
     pub fn exec(&self, elf_data: &[u8], args: Vec<String>) {
         trace!("os::task::TaskControlBlock::exec");
-        let LoadedElf { memory_set, user_sp: stack_top, entry_point, ph_addr, ph_entsize, ph_num } = MemorySet::from_elf(elf_data);
+        let LoadedElf {
+            memory_set,
+            user_sp: stack_top,
+            entry_point,
+            ph_addr,
+            ph_entsize,
+            ph_num,
+        } = MemorySet::from_elf(elf_data);
         let heap_bottom = stack_top;
 
         memory_set.activate();
@@ -275,8 +311,12 @@ impl TaskControlBlock {
         // Step 3: AT_RANDOM data (16 bytes below string area)
         sp -= 16;
         let random_addr = sp;
-        let rand1 = (polyhal::time::Time::now().to_nsec() as u64).wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        let rand2 = rand1.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let rand1 = (polyhal::time::Time::now().to_nsec() as u64)
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let rand2 = rand1
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         *translated_refmut(token, random_addr as *mut u64) = rand1;
         *translated_refmut(token, (random_addr + 8) as *mut u64) = rand2;
 
@@ -344,25 +384,59 @@ impl TaskControlBlock {
         trap_cx[TrapFrameArgs::ARG1] = argv_base;
         *inner.get_trap_cx() = trap_cx;
     }
-    pub fn fork(self: &Arc<TaskControlBlock>) -> Arc<TaskControlBlock> {
+    pub fn fork(self: &Arc<TaskControlBlock>) -> Option<Arc<TaskControlBlock>> {
         trace!("os::task::TaskControlBlock::fork");
-        // ---- hold parent PCB lock
-        let mut parent_inner = self.inner_exclusive_access();
-        // copy user space(include trap context)
-        let memory_set = MemorySet::from_existed_user(&parent_inner.memory_set);
+        // Copy the user address space before collecting the remaining task state.
+        let memory_set = {
+            let parent_inner = self.inner_exclusive_access();
+            MemorySet::from_existed_user(&parent_inner.memory_set)?
+        };
 
-        // alloc a pid and a kernel stack in kernel space
+        let (
+            trap_cx_clone,
+            base_size,
+            fd_table,
+            fd_cloexec,
+            cwd,
+            root,
+            tid_ptr,
+            uid,
+            euid,
+            gid,
+            egid,
+            umask,
+            signal_mask,
+            signal_actions,
+            heap_bottom,
+            program_brk,
+        ) = {
+            let parent_inner = self.inner_exclusive_access();
+            (
+                parent_inner.trap_cx.clone(),
+                parent_inner.base_size,
+                parent_inner
+                    .fd_table
+                    .iter()
+                    .map(|f| f.as_ref().map(|x| x.clone()))
+                    .collect::<Vec<_>>(),
+                parent_inner.fd_cloexec.clone(),
+                parent_inner.cwd.clone(),
+                parent_inner.root.clone(),
+                parent_inner.tid_ptr,
+                parent_inner.uid,
+                parent_inner.euid,
+                parent_inner.gid,
+                parent_inner.egid,
+                parent_inner.umask,
+                parent_inner.signal_mask,
+                parent_inner.signal_actions.clone(),
+                parent_inner.heap_bottom,
+                parent_inner.program_brk,
+            )
+        };
+
         let pid_handle = pid_alloc();
         let kstack = KernelStack::new();
-        // copy fd table
-        let mut new_fd_table: Vec<Option<Arc<dyn File + Send + Sync>>> = Vec::new();
-        for fd in parent_inner.fd_table.iter() {
-            if let Some(file) = fd {
-                new_fd_table.push(Some(file.clone()));
-            } else {
-                new_fd_table.push(None);
-            }
-        }
         let task_control_block = Arc::new(TaskControlBlock {
             pid: pid_handle,
             inner: unsafe {
@@ -375,27 +449,26 @@ impl TaskControlBlock {
                     parent: Some(Arc::downgrade(self)),
                     children: Vec::new(),
                     exit_code: 0,
-                    fd_table: new_fd_table,
-                    fd_cloexec: parent_inner.fd_cloexec.clone(),
-                    cwd: parent_inner.cwd.clone(),
-                    root: parent_inner.root.clone(),
-                    tid_ptr: parent_inner.tid_ptr,
-                    uid: parent_inner.uid,
-                    euid: parent_inner.euid,
-                    gid: parent_inner.gid,
-                    egid: parent_inner.egid,
-                    umask: parent_inner.umask,
+                    fd_table,
+                    fd_cloexec,
+                    cwd,
+                    root,
+                    tid_ptr,
+                    uid,
+                    euid,
+                    gid,
+                    egid,
+                    umask,
                     signals: SignalFlags::empty(),
-                    // inherit the signal_mask and signal_action
-                    signal_mask: parent_inner.signal_mask,
+                    signal_mask,
                     handling_sig: -1,
-                    signal_actions: parent_inner.signal_actions.clone(),
+                    signal_actions,
                     killed: false,
                     frozen: false,
                     trap_ctx_backup: None,
                     kernel_stack: kstack,
-                    heap_bottom: parent_inner.heap_bottom,
-                    program_brk: parent_inner.program_brk,
+                    heap_bottom,
+                    program_brk,
                     sleeping: None,
                     utime: 0,
                     stime: 0,
@@ -403,39 +476,50 @@ impl TaskControlBlock {
                     cstime: 0,
                     last_time: polyhal::time::Time::now().to_msec() as usize,
                     block_reason: None,
+                    itimer_expire: 0,
+                    itimer_interval_ms: 0,
+                    child_tid: 0,
                 }, "TaskInner")
             },
         });
-        parent_inner.children.push(task_control_block.clone());
-        // modify kernel_sp in trap_cx
-        // **** access child PCB exclusively
-        task_control_block
-        // **** release child PCB
-        // ---- release parent PCB
+        // add child to parent's children list
+        {
+            let mut parent_inner = self.inner_exclusive_access();
+            parent_inner.children.push(task_control_block.clone());
+        }
+        Some(task_control_block)
     }
     pub fn getpid(&self) -> usize {
         self.pid.0
     }
     pub fn record_time_user_to_kernel(&self) {
-        let mut inner = self.inner_exclusive_access();
+        let Some(mut inner) = self.try_inner_exclusive_access() else {
+            return;
+        };
         let now = polyhal::time::Time::now().to_msec() as usize;
         inner.utime += now - inner.last_time;
         inner.last_time = now;
     }
     pub fn record_time_kernel_to_user(&self) {
-        let mut inner = self.inner_exclusive_access();
+        let Some(mut inner) = self.try_inner_exclusive_access() else {
+            return;
+        };
         let now = polyhal::time::Time::now().to_msec() as usize;
         inner.stime += now - inner.last_time;
         inner.last_time = now;
     }
     pub fn record_time_suspend(&self) {
-        let mut inner = self.inner_exclusive_access();
+        let Some(mut inner) = self.try_inner_exclusive_access() else {
+            return;
+        };
         let now = polyhal::time::Time::now().to_msec() as usize;
         inner.stime += now - inner.last_time;
         inner.last_time = now;
     }
     pub fn record_time_resume(&self) {
-        let mut inner = self.inner_exclusive_access();
+        let Some(mut inner) = self.try_inner_exclusive_access() else {
+            return;
+        };
         inner.last_time = polyhal::time::Time::now().to_msec() as usize;
     }
 }

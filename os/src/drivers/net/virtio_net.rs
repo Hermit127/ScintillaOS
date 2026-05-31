@@ -62,11 +62,12 @@ impl VirtIONetAdapter {
             mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
         }
 
-        println!("[net] VirtIONetAdapter initialized successfully, MAC={:02x?}", mac);
+        println!(
+            "[net] VirtIONetAdapter initialized successfully, MAC={:02x?}",
+            mac
+        );
         Some(Self {
-            inner: unsafe {
-                UPSafeCell::new(VirtIONetInner { net })
-            },
+            inner: unsafe { UPSafeCell::new(VirtIONetInner { net }) },
             rx_buf: [0u8; NET_BUF_SIZE],
             rx_len: 0,
             tx_buf: [0u8; NET_BUF_SIZE],
@@ -157,7 +158,9 @@ impl Device for VirtIONetAdapter {
             self.rx_buf[..len].copy_from_slice(&frame[..len]);
             self.rx_len = len;
             return Some((
-                VirtioRxToken { buf: &mut self.rx_buf[..self.rx_len] },
+                VirtioRxToken {
+                    buf: &mut self.rx_buf[..self.rx_len],
+                },
                 VirtioTxToken {
                     buf: &mut self.tx_buf,
                     device: &self.inner,

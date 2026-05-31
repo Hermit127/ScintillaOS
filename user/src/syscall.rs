@@ -225,7 +225,14 @@ pub fn sys_sigaction(
 ) -> isize {
     syscall(
         SYSCALL_SIGACTION,
-        [signum as usize, action as usize, old_action as usize, 0, 0, 0],
+        [
+            signum as usize,
+            action as usize,
+            old_action as usize,
+            0,
+            0,
+            0,
+        ],
     )
 }
 
@@ -252,7 +259,6 @@ pub fn sys_chdir(path: &str) -> isize {
 pub fn sys_getcwd(buf: &mut [u8]) -> isize {
     syscall(SYSCALL_GETCWD, [buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0, 0])
 }
-
 pub fn sys_getdents64(fd: usize, buf: &mut [u8]) -> isize {
     syscall(SYSCALL_GETDENTS64, [fd, buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0])
 }
@@ -295,7 +301,10 @@ pub fn sys_shutdown() -> isize {
 }
 
 pub fn sys_mkdir(path: *const u8, mode: u32) -> isize {
-    syscall(SYSCALL_MKDIRAT, [AT_FDCWD as usize, path as usize, mode as usize, 0, 0, 0])
+    syscall(
+        SYSCALL_MKDIRAT,
+        [AT_FDCWD as usize, path as usize, mode as usize, 0, 0, 0],
+    )
 }
 
 pub fn sys_getuid() -> isize {

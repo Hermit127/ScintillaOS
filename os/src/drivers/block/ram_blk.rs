@@ -5,8 +5,8 @@ use core::{
 
 extern crate alloc;
 
-use log::info;
 use super::BlockDevice;
+use log::info;
 
 // 虚拟IO设备
 pub struct RamDiskBlock {
@@ -59,10 +59,7 @@ impl RamDiskBlock {
         let start = ramdisk_start as _;
         let size = ramdisk_end as usize - ramdisk_start as usize;
         assert_ne!(size, 0, "ramdisk size is 0");
-        Self {
-            start,
-            size,
-        }
+        Self { start, size }
     }
 }
 

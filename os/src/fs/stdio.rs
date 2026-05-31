@@ -1,8 +1,8 @@
 use polyhal::debug_console::DebugConsole;
 
 use super::{File, Kstat, S_IFCHR};
-use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use crate::task::{current_task, suspend_current_and_run_next};
+use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 static STDOUT_BUSY: AtomicBool = AtomicBool::new(false);
 static STDOUT_OWNER: AtomicI32 = AtomicI32::new(0);
@@ -28,7 +28,9 @@ fn stdout_acquire() {
 pub fn stdout_release_if_owner() {
     if let Some(task) = current_task() {
         let pid = task.getpid() as i32;
-        STDOUT_OWNER.compare_exchange(pid, 0, Ordering::Release, Ordering::Relaxed).ok();
+        STDOUT_OWNER
+            .compare_exchange(pid, 0, Ordering::Release, Ordering::Relaxed)
+            .ok();
     }
 }
 
@@ -63,7 +65,9 @@ impl File for Stdin {
     fn stat(&self) -> Kstat {
         Kstat::new(S_IFCHR)
     }
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
 impl File for Stdout {
@@ -88,16 +92,23 @@ impl File for Stdout {
     fn stat(&self) -> Kstat {
         Kstat::new(S_IFCHR)
     }
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
 pub struct Urandom;
 
 impl File for Urandom {
-    fn readable(&self) -> bool { true }
-    fn writable(&self) -> bool { false }
+    fn readable(&self) -> bool {
+        true
+    }
+    fn writable(&self) -> bool {
+        false
+    }
     fn read(&self, buf: &mut [u8]) -> isize {
-        let mut state: u32 = 0x92f4a3b7u32.wrapping_add(polyhal::time::Time::now().to_msec() as u32);
+        let mut state: u32 =
+            0x92f4a3b7u32.wrapping_add(polyhal::time::Time::now().to_msec() as u32);
         for b in buf.iter_mut() {
             state ^= state << 13;
             state ^= state >> 17;
@@ -107,18 +118,36 @@ impl File for Urandom {
         }
         buf.len() as isize
     }
-    fn write(&self, _buf: &mut [u8]) -> isize { 0 }
-    fn stat(&self) -> Kstat { Kstat::new(S_IFCHR) }
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn write(&self, _buf: &mut [u8]) -> isize {
+        0
+    }
+    fn stat(&self) -> Kstat {
+        Kstat::new(S_IFCHR)
+    }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
 pub struct DevNull;
 
 impl File for DevNull {
-    fn readable(&self) -> bool { true }
-    fn writable(&self) -> bool { true }
-    fn read(&self, _buf: &mut [u8]) -> isize { 0 }
-    fn write(&self, buf: &mut [u8]) -> isize { buf.len() as isize }
-    fn stat(&self) -> Kstat { Kstat::new(S_IFCHR) }
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn readable(&self) -> bool {
+        true
+    }
+    fn writable(&self) -> bool {
+        true
+    }
+    fn read(&self, _buf: &mut [u8]) -> isize {
+        0
+    }
+    fn write(&self, buf: &mut [u8]) -> isize {
+        buf.len() as isize
+    }
+    fn stat(&self) -> Kstat {
+        Kstat::new(S_IFCHR)
+    }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }

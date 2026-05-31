@@ -62,6 +62,9 @@ pub fn pid2task(pid: usize) -> Option<Arc<TaskControlBlock>> {
 pub fn remove_from_pid2task(pid: usize) {
     let mut map = PID2TCB.exclusive_access();
     if map.remove(&pid).is_none() {
-        warn!("remove_from_pid2task: pid {} not found, may have been removed already", pid);
+        warn!(
+            "remove_from_pid2task: pid {} not found, may have been removed already",
+            pid
+        );
     }
 }

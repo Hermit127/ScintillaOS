@@ -165,7 +165,7 @@ impl File for Pipe {
             let mut ring_buffer = self.buffer.exclusive_access();
             for _ in 0..loop_write {
                 if let Some(byte_ref) = buf_iter.next() {
-                    ring_buffer.write_byte( *byte_ref );
+                    ring_buffer.write_byte(*byte_ref);
                     already_write += 1;
                     if already_write == want_to_write {
                         return want_to_write as isize;
@@ -179,5 +179,7 @@ impl File for Pipe {
     fn stat(&self) -> Kstat {
         Kstat::new(S_IFIFO)
     }
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }

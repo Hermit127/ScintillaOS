@@ -93,7 +93,6 @@ impl FileWrapper {
 
 /// The [`VfsNodeOps`] trait provides operations on a file or a directory.
 impl VfsNodeOps for FileWrapper {
-
     /*
     fn get_attr(&self) -> Result<usize, i32> {
         let mut file = self.0.lock();

@@ -303,3 +303,11 @@ pub fn times(tms: &mut Tms) -> isize {
 pub fn shutdown() -> isize {
     sys_shutdown()
 }
+
+pub fn mount(source: &str, target: &str, fstype: &str, flags: usize, data: &[u8]) -> isize {
+    sys_mount(source, target, fstype, flags, data)
+}
+
+pub fn umount2(target: &str, flags: usize) -> isize {
+    sys_umount2(target, flags)
+}

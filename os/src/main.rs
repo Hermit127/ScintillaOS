@@ -5,7 +5,9 @@
 use crate::{
     syscall::syscall,
     task::{
-        SignalFlags, check_and_wake_up_tasks, check_signals_error_of_current, current_add_signal, exit_current_and_run_next, handle_signals
+        check_and_wake_up_tasks, check_signals_error_of_current, current_add_signal,
+        current_task, exit_current_and_run_next, handle_signals, SignalFlags,
+        suspend_current_and_run_next,
     },
 };
 // use polyhal::api::ArchInterface;
@@ -61,11 +63,8 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             // cx is changed during sys_exec, so we have to call it again
             ctx[TrapFrameArgs::RET] = result as usize;
         }
-        StorePageFault(bad_addr) => {
-            // Try COW (Copy-On-Write) first
-            if !crate::mm::handle_cow_fault(bad_addr) {
-                exit_current_and_run_next(-11);
-            }
+        StorePageFault(_bad_addr) => {
+            exit_current_and_run_next(-11);
         }
         LoadPageFault(_paddr) | InstructionPageFault(_paddr) => {
             exit_current_and_run_next(-11);
@@ -74,9 +73,13 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             current_add_signal(SignalFlags::SIGILL);
         }
         Timer => {
+            static mut TICK: usize = 0;
+            unsafe { TICK += 1; }
             net::net_poll();
             net::wake_net_blocked_tasks();
             check_and_wake_up_tasks();
+            check_itimer();
+            suspend_current_and_run_next();
         }
         _ => {
             warn!("unsuspended trap type: {:?}", trap_type);
@@ -95,6 +98,23 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
     // kernel time accounting
     if let Some(task) = crate::task::current_task() {
         task.record_time_kernel_to_user();
+    }
+}
+
+fn check_itimer() {
+    let Some(task) = current_task() else { return };
+    let Some(mut inner) = task.try_inner_exclusive_access() else { return };
+    if inner.itimer_expire == 0 {
+        return;
+    }
+    let now = polyhal::time::Time::now().to_msec() as u64;
+    if now >= inner.itimer_expire {
+        inner.signals.insert(SignalFlags::SIGALRM);
+        if inner.itimer_interval_ms > 0 {
+            inner.itimer_expire = now + inner.itimer_interval_ms;
+        } else {
+            inner.itimer_expire = 0;
+        }
     }
 }
 
