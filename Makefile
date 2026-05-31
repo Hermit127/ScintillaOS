@@ -157,6 +157,10 @@ fs-img: $(APPS)
 		mkdir -p "$(ROOTFS_MNT_DIR)"; \
 	fi
 	@cp -f tmp/hello_riscv64_musl $(ROOTFS_BIN_DIR)/hello 2>/dev/null || true
+	@cp -f tmp/lua $(ROOTFS_BIN_DIR)/lua 2>/dev/null || true
+	@cp -f testsuits-for-oskernel/scripts/lua/*.lua $(ROOTFS_DIR)/ 2>/dev/null || true
+	@cp -f tmp/strings.lua $(ROOTFS_DIR)/strings.lua 2>/dev/null || true
+	@printf '#!/bin/sh\necho "#### OS COMP TEST GROUP START lua ####"\nfor f in date.lua file_io.lua max_min.lua random.lua remove.lua round_num.lua sin30.lua sort.lua strings.lua; do ./lua /$$f; if [ $$? = 0 ]; then echo "testcase lua $$f success"; else echo "testcase lua $$f fail"; fi; done\necho "#### OS COMP TEST GROUP END lua ####"\n' > $(ROOTFS_DIR)/lua_testcode.sh 2>/dev/null || true
 	@if [ "$(ARCH)" = "riscv64" ]; then \
 		cp -f tmp/busybox-musl $(ROOTFS_BIN_DIR)/busybox 2>/dev/null || true; \
 		cp -f tmp/busybox-musl $(ROOTFS_DIR)/busybox 2>/dev/null || true; \
@@ -169,6 +173,7 @@ fs-img: $(APPS)
 		printf '#!/bin/sh\n./busybox --install -s /bin 2>/dev/null\necho "#### OS COMP TEST GROUP START busybox-musl ####"\nwhile IFS= read -r line; do case "$$line" in ""|\\#*) continue ;; esac; eval "./busybox $$line"; RTN=$$?; if [ $$RTN -ne 0 ] && [ "$$line" != "false" ]; then echo "testcase busybox $$line fail"; else echo "testcase busybox $$line success"; fi; done < ./busybox_cmd.txt\necho "#### OS COMP TEST GROUP END busybox-musl ####"\n' > $(ROOTFS_DIR)/busybox_testcode.sh; \
 	fi
 	@if [ "$(ARCH)" = "loongarch64" ]; then \
+		cp -f tmp/lua-loongarch64 $(ROOTFS_BIN_DIR)/lua 2>/dev/null || true; \
 		cp -f tmp/busybox-musl-loongarch64 $(ROOTFS_BIN_DIR)/busybox 2>/dev/null || true; \
 		cp -f tmp/busybox-musl-loongarch64 $(ROOTFS_DIR)/busybox 2>/dev/null || true; \
 		cp -f tmp/busybox-glibc-loongarch64 $(ROOTFS_BIN_DIR)/busybox-glibc 2>/dev/null || true; \
