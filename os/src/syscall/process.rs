@@ -1,6 +1,5 @@
 use crate::fs::{open_file, OpenFlags, File};
 use crate::fs::stdio::stdout_release_if_owner;
-use crate::fs::{open_file, OpenFlags};
 use crate::mm::{
     translated_byte_buffer, translated_ref, translated_refmut, translated_str, MapPermission,
 };
@@ -117,7 +116,7 @@ const CLONE_PARENT_SETTID: usize = 0x100000;
 const CLONE_CHILD_CLEARTID: usize = 0x200000;
 const CLONE_CHILD_SETTID: usize = 0x01000000;
 
-pub fn sys_clone(_flags: usize, stack: usize, _ptid: usize, _tls: usize, _ctid: usize) -> isize {
+pub fn sys_clone(flags: usize, stack: usize, ptid: usize, tls: usize, ctid: usize) -> isize {
     let current_task = current_task().unwrap();
     let Some(new_task) = current_task.fork() else {
         return -12;

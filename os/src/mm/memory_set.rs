@@ -165,12 +165,6 @@ impl MemorySet {
             areas: Vec::new(),
         }
     }
-    pub fn from_shared(user_space: &MemorySet) -> MemorySet {
-        MemorySet {
-            page_table: user_space.page_table.clone(),
-            areas: Vec::new(),
-        }
-    }
     pub fn activate(&self) {
         self.page_table.change();
     }

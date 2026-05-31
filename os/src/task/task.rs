@@ -146,9 +146,6 @@ impl TaskControlBlock {
     pub fn inner_exclusive_access(&self) -> RefMut<'_, TaskControlBlockInner> {
         self.inner.exclusive_access()
     }
-    pub fn inner_try_borrow(&self) -> Result<RefMut<'_, TaskControlBlockInner>, core::cell::BorrowMutError> {
-        self.inner.try_borrow_mut()
-    }
     pub fn from_raw(pid: PidHandle, inner: TaskControlBlockInner) -> Self {
         Self {
             pid,

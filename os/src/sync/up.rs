@@ -1,4 +1,4 @@
-use core::cell::{RefCell, RefMut, BorrowMutError};
+use core::cell::{RefCell, RefMut};
 use core::panic::Location;
 
 /// Wrap a static data structure inside it so that we are
@@ -46,8 +46,5 @@ impl<T> UPSafeCell<T> {
             Ok(g) => Some(g),
             Err(_) => None,
         }
-    }
-    pub fn try_borrow_mut(&self) -> Result<RefMut<'_, T>, BorrowMutError> {
-        self.inner.try_borrow_mut()
     }
 }
