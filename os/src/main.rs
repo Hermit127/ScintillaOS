@@ -75,6 +75,8 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             current_add_signal(SignalFlags::SIGILL);
         }
         Timer => {
+            static mut TICK: usize = 0;
+            unsafe { TICK += 1; }
             net::net_poll();
             net::wake_net_blocked_tasks();
             check_and_wake_up_tasks();
@@ -103,7 +105,7 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
 
 fn check_itimer() {
     let Some(task) = current_task() else { return };
-    let mut inner = task.inner_exclusive_access();
+    let Ok(mut inner) = task.inner_try_borrow() else { return };
     if inner.itimer_expire == 0 {
         return;
     }

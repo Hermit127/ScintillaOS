@@ -1,6 +1,6 @@
-use crate::fs::{open_file, OpenFlags};
+use crate::fs::{open_file, OpenFlags, File};
 use crate::fs::stdio::stdout_release_if_owner;
-use crate::mm::{translated_byte_buffer, translated_ref, translated_refmut, translated_str, MapPermission};
+use crate::mm::{translated_byte_buffer, translated_ref, translated_refmut, translated_str, MemorySet};
 use crate::task::{
     add_task, block_current_and_run_next, current_task, current_user_token,
     exit_current_and_run_next, pid2task, pid_alloc,
@@ -71,7 +71,7 @@ pub fn sys_exit(exit_code: i32) -> ! {
 }
 
 pub fn sys_yield() -> isize {
-    stdout_release_if_owner();
+    // stdout_release_if_owner();
     suspend_current_and_run_next();
     0
 }
@@ -110,97 +110,16 @@ const CLONE_THREAD: usize = 0x10000;
 const CLONE_SETTLS: usize = 0x80000;
 const CLONE_PARENT_SETTID: usize = 0x100000;
 const CLONE_CHILD_CLEARTID: usize = 0x200000;
+const CLONE_CHILD_SETTID: usize = 0x01000000;
 
-pub fn sys_clone(flags: usize, stack: usize, ptid: usize, tls: usize, ctid: usize) -> isize {
-    use polyhal::kcontext::read_current_tp;
-
+pub fn sys_clone(_flags: usize, stack: usize, _ptid: usize, _tls: usize, _ctid: usize) -> isize {
     let current_task = current_task().unwrap();
-    let new_pid_handle = pid_alloc();
-    let new_pid = new_pid_handle.0;
-
-    let is_thread = (flags & CLONE_VM) != 0;
-
-    if (flags & CLONE_PARENT_SETTID) != 0 && ptid != 0 {
-        let token = current_task.inner_exclusive_access().get_user_token();
-        *translated_refmut(token, ptid as *mut i32) = new_pid as i32;
-    }
-
-    let new_task = {
-        let mut parent_inner = current_task.inner_exclusive_access();
-
-        let memory_set = if is_thread {
-            MemorySet::from_shared(&parent_inner.memory_set)
-        } else {
-            MemorySet::from_existed_user(&parent_inner.memory_set)
-        };
-
-        let new_fd_table: Vec<Option<Arc<dyn File + Send + Sync>>> = parent_inner
-            .fd_table
-            .iter()
-            .map(|opt| opt.as_ref().map(|f| f.clone()))
-            .collect();
-
-        let kstack = KernelStack::new();
-        let inner = TaskControlBlockInner {
-            trap_cx: parent_inner.trap_cx.clone(),
-            base_size: parent_inner.base_size,
-            task_cx: blank_kcontext(kstack.get_position().1),
-            task_status: TaskStatus::Ready,
-            memory_set,
-            parent: Some(Arc::downgrade(&current_task)),
-            children: Vec::new(),
-            exit_code: 0,
-            fd_table: new_fd_table,
-            fd_cloexec: parent_inner.fd_cloexec.clone(),
-            cwd: parent_inner.cwd.clone(),
-            root: parent_inner.root.clone(),
-            tid_ptr: parent_inner.tid_ptr,
-            uid: parent_inner.uid,
-            euid: parent_inner.euid,
-            gid: parent_inner.gid,
-            egid: parent_inner.egid,
-            umask: parent_inner.umask,
-            signals: SignalFlags::empty(),
-            signal_mask: parent_inner.signal_mask,
-            handling_sig: -1,
-            signal_actions: parent_inner.signal_actions.clone(),
-            killed: false,
-            frozen: false,
-            trap_ctx_backup: None,
-            kernel_stack: kstack,
-            heap_bottom: parent_inner.heap_bottom,
-            program_brk: parent_inner.program_brk,
-            sleeping: None,
-            utime: 0,
-            stime: 0,
-            cutime: 0,
-            cstime: 0,
-            last_time: polyhal::time::Time::now().to_msec() as usize,
-            block_reason: None,
-            itimer_expire: 0,
-            itimer_interval_ms: 0,
-            child_tid: if (flags & CLONE_CHILD_CLEARTID) != 0 { ctid } else { 0 },
-        };
-        let task_control_block = Arc::new(TaskControlBlock::from_raw(new_pid_handle, inner));
-        parent_inner.children.push(task_control_block.clone());
-        task_control_block
-    };
-
+    let new_task = current_task.fork();
+    let new_pid = new_task.pid.0;
     let trap_cx = new_task.inner_exclusive_access().get_trap_cx();
-    trap_cx[TrapFrameArgs::RET] = 0;
     trap_cx[TrapFrameArgs::RET] = 0;
     if stack != 0 {
         trap_cx[TrapFrameArgs::SP] = stack;
-    }
-    // CLONE_CHILD_SETTID: write child pid to ctid in child's address space
-    if flags & CLONE_CHILD_SETTID != 0 && ctid != 0 {
-        let token = new_task.inner_exclusive_access().memory_set.token();
-        *translated_refmut(token, ctid as *mut i32) = new_pid as i32;
-    }
-    // CLONE_CHILD_CLEARTID: store ctid for exit cleanup
-    if flags & CLONE_CHILD_CLEARTID != 0 && ctid != 0 {
-        let mut inner = new_task.inner_exclusive_access();
-        inner.tid_ptr = ctid;
     }
     add_task(new_task);
     new_pid as isize
@@ -266,8 +185,9 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: usize) -> isize
         let pair = inner.children.iter().enumerate().find(|(_, p)| {
             p.inner_exclusive_access().is_zombie() && (pid == -1 || pid as usize == p.getpid())
         });
-        if let Some((idx, _)) = pair {
-            let child = inner.children.remove(idx);
+    if let Some((idx, _)) = pair {
+        let child = inner.children.remove(idx);
+        crate::println!("[waitpid] pid={} reaps child pid={}", task.getpid(), child.getpid());
             let found_pid = child.getpid();
             let exit_code = child.inner_exclusive_access().exit_code;
             if !exit_code_ptr.is_null() {

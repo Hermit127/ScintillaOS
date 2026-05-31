@@ -124,8 +124,6 @@ use crate::net::syscall::{
 use log::*;
 use crate::task::SignalAction;
 
-const SYSCALL_SHUTDOWN: usize = 403;
-
 pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     if syscall_id == SYSCALL_SHUTDOWN {
         return sys_shutdown();
