@@ -1,5 +1,3 @@
-
-
 local str = "Jelly Think"
 
 result = 0
