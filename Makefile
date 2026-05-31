@@ -158,7 +158,7 @@ fs-img: $(APPS)
 	fi
 	@cp -f tmp/hello_riscv64_musl $(ROOTFS_BIN_DIR)/hello 2>/dev/null || true
 	@cp -f tmp/lua $(ROOTFS_BIN_DIR)/lua 2>/dev/null || true
-	@cp -f testsuits-for-oskernel/scripts/lua/*.lua $(ROOTFS_DIR)/ 2>/dev/null || true
+	@cp -f lua-tests/*.lua $(ROOTFS_DIR)/ 2>/dev/null || true
 	@cp -f tmp/strings.lua $(ROOTFS_DIR)/strings.lua 2>/dev/null || true
 	@printf '#!/bin/sh\necho "#### OS COMP TEST GROUP START lua ####"\nfor f in date.lua file_io.lua max_min.lua random.lua remove.lua round_num.lua sin30.lua sort.lua strings.lua; do ./lua /$$f; if [ $$? = 0 ]; then echo "testcase lua $$f success"; else echo "testcase lua $$f fail"; fi; done\necho "#### OS COMP TEST GROUP END lua ####"\n' > $(ROOTFS_DIR)/lua_testcode.sh 2>/dev/null || true
 	@if [ "$(ARCH)" = "riscv64" ]; then \
