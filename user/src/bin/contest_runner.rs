@@ -11,6 +11,38 @@ use alloc::vec::Vec;
 use user_lib::{exec, fork, waitpid, shutdown, mount, exit};
 
 const TEST_LIST: &[&str] = &[
+    "brk",
+    "chdir",
+    "clone",
+    "close",
+    "dup",
+    "dup2",
+    "execve",
+    "exit",
+    "fork",
+    "fstat",
+    "getcwd",
+    "getdents",
+    "getpid",
+    "getppid",
+    "gettimeofday",
+    "mkdir_",
+    "mmap",
+    "mount",
+    "munmap",
+    "openat",
+    "open",
+    "pipe",
+    "read",
+    "sleep",
+    "times",
+    "umount",
+    "uname",
+    "unlink",
+    "wait",
+    "waitpid",
+    "write",
+    "yield",
     "brk", "chdir", "close", "dup", "dup2", "execve", "exit",
     "fstat", "getcwd", "getdents", "getpid", "getppid", "gettimeofday",
     "mkdir_", "mmap", "mount", "munmap", "openat", "open", "pipe", "read",
@@ -75,7 +107,29 @@ fn run_iozone() {
     println!("#### OS COMP TEST GROUP END iozone ####");
 }
 
+fn run_group(name: &str) {
+    println!("#### OS COMP TEST GROUP START {} ####", name);
+    for test in TEST_LIST {
+        run_test(test);
+    }
+    println!("#### OS COMP TEST GROUP END {} ####", name);
+}
+
 #[no_mangle]
+pub fn main(argc: usize, argv: &[&str]) -> i32 {
+    if argc > 1 {
+        if argv[1] == "musl" {
+            run_group("basic-musl");
+            return 0;
+        }
+        if argv[1] == "glibc" {
+            run_group("basic-glibc");
+            return 0;
+        }
+    }
+
+    run_group("basic-musl");
+    run_group("basic-glibc");
 pub fn main() -> i32 {
     mount("", "/mnt\0", "ext4\0", 0, &[]);
 

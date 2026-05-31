@@ -5,8 +5,8 @@
 use crate::{
     syscall::syscall,
     task::{
-        SignalFlags, check_and_wake_up_tasks, check_signals_error_of_current, current_add_signal,
-        current_task, exit_current_and_run_next, handle_signals, suspend_current_and_run_next
+        check_and_wake_up_tasks, check_signals_error_of_current, current_add_signal,
+        exit_current_and_run_next, handle_signals, SignalFlags,
     },
 };
 // use polyhal::api::ArchInterface;
@@ -62,11 +62,8 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             // cx is changed during sys_exec, so we have to call it again
             ctx[TrapFrameArgs::RET] = result as usize;
         }
-        StorePageFault(bad_addr) => {
-            // Try COW (Copy-On-Write) first
-            if !crate::mm::handle_cow_fault(bad_addr) {
-                exit_current_and_run_next(-11);
-            }
+        StorePageFault(_bad_addr) => {
+            exit_current_and_run_next(-11);
         }
         LoadPageFault(_paddr) | InstructionPageFault(_paddr) => {
             exit_current_and_run_next(-11);

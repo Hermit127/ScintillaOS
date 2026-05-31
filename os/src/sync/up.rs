@@ -1,4 +1,5 @@
 use core::cell::{RefCell, RefMut, BorrowMutError};
+use core::panic::Location;
 
 /// Wrap a static data structure inside it so that we are
 /// able to access it without any `unsafe`.
@@ -23,8 +24,28 @@ impl<T> UPSafeCell<T> {
         }
     }
     /// Panic if the data has been borrowed.
+    #[track_caller]
     pub fn exclusive_access(&self) -> RefMut<'_, T> {
-        self.inner.borrow_mut()
+        match self.inner.try_borrow_mut() {
+            Ok(g) => g,
+            Err(_) => {
+                let caller = Location::caller();
+                panic!("already borrowed at {}:{}", caller.file(), caller.line())
+            }
+        }
+    }
+    /// Try to borrow, returns None if already borrowed
+    pub fn try_borrow_mut(&self) -> Option<RefMut<'_, T>> {
+        match self.inner.try_borrow_mut() {
+            Ok(g) => Some(g),
+            Err(_) => None,
+        }
+    }
+    pub fn try_borrow(&self) -> Option<core::cell::Ref<'_, T>> {
+        match self.inner.try_borrow() {
+            Ok(g) => Some(g),
+            Err(_) => None,
+        }
     }
     pub fn try_borrow_mut(&self) -> Result<RefMut<'_, T>, BorrowMutError> {
         self.inner.try_borrow_mut()

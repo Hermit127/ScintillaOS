@@ -96,7 +96,8 @@ impl File for SocketFile {
 
     fn set_flags(&self, flags: usize) -> bool {
         const O_NONBLOCK: usize = 0x800;
-        self.nonblock.store((flags & O_NONBLOCK) != 0, Ordering::Relaxed);
+        self.nonblock
+            .store((flags & O_NONBLOCK) != 0, Ordering::Relaxed);
         true
     }
 
@@ -109,17 +110,21 @@ impl File for SocketFile {
             crate::net::with_net_iface(|iface| match self.socket_type {
                 SocketType::Tcp => {
                     let sock: &TcpSocket = iface.sockets.get(handle);
-                    let has_pending = sock.is_active() && !sock.is_listening()
+                    let has_pending = sock.is_active()
+                        && !sock.is_listening()
                         && self.was_listening.load(Ordering::Relaxed);
-                    (sock.can_recv() || !sock.may_recv() || has_pending,
-                     sock.can_send() || !sock.is_active(),
-                     !sock.is_active() && !sock.is_listening() && sock.recv_queue() == 0)
+                    (
+                        sock.can_recv() || !sock.may_recv() || has_pending,
+                        sock.can_send() || !sock.is_active(),
+                        !sock.is_active() && !sock.is_listening() && sock.recv_queue() == 0,
+                    )
                 }
                 SocketType::Udp => {
                     let sock: &UdpSocket = iface.sockets.get(handle);
                     (sock.can_recv(), true, false)
                 }
-            }).unwrap_or((false, false, false))
+            })
+            .unwrap_or((false, false, false))
         }
         #[cfg(not(any(target_arch = "riscv64", target_arch = "aarch64")))]
         {
@@ -127,5 +132,7 @@ impl File for SocketFile {
         }
     }
 
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }

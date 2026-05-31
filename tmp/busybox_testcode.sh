@@ -1,5 +1,5 @@
 #!/bin/sh
-echo "#### OS COMP TEST GROUP START busybox ####"
+echo "#### OS COMP TEST GROUP START busybox-musl ####"
 cat ./busybox_cmd.txt | while read line
 do
 	case "$line" in ""|\#*) continue ;; esac
@@ -14,4 +14,4 @@ do
 		echo "testcase busybox $line success"
 	fi
 done
-echo "#### OS COMP TEST GROUP END busybox ####"
+echo "#### OS COMP TEST GROUP END busybox-musl ####"

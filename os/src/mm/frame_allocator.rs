@@ -7,28 +7,21 @@ use core::{
     mem::size_of,
     sync::atomic::{AtomicUsize, Ordering},
 };
-use log::trace;
 use polyhal::{pa, utils::MutexNoIrq, PhysAddr};
 
-/// COW refcount: only tracks shared (refcount > 1) pages.
-/// Single-owner pages (refcount=1) don't appear in the map.
-type RefMap = BTreeMap<usize, u8>;
+type RefMap = BTreeMap<usize, usize>;
 static FRAME_REFS: MutexNoIrq<RefMap> = MutexNoIrq::new(BTreeMap::new());
 
-fn ref_key(paddr: PhysAddr) -> usize { paddr.raw() / PAGE_SIZE }
-
-fn ref_get(paddr: PhysAddr) -> u8 {
-    FRAME_REFS.lock().get(&ref_key(paddr)).copied().unwrap_or(1)
+fn ref_key(paddr: PhysAddr) -> usize {
+    paddr.raw() / PAGE_SIZE
 }
 
-fn ref_inc(paddr: PhysAddr) -> u8 {
-    let mut map = FRAME_REFS.lock();
-    let e = map.entry(ref_key(paddr)).or_insert(1);
-    *e = e.saturating_add(1);
-    *e
+fn ref_inc(paddr: PhysAddr) {
+    let mut refs = FRAME_REFS.lock();
+    let entry = refs.entry(ref_key(paddr)).or_insert(1);
+    *entry += 1;
 }
 
-/// Frame tracker. Default refcount=1. Only shared pages (refcount>1) are in the map.
 pub struct FrameTracker {
     pub paddr: PhysAddr,
 }
@@ -38,31 +31,26 @@ impl FrameTracker {
         paddr.clear_len(PAGE_SIZE);
         Self { paddr }
     }
-    pub fn cow_clone(&self) -> Self {
+    pub fn shared_clone(&self) -> Self {
         ref_inc(self.paddr);
         Self { paddr: self.paddr }
-    }
-    pub fn ref_count(&self) -> usize {
-        ref_get(self.paddr) as usize
     }
 }
 
 impl Drop for FrameTracker {
     fn drop(&mut self) {
-        let mut map = FRAME_REFS.lock();
+        let mut refs = FRAME_REFS.lock();
         let key = ref_key(self.paddr);
-        let cur = map.get(&key).copied().unwrap_or(0);
-        if cur == 0 {
-            // Single owner: not in map, free directly
-            drop(map);
-            frame_dealloc(self.paddr);
-        } else if cur <= 2 {
-            // Shared by 2, now down to 1 (single owner): remove from map, don't free
-            map.remove(&key);
-        } else {
-            // Shared by >2: decrement
-            map.insert(key, cur - 1);
+        if let Some(count) = refs.get_mut(&key) {
+            if *count > 2 {
+                *count -= 1;
+            } else {
+                refs.remove(&key);
+            }
+            return;
         }
+        drop(refs);
+        frame_dealloc(self.paddr);
     }
 }
 

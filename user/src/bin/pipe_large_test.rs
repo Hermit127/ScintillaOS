@@ -25,7 +25,10 @@ pub fn main() -> i32 {
         close(down_pipe_fd[1] as usize);
         // close read end of up pipe
         close(up_pipe_fd[0] as usize);
-        assert_eq!(read(down_pipe_fd[0] as usize, &mut random_str) as usize, LENGTH);
+        assert_eq!(
+            read(down_pipe_fd[0] as usize, &mut random_str) as usize,
+            LENGTH
+        );
         close(down_pipe_fd[0] as usize);
         let sum: usize = random_str.iter().map(|v| *v as usize).sum::<usize>();
         println!("sum = {}(child)", sum);

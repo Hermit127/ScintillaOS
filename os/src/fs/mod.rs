@@ -67,23 +67,38 @@ pub trait File: Send + Sync {
     fn read(&self, buf: &mut [u8]) -> isize;
     fn write(&self, buf: &mut [u8]) -> isize;
     fn stat(&self) -> Kstat;
-    fn is_dir(&self) -> bool { false }
-    fn path(&self) -> Option<String> { None }
-    fn getdents64(&self, _buf: &mut [u8]) -> isize { -1 }
-    fn seek(&self, _offset: usize) { }
-    fn get_offset(&self) -> usize { 0 }
+    fn is_dir(&self) -> bool {
+        false
+    }
+    fn path(&self) -> Option<String> {
+        None
+    }
+    fn getdents64(&self, _buf: &mut [u8]) -> isize {
+        -1
+    }
+    fn seek(&self, _offset: usize) {}
+    fn get_offset(&self) -> usize {
+        0
+    }
     fn get_flags(&self) -> usize {
         let mut flags = 0usize;
-        if self.readable() && self.writable() { flags |= 2; }
-        else if self.writable() { flags |= 1; }
+        if self.readable() && self.writable() {
+            flags |= 2;
+        } else if self.writable() {
+            flags |= 1;
+        }
         0x8000 | flags
     }
-    fn set_flags(&self, _flags: usize) -> bool { false }
-    fn poll(&self) -> (bool, bool, bool) { (true, true, false) }
+    fn set_flags(&self, _flags: usize) -> bool {
+        false
+    }
+    fn poll(&self) -> (bool, bool, bool) {
+        (true, true, false)
+    }
     fn as_any(&self) -> &dyn core::any::Any;
 }
 
 pub use inode::{mkdir_at, open_file, open_file_at, rename_at, symlink_at, unlink_at, OpenFlags};
 pub use pipe::make_pipe;
-pub use stdio::{Stdin, Stdout, Urandom, DevNull};
+pub use stdio::{DevNull, Stdin, Stdout, Urandom};
 pub use vfs::{list_apps, mount_root};

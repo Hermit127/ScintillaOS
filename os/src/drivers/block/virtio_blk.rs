@@ -8,7 +8,7 @@ use lazy_static::*;
 use polyhal::consts::VIRT_ADDR_START;
 use polyhal::pagetable::PAGE_SIZE;
 use polyhal::PhysAddr;
-use virtio_drivers::device::blk::{SECTOR_SIZE, VirtIOBlk};
+use virtio_drivers::device::blk::{VirtIOBlk, SECTOR_SIZE};
 #[cfg(not(target_arch = "loongarch64"))]
 use virtio_drivers::transport::mmio::MmioTransport;
 #[cfg(target_arch = "loongarch64")]
@@ -111,9 +111,7 @@ impl VirtIOBlock {
                 let transport = PciTransport::new::<VirtioHal>(&mut root, device_function)
                     .expect("this is not a valid virtio pci block device");
                 return Self(unsafe {
-                    UPSafeCell::new(
-                        VirtIOBlk::<VirtioHal, PciTransport>::new(transport).unwrap(),
-                    )
+                    UPSafeCell::new(VirtIOBlk::<VirtioHal, PciTransport>::new(transport).unwrap())
                 });
             }
             block_index += 1;

@@ -1,12 +1,12 @@
 #![allow(unused_variables)]
-use pci::{PortOps, CSpaceAccessMethod};
+use pci::{CSpaceAccessMethod, PortOps};
 
 pub const PCI_COMMAND: u16 = 0x04;
 pub const BAR0: u16 = 0x10;
 pub const PCI_CAP_PTR: u16 = 0x34;
 pub const PCI_INTERRUPT_LINE: u16 = 0x3c;
 pub const PCI_INTERRUPT_PIN: u16 = 0x3d;
-pub const PCI_COMMAND_INTX_DISABLE:u16 = 0x400;
+pub const PCI_COMMAND_INTX_DISABLE: u16 = 0x400;
 
 pub const PCI_MSI_CTRL_CAP: u16 = 0x00;
 pub const PCI_MSI_ADDR: u16 = 0x04;
