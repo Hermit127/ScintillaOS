@@ -1,14 +1,16 @@
-use crate::fs::{open_file, OpenFlags};
-use crate::mm::{translated_byte_buffer, translated_ref, translated_refmut, translated_str, MapPermission};
+use crate::fs::{open_file, OpenFlags, File};
+use crate::mm::{translated_byte_buffer, translated_ref, translated_refmut, translated_str, MapPermission, MemorySet};
 use crate::task::{
-    add_task, current_task, current_user_token, exit_current_and_run_next, pid2task,
+    add_task, current_task, current_user_token, exit_current_and_run_next, pid2task, pid_alloc,
     sleep_current_and_run_next, suspend_current_and_run_next, SignalAction, SignalFlags, MAX_SIG,
+    blank_kcontext, KernelStack, TaskControlBlock, TaskControlBlockInner, TaskStatus,
 };
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use log::info;
+use polyhal::kcontext::KContextArgs;
 use polyhal::time::Time;
 use polyhal_trap::trapframe::TrapFrameArgs;
 
@@ -55,6 +57,7 @@ impl UtsName {
 }
 
 #[repr(C)]
+#[derive(Debug, Clone, Copy)]
 struct TimeVal {
     pub sec: u64,
     pub usec: u64,
@@ -96,15 +99,99 @@ pub fn sys_getppid() -> isize {
     }
 }
 
-pub fn sys_clone(_flags: usize, stack: usize, _ptid: usize, _tls: usize, _ctid: usize) -> isize {
+const CLONE_VM: usize = 0x100;
+const CLONE_FS: usize = 0x200;
+const CLONE_FILES: usize = 0x400;
+const CLONE_SIGHAND: usize = 0x800;
+const CLONE_THREAD: usize = 0x10000;
+const CLONE_SETTLS: usize = 0x80000;
+const CLONE_PARENT_SETTID: usize = 0x100000;
+const CLONE_CHILD_CLEARTID: usize = 0x200000;
+
+pub fn sys_clone(flags: usize, stack: usize, ptid: usize, tls: usize, ctid: usize) -> isize {
+    use polyhal::kcontext::read_current_tp;
+
     let current_task = current_task().unwrap();
-    let new_task = current_task.fork();
-    let new_pid = new_task.pid.0;
+    let new_pid_handle = pid_alloc();
+    let new_pid = new_pid_handle.0;
+
+    let is_thread = (flags & CLONE_VM) != 0;
+
+    if (flags & CLONE_PARENT_SETTID) != 0 && ptid != 0 {
+        let token = current_task.inner_exclusive_access().get_user_token();
+        *translated_refmut(token, ptid as *mut i32) = new_pid as i32;
+    }
+
+    let new_task = {
+        let mut parent_inner = current_task.inner_exclusive_access();
+
+        let memory_set = if is_thread {
+            MemorySet::from_shared(&parent_inner.memory_set)
+        } else {
+            MemorySet::from_existed_user(&parent_inner.memory_set)
+        };
+
+        let new_fd_table: Vec<Option<Arc<dyn File + Send + Sync>>> = parent_inner
+            .fd_table
+            .iter()
+            .map(|opt| opt.as_ref().map(|f| f.clone()))
+            .collect();
+
+        let kstack = KernelStack::new();
+        let inner = TaskControlBlockInner {
+            trap_cx: parent_inner.trap_cx.clone(),
+            base_size: parent_inner.base_size,
+            task_cx: blank_kcontext(kstack.get_position().1),
+            task_status: TaskStatus::Ready,
+            memory_set,
+            parent: Some(Arc::downgrade(&current_task)),
+            children: Vec::new(),
+            exit_code: 0,
+            fd_table: new_fd_table,
+            fd_cloexec: parent_inner.fd_cloexec.clone(),
+            cwd: parent_inner.cwd.clone(),
+            root: parent_inner.root.clone(),
+            tid_ptr: parent_inner.tid_ptr,
+            uid: parent_inner.uid,
+            euid: parent_inner.euid,
+            gid: parent_inner.gid,
+            egid: parent_inner.egid,
+            umask: parent_inner.umask,
+            signals: SignalFlags::empty(),
+            signal_mask: parent_inner.signal_mask,
+            handling_sig: -1,
+            signal_actions: parent_inner.signal_actions.clone(),
+            killed: false,
+            frozen: false,
+            trap_ctx_backup: None,
+            kernel_stack: kstack,
+            heap_bottom: parent_inner.heap_bottom,
+            program_brk: parent_inner.program_brk,
+            sleeping: None,
+            utime: 0,
+            stime: 0,
+            cutime: 0,
+            cstime: 0,
+            last_time: polyhal::time::Time::now().to_msec() as usize,
+            block_reason: None,
+            itimer_expire: 0,
+            itimer_interval_ms: 0,
+            child_tid: if (flags & CLONE_CHILD_CLEARTID) != 0 { ctid } else { 0 },
+        };
+        let task_control_block = Arc::new(TaskControlBlock::from_raw(new_pid_handle, inner));
+        parent_inner.children.push(task_control_block.clone());
+        task_control_block
+    };
+
     let trap_cx = new_task.inner_exclusive_access().get_trap_cx();
     trap_cx[TrapFrameArgs::RET] = 0;
     if stack != 0 {
         trap_cx[TrapFrameArgs::SP] = stack;
     }
+    if (flags & CLONE_SETTLS) != 0 {
+        new_task.inner_exclusive_access().task_cx[KContextArgs::KTP] = tls;
+    }
+
     add_task(new_task);
     new_pid as isize
 }
@@ -929,8 +1016,121 @@ pub fn sys_madvise(_start: usize, _len: usize, _advice: usize) -> isize {
     0
 }
 
-pub fn sys_clock_gettime(_clk_id: usize, _ts: *mut u8) -> isize {
-    -38
+const ITIMER_REAL: usize = 0;
+const ITIMER_VIRTUAL: usize = 1;
+const ITIMER_PROF: usize = 2;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct ITimerVal {
+    it_interval: TimeVal,
+    it_value: TimeVal,
+}
+
+pub fn sys_getitimer(which: usize, curr_value_ptr: *mut u8) -> isize {
+    if curr_value_ptr.is_null() {
+        return -1;
+    }
+    let task = current_task().unwrap();
+    let token = current_user_token();
+    let inner = task.inner_exclusive_access();
+
+    let now = polyhal::time::Time::now().to_msec() as u64;
+    let remaining_ms = if inner.itimer_expire > now {
+        inner.itimer_expire - now
+    } else {
+        0
+    };
+
+    let itv = if inner.itimer_expire == 0 {
+        ITimerVal {
+            it_interval: TimeVal { sec: 0, usec: 0 },
+            it_value: TimeVal { sec: 0, usec: 0 },
+        }
+    } else {
+        let rem_sec = remaining_ms / 1000;
+        let rem_usec = (remaining_ms % 1000) * 1000;
+        let interval_sec = inner.itimer_interval_ms / 1000;
+        let interval_usec = (inner.itimer_interval_ms % 1000) * 1000;
+        ITimerVal {
+            it_interval: TimeVal { sec: interval_sec, usec: interval_usec },
+            it_value: TimeVal { sec: rem_sec, usec: rem_usec },
+        }
+    };
+
+    drop(inner);
+    *translated_refmut(token, curr_value_ptr as *mut ITimerVal) = itv;
+    0
+}
+
+pub fn sys_setitimer(which: usize, new_value: *const u8, old_value: *mut u8) -> isize {
+    if which != ITIMER_REAL {
+        return 0;  // silently ignore non-ITIMER_REAL
+    }
+
+    let token = current_user_token();
+    let task = current_task().unwrap();
+    let now = polyhal::time::Time::now().to_msec() as u64;
+
+    // return old value regardless
+    if !old_value.is_null() {
+        let mut inner = task.inner_exclusive_access();
+        let remaining_ms = if inner.itimer_expire > now {
+            inner.itimer_expire - now
+        } else {
+            0
+        };
+        let old_interval_sec = inner.itimer_interval_ms / 1000;
+        let old_interval_usec = (inner.itimer_interval_ms % 1000) * 1000;
+        let old_rem_sec = remaining_ms / 1000;
+        let old_rem_usec = (remaining_ms % 1000) * 1000;
+        let old_itv = if inner.itimer_expire == 0 {
+            ITimerVal {
+                it_interval: TimeVal { sec: 0, usec: 0 },
+                it_value: TimeVal { sec: 0, usec: 0 },
+            }
+        } else {
+            ITimerVal {
+                it_interval: TimeVal { sec: old_interval_sec, usec: old_interval_usec },
+                it_value: TimeVal { sec: old_rem_sec, usec: old_rem_usec },
+            }
+        };
+        drop(inner);
+        *translated_refmut(token, old_value as *mut ITimerVal) = old_itv;
+    }
+
+    if new_value.is_null() {
+        return 0;  // only query old value, don't set new
+    }
+
+    let new_itv: &ITimerVal = translated_ref(token, new_value as *const ITimerVal);
+    let new_value_ms = new_itv.it_value.sec * 1000 + new_itv.it_value.usec / 1000;
+    let new_interval_ms = new_itv.it_interval.sec * 1000 + new_itv.it_interval.usec / 1000;
+
+    let mut inner = task.inner_exclusive_access();
+    if new_value_ms == 0 {
+        inner.itimer_expire = 0;
+    } else {
+        inner.itimer_expire = now + new_value_ms as u64;
+    }
+    inner.itimer_interval_ms = new_interval_ms as u64;
+    0
+}
+
+pub fn sys_clock_gettime(clk_id: usize, ts: *mut u8) -> isize {
+    const CLOCK_REALTIME: usize = 0;
+    const CLOCK_MONOTONIC: usize = 1;
+
+    if ts.is_null() || (clk_id != CLOCK_REALTIME && clk_id != CLOCK_MONOTONIC) {
+        return -22; // EINVAL
+    }
+
+    let token = current_user_token();
+    let now_ms = polyhal::time::Time::now().to_msec() as u64;
+    let ts_out: &mut crate::task::TimeSpec = translated_refmut(token, ts as *mut crate::task::TimeSpec);
+    ts_out.tv_sec = (now_ms / 1000) as usize;
+    ts_out.tv_nsec = ((now_ms % 1000) * 1_000_000) as usize;
+    0
 }
 
 pub fn sys_readv(fd: usize, iov: *const u8, iovcnt: usize) -> isize {

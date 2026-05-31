@@ -973,6 +973,124 @@ pub fn sys_statfs(path: *const u8, buf: *mut u8) -> isize {
     0
 }
 
+pub fn sys_pread64(fd: usize, buf: *mut u8, len: usize, offset: usize) -> isize {
+    let token = current_user_token();
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+    if fd >= inner.fd_table.len() || inner.fd_table[fd].is_none() {
+        return -1;
+    }
+    let file = inner.fd_table[fd].as_ref().unwrap().clone();
+    if !file.readable() {
+        return -1;
+    }
+    let dentry = match file.as_any().downcast_ref::<crate::fs::inode::OSInode>() {
+        Some(inode) => inode.dentry().clone(),
+        None => return -1,
+    };
+    drop(inner);
+    let user_buf = translated_byte_buffer(token, buf, len);
+    let n = dentry.super_block.read_at(&dentry.fs_path, offset, user_buf);
+    n as isize
+}
+
+pub fn sys_pwrite64(fd: usize, buf: *mut u8, len: usize, offset: usize) -> isize {
+    let token = current_user_token();
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+    if fd >= inner.fd_table.len() || inner.fd_table[fd].is_none() {
+        return -1;
+    }
+    let file = inner.fd_table[fd].as_ref().unwrap().clone();
+    if !file.writable() {
+        return -1;
+    }
+    let dentry = match file.as_any().downcast_ref::<crate::fs::inode::OSInode>() {
+        Some(inode) => inode.dentry().clone(),
+        None => return -1,
+    };
+    drop(inner);
+    let user_buf = translated_byte_buffer(token, buf, len);
+    let n = dentry.super_block.write_at(&dentry.fs_path, offset, user_buf);
+    n as isize
+}
+
+pub fn sys_preadv(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> isize {
+    use crate::mm::translated_ref;
+    let token = current_user_token();
+    #[repr(C)]
+    struct IoVec {
+        iov_base: usize,
+        iov_len: usize,
+    }
+    let mut off = offset;
+    let mut total = 0isize;
+    for i in 0..iovcnt {
+        let iov_ptr = unsafe { iov.add(i * core::mem::size_of::<IoVec>()) };
+        let iov: &IoVec = translated_ref(token, iov_ptr as *const IoVec);
+        if iov.iov_len == 0 {
+            continue;
+        }
+        let user_buf = crate::mm::translated_byte_buffer(token, iov.iov_base as *mut u8, iov.iov_len);
+        let task = current_task().unwrap();
+        let inner = task.inner_exclusive_access();
+        if fd >= inner.fd_table.len() || inner.fd_table[fd].is_none() {
+            return -1;
+        }
+        let file = inner.fd_table[fd].as_ref().unwrap().clone();
+        let dentry = match file.as_any().downcast_ref::<crate::fs::inode::OSInode>() {
+            Some(inode) => inode.dentry().clone(),
+            None => return -1,
+        };
+        drop(inner);
+        let n = dentry.super_block.read_at(&dentry.fs_path, off, user_buf);
+        total += n as isize;
+        off += n;
+        if n < iov.iov_len {
+            break;
+        }
+    }
+    total
+}
+
+pub fn sys_pwritev(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> isize {
+    use crate::mm::translated_ref;
+    let token = current_user_token();
+    #[repr(C)]
+    struct IoVec {
+        iov_base: usize,
+        iov_len: usize,
+    }
+    let mut off = offset;
+    let mut total = 0isize;
+    for i in 0..iovcnt {
+        let iov_ptr = unsafe { iov.add(i * core::mem::size_of::<IoVec>()) };
+        let iov: &IoVec = translated_ref(token, iov_ptr as *const IoVec);
+        if iov.iov_len == 0 {
+            continue;
+        }
+        let user_buf = crate::mm::translated_byte_buffer(token, iov.iov_base as *mut u8, iov.iov_len);
+        let task = current_task().unwrap();
+        let inner = task.inner_exclusive_access();
+        if fd >= inner.fd_table.len() || inner.fd_table[fd].is_none() {
+            return -1;
+        }
+        let file = inner.fd_table[fd].as_ref().unwrap().clone();
+        let dentry = match file.as_any().downcast_ref::<crate::fs::inode::OSInode>() {
+            Some(inode) => inode.dentry().clone(),
+            None => return -1,
+        };
+        drop(inner);
+        let n = dentry.super_block.write_at(&dentry.fs_path, off, user_buf);
+        total += n as isize;
+        off += n;
+        if n < iov.iov_len {
+            break;
+        }
+    }
+    total
+}
+
 pub fn sys_fstatfs(fd: usize, buf: *mut u8) -> isize {
     let token = current_user_token();
     let task = current_task().unwrap();

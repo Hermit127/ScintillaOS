@@ -87,6 +87,9 @@ pub struct TaskControlBlockInner {
     pub cstime: usize,
     pub last_time: usize,
     pub block_reason: Option<BlockReason>,
+    pub itimer_expire: u64,
+    pub itimer_interval_ms: u64,
+    pub child_tid: usize,
 }
 
 impl TaskControlBlockInner {
@@ -131,7 +134,7 @@ fn task_entry() {
     }
 }
 
-fn blank_kcontext(ksp: usize) -> KContext {
+pub fn blank_kcontext(ksp: usize) -> KContext {
     let mut kcx = KContext::blank();
     kcx[KContextArgs::KPC] = task_entry as usize;
     kcx[KContextArgs::KSP] = ksp;
@@ -142,6 +145,12 @@ fn blank_kcontext(ksp: usize) -> KContext {
 impl TaskControlBlock {
     pub fn inner_exclusive_access(&self) -> RefMut<'_, TaskControlBlockInner> {
         self.inner.exclusive_access()
+    }
+    pub fn from_raw(pid: PidHandle, inner: TaskControlBlockInner) -> Self {
+        Self {
+            pid,
+            inner: unsafe { UPSafeCell::new(inner) },
+        }
     }
     pub fn new(elf_data: &[u8]) -> Self {
         trace!("os::task::TaskControlBlock::new");
@@ -198,6 +207,9 @@ impl TaskControlBlock {
                     cstime: 0,
                     last_time: polyhal::time::Time::now().to_msec() as usize,
                     block_reason: None,
+                    itimer_expire: 0,
+                    itimer_interval_ms: 0,
+                    child_tid: 0,
                 })
             },
         };
@@ -388,6 +400,9 @@ impl TaskControlBlock {
                     cstime: 0,
                     last_time: polyhal::time::Time::now().to_msec() as usize,
                     block_reason: None,
+                    itimer_expire: 0,
+                    itimer_interval_ms: 0,
+                    child_tid: 0,
                 })
             },
         });

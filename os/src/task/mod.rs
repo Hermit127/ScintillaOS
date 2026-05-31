@@ -7,6 +7,7 @@ mod signal;
 mod task;
 
 use crate::fs::{open_file, OpenFlags};
+use crate::mm::translated_refmut;
 use alloc::sync::Arc;
 use lazy_static::*;
 use log::*;
@@ -25,7 +26,7 @@ pub use processor::{
     current_task, current_user_token, init_kernel_page, run_tasks, schedule, take_current_task,
 };
 pub use signal::{SignalFlags, MAX_SIG};
-pub use task::{BlockReason, TaskControlBlock, TaskStatus};
+pub use task::{BlockReason, KernelStack, TaskControlBlock, TaskControlBlockInner, TaskStatus, blank_kcontext};
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -118,6 +119,15 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         shutdown();
     }
 
+    let child_tid = {
+        let inner = task.inner_exclusive_access();
+        inner.child_tid
+    };
+    if child_tid != 0 {
+        let token = task.inner_exclusive_access().get_user_token();
+        *translated_refmut(token, child_tid as *mut i32) = 0;
+    }
+
     // remove from pid2task
     remove_from_pid2task(task.getpid());
     // **** access current TCB exclusively
@@ -168,7 +178,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
 
 lazy_static! {
     pub static ref INITPROC: Arc<TaskControlBlock> = Arc::new({
-        let inode = open_file("/bin/initproc", OpenFlags::RDONLY).unwrap();
+        let inode = open_file("/bin/contest_runner", OpenFlags::RDONLY).unwrap();
         let v = inode.read_all();
         TaskControlBlock::new(v.as_slice())
     });
