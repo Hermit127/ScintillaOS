@@ -71,6 +71,7 @@ fn run_root_fallback() {
     );
     run_exec("/\0", "/busybox\0", &[SH, b"/lua_musl_testcode.sh\0".as_ptr(), NULL]);
     run_exec("/\0", "/busybox-glibc\0", &[SH, b"/lua_testcode.sh\0".as_ptr(), NULL]);
+    run_exec("/\0", "/busybox\0", &[SH, b"/lua_standalone_testcode.sh\0".as_ptr(), NULL]);
 }
 
 #[no_mangle]

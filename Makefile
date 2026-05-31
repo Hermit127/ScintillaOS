@@ -160,8 +160,9 @@ fs-img: $(APPS)
 	@cp -f tmp/lua $(ROOTFS_BIN_DIR)/lua 2>/dev/null || true
 	@cp -f lua-tests/*.lua $(ROOTFS_DIR)/ 2>/dev/null || true
 	@cp -f tmp/strings.lua $(ROOTFS_DIR)/strings.lua 2>/dev/null || true
-	@printf '#!/bin/sh\necho "#### OS COMP TEST GROUP START lua ####"\nfor f in date.lua file_io.lua max_min.lua random.lua remove.lua round_num.lua sin30.lua sort.lua strings.lua; do ./lua /$$f; if [ $$? = 0 ]; then echo "testcase lua $$f success"; else echo "testcase lua $$f fail"; fi; done\necho "#### OS COMP TEST GROUP END lua ####"\n' > $(ROOTFS_DIR)/lua_testcode.sh 2>/dev/null || true
+	@printf '#!/bin/sh\necho "#### OS COMP TEST GROUP START lua-glibc ####"\nfor f in date.lua file_io.lua max_min.lua random.lua remove.lua round_num.lua sin30.lua sort.lua strings.lua; do ./lua /$$f; if [ $$? = 0 ]; then echo "testcase lua $$f success"; else echo "testcase lua $$f fail"; fi; done\necho "#### OS COMP TEST GROUP END lua-glibc ####"\n' > $(ROOTFS_DIR)/lua_testcode.sh 2>/dev/null || true
 	@printf '#!/bin/sh\necho "#### OS COMP TEST GROUP START lua-musl ####"\nfor f in date.lua file_io.lua max_min.lua random.lua remove.lua round_num.lua sin30.lua sort.lua strings.lua; do ./lua /$$f; if [ $$? = 0 ]; then echo "testcase lua $$f success"; else echo "testcase lua $$f fail"; fi; done\necho "#### OS COMP TEST GROUP END lua-musl ####"\n' > $(ROOTFS_DIR)/lua_musl_testcode.sh 2>/dev/null || true
+	@printf '#!/bin/sh\necho "#### OS COMP TEST GROUP START lua ####"\nfor f in date.lua file_io.lua max_min.lua random.lua remove.lua round_num.lua sin30.lua sort.lua strings.lua; do ./lua /$$f; if [ $$? = 0 ]; then echo "testcase lua $$f success"; else echo "testcase lua $$f fail"; fi; done\necho "#### OS COMP TEST GROUP END lua ####"\n' > $(ROOTFS_DIR)/lua_standalone_testcode.sh 2>/dev/null || true
 	@if [ "$(ARCH)" = "riscv64" ]; then \
 		cp -f tmp/busybox-musl $(ROOTFS_BIN_DIR)/busybox 2>/dev/null || true; \
 		cp -f tmp/busybox-musl $(ROOTFS_DIR)/busybox 2>/dev/null || true; \
