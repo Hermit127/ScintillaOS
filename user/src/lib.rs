@@ -86,6 +86,9 @@ pub fn openat(dirfd: isize, path: &str, flags: OpenFlags, mode: u32) -> isize {
 pub fn close(fd: usize) -> isize {
     sys_close(fd)
 }
+pub fn getdents64(fd: usize, buf: &mut [u8]) -> isize {
+    sys_getdents64(fd, buf)
+}
 pub fn pipe(pipe_fd: &mut [u32]) -> isize {
     sys_pipe(pipe_fd)
 }

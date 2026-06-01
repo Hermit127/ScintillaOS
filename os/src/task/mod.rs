@@ -43,13 +43,13 @@ pub struct SleepTask {
 lazy_static! {
     // public sleep queue for timer interrupt handler to access
     pub static ref SLEEP_QUEUE: UPSafeCell<Vec<SleepTask>> = unsafe {
-        UPSafeCell::new(Vec::new())
+        UPSafeCell::new_named(Vec::new(), "SleepQueue")
     };
     pub static ref NET_BLOCK_QUEUE: UPSafeCell<Vec<Arc<TaskControlBlock>>> = unsafe {
-        UPSafeCell::new(Vec::new())
+        UPSafeCell::new_named(Vec::new(), "NetBlockQueue")
     };
     pub static ref WAITPID_QUEUE: UPSafeCell<Vec<Arc<TaskControlBlock>>> = unsafe {
-        UPSafeCell::new(Vec::new())
+        UPSafeCell::new_named(Vec::new(), "WaitpidQueue")
     };
 }
 
@@ -174,7 +174,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
 
 lazy_static! {
     pub static ref INITPROC: Arc<TaskControlBlock> = Arc::new({
-        let inode = open_file("/bin/contest_runner", OpenFlags::RDONLY).unwrap();
+        let inode = open_file("/bin/initproc", OpenFlags::RDONLY).unwrap();
         let v = inode.read_all();
         TaskControlBlock::new(v.as_slice())
     });

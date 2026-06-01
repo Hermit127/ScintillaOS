@@ -180,7 +180,7 @@ impl TaskControlBlock {
         let task_control_block = Self {
             pid: pid_handle,
             inner: unsafe {
-                UPSafeCell::new(TaskControlBlockInner {
+                UPSafeCell::new_named(TaskControlBlockInner {
                     trap_cx: TrapFrame::new(),
                     base_size: user_sp,
                     task_cx: blank_kcontext(kstack.get_position().1), // Set task_cx's Kernel Stack Top
@@ -227,7 +227,7 @@ impl TaskControlBlock {
                     itimer_expire: 0,
                     itimer_interval_ms: 0,
                     child_tid: 0,
-                })
+                }, "TaskInner")
             },
         };
         // prepare TrapContext in user space
@@ -440,10 +440,10 @@ impl TaskControlBlock {
         let task_control_block = Arc::new(TaskControlBlock {
             pid: pid_handle,
             inner: unsafe {
-                UPSafeCell::new(TaskControlBlockInner {
+                UPSafeCell::new_named(TaskControlBlockInner {
                     trap_cx: trap_cx_clone,
                     base_size,
-                    task_cx: blank_kcontext(kstack.get_position().1),
+                    task_cx: blank_kcontext(kstack.get_position().1), // Set task_cx's Kernel Stack Top
                     task_status: TaskStatus::Ready,
                     memory_set,
                     parent: Some(Arc::downgrade(self)),
@@ -479,7 +479,7 @@ impl TaskControlBlock {
                     itimer_expire: 0,
                     itimer_interval_ms: 0,
                     child_tid: 0,
-                })
+                }, "TaskInner")
             },
         });
         // add child to parent's children list

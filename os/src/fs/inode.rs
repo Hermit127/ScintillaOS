@@ -41,6 +41,10 @@ impl Drop for OSInode {
 }
 
 impl OSInode {
+    pub fn get_dentry(&self) -> &Arc<Dentry> {
+        &self.dentry
+    }
+
     pub fn new(readable: bool, writable: bool, append: bool, dentry: Arc<Dentry>) -> Self {
         let offset = if append {
             dentry
@@ -56,7 +60,7 @@ impl OSInode {
             writable,
             append,
             dentry,
-            inner: unsafe { UPSafeCell::new(OSInodeInner { offset, file_handle: None }) },
+            inner: unsafe { UPSafeCell::new_named(OSInodeInner { offset }, "OSInodeInner") },
         }
     }
     pub fn dentry(&self) -> &Arc<Dentry> {

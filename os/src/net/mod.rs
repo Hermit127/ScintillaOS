@@ -348,6 +348,9 @@ pub fn wake_net_blocked_tasks() {
         drop(inner);
         add_priority_task(task.clone());
     }
+    if !to_wake.is_empty() {
+        crate::task::suspend_current_and_run_next();
+    }
 }
 
 #[cfg(not(any(target_arch = "riscv64", target_arch = "aarch64")))]

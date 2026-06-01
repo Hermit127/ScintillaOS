@@ -402,6 +402,149 @@ pub fn sys_faccessat(dirfd: isize, path: *const u8, mode: usize, _flags: usize) 
     } // EACCES
 }
 
+pub fn sys_fchmodat(dirfd: isize, path: *const u8, mode: u32) -> isize {
+    let token = current_user_token();
+    let path_str = translated_str(token, path);
+    let base = match resolve_base_dir(dirfd) {
+        Some(b) => b,
+        None => return -2,
+    };
+    let dentry = match vfs_resolve_with_fallback(&base, &path_str) {
+        Some(d) => d,
+        None => return -2,
+    };
+
+    let task = current_task().unwrap();
+    let euid = {
+        let inner = task.inner_exclusive_access();
+        inner.euid
+    };
+
+    let fs_path = &dentry.fs_path;
+    if euid != 0 {
+        let is_owner = match dentry.super_block.get_inode_info(fs_path) {
+            Some(info) => info.uid == euid,
+            None => return -2,
+        };
+        if !is_owner {
+            return -1;
+        }
+    }
+
+    let rc = dentry.super_block.set_mode(fs_path, mode);
+    if rc != 0 {
+        return -1;
+    }
+
+    let now_sec = (polyhal::time::Time::now().to_msec() / 1000) as u32;
+    dentry.super_block.set_ctime(fs_path, now_sec);
+    0
+}
+
+fn resolve_fd_dentry(fd: usize) -> Option<Arc<Dentry>> {
+    let task = current_task()?;
+    let inner = task.inner_exclusive_access();
+    if fd >= inner.fd_table.len() {
+        return None;
+    }
+    let file = inner.fd_table[fd].as_ref()?;
+    let inode = file.as_any().downcast_ref::<crate::fs::inode::OSInode>()?;
+    Some(inode.get_dentry().clone())
+}
+
+pub fn sys_fchmod(fd: usize, mode: u32) -> isize {
+    let dentry = match resolve_fd_dentry(fd) {
+        Some(d) => d,
+        None => return -9,
+    };
+
+    let task = current_task().unwrap();
+    let euid = {
+        let inner = task.inner_exclusive_access();
+        inner.euid
+    };
+
+    let fs_path = &dentry.fs_path;
+    if euid != 0 {
+        let is_owner = match dentry.super_block.get_inode_info(fs_path) {
+            Some(info) => info.uid == euid,
+            None => return -9,
+        };
+        if !is_owner {
+            return -1;
+        }
+    }
+
+    let rc = dentry.super_block.set_mode(fs_path, mode);
+    if rc != 0 {
+        return -1;
+    }
+
+    let now_sec = (polyhal::time::Time::now().to_msec() / 1000) as u32;
+    dentry.super_block.set_ctime(fs_path, now_sec);
+    0
+}
+
+pub fn sys_fchownat(dirfd: isize, path: *const u8, owner: u32, group: u32, _flags: u32) -> isize {
+    let token = current_user_token();
+    let path_str = translated_str(token, path);
+    let base = match resolve_base_dir(dirfd) {
+        Some(b) => b,
+        None => return -2,
+    };
+    let dentry = match vfs_resolve_with_fallback(&base, &path_str) {
+        Some(d) => d,
+        None => return -2,
+    };
+
+    let task = current_task().unwrap();
+    let euid = {
+        let inner = task.inner_exclusive_access();
+        inner.euid
+    };
+
+    if euid != 0 {
+        return -1;
+    }
+
+    let fs_path = &dentry.fs_path;
+    let rc = dentry.super_block.set_owner(fs_path, owner, group);
+    if rc != 0 {
+        return -1;
+    }
+
+    let now_sec = (polyhal::time::Time::now().to_msec() / 1000) as u32;
+    dentry.super_block.set_ctime(fs_path, now_sec);
+    0
+}
+
+pub fn sys_fchown(fd: usize, owner: u32, group: u32) -> isize {
+    let dentry = match resolve_fd_dentry(fd) {
+        Some(d) => d,
+        None => return -9,
+    };
+
+    let task = current_task().unwrap();
+    let euid = {
+        let inner = task.inner_exclusive_access();
+        inner.euid
+    };
+
+    if euid != 0 {
+        return -1;
+    }
+
+    let fs_path = &dentry.fs_path;
+    let rc = dentry.super_block.set_owner(fs_path, owner, group);
+    if rc != 0 {
+        return -1;
+    }
+
+    let now_sec = (polyhal::time::Time::now().to_msec() / 1000) as u32;
+    dentry.super_block.set_ctime(fs_path, now_sec);
+    0
+}
+
 pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
     const F_DUPFD: usize = 0;
     const F_GETFD: usize = 1;
@@ -624,12 +767,15 @@ pub fn sys_pipe2(pipe: *mut usize, flags: usize) -> isize {
     }
     let task = current_task().unwrap();
     let token = current_user_token();
-    let mut inner = task.inner_exclusive_access();
-    let (pipe_read, pipe_write) = make_pipe();
-    let read_fd = inner.alloc_fd();
-    inner.fd_table[read_fd] = Some(pipe_read);
-    let write_fd = inner.alloc_fd();
-    inner.fd_table[write_fd] = Some(pipe_write);
+    let (read_fd, write_fd) = {
+        let mut inner = task.inner_exclusive_access();
+        let (pipe_read, pipe_write) = make_pipe();
+        let read_fd = inner.alloc_fd();
+        inner.fd_table[read_fd] = Some(pipe_read);
+        let write_fd = inner.alloc_fd();
+        inner.fd_table[write_fd] = Some(pipe_write);
+        (read_fd, write_fd)
+    };
     let p = pipe as *mut u8;
     *translated_refmut(token, p as *mut u32) = read_fd as u32;
     *translated_refmut(token, unsafe { p.add(4) } as *mut u32) = write_fd as u32;

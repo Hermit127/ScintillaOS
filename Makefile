@@ -75,6 +75,11 @@ DISASM ?= -x
 # Run usertests or usershell
 TEST ?=
 
+# LTP 集成
+LTP_DIR_DEFAULT := testsuits-for-oskernel/sdcard/riscv/musl
+LTP_BIN_DIR ?= $(LTP_DIR_DEFAULT)
+LTP_MODE ?= subset
+
 # ==================== Contest Submission Targets ====================
 
 all: kernel-rv disk.img disk-rv.img kernel-la disk-la.img
@@ -180,13 +185,35 @@ fs-img: $(APPS)
 		printf '#!/bin/sh\n./busybox --install -s /bin 2>/dev/null\necho "#### OS COMP TEST GROUP START busybox-musl ####"\nwhile IFS= read -r line; do case "$$line" in ""|\\#*) continue ;; esac; eval "./busybox $$line"; RTN=$$?; if [ $$RTN -ne 0 ] && [ "$$line" != "false" ]; then echo "testcase busybox $$line fail"; else echo "testcase busybox $$line success"; fi; done < ./busybox_cmd.txt\necho "#### OS COMP TEST GROUP END busybox-musl ####"\n' > $(ROOTFS_DIR)/busybox_testcode.sh; \
 	fi
 	@cp -f tmp/debug_test.sh $(ROOTFS_DIR)/debug_test.sh 2>/dev/null || true
+	@mkdir -p $(ROOTFS_DIR)/etc $(ROOTFS_DIR)/sbin 2>/dev/null || true
 	@cp -f tmp/run_all.sh $(ROOTFS_DIR)/run_all.sh 2>/dev/null || true
 	@cp -f tmp/basic_testcode.sh $(ROOTFS_DIR)/basic_testcode.sh 2>/dev/null || true
-	@mkdir -p $(ROOTFS_DIR)/etc $(ROOTFS_DIR)/sbin 2>/dev/null || true
 	@cp -f tmp/init.sh $(ROOTFS_DIR)/etc/init.sh 2>/dev/null || true
 	@cp -f target/$(TARGET)/release/contest_runner $(ROOTFS_DIR)/contest_runner 2>/dev/null || true
-	@dd if=/dev/zero of=$(FS_IMG) bs=1M count=128
+	@echo "===== LTP integration (mode: $(LTP_MODE)) ====="
+ifeq ($(LTP_MODE), full)
+	@touch $(ROOTFS_DIR)/ltp_full
+endif
+	@cp -f tmp/ltp_testcode.sh $(ROOTFS_DIR)/ltp_testcode.sh
+ifeq ($(LTP_MODE), subset)
+	@cp -f tmp/ltp_testcode_subset.sh $(ROOTFS_DIR)/ltp_testcode.sh
+endif
+	@mkdir -p $(ROOTFS_DIR)/ltp/testcases/bin
+	@if [ -d "$(LTP_BIN_DIR)/ltp/testcases/bin" ]; then \
+		for f in $(LTP_BIN_DIR)/ltp/testcases/bin/*; do \
+			if [ -f "$$f" ] && [ -x "$$f" ]; then \
+				cp "$$f" $(ROOTFS_DIR)/ltp/testcases/bin/; \
+			fi; \
+		done; \
+		echo "  LTP binaries copied: $$(ls $(ROOTFS_DIR)/ltp/testcases/bin/ | wc -l) files"; \
+	else \
+		echo "  LTP directory not found: $(LTP_BIN_DIR)/ltp/testcases/bin (build LTP first in Docker)"; \
+	fi
+	@cp -f target/$(TARGET)/release/ltp_runner $(ROOTFS_BIN_DIR)/initproc
+	@echo "  ltp_runner set as initproc (default LTP test mode)"
+	@dd if=/dev/zero of=$(FS_IMG) bs=1M count=512
 	@mke2fs -t ext4 -b 4096 -F -O ^metadata_csum,^64bit,^orphan_file -d $(ROOTFS_DIR) $(FS_IMG)
+	@e2fsck -fy $(FS_IMG) 2>/dev/null || true
 	cp target/$(TARGET)/$(MODE)/fs.img fs-img.img
 
 $(APPS):
