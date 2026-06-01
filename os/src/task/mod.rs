@@ -147,8 +147,6 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         let mut queue = WAITPID_QUEUE.exclusive_access();
         if let Some(idx) = queue.iter().position(|t| t.getpid() == parent.getpid()) {
             let parent_task = queue.remove(idx);
-            crate::println!("[exit] wake parent pid={}", parent_task.getpid());
-            log::error!("[exit] wake parent pid={}", parent_task.getpid());
             drop(queue);
             let mut pinner = parent_task.inner_exclusive_access();
             pinner.task_status = TaskStatus::Ready;

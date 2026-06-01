@@ -72,7 +72,7 @@ pub fn sys_exit(exit_code: i32) -> ! {
 }
 
 pub fn sys_yield() -> isize {
-    // stdout_release_if_owner();
+    stdout_release_if_owner();
     suspend_current_and_run_next();
     0
 }

@@ -80,6 +80,8 @@ const SYSCALL_FSTATAT: usize = 79;
 const SYSCALL_READLINKAT: usize = 78;
 const SYSCALL_FSTAT: usize = 80;
 const SYSCALL_SYNC: usize = 81;
+const SYSCALL_FSYNC: usize = 82;
+const SYSCALL_FDATASYNC: usize = 83;
 const SYSCALL_SLEEP: usize = 300;
 const SYSCALL_DUP2: usize = 33;
 
@@ -203,6 +205,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         //added
         SYSCALL_FSTAT => sys_fstat(args[0], args[1] as *mut u8),
         SYSCALL_SYNC => 0,
+        SYSCALL_FSYNC => 0,
+        SYSCALL_FDATASYNC => 0,
         SYSCALL_FSTATAT => sys_fstatat(
             args[0] as isize,
             args[1] as *const u8,
