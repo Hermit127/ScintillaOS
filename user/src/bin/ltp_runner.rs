@@ -106,6 +106,9 @@ fn for_each_dirent(buf: &[u8], n: isize, mut f: impl FnMut(&str)) {
 
 #[no_mangle]
 pub fn main() -> i32 {
+    println!("========================================");
+    println!("  LTP RUNNER STARTING (v2)");
+    println!("========================================");
     let full = is_full_mode();
     if full {
         println!("#### OS COMP TEST GROUP START ltp-musl ####");

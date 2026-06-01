@@ -441,8 +441,8 @@ impl TaskControlBlock {
             pid: pid_handle,
             inner: unsafe {
                 UPSafeCell::new_named(TaskControlBlockInner {
-                    trap_cx: parent_inner.trap_cx.clone(),
-                    base_size: parent_inner.base_size,
+                    trap_cx: trap_cx_clone,
+                    base_size,
                     task_cx: blank_kcontext(kstack.get_position().1), // Set task_cx's Kernel Stack Top
                     task_status: TaskStatus::Ready,
                     memory_set,

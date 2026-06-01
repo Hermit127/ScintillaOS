@@ -129,6 +129,9 @@ impl File for Pipe {
                 if write_end_closed {
                     return already_read as isize;
                 }
+                if already_read > 0 {
+                    return already_read as isize;
+                }
                 stdout_release_if_owner();
                 suspend_current_and_run_next();
                 continue;

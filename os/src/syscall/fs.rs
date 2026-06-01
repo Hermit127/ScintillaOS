@@ -402,12 +402,147 @@ pub fn sys_faccessat(dirfd: isize, path: *const u8, mode: usize, _flags: usize) 
     } // EACCES
 }
 
-pub fn sys_fchmodat(_dirfd: isize, _path: *const u8, _mode: u32) -> isize {
-    0 // no-op: no permission tracking
+pub fn sys_fchmodat(dirfd: isize, path: *const u8, mode: u32) -> isize {
+    let token = current_user_token();
+    let path_str = translated_str(token, path);
+    let base = match resolve_base_dir(dirfd) {
+        Some(b) => b,
+        None => return -2,
+    };
+    let dentry = match vfs_resolve_with_fallback(&base, &path_str) {
+        Some(d) => d,
+        None => return -2,
+    };
+
+    let task = current_task().unwrap();
+    let euid = {
+        let inner = task.inner_exclusive_access();
+        inner.euid
+    };
+
+    let fs_path = &dentry.fs_path;
+    if euid != 0 {
+        let is_owner = match dentry.super_block.get_inode_info(fs_path) {
+            Some(info) => info.uid == euid,
+            None => return -2,
+        };
+        if !is_owner {
+            return -1;
+        }
+    }
+
+    let rc = dentry.super_block.set_mode(fs_path, mode);
+    if rc != 0 {
+        return -1;
+    }
+
+    let now_sec = (polyhal::time::Time::now().to_msec() / 1000) as u32;
+    dentry.super_block.set_ctime(fs_path, now_sec);
+    0
 }
 
-pub fn sys_fchownat(_dirfd: isize, _path: *const u8, _owner: u32, _group: u32, _flags: u32) -> isize {
-    0 // no-op: no ownership tracking
+fn resolve_fd_dentry(fd: usize) -> Option<Arc<Dentry>> {
+    let task = current_task()?;
+    let inner = task.inner_exclusive_access();
+    if fd >= inner.fd_table.len() {
+        return None;
+    }
+    let file = inner.fd_table[fd].as_ref()?;
+    let inode = file.as_any().downcast_ref::<crate::fs::inode::OSInode>()?;
+    Some(inode.get_dentry().clone())
+}
+
+pub fn sys_fchmod(fd: usize, mode: u32) -> isize {
+    let dentry = match resolve_fd_dentry(fd) {
+        Some(d) => d,
+        None => return -9,
+    };
+
+    let task = current_task().unwrap();
+    let euid = {
+        let inner = task.inner_exclusive_access();
+        inner.euid
+    };
+
+    let fs_path = &dentry.fs_path;
+    if euid != 0 {
+        let is_owner = match dentry.super_block.get_inode_info(fs_path) {
+            Some(info) => info.uid == euid,
+            None => return -9,
+        };
+        if !is_owner {
+            return -1;
+        }
+    }
+
+    let rc = dentry.super_block.set_mode(fs_path, mode);
+    if rc != 0 {
+        return -1;
+    }
+
+    let now_sec = (polyhal::time::Time::now().to_msec() / 1000) as u32;
+    dentry.super_block.set_ctime(fs_path, now_sec);
+    0
+}
+
+pub fn sys_fchownat(dirfd: isize, path: *const u8, owner: u32, group: u32, _flags: u32) -> isize {
+    let token = current_user_token();
+    let path_str = translated_str(token, path);
+    let base = match resolve_base_dir(dirfd) {
+        Some(b) => b,
+        None => return -2,
+    };
+    let dentry = match vfs_resolve_with_fallback(&base, &path_str) {
+        Some(d) => d,
+        None => return -2,
+    };
+
+    let task = current_task().unwrap();
+    let euid = {
+        let inner = task.inner_exclusive_access();
+        inner.euid
+    };
+
+    if euid != 0 {
+        return -1;
+    }
+
+    let fs_path = &dentry.fs_path;
+    let rc = dentry.super_block.set_owner(fs_path, owner, group);
+    if rc != 0 {
+        return -1;
+    }
+
+    let now_sec = (polyhal::time::Time::now().to_msec() / 1000) as u32;
+    dentry.super_block.set_ctime(fs_path, now_sec);
+    0
+}
+
+pub fn sys_fchown(fd: usize, owner: u32, group: u32) -> isize {
+    let dentry = match resolve_fd_dentry(fd) {
+        Some(d) => d,
+        None => return -9,
+    };
+
+    let task = current_task().unwrap();
+    let euid = {
+        let inner = task.inner_exclusive_access();
+        inner.euid
+    };
+
+    if euid != 0 {
+        return -1;
+    }
+
+    let fs_path = &dentry.fs_path;
+    let rc = dentry.super_block.set_owner(fs_path, owner, group);
+    if rc != 0 {
+        return -1;
+    }
+
+    let now_sec = (polyhal::time::Time::now().to_msec() / 1000) as u32;
+    dentry.super_block.set_ctime(fs_path, now_sec);
+    0
 }
 
 pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {

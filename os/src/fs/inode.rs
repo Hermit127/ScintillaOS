@@ -26,6 +26,10 @@ pub struct OSInodeInner {
 }
 
 impl OSInode {
+    pub fn get_dentry(&self) -> &Arc<Dentry> {
+        &self.dentry
+    }
+
     pub fn new(readable: bool, writable: bool, append: bool, dentry: Arc<Dentry>) -> Self {
         let offset = if append {
             dentry

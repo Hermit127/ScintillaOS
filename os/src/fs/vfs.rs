@@ -406,6 +406,28 @@ impl VfsSuperBlock {
         })
     }
 
+    pub fn set_mode(&self, fs_path: &str, mode: u32) -> i32 {
+        self.with_fs(|_fs| {
+            if let Ok(c_path) = CString::new(fs_path) {
+                let r = unsafe { ext4_mode_set(c_path.as_ptr() as *const c_char, mode) };
+                r
+            } else {
+                -1
+            }
+        })
+    }
+
+    pub fn set_owner(&self, fs_path: &str, uid: u32, gid: u32) -> i32 {
+        self.with_fs(|_fs| {
+            if let Ok(c_path) = CString::new(fs_path) {
+                let r = unsafe { ext4_owner_set(c_path.as_ptr() as *const c_char, uid, gid) };
+                r
+            } else {
+                -1
+            }
+        })
+    }
+
     pub fn get_fs_stats(&self) -> ext4_mount_stats {
         self.with_fs(|wrapper| wrapper.0.get_mount_stats())
     }
