@@ -1975,7 +1975,6 @@ int ext4_fwrite(ext4_file *file, const void *buf, size_t size, size_t *wcnt)
 		goto Finish;
 
 	if (size) {
-		uint64_t off;
 		if (iblk_idx < ifile_blocks) {
 			r = ext4_fs_init_inode_dblk_idx(&ref, iblk_idx, &fblk);
 			if (r != EOK)
@@ -1983,12 +1982,19 @@ int ext4_fwrite(ext4_file *file, const void *buf, size_t size, size_t *wcnt)
 		} else {
 			r = ext4_fs_append_inode_dblk(&ref, &fblk, &iblk_idx);
 			if (r != EOK)
-				/*Node size sholud be updated.*/
 				goto out_fsize;
 		}
 
-		off = fblk * block_size;
-		r = ext4_block_writebytes(file->mp->fs.bdev, off, u8_buf, size);
+		/* Write using ext4_blocks_set_direct for full-block commit.
+		 * For partial writes (< block_size), zero-pad to a full block. */
+		{
+			uint8_t pad_buf[4096];
+			uint32_t write_size = (size < block_size) ? block_size : size;
+			for (uint32_t i = 0; i < write_size; i++) {
+				pad_buf[i] = (i < (uint32_t)size) ? ((const uint8_t*)u8_buf)[i] : 0;
+			}
+			r = ext4_blocks_set_direct(file->mp->fs.bdev, pad_buf, fblk, 1);
+		}
 		if (r != EOK)
 			goto Finish;
 
