@@ -67,6 +67,7 @@ struct TimeVal {
 }
 
 pub fn sys_exit(exit_code: i32) -> ! {
+    println!("[exit] pid={} code={}(0x{:x})", current_task().map_or(0, |t| t.getpid()), exit_code, exit_code as u32);
     exit_current_and_run_next(exit_code);
     panic!("Unreachable in sys_exit!");
 }
@@ -620,6 +621,7 @@ pub fn sys_set_tid_address(tidptr: *mut i32) -> isize {
 }
 
 pub fn sys_exit_group(status: i32) -> ! {
+    println!("[exit_group] pid={} code={}(0x{:x})", current_task().map_or(0, |t| t.getpid()), status, status as u32);
     let tid = {
         let task = current_task().unwrap();
         let inner = task.inner_exclusive_access();
@@ -962,29 +964,8 @@ pub fn sys_pselect6(
         drop(inner);
         drop(task);
 
-        if ready > 0 && !readfds.is_null() && !writefds.is_null() {
-            let mut has_read = false;
-            let n = nfds.min(FD_SETSIZE);
-            for fd in 0..n {
-                if fd_isset(&rfds, fd) { has_read = true; break; }
-            }
-            if !has_read {
-                for fd in 0..n {
-                    if fd_isset(&wfds, fd) {
-                        fd_set(&mut rfds, fd);
-                        ready += 1;
-                        break;
-                    }
-                }
-            }
-
-            if !readfds.is_null() { write_fdset(readfds, &rfds); }
-            if !writefds.is_null() { write_fdset(writefds, &wfds); }
-            if !exceptfds.is_null() { write_fdset(exceptfds, &efds); }
-            return ready as isize;
-        }
-
         if ready > 0 {
+            static mut N: u64 = 0;
             if !readfds.is_null() { write_fdset(readfds, &rfds); }
             if !writefds.is_null() { write_fdset(writefds, &wfds); }
             if !exceptfds.is_null() { write_fdset(exceptfds, &efds); }

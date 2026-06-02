@@ -18,7 +18,7 @@ use syscall::*;
 
 pub use syscall::*;
 
-const USER_HEAP_SIZE: usize = 32768;
+const USER_HEAP_SIZE: usize = 8 * 1024 * 1024; // 8MB for iperf3
 
 static mut HEAP_SPACE: [u8; USER_HEAP_SIZE] = [0; USER_HEAP_SIZE];
 

@@ -92,6 +92,7 @@ pub fn sleep_current_and_run_next() {
 }
 
 pub fn block_current_and_run_next(block_reason: BlockReason) {
+    static mut C: u64 = 0;
     crate::fs::stdio::stdout_release_if_owner();
     let task = current_task().unwrap();
     task.record_time_suspend();

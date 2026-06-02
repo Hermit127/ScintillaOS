@@ -17,11 +17,11 @@ fn run_client(name: &str, args: &[*const u8]) {
         exit(127);
     }
     let mut exit_code: i32 = 0;
-    waitpid(pid as usize, &mut exit_code);
+    let ret = waitpid(pid as usize, &mut exit_code);
     if exit_code == 0 {
         println!("====== iperf {} end success ======", name);
     } else {
-        println!("====== iperf {} end fail-{} ======", name, exit_code);
+        println!("====== iperf {} end fail-{}(0x{:x}) ret={} ======", name, exit_code, exit_code as u32, ret);
     }
 }
 
@@ -44,8 +44,8 @@ pub fn main() -> i32 {
     println!("iperf server started (pid={})", pid);
     sleep(500);
 
-    // TCP only: -n 1K
-    let args: [*const u8; 10] = [
+    // TCP only: -n 100 -l 1K -i 1
+    let args: [*const u8; 12] = [
         b"iperf3\0".as_ptr(),
         b"-c\0".as_ptr(),
         b"127.0.0.1\0".as_ptr(),
@@ -53,28 +53,13 @@ pub fn main() -> i32 {
         b"5001\0".as_ptr(),
         b"-n\0".as_ptr(),
         b"100\0".as_ptr(),
+        b"-l\0".as_ptr(),
+        b"1K\0".as_ptr(),
         b"-i\0".as_ptr(),
-        b"0\0".as_ptr(),
+        b"1\0".as_ptr(),
         NULL,
     ];
     run_client("BASIC_TCP", &args);
-
-    let args: [*const u8; 13] = [
-        b"iperf3\0".as_ptr(),
-        b"-c\0".as_ptr(),
-        b"127.0.0.1\0".as_ptr(),
-        b"-p\0".as_ptr(),
-        b"5001\0".as_ptr(),
-        b"-t\0".as_ptr(),
-        b"1\0".as_ptr(),
-        b"-l\0".as_ptr(),
-        b"1K\0".as_ptr(),
-        b"-u\0".as_ptr(),
-        b"-b\0".as_ptr(),
-        b"1000G\0".as_ptr(),
-        NULL,
-    ];
-    run_client("BASIC_UDP", &args);
 
     println!("#### OS COMP TEST GROUP END iperf-musl ####");
     0

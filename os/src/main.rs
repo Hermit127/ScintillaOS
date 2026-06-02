@@ -63,10 +63,12 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             // cx is changed during sys_exec, so we have to call it again
             ctx[TrapFrameArgs::RET] = result as usize;
         }
-        StorePageFault(_bad_addr) => {
+        StorePageFault(bad_addr) => {
+            println!("[pagefault] pid={} store at {:#x}", current_task().map_or(0,|t|t.getpid()), bad_addr);
             exit_current_and_run_next(-11);
         }
-        LoadPageFault(_paddr) | InstructionPageFault(_paddr) => {
+        LoadPageFault(bad_addr) | InstructionPageFault(bad_addr) => {
+            println!("[pagefault] pid={} load at {:#x}", current_task().map_or(0,|t|t.getpid()), bad_addr);
             exit_current_and_run_next(-11);
         }
         IllegalInstruction(_) => {

@@ -75,10 +75,11 @@ impl File for SocketFile {
         let nonblock = self.get_nonblock();
         let handle = self.get_handle();
         let data: &[u8] = buf;
-        match self.socket_type {
+        let result = match self.socket_type {
             SocketType::Tcp => super::syscall::tcp_send(handle, nonblock, data),
             SocketType::Udp => super::syscall::udp_write(handle, data, self.get_peer_endpoint()),
-        }
+        };
+        result
     }
 
     fn stat(&self) -> Kstat {
