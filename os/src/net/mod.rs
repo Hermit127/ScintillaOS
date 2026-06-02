@@ -261,12 +261,21 @@ pub fn with_net_iface_tcp_connect(
     handle: smoltcp::iface::SocketHandle,
     remote: smoltcp::wire::IpEndpoint,
     local: smoltcp::wire::IpListenEndpoint,
-) {
+) -> isize {
     let mut guard = NET_IFACE.exclusive_access();
     if let Some(state) = guard.as_mut() {
         let sock: &mut smoltcp::socket::tcp::Socket = state.sockets.get_mut(handle);
         let cx: &mut smoltcp::iface::Context = unsafe { core::mem::transmute(&mut state.iface) };
-        let result = sock.connect(cx, remote, local);
+        match sock.connect(cx, remote, local) {
+            Ok(()) => {
+                0
+            }
+            Err(e) => {
+                -111
+            }
+        }
+    } else {
+        -1
     }
 }
 
@@ -283,8 +292,10 @@ pub fn wake_net_blocked_tasks() {
     }
 
     let mut to_wake = alloc::vec::Vec::new();
+    let orig_blocked;
     {
         let mut queue = NET_BLOCK_QUEUE.exclusive_access();
+        orig_blocked = queue.len();
         let mut i = 0;
         while i < queue.len() {
             let should_wake = {
@@ -341,15 +352,13 @@ pub fn wake_net_blocked_tasks() {
             }
         }
     }
-    for task in &to_wake {
-        let mut inner = task.inner_exclusive_access();
-        inner.task_status = TaskStatus::Ready;
-        inner.block_reason = None;
-        drop(inner);
-        add_priority_task(task.clone());
+    if !to_wake.is_empty() {
+    } else if orig_blocked > 0 {
     }
     if !to_wake.is_empty() {
-        crate::task::suspend_current_and_run_next();
+    }
+    for task in &to_wake {
+        add_task(task.clone());
     }
 }
 

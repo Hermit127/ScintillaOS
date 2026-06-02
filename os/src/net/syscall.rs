@@ -11,8 +11,8 @@ use crate::net::socket::{SocketFile, SocketType};
 use crate::task::{block_current_and_run_next, current_task, current_user_token, BlockReason};
 use alloc::sync::Arc;
 
-const SOCKET_BUFFER_SIZE: usize = 65536;
-const UDP_META_COUNT: usize = 16;
+const SOCKET_BUFFER_SIZE: usize = 262144; // 256KB
+const UDP_META_COUNT: usize = 64;
 const AF_INET: usize = 2;
 const SOCK_STREAM: usize = 1;
 const SOCK_DGRAM: usize = 2;
@@ -214,11 +214,22 @@ pub fn sys_bind(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
     crate::net::with_net_iface(|iface| match st {
         SocketType::Tcp => {
             let sock: &mut TcpSocket = iface.sockets.get_mut(handle);
-            sock.listen(endpoint).map(|_| 0).unwrap_or(-22)
+            // Convert 0.0.0.0 to wildcard (None) for listen endpoint
+            let listen_ep = if ip == 0 {
+                IpListenEndpoint { addr: None, port }
+            } else {
+                IpListenEndpoint { addr: Some(endpoint.addr), port }
+            };
+            sock.listen(listen_ep).map(|_| 0).unwrap_or(-22)
         }
         SocketType::Udp => {
             let sock: &mut UdpSocket = iface.sockets.get_mut(handle);
-            sock.bind(endpoint).map(|_| 0).unwrap_or(-22)
+            let listen_ep = if ip == 0 {
+                IpListenEndpoint { addr: None, port }
+            } else {
+                IpListenEndpoint { addr: Some(endpoint.addr), port }
+            };
+            sock.bind(listen_ep).map(|_| 0).unwrap_or(-22)
         }
     })
     .unwrap_or(-1)
@@ -266,11 +277,16 @@ pub fn sys_connect(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
         port: 32768 + ((sockfd as u16).wrapping_mul(7919) % 32767), // non-zero ephemeral port
     };
 
-    crate::net::with_net_iface_tcp_connect(handle, remote, local);
+    let ret = crate::net::with_net_iface_tcp_connect(handle, remote, local);
+    if ret < 0 {
+        return ret;
+    }
     crate::net::net_poll();
 
     if !nonblock {
         loop {
+            crate::net::net_poll();
+            crate::net::net_poll();
             crate::net::net_poll();
             let connected = crate::net::with_net_iface(|iface| {
                 let sock: &TcpSocket = iface.sockets.get(handle);
@@ -356,19 +372,16 @@ pub fn sys_accept(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
     crate::net::net_poll();
 
     if !nonblock {
-        let mut prev_listening = true;
         loop {
+            crate::net::net_poll();
             crate::net::net_poll();
             crate::net::net_poll();
             let active = crate::net::with_net_iface(|iface| {
                 let sock: &TcpSocket = iface.sockets.get(handle);
                 let listening = sock.is_listening();
                 let active = sock.is_active();
-                if !listening && prev_listening && active {
+                if !listening && active {
                     return true;
-                }
-                if listening {
-                    prev_listening = true;
                 }
                 false
             })
@@ -752,7 +765,35 @@ pub fn sys_getsockopt(
             *translated_refmut(token, optval as *mut i32) = if nagle { 1 } else { 0 };
             0
         }
-        _ => -92, // ENOPROTOOPT
+        (IPPROTO_TCP, 2) => {
+            // TCP_MAXSEG - return default MSS
+            if st != SocketType::Tcp {
+                return -95;
+            }
+            *translated_refmut(token, optlen as *mut u32) = 4;
+            *translated_refmut(token, optval as *mut i32) = 1460;
+            0
+        }
+        (IPPROTO_TCP, 11) => {
+            // TCP_INFO - return minimal size, no data
+            *translated_refmut(token, optlen as *mut u32) = 0;
+            0
+        }
+        (IPPROTO_TCP, 13) => {
+            // TCP_WINDOW_CLAMP or similar - return 0
+            *translated_refmut(token, optlen as *mut u32) = 4;
+            *translated_refmut(token, optval as *mut i32) = 65536;
+            0
+        }
+        (IPPROTO_TCP, 14) => {
+            // TCP_CONGESTION - return "reno"
+            *translated_refmut(token, optlen as *mut u32) = 4;
+            *translated_refmut(token, optval as *mut u32) = u32::from_be_bytes(*b"reno");
+            0
+        }
+        _ => {
+            -92
+        }
     }
 }
 
@@ -941,7 +982,9 @@ pub(crate) fn tcp_recv(handle: SocketHandle, nonblock: bool, buf: &mut [u8]) -> 
             }
         });
         match result {
-            Some(Ok(n)) => return n as isize,
+            Some(Ok(n)) => {
+                return n as isize;
+            }
             Some(Err(())) => {
                 if !sock_is_active_tcp(handle) && sock_recv_queue_tcp(handle) == 0 {
                     return 0;

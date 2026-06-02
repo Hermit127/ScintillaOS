@@ -144,7 +144,8 @@ fs-img: $(APPS)
 	fi
 	@rm -f $(FS_IMG)
 	@rm -rf $(ROOTFS_DIR)
-	@mkdir -p $(ROOTFS_BIN_DIR) $(ROOTFS_MNT_DIR) $(ROOTFS_DIR)/tmp
+	@mkdir -p $(ROOTFS_BIN_DIR) $(ROOTFS_MNT_DIR) $(ROOTFS_DIR)/tmp $(ROOTFS_DIR)/dev
+	@touch $(ROOTFS_DIR)/dev/null
 	@printf "Hi, this is a text file.\nsyscalls testing success!\n" > $(ROOTFS_DIR)/text.txt
 	@for src in user/src/bin/*.rs; do \
 		app=$$(basename $$src .rs); \
@@ -162,6 +163,7 @@ fs-img: $(APPS)
 		mkdir -p "$(ROOTFS_MNT_DIR)"; \
 	fi
 	@cp -f tmp/hello_riscv64_musl $(ROOTFS_BIN_DIR)/hello 2>/dev/null || true
+	@cp -f tmp/iperf3 $(ROOTFS_BIN_DIR)/iperf3 2>/dev/null || true
 	@if [ "$(ARCH)" = "riscv64" ]; then \
 		cp -f tmp/busybox-musl $(ROOTFS_BIN_DIR)/busybox 2>/dev/null || true; \
 		cp -f tmp/busybox-musl $(ROOTFS_DIR)/busybox 2>/dev/null || true; \
@@ -209,8 +211,8 @@ endif
 	else \
 		echo "  LTP directory not found: $(LTP_BIN_DIR)/ltp/testcases/bin (build LTP first in Docker)"; \
 	fi
-	@cp -f target/$(TARGET)/release/ltp_runner $(ROOTFS_BIN_DIR)/initproc
-	@echo "  ltp_runner set as initproc (default LTP test mode)"
+	@#cp -f target/$(TARGET)/release/ltp_runner $(ROOTFS_BIN_DIR)/initproc
+	@#echo "  ltp_runner set as initproc (default LTP test mode)"
 	@dd if=/dev/zero of=$(FS_IMG) bs=1M count=512
 	@mke2fs -t ext4 -b 4096 -F -O ^metadata_csum,^64bit,^orphan_file -d $(ROOTFS_DIR) $(FS_IMG)
 	@e2fsck -fy $(FS_IMG) 2>/dev/null || true

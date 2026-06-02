@@ -106,6 +106,10 @@ pub fn sys_getppid() -> isize {
     }
 }
 
+pub fn sys_setsid() -> isize {
+    current_task().map(|t| t.getpid() as isize).unwrap_or(-1)
+}
+
 const CLONE_VM: usize = 0x100;
 const CLONE_FS: usize = 0x200;
 const CLONE_FILES: usize = 0x400;
@@ -900,7 +904,6 @@ pub fn sys_pselect6(
         crate::net::net_poll();
         crate::net::net_poll();
         let mut ready = 0i32;
-        let mut has_read_ready = false;
         let n = nfds.min(FD_SETSIZE);
 
         let task = current_task().unwrap();
@@ -937,7 +940,6 @@ pub fn sys_pselect6(
             if check_read && readable {
                 fd_set(&mut rfds, fd);
                 ready += 1;
-                has_read_ready = true;
             } else {
                 fd_clr(&mut rfds, fd);
             }
@@ -960,26 +962,32 @@ pub fn sys_pselect6(
         drop(inner);
         drop(task);
 
+        if ready > 0 && !readfds.is_null() && !writefds.is_null() {
+            let mut has_read = false;
+            let n = nfds.min(FD_SETSIZE);
+            for fd in 0..n {
+                if fd_isset(&rfds, fd) { has_read = true; break; }
+            }
+            if !has_read {
+                for fd in 0..n {
+                    if fd_isset(&wfds, fd) {
+                        fd_set(&mut rfds, fd);
+                        ready += 1;
+                        break;
+                    }
+                }
+            }
+
+            if !readfds.is_null() { write_fdset(readfds, &rfds); }
+            if !writefds.is_null() { write_fdset(writefds, &wfds); }
+            if !exceptfds.is_null() { write_fdset(exceptfds, &efds); }
+            return ready as isize;
+        }
+
         if ready > 0 {
-            if !has_read_ready {
-                // iperf3 event loop requires select() returning 0 (timeout)
-                // to transition into the write state. But FD_ISSET fails
-                // in user space, so report timeout AND write fd_sets.
-                if !readfds.is_null() { write_fdset(readfds, &rfds); }
-                if !writefds.is_null() { write_fdset(writefds, &wfds); }
-                if !exceptfds.is_null() { write_fdset(exceptfds, &efds); }
-                return 0;
-            }
-            // Write back modified fd_sets
-            if !readfds.is_null() {
-                write_fdset(readfds, &rfds);
-            }
-            if !writefds.is_null() {
-                write_fdset(writefds, &wfds);
-            }
-            if !exceptfds.is_null() {
-                write_fdset(exceptfds, &efds);
-            }
+            if !readfds.is_null() { write_fdset(readfds, &rfds); }
+            if !writefds.is_null() { write_fdset(writefds, &wfds); }
+            if !exceptfds.is_null() { write_fdset(exceptfds, &efds); }
             return ready as isize;
         }
 
