@@ -37,6 +37,11 @@ fn resolve_base_dir(dirfd: isize) -> Option<Arc<Dentry>> {
 }
 
 pub fn sys_write(fd: usize, buf: *mut u8, len: usize) -> isize {
+    if fd >= 5 {
+        let pid = crate::task::current_task().map(|t| t.getpid()).unwrap_or(0);
+        println!("[W] pid={} fd={} len={}", pid, fd, len);
+    }
+    let token = current_user_token();
     let token = current_user_token();
     let task = current_task().unwrap();
     let inner = task.inner_exclusive_access();

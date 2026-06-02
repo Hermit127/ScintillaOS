@@ -78,6 +78,7 @@ const SYSCALL_FORK: usize = 401;
 const SYSCALL_EXEC: usize = 221;
 const SYSCALL_MMAP: usize = 222;
 const SYSCALL_WAITPID: usize = 260;
+const SYSCALL_SETSID: usize = 157;
 
 const SYSCALL_GETDENTS64: usize = 61;
 const SYSCALL_FSTATAT: usize = 79;
@@ -192,6 +193,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GET_TIME => sys_get_time(args[0], args[1]),
         SYSCALL_GETPID => sys_getpid(),
         SYSCALL_GETPPID => sys_getppid(),
+        SYSCALL_SETSID => sys_setsid(),
         SYSCALL_GETUID => sys_getuid(),
         SYSCALL_GETEUID => sys_geteuid(),
         SYSCALL_GETGID => sys_getgid(),
