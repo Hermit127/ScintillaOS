@@ -25,9 +25,7 @@ unsafe extern "C" fn printf(str: *const c_char, mut args: ...) -> c_int {
 unsafe extern "C" fn printf(str: *const c_char, mut args: ...) -> c_int {
     use core::ffi::CStr;
     let c_str = unsafe { CStr::from_ptr(str) };
-    //let arg1 = args.arg::<usize>();
-
-    info!("[lwext4] {:?}", c_str);
+    error!("[lwext4] {:?}", c_str);
     0
 }
 

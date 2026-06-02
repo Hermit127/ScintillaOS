@@ -1,0 +1,67 @@
+# Work Log
+
+## 2026-06-02: IOzone 测试调试 & lwext4 写路径修复
+
+### 问题背景
+
+IOzone 测试在 lwext4 ext4 文件系统上运行时，`write/read` 测试失败，`pwrite/pread` 测试通过。
+
+### 根因分析
+
+#### 1. lwext4 `ext4_fwrite` 小块写入不落盘（已修复）
+
+- **位置**: `lwext4_rust/c/lwext4/src/ext4.c:1977-1999`
+- **原因**: post-loop 使用 `ext4_block_writebytes` 写入不足 4096 字节的数据，该函数最终调用 `ext4_bdif_bwrite`，但经过 panic 测试验证，`dev_bwrite` 回调从未被 lwext4 C 层调用，写路径在 C 层断裂
+- **修复**: 改为 `ext4_blocks_set_direct(bdev, pad_buf, fblk, 1)`，将不足块数据 zero-pad 到完整块后直接写入
+
+```c
+// Before:
+r = ext4_block_writebytes(file->mp->fs.bdev, off, u8_buf, size);
+
+// After:
+uint8_t pad_buf[4096];
+for (uint32_t i = 0; i < write_size; i++)
+    pad_buf[i] = (i < (uint32_t)size) ? ((const uint8_t*)u8_buf)[i] : 0;
+r = ext4_blocks_set_direct(file->mp->fs.bdev, pad_buf, fblk, 1);
+```
+
+- **验证**: `ioztest` 简单 creat→write(1024)→close→open→read 流程数据正确 (`READ [cccc] OK`)
+
+#### 2. IOzone w/r 测试 read_perf_test 打开失败
+
+- **现象**: `read_perf_test` 的 `open("iozone.tmp", O_RDONLY)` 返回 -1 (EPERM)
+- **追踪**: 通过内核 debug print 确认 root dentry children 中不存在 "iozone.tmp"
+- **进一步追踪**: `sys_openat` 只收到一次 `iozone.tmp` 的打开请求（flags=0b0, RDONLY），从未收到 O_CREAT 的打开请求
+- **结论**: IOzone 二进制文件中 `write_perf_test` 的文件创建代码路径未被执行——这是 IOzone 二进制编译问题，与内核无关
+- **佐证**: `creattest`（自编简单 creat+write+read 程序）**通过**，`iozone pw/pr` 测试**通过**
+
+#### 3. 内核 read/write 路径优化（已清理，未保留）
+
+- 尝试将 `read_at`/`write_at` 改为每次 `ext4_fopen`/`ext4_fclose` 独立句柄
+- 尝试在 `write_at` 后添加 `ext4_cache_flush`
+- 最终通过 `git checkout` 恢复为原始代码（上述修改未解决根本问题）
+
+#### 4. sys_creat 系统调用尝试（已清理，未保留）
+
+- 发现 IOzone 二进制中 `I_CREAT` 宏映射到 musl 的 `creat()` 函数
+- musl 的 `creat()` 内部调用 `__libc_open` → `openat(AT_FDCWD, path, O_CREAT|O_WRONLY|O_TRUNC, mode)`
+- 尝试添加 `SYSCALL_CREAT=138` 转发到 `sys_openat`，但该路径从未被触发
+- 最终通过 `git checkout` 恢复
+
+### 已保留的修改
+
+| 文件 | 修改内容 |
+|------|----------|
+| `lwext4_rust/c/lwext4/src/ext4.c` | post-loop 改用 `ext4_blocks_set_direct` 写整块 |
+| `lwext4_rust/c/lwext4/liblwext4-riscv64.a` | 重新编译的 lwext4 静态库 |
+| `lwext4_rust/src/ulibc.rs` | printf 日志级别 info→error |
+| `os/src/task/mod.rs` | initproc 改为 `/bin/contest_runner` |
+
+### 测试状态
+
+| 测试 | 状态 | 备注 |
+|------|------|------|
+| ioztest (简单读写) | PASS | creat+write(1024)+read |
+| iozone pw/pr | PASS | pwrite+pread 测试 |
+| iozone w/r | FAIL | write_perf_test 文件创建代码未被二进制执行 |
+
