@@ -38,15 +38,17 @@ fn resolve_base_dir(dirfd: isize) -> Option<Arc<Dentry>> {
 
 pub fn sys_write(fd: usize, buf: *mut u8, len: usize) -> isize {
     let token = current_user_token();
-    let token = current_user_token();
     let task = current_task().unwrap();
     let inner = task.inner_exclusive_access();
     if fd >= inner.fd_table.len() {
-        return -1;
+        return -9;
     }
     if let Some(file) = &inner.fd_table[fd] {
+        if file.is_dir() {
+            return -21;
+        }
         if !file.writable() {
-            return -1;
+            return -9;
         }
         let file = file.clone();
         drop(inner);
@@ -61,17 +63,36 @@ pub fn sys_read(fd: usize, buf: *mut u8, len: usize) -> isize {
     let task = current_task().unwrap();
     let inner = task.inner_exclusive_access();
     if fd >= inner.fd_table.len() {
-        return -1;
+        return -9;
     }
     if let Some(file) = &inner.fd_table[fd] {
         let file = file.clone();
+        if file.is_dir() {
+            return -21;
+        }
         if !file.readable() {
-            return -1;
+            return -9;
         }
         drop(inner);
-        file.read(translated_byte_buffer(token, buf, len))
+
+        let chunk = len.min(4096);
+        let mut kbuf = [0u8; 4096];
+        let n = file.read(&mut kbuf[..chunk]);
+        if n <= 0 {
+            return n;
+        }
+
+        let task2 = current_task().unwrap();
+        let inner2 = task2.inner_exclusive_access();
+        if !inner2.memory_set.valid_user_buf(buf, n as usize, true) {
+            return -14;
+        }
+        drop(inner2);
+        let user_buf = translated_byte_buffer(token, buf, n as usize);
+        user_buf[..n as usize].copy_from_slice(&kbuf[..n as usize]);
+        n
     } else {
-        -1
+        -9
     }
 }
 
@@ -79,7 +100,7 @@ pub fn sys_open(path: *const u8, flags: u32) -> isize {
     sys_openat(AT_FDCWD, path, flags, 0)
 }
 
-pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isize {
+pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> isize {
     let task = current_task().unwrap();
     let token = current_user_token();
     let path = translated_str(token, path);
@@ -108,7 +129,7 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
 
     let open_flags = OpenFlags::from_raw(flags);
     let base_dir = resolve_base_dir(dirfd);
-    let inode = open_file_at(base_dir, path.as_str(), open_flags);
+    let inode = open_file_at(base_dir, path.as_str(), open_flags, mode as u32);
 
     if let Some(inode) = inode {
         let mut inner = task.inner_exclusive_access();
@@ -200,17 +221,26 @@ pub fn sys_unlinkat(dirfd: isize, path: *const u8, flags: u32) -> isize {
 
 pub fn sys_chdir(path: *const u8) -> isize {
     if path.is_null() {
-        return -1;
+        return -14;
     }
-    let task = current_task().unwrap();
     let token = current_user_token();
-    let path = translated_str(token, path);
-    let cwd = {
-        let inner = task.inner_exclusive_access();
-        inner.cwd.clone()
-    };
-    let Some(dir_dentry) = vfs_resolve_path(&cwd, &path) else {
-        return -1;
+    // Validate user path before reading — only check first page
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+    let max_len = 4096;
+    let end_of_page = ((path as usize) + crate::config::PAGE_SIZE) & !(crate::config::PAGE_SIZE - 1);
+    let first_page_len = max_len.min(end_of_page - (path as usize));
+    if !inner.memory_set.valid_user_buf(path, first_page_len, false) {
+        return -14;
+    }
+    let path_str = translated_str(token, path);
+    if path_str.len() >= max_len {
+        return -36;
+    }
+    let cwd = inner.cwd.clone();
+    drop(inner);
+    let Some(dir_dentry) = vfs_resolve_path(&cwd, &path_str) else {
+        return -2;
     };
     if !dir_dentry.is_dir {
         return -20;
@@ -221,23 +251,31 @@ pub fn sys_chdir(path: *const u8) -> isize {
 }
 
 pub fn sys_getcwd(buf: *mut u8, size: usize) -> isize {
-    if buf.is_null() || size == 0 {
-        return 0;
-    }
     let task = current_task().unwrap();
     let cwd_path = {
         let inner = task.inner_exclusive_access();
         inner.cwd.path.clone()
     };
     let need = cwd_path.len() + 1;
-    if need > size {
-        return 0;
+    if size > 0 && size < need {
+        return -34;
+    }
+    if size == 0 {
+        return -34;
+    }
+    if buf.is_null() {
+        return -14;
     }
     let token = current_user_token();
+    let inner = task.inner_exclusive_access();
+    if !inner.memory_set.valid_user_buf(buf, need, true) {
+        return -14;
+    }
+    drop(inner);
     let user_buf = translated_byte_buffer(token, buf, size);
     user_buf[..cwd_path.len()].copy_from_slice(cwd_path.as_bytes());
     user_buf[cwd_path.len()] = 0;
-    buf as isize
+    need as isize
 }
 
 pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const u8, _flags: usize) -> isize {
@@ -755,7 +793,7 @@ pub fn sys_close(fd: usize) -> isize {
         inner.fd_table[fd].take();
         return 0;
     }
-    -1
+    -9
 }
 
 pub fn sys_pipe(pipe: *mut usize) -> isize {
@@ -787,10 +825,10 @@ pub fn sys_dup(fd: usize) -> isize {
     let task = current_task().unwrap();
     let mut inner = task.inner_exclusive_access();
     if fd >= inner.fd_table.len() {
-        return -1;
+        return -9;
     }
     if inner.fd_table[fd].is_none() {
-        return -1;
+        return -9;
     }
     let new_fd = inner.alloc_fd();
     inner.fd_table[new_fd] = Some(Arc::clone(inner.fd_table[fd].as_ref().unwrap()));
@@ -803,19 +841,23 @@ pub fn sys_dup2(fd: usize, new_fd: usize) -> isize {
 
 pub fn sys_dup3(fd: usize, new_fd: usize, flags: usize) -> isize {
     const O_CLOEXEC: usize = 0x80000;
+    const MAX_FD: usize = 1024;
     if flags != 0 && flags != O_CLOEXEC {
-        return -22; // EINVAL
+        return -22;
     }
     if fd == new_fd {
         return new_fd as isize;
     }
+    if new_fd >= MAX_FD {
+        return -9;
+    }
     let task = current_task().unwrap();
     let mut inner = task.inner_exclusive_access();
     if fd >= inner.fd_table.len() {
-        return -1;
+        return -9;
     }
     let Some(file) = inner.fd_table[fd].as_ref().cloned() else {
-        return -1;
+        return -9;
     };
     while inner.fd_table.len() <= new_fd {
         inner.fd_table.push(None);
@@ -1565,7 +1607,7 @@ pub fn sys_mknodat(dirfd: isize, path: *const u8, mode: u32, _dev: usize) -> isi
         Some(p) => p,
         None => return -2,
     };
-    crate::fs::vfs::vfs_create(&parent, &name, false);
+    crate::fs::vfs::vfs_create(&parent, &name, false, 0o666);
     0
 }
 

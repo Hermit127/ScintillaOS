@@ -64,12 +64,28 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             ctx[TrapFrameArgs::RET] = result as usize;
         }
         StorePageFault(bad_addr) => {
-            println!("[pagefault] pid={} store at {:#x}", current_task().map_or(0,|t|t.getpid()), bad_addr);
-            exit_current_and_run_next(-11);
+            let in_sys = current_task()
+                .map(|t| t.inner_exclusive_access().in_syscall)
+                .unwrap_or(false);
+            if in_sys {
+                warn!("[pagefault-in-syscall] pid={} store at {:#x}", current_task().map_or(0,|t|t.getpid()), bad_addr);
+                ctx[TrapFrameArgs::RET] = (-14isize) as usize;
+            } else {
+                error!("[pagefault] pid={} store at {:#x}", current_task().map_or(0,|t|t.getpid()), bad_addr);
+                exit_current_and_run_next(-11);
+            }
         }
         LoadPageFault(bad_addr) | InstructionPageFault(bad_addr) => {
-            println!("[pagefault] pid={} load at {:#x}", current_task().map_or(0,|t|t.getpid()), bad_addr);
-            exit_current_and_run_next(-11);
+            let in_sys = current_task()
+                .map(|t| t.inner_exclusive_access().in_syscall)
+                .unwrap_or(false);
+            if in_sys {
+                warn!("[pagefault-in-syscall] pid={} load at {:#x}", current_task().map_or(0,|t|t.getpid()), bad_addr);
+                ctx[TrapFrameArgs::RET] = (-14isize) as usize;
+            } else {
+                error!("[pagefault] pid={} load at {:#x}", current_task().map_or(0,|t|t.getpid()), bad_addr);
+                exit_current_and_run_next(-11);
+            }
         }
         IllegalInstruction(_) => {
             current_add_signal(SignalFlags::SIGILL);

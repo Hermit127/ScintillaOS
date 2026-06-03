@@ -4,6 +4,7 @@ use alloc::string::{String, ToString};
 use bitflags::*;
 use log::*;
 use polyhal::pagetable::PageTable;
+use polyhal::VirtAddr;
 bitflags! {
     pub struct PTEFlags: u8 {
         const V = 1 << 0;

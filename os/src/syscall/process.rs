@@ -81,7 +81,13 @@ pub fn sys_yield() -> isize {
 pub fn sys_get_time(ts_ptr: usize, _tz: usize) -> isize {
     let now_ms = Time::now().to_msec() as u64;
     if ts_ptr != 0 {
-        let token = current_user_token();
+        let task = current_task().unwrap();
+        let inner = task.inner_exclusive_access();
+        if !inner.memory_set.valid_user_buf(ts_ptr as *const u8, core::mem::size_of::<TimeVal>(), true) {
+            return -14;
+        }
+        let token = inner.get_user_token();
+        drop(inner);
         let ts = crate::mm::translated_refmut(token, ts_ptr as *mut TimeVal);
         ts.sec = now_ms / 1000;
         ts.usec = (now_ms % 1000) * 1000;
@@ -218,7 +224,7 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: usize) -> isize
                 }
             }
             if !has_child {
-                return -1;
+                return -10;
             }
             zombie_idx.map(|idx| (inner.children.remove(idx), inner.memory_set.token()))
         };
@@ -519,11 +525,15 @@ pub fn sys_times(tms_ptr: usize) -> isize {
 
 pub fn sys_uname(uts_ptr: usize) -> isize {
     if uts_ptr == 0 {
-        return -1;
+        return -14;
     }
-
     let task = crate::task::current_task().unwrap();
-    let token = task.inner_exclusive_access().get_user_token();
+    let inner = task.inner_exclusive_access();
+    if !inner.memory_set.valid_user_buf(uts_ptr as *const u8, core::mem::size_of::<UtsName>(), true) {
+        return -14;
+    }
+    let token = inner.get_user_token();
+    drop(inner);
     let uts = crate::mm::translated_refmut(token, uts_ptr as *mut UtsName);
 
     *uts = UtsName {

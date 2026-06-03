@@ -202,13 +202,23 @@ impl OpenFlags {
 // ==================== File Operations ====================
 
 pub fn open_file(path: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
-    open_file_at(None, path, flags)
+    open_file_new(None, path, flags, 0o666)
 }
 
 pub fn open_file_at(
     base: Option<Arc<Dentry>>,
     path: &str,
     flags: OpenFlags,
+    mode: u32,
+) -> Option<Arc<OSInode>> {
+    open_file_new(base, path, flags, mode)
+}
+
+fn open_file_new(
+    base: Option<Arc<Dentry>>,
+    path: &str,
+    flags: OpenFlags,
+    mode: u32,
 ) -> Option<Arc<OSInode>> {
     let start = base.unwrap_or_else(|| crate::fs::vfs::ROOT_DENTRY.clone());
     let want_dir = flags.directory_requested();
@@ -233,7 +243,7 @@ pub fn open_file_at(
         }
 
         let (parent, name) = vfs_resolve_parent_and_name(&start, path)?;
-        let dentry = vfs_create(&parent, &name, false)?;
+        let dentry = vfs_create(&parent, &name, false, mode)?;
         let (readable, writable) = flags.read_write();
         return Some(Arc::new(OSInode::new(
             readable,
@@ -276,7 +286,7 @@ pub fn mkdir_at(base: Option<Arc<Dentry>>, path: &str) -> bool {
         None => return false,
     };
 
-    vfs_create(&parent, &name, true).is_some()
+    vfs_create(&parent, &name, true, 0o777).is_some()
 }
 
 pub fn unlink_at(base: Option<Arc<Dentry>>, path: &str, is_dir: bool) -> bool {

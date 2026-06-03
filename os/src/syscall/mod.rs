@@ -169,7 +169,10 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         return sys_shutdown();
     }
     trace!("syscall: id: {}, args: {:?}", syscall_id, args);
-    match syscall_id {
+    if let Some(task) = crate::task::current_task() {
+        task.inner_exclusive_access().in_syscall = true;
+    }
+    let result = match syscall_id {
         SYSCALL_DUP => sys_dup(args[0]),
         SYSCALL_DUP3 => sys_dup3(args[0], args[1], args[2]),
         SYSCALL_FCNTL => sys_fcntl(args[0], args[1], args[2]),
@@ -320,5 +323,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_FTRUNCATE => sys_ftruncate(args[0], args[1] as u64),
         SYSCALL_FALLOCATE => sys_fallocate(args[0], args[1], args[2], args[3]),
         _ => -38,
+    };
+    if let Some(task) = crate::task::current_task() {
+        task.inner_exclusive_access().in_syscall = false;
     }
+    result
 }

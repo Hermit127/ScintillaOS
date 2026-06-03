@@ -686,12 +686,19 @@ pub fn vfs_resolve_parent_and_name(
 
 // ==================== File Creation ====================
 
-pub fn vfs_create(parent: &Arc<Dentry>, name: &str, is_dir: bool) -> Option<Arc<Dentry>> {
+pub fn vfs_create(parent: &Arc<Dentry>, name: &str, is_dir: bool, mode: u32) -> Option<Arc<Dentry>> {
     let inode_num = parent
         .super_block
         .create_file(&parent.fs_path, name, is_dir)?;
 
     let child = Dentry::new_child(parent, name, inode_num, is_dir);
+
+    let umask = crate::task::current_task()
+        .map(|t| t.inner_exclusive_access().umask)
+        .unwrap_or(0o22);
+    let effective_mode = mode & !umask;
+    let fs_path = child.fs_path.clone();
+    child.super_block.set_mode(&fs_path, effective_mode);
 
     {
         let mut children = parent.children.exclusive_access();

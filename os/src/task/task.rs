@@ -93,6 +93,7 @@ pub struct TaskControlBlockInner {
     pub alt_stack: usize,
     pub alt_stack_size: usize,
     pub alt_stack_flags: u32,
+    pub in_syscall: bool,
 }
 
 impl TaskControlBlockInner {
@@ -233,6 +234,7 @@ impl TaskControlBlock {
                     alt_stack: 0,
                     alt_stack_size: 0,
                     alt_stack_flags: 0,
+                    in_syscall: false,
                 }, "TaskInner")
             },
         };
@@ -488,6 +490,7 @@ impl TaskControlBlock {
                     alt_stack: 0,
                     alt_stack_size: 0,
                     alt_stack_flags: 0,
+                    in_syscall: false,
                 }, "TaskInner")
             },
         });

@@ -175,6 +175,46 @@ impl MemorySet {
             .translate(vaddr)
             .map(|(pa, flags)| (pa.into(), flags))
     }
+    pub fn valid_user_buf(&self, ptr: *const u8, len: usize, need_write: bool) -> bool {
+        if len == 0 {
+            return true;
+        }
+        let addr = ptr as usize;
+        let addr_end = addr.checked_add(len.saturating_sub(1));
+        if addr_end.is_none() {
+            return false;
+        }
+        let addr_end = addr_end.unwrap();
+        if addr_end < addr {
+            return false;
+        }
+        let start = addr & !(crate::config::PAGE_SIZE - 1);
+        let end = (addr_end & !(crate::config::PAGE_SIZE - 1)) + crate::config::PAGE_SIZE;
+        if end < start {
+            return false;
+        }
+        let mut vpn = start;
+        while vpn < end {
+            if let Some((_pa, flags)) = self.translate(VirtAddr::from(vpn)) {
+                if !flags.contains(MappingFlags::U) {
+                    return false;
+                }
+                if need_write {
+                    if !flags.contains(MappingFlags::W) {
+                        return false;
+                    }
+                } else {
+                    if !flags.contains(MappingFlags::R) {
+                        return false;
+                    }
+                }
+            } else {
+                return false;
+            }
+            vpn += crate::config::PAGE_SIZE;
+        }
+        true
+    }
     pub fn recycle_data_pages(&mut self) {
         //*self = Self::new_bare();
         self.areas.clear();
