@@ -127,7 +127,9 @@ impl MemorySet {
         for area in user_space.areas.iter() {
             let mut new_area = MapArea::from_another(area);
             for (&vpn, frame) in area.data_frames.iter() {
-                if !area.map_perm.contains(MapPermission::W) {
+                let share = !area.map_perm.contains(MapPermission::W)
+                    || area.map_type == MapType::Shared;
+                if share {
                     let shared_frame = frame.shared_clone();
                     memory_set.page_table.map_page(
                         vpn,
@@ -253,9 +255,10 @@ impl MemorySet {
         self.insert_framed_area(start_addr, end_addr, permission);
 
         file.seek(offset);
-        let area = self.areas.last().unwrap();
+        let area_idx = self.areas.len() - 1;
+        self.areas[area_idx].backing_file = Some((file.clone(), offset));
 
-        for vaddr in area.vaddr_range.clone() {
+        for vaddr in self.areas[area_idx].vaddr_range.clone() {
             let (paddr, _flags) = self.page_table.translate(vaddr).unwrap();
 
             let page_content = paddr.slice_mut_with_len(crate::config::PAGE_SIZE);
@@ -273,6 +276,34 @@ impl MemorySet {
             .map(|a| a.vaddr_range.get_end())
             .max()
             .unwrap_or_else(|| polyhal::VirtAddr::new(0))
+    }
+
+    pub fn msync(&self, start_addr: polyhal::VirtAddr, end_addr: polyhal::VirtAddr) -> bool {
+        let start = start_addr.floor();
+        let end = end_addr.ceil();
+        for area in self.areas.iter() {
+            if area.map_type != MapType::Shared {
+                continue;
+            }
+            let area_start = area.vaddr_range.get_start();
+            let area_end = area.vaddr_range.get_end();
+            if area_start >= end || area_end <= start {
+                continue;
+            }
+            let sync_start = start.max(area_start);
+            let sync_end = end.min(area_end);
+            if let Some((ref file, file_off)) = area.backing_file {
+                for vpn in area.data_frames.range(sync_start..sync_end) {
+                    let page_off = vpn.0.raw() - area_start.raw();
+                    let file_offset = file_off + page_off;
+                    let (paddr, _) = self.page_table.translate(*vpn.0).unwrap();
+                    let page_data = paddr.slice_mut_with_len(crate::config::PAGE_SIZE);
+                    file.seek(file_offset);
+                    file.write(page_data);
+                }
+            }
+        }
+        true
     }
 
     pub fn munmap(&mut self, start_addr: polyhal::VirtAddr, end_addr: polyhal::VirtAddr) -> bool {
@@ -327,8 +358,9 @@ impl MemorySet {
 pub struct MapArea {
     pub vaddr_range: VAddrRange,
     data_frames: BTreeMap<VirtAddr, FrameTracker>,
-    map_type: MapType,
-    map_perm: MapPermission,
+    pub map_type: MapType,
+    pub map_perm: MapPermission,
+    pub backing_file: Option<(alloc::sync::Arc<dyn crate::fs::File>, usize)>,
 }
 
 impl MapArea {
@@ -348,6 +380,7 @@ impl MapArea {
             data_frames: BTreeMap::new(),
             map_type,
             map_perm,
+            backing_file: None,
         }
     }
     pub fn from_another(another: &MapArea) -> Self {
@@ -359,6 +392,7 @@ impl MapArea {
             data_frames: BTreeMap::new(),
             map_type: another.map_type,
             map_perm: another.map_perm,
+            backing_file: another.backing_file.clone(),
         }
     }
     pub fn map(&mut self, page_table: &Arc<PageTableWrapper>) -> Result<(), ()> {
@@ -425,8 +459,8 @@ impl MapArea {
 
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub enum MapType {
-    //  Identical, not used now
     Framed,
+    Shared,
 }
 
 bitflags! {

@@ -90,6 +90,9 @@ pub struct TaskControlBlockInner {
     pub itimer_expire: u64,
     pub itimer_interval_ms: u64,
     pub child_tid: usize,
+    pub alt_stack: usize,
+    pub alt_stack_size: usize,
+    pub alt_stack_flags: u32,
 }
 
 impl TaskControlBlockInner {
@@ -227,6 +230,9 @@ impl TaskControlBlock {
                     itimer_expire: 0,
                     itimer_interval_ms: 0,
                     child_tid: 0,
+                    alt_stack: 0,
+                    alt_stack_size: 0,
+                    alt_stack_flags: 0,
                 }, "TaskInner")
             },
         };
@@ -479,6 +485,9 @@ impl TaskControlBlock {
                     itimer_expire: 0,
                     itimer_interval_ms: 0,
                     child_tid: 0,
+                    alt_stack: 0,
+                    alt_stack_size: 0,
+                    alt_stack_flags: 0,
                 }, "TaskInner")
             },
         });

@@ -428,6 +428,23 @@ impl VfsSuperBlock {
         })
     }
 
+    pub fn fsync(&self, fs_path: &str) -> i32 {
+        self.with_fs(|_fs| {
+            if let Ok(c_path) = CString::new(fs_path) {
+                unsafe { ext4_cache_flush(c_path.as_ptr() as *const c_char) }
+            } else {
+                -1
+            }
+        })
+    }
+
+    pub fn sync_all(&self) -> i32 {
+        self.with_fs(|_fs| {
+            let root = CString::new("/").unwrap();
+            unsafe { ext4_cache_flush(root.as_ptr() as *const c_char) }
+        })
+    }
+
     pub fn get_fs_stats(&self) -> ext4_mount_stats {
         self.with_fs(|wrapper| wrapper.0.get_mount_stats())
     }

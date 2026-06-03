@@ -17,11 +17,11 @@ fn run_client(name: &str, args: &[*const u8]) {
         exit(127);
     }
     let mut exit_code: i32 = 0;
-    let ret = waitpid(pid as usize, &mut exit_code);
+    waitpid(pid as usize, &mut exit_code);
     if exit_code == 0 {
         println!("====== iperf {} end success ======", name);
     } else {
-        println!("====== iperf {} end fail-{}(0x{:x}) ret={} ======", name, exit_code, exit_code as u32, ret);
+        println!("====== iperf {} end fail-{} ======", name, exit_code);
     }
 }
 

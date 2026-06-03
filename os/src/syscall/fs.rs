@@ -1429,6 +1429,74 @@ pub fn sys_pwritev(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> i
     total
 }
 
+pub fn sys_preadv2(fd: usize, iov: *const u8, iovcnt: usize, offset: usize, _flags: usize) -> isize {
+    sys_preadv(fd, iov, iovcnt, offset)
+}
+
+pub fn sys_pwritev2(fd: usize, iov: *const u8, iovcnt: usize, offset: usize, _flags: usize) -> isize {
+    sys_pwritev(fd, iov, iovcnt, offset)
+}
+
+fn sync_fd(fd: usize) -> isize {
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+    if fd >= inner.fd_table.len() || inner.fd_table[fd].is_none() {
+        return -9;
+    }
+    let file = inner.fd_table[fd].as_ref().unwrap().clone();
+    let dentry = match file.as_any().downcast_ref::<crate::fs::inode::OSInode>() {
+        Some(inode) => inode.dentry().clone(),
+        None => return -22,
+    };
+    drop(inner);
+    let rc = dentry.super_block.fsync(&dentry.fs_path);
+    if rc == 0 { 0 } else { -5 }
+}
+
+pub fn sys_fsync(fd: usize) -> isize {
+    sync_fd(fd)
+}
+
+pub fn sys_fdatasync(fd: usize) -> isize {
+    sync_fd(fd)
+}
+
+pub fn sys_sync() -> isize {
+    let rc = crate::fs::vfs::ROOT_SB.sync_all();
+    if rc == 0 { 0 } else { -5 }
+}
+
+pub fn sys_syncfs(fd: usize) -> isize {
+    sync_fd(fd)
+}
+
+pub fn sys_fallocate(fd: usize, mode: usize, offset: usize, len: usize) -> isize {
+    const FALLOC_FL_KEEP_SIZE: usize = 0x01;
+    if fd >= 1024 || len == 0 {
+        return -22;
+    }
+    if mode & !FALLOC_FL_KEEP_SIZE != 0 {
+        return -38;
+    }
+    if mode & FALLOC_FL_KEEP_SIZE != 0 {
+        return 0;
+    }
+    crate::syscall::fs::sys_ftruncate(fd, (offset + len) as u64)
+}
+
+pub fn sys_fadvise64(fd: usize, offset: usize, len: usize, advice: usize) -> isize {
+    const POSIX_FADV_NORMAL: usize = 0;
+    const POSIX_FADV_RANDOM: usize = 1;
+    const POSIX_FADV_SEQUENTIAL: usize = 2;
+    const POSIX_FADV_WILLNEED: usize = 3;
+    const POSIX_FADV_DONTNEED: usize = 4;
+    const POSIX_FADV_NOREUSE: usize = 5;
+    if advice > POSIX_FADV_NOREUSE {
+        return -22;
+    }
+    0
+}
+
 pub fn sys_fstatfs(fd: usize, buf: *mut u8) -> isize {
     let token = current_user_token();
     let task = current_task().unwrap();
@@ -1476,4 +1544,96 @@ pub fn sys_ftruncate(fd: usize, length: u64) -> isize {
         }
         None => -1,
     }
+}
+
+// ---- flock (32) ----
+
+pub fn sys_flock(_fd: usize, _op: usize) -> isize {
+    0
+}
+
+// ---- mknodat (33) ----
+
+pub fn sys_mknodat(dirfd: isize, path: *const u8, mode: u32, _dev: usize) -> isize {
+    let token = current_user_token();
+    let path_str = translated_str(token, path);
+    let base = match resolve_base_dir(dirfd) {
+        Some(b) => b,
+        None => return -2,
+    };
+    let (parent, name) = match crate::fs::vfs::vfs_resolve_parent_and_name(&base, &path_str) {
+        Some(p) => p,
+        None => return -2,
+    };
+    crate::fs::vfs::vfs_create(&parent, &name, false);
+    0
+}
+
+// ---- readahead (213) ----
+
+pub fn sys_readahead(_fd: usize, _offset: usize, _count: usize) -> isize {
+    0
+}
+
+// ---- copy_file_range (285) ----
+
+pub fn sys_copy_file_range(fd_in: usize, off_in: *mut usize, fd_out: usize, off_out: *mut usize, len: usize, _flags: usize) -> isize {
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+    if fd_in >= inner.fd_table.len() || inner.fd_table[fd_in].is_none() {
+        return -9;
+    }
+    if fd_out >= inner.fd_table.len() || inner.fd_table[fd_out].is_none() {
+        return -9;
+    }
+    let f_in = inner.fd_table[fd_in].as_ref().unwrap().clone();
+    let f_out = inner.fd_table[fd_out].as_ref().unwrap().clone();
+    drop(inner);
+
+    if let Some(ref off) = unsafe { off_in.as_ref() } {
+        f_in.seek(**off);
+    }
+    if let Some(ref off) = unsafe { off_out.as_ref() } {
+        f_out.seek(**off);
+    }
+
+    let mut buf = [0u8; 4096];
+    let mut total: isize = 0;
+    while (total as usize) < len {
+        let chunk = (len - total as usize).min(buf.len());
+        let n = f_in.read(&mut buf[..chunk]);
+        if n <= 0 { break; }
+        let w = f_out.write(&mut buf[..n as usize]);
+        if w <= 0 { break; }
+        total += w;
+    }
+    total
+}
+
+// ---- memfd_create (279) ----
+
+pub fn sys_memfd_create(_name: *const u8, _flags: usize) -> isize {
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    let fd = inner.alloc_fd();
+    inner.fd_table[fd] = Some(alloc::sync::Arc::new(crate::fs::DevNull));
+    fd as isize
+}
+
+// ---- close_range (436) ----
+
+pub fn sys_close_range(first: usize, last: usize, _flags: usize) -> isize {
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    let last = last.min(inner.fd_table.len().saturating_sub(1));
+    for fd in first..=last {
+        inner.fd_table[fd].take();
+    }
+    0
+}
+
+// ---- socketpair (199) ----
+
+pub fn sys_socketpair(_domain: usize, _typ: usize, _protocol: usize, _sv: *mut usize) -> isize {
+    0
 }

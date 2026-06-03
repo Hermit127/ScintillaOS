@@ -113,6 +113,18 @@ impl File for Pipe {
     fn writable(&self) -> bool {
         self.writable
     }
+    fn poll(&self) -> (bool, bool, bool) {
+        let ring_buffer = self.buffer.exclusive_access();
+        let has_data = ring_buffer.available_read() > 0;
+        let write_end_closed = ring_buffer.all_write_ends_closed();
+        if self.readable {
+            let r = has_data || write_end_closed;
+            let e = !has_data && write_end_closed;
+            (r, false, e)
+        } else {
+            (false, true, false)
+        }
+    }
     fn read(&self, buf: &mut [u8]) -> isize {
         assert!(self.readable());
         let want_to_read = buf.len();
