@@ -447,6 +447,10 @@ pub fn sys_mmap(
         start
     };
 
+    if real_start.checked_add(len).is_none() {
+        return -22;
+    }
+
     if (flags & MAP_ANONYMOUS) != 0 {
         let start_addr = polyhal::VirtAddr::from(real_start);
         let end_addr = polyhal::VirtAddr::from(real_start + len);
@@ -1497,15 +1501,21 @@ pub fn sys_getitimer(which: usize, curr_value_ptr: *mut u8) -> isize {
 
 pub fn sys_setitimer(which: usize, new_value: *const u8, old_value: *mut u8) -> isize {
     if which != ITIMER_REAL {
-        return 0;  // silently ignore non-ITIMER_REAL
+        return -22;
     }
 
     let token = current_user_token();
     let task = current_task().unwrap();
     let now = polyhal::time::Time::now().to_msec() as u64;
 
-    // return old value regardless
     if !old_value.is_null() {
+        let ok = {
+            let inner = task.inner_exclusive_access();
+            inner.memory_set.valid_user_buf(old_value, core::mem::size_of::<ITimerVal>(), true)
+        };
+        if !ok {
+            return -14;
+        }
         let mut inner = task.inner_exclusive_access();
         let remaining_ms = if inner.itimer_expire > now {
             inner.itimer_expire - now
@@ -1532,9 +1542,16 @@ pub fn sys_setitimer(which: usize, new_value: *const u8, old_value: *mut u8) -> 
     }
 
     if new_value.is_null() {
-        return 0;  // only query old value, don't set new
+        return 0;
     }
 
+    let ok = {
+        let inner = task.inner_exclusive_access();
+        inner.memory_set.valid_user_buf(new_value, core::mem::size_of::<ITimerVal>(), false)
+    };
+    if !ok {
+        return -14;
+    }
     let new_itv: &ITimerVal = translated_ref(token, new_value as *const ITimerVal);
     let new_value_ms = new_itv.it_value.sec * 1000 + new_itv.it_value.usec / 1000;
     let new_interval_ms = new_itv.it_interval.sec * 1000 + new_itv.it_interval.usec / 1000;
@@ -1649,6 +1666,9 @@ pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset_ptr: *mut usize, count: 
     }
 
     let saved_in_off = if !offset_ptr.is_null() {
+        if !inner.memory_set.valid_user_buf(offset_ptr as *const u8, core::mem::size_of::<usize>(), false) {
+            return -14;
+        }
         let off = in_file.get_offset();
         let user_off = *translated_ref(token, offset_ptr);
         in_file.seek(user_off);

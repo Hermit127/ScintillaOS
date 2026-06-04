@@ -46,18 +46,15 @@ impl File for Stdin {
         false
     }
     fn read(&self, user_buf: &mut [u8]) -> isize {
-        assert_eq!(user_buf.len(), 1);
-        let c: u8;
-        loop {
-            if let Some(ch) = DebugConsole::getchar() {
-                c = ch;
-                break;
-            }
-            stdout_release_if_owner();
-            suspend_current_and_run_next();
+        if user_buf.is_empty() {
+            return 0;
         }
-        user_buf[0] = c as u8;
-        1
+        if let Some(c) = DebugConsole::getchar() {
+            user_buf[0] = c;
+            1
+        } else {
+            0
+        }
     }
     fn write(&self, _user_buf: &mut [u8]) -> isize {
         panic!("Cannot write to stdin!");

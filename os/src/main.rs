@@ -87,8 +87,9 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
                 exit_current_and_run_next(-11);
             }
         }
-        IllegalInstruction(_) => {
-            current_add_signal(SignalFlags::SIGILL);
+        IllegalInstruction(stval) => {
+            error!("[kernel] IllegalInstruction at {:#x}, pid={}", stval, current_task().map_or(0,|t|t.getpid()));
+            exit_current_and_run_next(-4);
         }
         Timer => {
             static mut TICK: usize = 0;
@@ -142,6 +143,8 @@ fn main(hartid: usize) {
         return;
     }
     println!("[kernel] Hello, world!");
+    // Enable FPU for user space (set sstatus.FS = 1)
+    unsafe { core::arch::asm!("csrs sstatus, {}", in(reg) 0x6000u64) };
     mm::init_heap();
     logging::init(option_env!("LOG"));
     println!("init logging");

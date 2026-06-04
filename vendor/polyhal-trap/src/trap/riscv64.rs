@@ -41,9 +41,9 @@ fn kernel_callback(context: &mut TrapFrame) -> TrapType {
         }
         Trap::Exception(Exception::LoadFault) => {
             if stval > VIRT_ADDR_START {
-                panic!("kernel error: {:#x}", stval);
+                log::error!("kernel LoadFault at {:#x}", stval);
             }
-            TrapType::Unknown
+            TrapType::LoadPageFault(stval)
         }
         Trap::Exception(Exception::UserEnvCall) => TrapType::SysCall,
         // 时钟中断
