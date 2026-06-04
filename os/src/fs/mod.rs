@@ -95,10 +95,12 @@ pub trait File: Send + Sync {
     fn poll(&self) -> (bool, bool, bool) {
         (true, true, false)
     }
+    fn dup_ref(&self) {}
+    fn close_ref(&self) {}
     fn as_any(&self) -> &dyn core::any::Any;
 }
 
 pub use inode::{mkdir_at, open_file, open_file_at, rename_at, symlink_at, unlink_at, OpenFlags};
 pub use pipe::make_pipe;
-pub use stdio::{DevNull, Stdin, Stdout, Urandom};
+pub use stdio::{DevNull, DevZero, Stdin, Stdout, Urandom};
 pub use vfs::{list_apps, mount_root};

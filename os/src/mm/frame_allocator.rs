@@ -35,6 +35,10 @@ impl FrameTracker {
         ref_inc(self.paddr);
         Self { paddr: self.paddr }
     }
+    pub fn is_shared(&self) -> bool {
+        let refs = FRAME_REFS.lock();
+        refs.get(&ref_key(self.paddr)).map_or(false, |&c| c > 1)
+    }
 }
 
 impl Drop for FrameTracker {

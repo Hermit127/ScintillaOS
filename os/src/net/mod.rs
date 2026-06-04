@@ -191,6 +191,13 @@ use imp::NET_IFACE;
 #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
 use imp::NET_INITED;
 
+#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
+const VIRTIO_NET_MMIO: usize = 0x10003000;
+#[cfg(target_arch = "aarch64")]
+const VIRTIO_NET_MMIO: usize = 0xa00_0300;
+const VIRTIO_MMIO_DEVICE_ID: usize = 0x08;
+const VIRTIO_NET_DEVICE_ID: u32 = 1;
+
 pub fn net_init() {
     #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
     {
@@ -204,6 +211,7 @@ pub fn net_init() {
             );
             println!("[net] Static IPs: loopback 127.0.0.0/8 + 10.0.2.15/24");
         } else {
+            NET_INITED.store(false, core::sync::atomic::Ordering::Relaxed);
             println!("[net] No virtio-net device available, networking disabled");
         }
     }
@@ -248,6 +256,26 @@ pub fn net_poll() {
 }
 
 #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+pub fn net_device_present() -> bool {
+    let ptr = polyhal::PhysAddr::new(VIRTIO_NET_MMIO + VIRTIO_MMIO_DEVICE_ID).get_mut_ptr();
+    let device_id = unsafe {
+        core::ptr::read_volatile(ptr as *const u32)
+    };
+    device_id == VIRTIO_NET_DEVICE_ID
+}
+
+#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+pub fn net_available() -> bool {
+    let guard = NET_IFACE.exclusive_access();
+    guard.as_ref().map(|state| state.inited).unwrap_or(false)
+}
+
+#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+pub fn net_available_fast() -> bool {
+    NET_INITED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
 pub fn with_net_iface<F, R>(f: F) -> Option<R>
 where
     F: FnOnce(&mut NetworkState) -> R,
@@ -285,11 +313,6 @@ pub fn wake_net_blocked_tasks() {
     use smoltcp::iface::SocketHandle;
     use smoltcp::socket::tcp::Socket as TcpSocket;
     use smoltcp::socket::udp::Socket as UdpSocket;
-
-    let inited = NET_INITED.load(core::sync::atomic::Ordering::Relaxed);
-    if !inited {
-        return;
-    }
 
     let mut to_wake = alloc::vec::Vec::new();
     let orig_blocked;

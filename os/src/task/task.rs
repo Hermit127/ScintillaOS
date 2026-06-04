@@ -88,7 +88,7 @@ pub struct TaskControlBlockInner {
     pub last_time: usize,
     pub block_reason: Option<BlockReason>,
     pub itimer_expire: u64,
-    pub itimer_interval_ms: u64,
+    pub itimer_interval_us: u64,
     pub child_tid: usize,
     pub alt_stack: usize,
     pub alt_stack_size: usize,
@@ -126,6 +126,22 @@ impl TaskControlBlockInner {
         } else {
             MAX_FD
         }
+    }
+    pub fn close_fd(&mut self, fd: usize) -> bool {
+        if fd < self.fd_table.len() {
+            if let Some(file) = self.fd_table[fd].take() {
+                file.close_ref();
+                return true;
+            }
+        }
+        false
+    }
+    pub fn clear_fd_table(&mut self) {
+        for fd in 0..self.fd_table.len() {
+            self.close_fd(fd);
+        }
+        self.fd_table.clear();
+        self.fd_cloexec.clear();
     }
 }
 
@@ -231,10 +247,10 @@ impl TaskControlBlock {
                     stime: 0,
                     cutime: 0,
                     cstime: 0,
-                    last_time: polyhal::time::Time::now().to_msec() as usize,
+                    last_time: polyhal::time::Time::now().to_nsec() as usize,
                     block_reason: None,
                     itimer_expire: 0,
-                    itimer_interval_ms: 0,
+                    itimer_interval_us: 0,
                     child_tid: 0,
                     alt_stack: 0,
                     alt_stack_size: 0,
@@ -250,7 +266,7 @@ impl TaskControlBlock {
         trap_cx[TrapFrameArgs::SP] = user_sp;
         task_control_block
     }
-    pub fn exec(&self, elf_data: &[u8], args: Vec<String>) {
+    pub fn exec(&self, elf_data: &[u8], args: Vec<String>, envs: Vec<String>) {
         trace!("os::task::TaskControlBlock::exec");
         let LoadedElf {
             memory_set,
@@ -265,6 +281,7 @@ impl TaskControlBlock {
         memory_set.activate();
         let token = memory_set.token();
         let argc = args.len();
+        let envc = envs.len();
 
         const AT_NULL: u64 = 0;
         const AT_PHDR: u64 = 3;
@@ -283,10 +300,11 @@ impl TaskControlBlock {
         const AT_RANDOM: u64 = 25;
         const AT_HWCAP: u64 = 16;
         const AT_PLATFORM: u64 = 15;
+        const AUXV_COUNT: usize = 17;
 
         // Stack layout (high to low):
-        //   [platform str] [arg strings] [16-align] [random 16B] [auxv entries][AT_NULL] [envp NULL] [argv NULL] [argv ptrs] [argc]
-        //   sp -> argc
+        //   [platform str] [env strings] [arg strings] [16-align] [random 16B]
+        //   [auxv entries][AT_NULL] [envp NULL] [envp ptrs] [argv NULL] [argv ptrs] [argc]
 
         let mut sp = stack_top;
 
@@ -304,7 +322,7 @@ impl TaskControlBlock {
             *translated_refmut(token, (platform_addr + i) as *mut u8) = b;
         }
 
-        // Step 1: write arg strings at top of stack
+        // Step 1: write arg/env strings at top of stack
         let mut string_addrs: Vec<usize> = Vec::with_capacity(argc);
         for arg in args.iter().rev() {
             sp -= arg.len() + 1;
@@ -316,11 +334,22 @@ impl TaskControlBlock {
             *translated_refmut(token, (addr + arg.len()) as *mut u8) = 0;
         }
         string_addrs.reverse();
+        let mut env_addrs: Vec<usize> = Vec::with_capacity(envc);
+        for env in envs.iter().rev() {
+            sp -= env.len() + 1;
+            let addr = sp;
+            env_addrs.push(addr);
+            for (i, &b) in env.as_bytes().iter().enumerate() {
+                *translated_refmut(token, (addr + i) as *mut u8) = b;
+            }
+            *translated_refmut(token, (addr + env.len()) as *mut u8) = 0;
+        }
+        env_addrs.reverse();
 
-        // Step 2: pad so the final initial stack pointer still points at argc and is 16-byte aligned.
-        let target_mod = if argc % 2 == 0 { 8 } else { 0 };
-        let sp_mod = sp % 16;
-        sp -= (sp_mod + 16 - target_mod) % 16;
+        // Step 2: pad so the final initial stack pointer points at argc and is 16-byte aligned.
+        let fixed_bytes = 16 + AUXV_COUNT * 16 + (argc + envc + 3) * 8;
+        let target_mod = fixed_bytes % 16;
+        sp -= (sp + 16 - target_mod) % 16;
 
         // Step 3: AT_RANDOM data (16 bytes below string area)
         sp -= 16;
@@ -335,7 +364,6 @@ impl TaskControlBlock {
         *translated_refmut(token, (random_addr + 8) as *mut u64) = rand2;
 
         // Step 4: auxv entries (each 16 bytes = 2*u64)
-        const AUXV_COUNT: usize = 17;
         sp -= AUXV_COUNT * 16;
         let mut a = sp;
         macro_rules! auxv_write {
@@ -365,9 +393,14 @@ impl TaskControlBlock {
         auxv_write!(AT_RANDOM, random_addr as u64);
         auxv_write!(AT_NULL, 0u64);
 
-        // Step 5: envp NULL
+        // Step 5: envp NULL and pointers
         sp -= 8;
         *translated_refmut(token, sp as *mut u64) = 0;
+        sp -= envc * 8;
+        let envp_base = sp;
+        for i in 0..envc {
+            *translated_refmut(token, (envp_base + i * 8) as *mut u64) = env_addrs[i] as u64;
+        }
 
         // Step 6: argv NULL sentinel
         sp -= 8;
@@ -431,7 +464,12 @@ impl TaskControlBlock {
                 parent_inner
                     .fd_table
                     .iter()
-                    .map(|f| f.as_ref().map(|x| x.clone()))
+                    .map(|f| {
+                        f.as_ref().map(|x| {
+                            x.dup_ref();
+                            x.clone()
+                        })
+                    })
                     .collect::<Vec<_>>(),
                 parent_inner.fd_cloexec.clone(),
                 parent_inner.cwd.clone(),
@@ -488,10 +526,10 @@ impl TaskControlBlock {
                     stime: 0,
                     cutime: 0,
                     cstime: 0,
-                    last_time: polyhal::time::Time::now().to_msec() as usize,
+                    last_time: polyhal::time::Time::now().to_nsec() as usize,
                     block_reason: None,
                     itimer_expire: 0,
-                    itimer_interval_ms: 0,
+                    itimer_interval_us: 0,
                     child_tid: 0,
                     alt_stack: 0,
                     alt_stack_size: 0,
@@ -515,7 +553,7 @@ impl TaskControlBlock {
         let Some(mut inner) = self.try_inner_exclusive_access() else {
             return;
         };
-        let now = polyhal::time::Time::now().to_msec() as usize;
+        let now = polyhal::time::Time::now().to_nsec() as usize;
         inner.utime += now - inner.last_time;
         inner.last_time = now;
     }
@@ -523,7 +561,7 @@ impl TaskControlBlock {
         let Some(mut inner) = self.try_inner_exclusive_access() else {
             return;
         };
-        let now = polyhal::time::Time::now().to_msec() as usize;
+        let now = polyhal::time::Time::now().to_nsec() as usize;
         inner.stime += now - inner.last_time;
         inner.last_time = now;
     }
@@ -531,7 +569,7 @@ impl TaskControlBlock {
         let Some(mut inner) = self.try_inner_exclusive_access() else {
             return;
         };
-        let now = polyhal::time::Time::now().to_msec() as usize;
+        let now = polyhal::time::Time::now().to_nsec() as usize;
         inner.stime += now - inner.last_time;
         inner.last_time = now;
     }
@@ -539,7 +577,7 @@ impl TaskControlBlock {
         let Some(mut inner) = self.try_inner_exclusive_access() else {
             return;
         };
-        inner.last_time = polyhal::time::Time::now().to_msec() as usize;
+        inner.last_time = polyhal::time::Time::now().to_nsec() as usize;
     }
 }
 

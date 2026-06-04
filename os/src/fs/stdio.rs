@@ -82,8 +82,11 @@ impl File for Stdout {
         while STDOUT_BUSY.swap(true, Ordering::Acquire) {
             core::hint::spin_loop();
         }
-        print!("{}", core::str::from_utf8(user_buf).unwrap());
+        for byte in user_buf.iter() {
+            DebugConsole::putchar(*byte);
+        }
         STDOUT_BUSY.store(false, Ordering::Release);
+        stdout_release_if_owner();
         user_buf.len() as isize
     }
     fn stat(&self) -> Kstat {
@@ -137,6 +140,32 @@ impl File for DevNull {
     }
     fn read(&self, _buf: &mut [u8]) -> isize {
         0
+    }
+    fn write(&self, buf: &mut [u8]) -> isize {
+        buf.len() as isize
+    }
+    fn stat(&self) -> Kstat {
+        Kstat::new(S_IFCHR)
+    }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+pub struct DevZero;
+
+impl File for DevZero {
+    fn readable(&self) -> bool {
+        true
+    }
+    fn writable(&self) -> bool {
+        true
+    }
+    fn read(&self, buf: &mut [u8]) -> isize {
+        for b in buf.iter_mut() {
+            *b = 0;
+        }
+        buf.len() as isize
     }
     fn write(&self, buf: &mut [u8]) -> isize {
         buf.len() as isize

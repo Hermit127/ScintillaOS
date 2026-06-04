@@ -67,6 +67,7 @@ bitflags! {
         const RDWR = 1 << 1;
         const CREATE = 0x40;
         const TRUNC = 0x200;
+        const APPEND = 0x400;
         const DIRECTORY = 0x10000;
     }
 }
@@ -135,7 +136,10 @@ pub fn fork() -> isize {
     sys_fork()
 }
 pub fn exec(path: &str, args: &[*const u8]) -> isize {
-    sys_exec(path, args)
+    sys_exec(path, args, &[core::ptr::null::<u8>()])
+}
+pub fn execve(path: &str, args: &[*const u8], envs: &[*const u8]) -> isize {
+    sys_exec(path, args, envs)
 }
 pub fn wait(exit_code: &mut i32) -> isize {
     loop {
@@ -185,7 +189,7 @@ impl Default for SignalAction {
     fn default() -> Self {
         Self {
             handler: 0,
-            mask: SignalFlags::empty(),
+            mask: SignalFlags::from_bits(40).unwrap(),
         }
     }
 }

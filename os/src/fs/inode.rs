@@ -341,33 +341,13 @@ impl File for OSInode {
     }
 
     fn read(&self, buf: &mut [u8]) -> isize {
-        // Check if we need to open handle
-        {
-            let inner = self.inner.exclusive_access();
-            if inner.file_handle.is_some() {
-                drop(inner);
-            } else {
-                drop(inner);
-                self.open_handle();
-            }
-        }
         let mut inner = self.inner.exclusive_access();
-        if let Some(ref mut file) = inner.file_handle {
-            let mut rw_count: usize = 0;
-            let rc = unsafe {
-                ext4_fread(
-                    file,
-                    buf.as_mut_ptr() as *mut core::ffi::c_void,
-                    buf.len(),
-                    &mut rw_count,
-                )
-            };
-            if rc == EOK as i32 {
-                inner.offset += rw_count;
-                return rw_count as isize;
-            }
-        }
-        -1
+        let rw_count = self
+            .dentry
+            .super_block
+            .read_at(&self.dentry.fs_path, inner.offset, buf);
+        inner.offset += rw_count;
+        rw_count as isize
     }
 
     fn write(&self, buf: &mut [u8]) -> isize {
@@ -475,7 +455,13 @@ impl File for OSInode {
     }
 
     fn seek(&self, offset: usize) {
-        self.inner.exclusive_access().offset = offset;
+        let mut inner = self.inner.exclusive_access();
+        inner.offset = offset;
+        if let Some(ref mut file) = inner.file_handle {
+            unsafe {
+                ext4_fseek(file, offset as i64, SEEK_SET as u32);
+            }
+        }
     }
 
     fn get_offset(&self) -> usize {

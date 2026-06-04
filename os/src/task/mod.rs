@@ -106,10 +106,36 @@ pub fn block_current_and_run_next(block_reason: BlockReason) {
     task.record_time_resume();
 }
 
+pub fn wake_poll_wait_tasks() {
+    let mut to_wake = Vec::new();
+    {
+        let mut queue = NET_BLOCK_QUEUE.exclusive_access();
+        let mut i = 0;
+        while i < queue.len() {
+            let should_wake = {
+                let inner = queue[i].inner_exclusive_access();
+                matches!(inner.block_reason, Some(BlockReason::PollWait))
+            };
+            if should_wake {
+                to_wake.push(queue.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+    }
+    for task in to_wake {
+        let mut inner = task.inner_exclusive_access();
+        inner.task_status = TaskStatus::Ready;
+        inner.block_reason = None;
+        drop(inner);
+        add_priority_task(task);
+    }
+}
+
 pub const IDLE_PID: usize = 0;
 
 /// Exit the current 'Running' task and run the next task in task list.
-pub fn exit_current_and_run_next(exit_code: i32) {
+pub fn exit_current_and_run_next(exit_code: i32) -> ! {
     crate::fs::stdio::stdout_release_if_owner();
     trace!("os::task::exit_current_and_run_next");
     // take from Processor
@@ -138,7 +164,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         // deallocate user space
         inner.memory_set.recycle_data_pages();
         // drop file descriptors
-        inner.fd_table.clear();
+        inner.clear_fd_table();
         (parent, orphan_children)
     };
     // **** release current PCB before touching parent/initproc
@@ -169,8 +195,10 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     drop(task);
     // we do not have to save task context
     take_current_task();
-    let mut _unused = KContext::blank();
-    schedule(&mut _unused as *mut _);
+    loop {
+        let mut unused = KContext::blank();
+        schedule(&mut unused as *mut _);
+    }
 }
 
 lazy_static! {
@@ -244,17 +272,25 @@ fn call_user_signal_handler(sig: usize, signal: SignalFlags) {
     let mut task_inner = task.inner_exclusive_access();
 
     let handler = task_inner.signal_actions.table[sig].handler;
+    if handler == 1 {
+        task_inner.signals ^= signal;
+        return;
+    }
     if handler != 0 {
-        // user handler
+        let action = task_inner.signal_actions.table[sig];
+
+        // handle flag
         task_inner.handling_sig = sig as isize;
         task_inner.signals ^= signal;
 
         // backup trapframe
         let trap_ctx = task_inner.get_trap_cx();
         task_inner.trap_ctx_backup = Some(trap_ctx.clone());
+        let saved_sepc = trap_ctx[TrapFrameArgs::SEPC];
 
         // modify trapframe
         trap_ctx[TrapFrameArgs::SEPC] = handler;
+        trap_ctx[TrapFrameArgs::RA] = saved_sepc;
 
         // set ra to restorer (sigreturn trampoline)
         let restorer = task_inner.signal_actions.table[sig].restorer;
@@ -291,11 +327,9 @@ fn call_user_signal_handler(sig: usize, signal: SignalFlags) {
         );
         if fatal {
             task_inner.killed = true;
-            task_inner.signals ^= signal;
             task_inner.exit_signal = -(sig as i32);
-        } else {
-            task_inner.signals ^= signal;
         }
+        task_inner.signals ^= signal;
     }
 }
 
@@ -390,7 +424,7 @@ pub fn add_sleep_task(wakeup_time: usize, task: Arc<TaskControlBlock>) {
 }
 
 pub fn check_and_wake_up_tasks() {
-    let now = polyhal::time::Time::now().to_msec() as usize;
+    let now = polyhal::time::Time::now().to_nsec() as usize;
     let mut queue = SLEEP_QUEUE.exclusive_access();
 
     let mut i = 0;
