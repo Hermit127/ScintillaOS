@@ -11,35 +11,31 @@ use user_lib::{exec, fork, waitpid, open, close, read, getdents64, OpenFlags};
 const LTP_DIR: &str = "/ltp/testcases/bin/";
 
 const SUBSET_LIST: &[&str] = &[
-    "close01", "close02",
-    "open01", "open02",
-    "read01", "read02",
-    "write01", "write02",
-    "lseek01", "lseek02",
-    "fstat01", "fstat02", "fstat03",
-    "dup01", "dup02", "dup201", "dup202",
-    "pipe01", "pipe02",
-    "brk01", "brk02",
-    "mmap01", "mmap02",
-    "munmap01", "munmap02",
-    "fork01", "fork02", "fork03",
-    "exit_group01",
-    "wait01", "wait02",
-    "getpid01", "getpid02",
-    "getcwd01", "getcwd02",
-    "chdir01", "chdir04",
-    "times01",
-    "uname01", "uname02",
-    "nanosleep01",
-    "kill01", "kill02",
-    "gettimeofday01", "gettimeofday02",
-    "umask01",
-    "mkdirat01", "mkdirat02",
-    "rename01", "rename02",
-    "unlink01", "unlink02",
-    "mprotect01", "mprotect02",
-    "fcntl01", "fcntl02",
-    "access01",
+    // Fork / child process
+    "fork04", "fork05", "fork08", "fork09", "fork10", "fork13",
+    // Wait
+    "waitpid01", "waitpid03", "waitpid04",
+    // Open variants
+    "open03", "open04", "open06", "open07", "open08",
+    // Read / Write variants
+    "read04", "write04", "write05",
+    // Pipe more variants
+    "pipe03", "pipe04", "pipe05", "pipe06", "pipe07", "pipe08",
+    // Dup more variants
+    "dup03", "dup04", "dup05", "dup06", "dup07",
+    // ftruncate
+    "ftruncate01", "ftruncate03", "ftruncate04",
+    // getdents
+    "getdents01", "getdents02",
+    // rename / mknodat
+    "rename03", "rename04", "rename05",
+    "mknodat01", "mknodat02",
+    // mmap more variants
+    "mmap14", "mmap16", "mmap17", "mmap18", "mmap19",
+    // fcntl more variants
+    "fcntl03", "fcntl04", "fcntl05",
+    "fcntl07", "fcntl08", "fcntl09", "fcntl10", "fcntl11",
+    "fcntl12", "fcntl13", "fcntl14",
 ];
 
 fn is_elf(name: &str) -> bool {

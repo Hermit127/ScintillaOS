@@ -246,8 +246,6 @@ fn call_user_signal_handler(sig: usize, signal: SignalFlags) {
     let handler = task_inner.signal_actions.table[sig].handler;
     if handler != 0 {
         // user handler
-
-        // handle flag
         task_inner.handling_sig = sig as isize;
         task_inner.signals ^= signal;
 
@@ -257,6 +255,12 @@ fn call_user_signal_handler(sig: usize, signal: SignalFlags) {
 
         // modify trapframe
         trap_ctx[TrapFrameArgs::SEPC] = handler;
+
+        // set ra to restorer (sigreturn trampoline)
+        let restorer = task_inner.signal_actions.table[sig].restorer;
+        if restorer != 0 {
+            trap_ctx[TrapFrameArgs::RA] = restorer;
+        }
 
         // put args (a0)
         trap_ctx[TrapFrameArgs::ARG0] = sig;
@@ -268,11 +272,22 @@ fn call_user_signal_handler(sig: usize, signal: SignalFlags) {
                 | SignalFlags::SIGILL
                 | SignalFlags::SIGFPE
                 | SignalFlags::SIGBUS
-                | SignalFlags::SIGSYS,
+                | SignalFlags::SIGSYS
+                | SignalFlags::SIGALRM
+                | SignalFlags::SIGVTALRM
+                | SignalFlags::SIGPROF
+                | SignalFlags::SIGTERM
+                | SignalFlags::SIGINT
+                | SignalFlags::SIGQUIT
+                | SignalFlags::SIGHUP
+                | SignalFlags::SIGPIPE
+                | SignalFlags::SIGUSR1
+                | SignalFlags::SIGUSR2,
         );
         if fatal {
             task_inner.killed = true;
             task_inner.signals ^= signal;
+            task_inner.exit_signal = -(sig as i32);
         }
     }
 }
@@ -335,7 +350,13 @@ pub fn handle_signals() {
             task_inner.killed
         };
         if killed {
-            exit_current_and_run_next(-9);
+            let exit_code = {
+                let task = current_task().unwrap();
+                let inner = task.inner_exclusive_access();
+                let sig = inner.exit_signal;
+                if sig != 0 { sig } else { -9 }
+            };
+            exit_current_and_run_next(exit_code);
         }
         let frozen = {
             let task = match current_task() {

@@ -122,7 +122,8 @@ impl File for Pipe {
             let e = !has_data && write_end_closed;
             (r, false, e)
         } else {
-            (false, true, false)
+            let has_room = ring_buffer.available_write() > 0;
+            (false, has_room, false)
         }
     }
     fn read(&self, buf: &mut [u8]) -> isize {
@@ -173,9 +174,7 @@ impl File for Pipe {
                 ring_buffer.available_write()
             };
             if loop_write == 0 {
-                stdout_release_if_owner();
-                suspend_current_and_run_next();
-                continue;
+                return already_write as isize;
             }
             let mut ring_buffer = self.buffer.exclusive_access();
             for _ in 0..loop_write {

@@ -210,7 +210,7 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: usize) -> isize
             let mut has_child = false;
             let mut zombie_idx = None;
             for (idx, child) in inner.children.iter().enumerate() {
-                if pid != -1 && pid as usize != child.getpid() {
+                if pid > 0 && pid as usize != child.getpid() {
                     continue;
                 }
                 has_child = true;
@@ -236,7 +236,11 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: usize) -> isize
                 inner.exit_code
             };
             if !exit_code_ptr.is_null() {
-                *translated_refmut(token, exit_code_ptr) = (exit_code << 8) as i32;
+                if exit_code < 0 {
+                    *translated_refmut(token, exit_code_ptr) = -exit_code;
+                } else {
+                    *translated_refmut(token, exit_code_ptr) = (exit_code << 8) as i32;
+                }
             }
             return found_pid as isize;
         }
@@ -832,7 +836,7 @@ pub fn sys_ppoll(
         }
 
         stdout_release_if_owner();
-        block_current_and_run_next(BlockReason::PollWait);
+        suspend_current_and_run_next();
     }
 }
 
@@ -900,8 +904,30 @@ pub fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flags: usiz
 // ---- mincore (232) ----
 
 pub fn sys_mincore(start: usize, len: usize, vec: *mut u8) -> isize {
-    let token = current_user_token();
+    if start % crate::config::PAGE_SIZE != 0 || len == 0 {
+        return -22;
+    }
     let npages = (len + crate::config::PAGE_SIZE - 1) / crate::config::PAGE_SIZE;
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+    // Validate vec pointer
+    if !inner.memory_set.valid_user_buf(vec, npages, true) {
+        return -14;
+    }
+    // Check that the address range is mapped
+    let mut vpn = start;
+    let end = start + len;
+    if end < start {
+        return -22;
+    }
+    while vpn < end {
+        if inner.memory_set.translate(polyhal::VirtAddr::from(vpn)).is_none() {
+            return -12;
+        }
+        vpn += crate::config::PAGE_SIZE;
+    }
+    drop(inner);
+    let token = current_user_token();
     let buf = crate::mm::translated_byte_buffer(token, vec, npages);
     for b in buf.iter_mut() {
         *b = 1;
@@ -979,7 +1005,13 @@ pub fn sys_sysinfo(info_ptr: *mut u8) -> isize {
     if info_ptr.is_null() {
         return -14;
     }
-    let token = current_user_token();
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+    if !inner.memory_set.valid_user_buf(info_ptr, core::mem::size_of::<SysInfo>(), true) {
+        return -14;
+    }
+    let token = inner.get_user_token();
+    drop(inner);
     let info = crate::mm::translated_refmut(token, info_ptr as *mut SysInfo);
     let now = polyhal::time::Time::now().to_msec() as isize / 1000;
     info.uptime = now;
@@ -1231,11 +1263,6 @@ pub fn sys_getpriority(_which: usize, _who: usize) -> isize {
 }
 
 pub fn sys_setpriority(_which: usize, _who: usize, _prio: isize) -> isize {
-    let task = current_task().unwrap();
-    let inner = task.inner_exclusive_access();
-    if inner.euid != 0 {
-        return -1;
-    }
     0
 }
 
@@ -1283,8 +1310,28 @@ pub fn sys_pselect6(
     timeout: *const u8,
     _sigmask: *const u8,
 ) -> isize {
+    if nfds > FD_SETSIZE {
+        return -22;
+    }
     let token = current_user_token();
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+    let fdset_size = core::mem::size_of::<FdSet>();
+    if !readfds.is_null() && !inner.memory_set.valid_user_buf(readfds, fdset_size, true) {
+        return -14;
+    }
+    if !writefds.is_null() && !inner.memory_set.valid_user_buf(writefds, fdset_size, true) {
+        return -14;
+    }
+    if !exceptfds.is_null() && !inner.memory_set.valid_user_buf(exceptfds, fdset_size, true) {
+        return -14;
+    }
+    if !timeout.is_null() && !inner.memory_set.valid_user_buf(timeout, core::mem::size_of::<crate::task::TimeSpec>(), false) {
+        return -14;
+    }
+    drop(inner);
 
+    let token = current_user_token();
     let mut rfds = [0u64; FD_SET_LONGS];
     let mut wfds = [0u64; FD_SET_LONGS];
     let mut efds = [0u64; FD_SET_LONGS];
@@ -1351,7 +1398,13 @@ pub fn sys_pselect6(
                     writable = w;
                     error = e;
                     inner = task.inner_exclusive_access();
+                } else {
+                    drop(inner);
+                    return -9;
                 }
+            } else {
+                drop(inner);
+                return -9;
             }
 
             if check_read && readable {
@@ -1418,7 +1471,7 @@ pub fn sys_pselect6(
         }
 
         stdout_release_if_owner();
-        block_current_and_run_next(BlockReason::PollWait);
+        suspend_current_and_run_next();
     }
 }
 
@@ -1464,13 +1517,18 @@ struct ITimerVal {
 }
 
 pub fn sys_getitimer(which: usize, curr_value_ptr: *mut u8) -> isize {
+    if which != ITIMER_REAL {
+        return -22;
+    }
     if curr_value_ptr.is_null() {
-        return -1;
+        return -14;
     }
     let task = current_task().unwrap();
-    let token = current_user_token();
     let inner = task.inner_exclusive_access();
-
+    if !inner.memory_set.valid_user_buf(curr_value_ptr, core::mem::size_of::<ITimerVal>(), true) {
+        return -14;
+    }
+    let token = inner.get_user_token();
     let now = polyhal::time::Time::now().to_msec() as u64;
     let remaining_ms = if inner.itimer_expire > now {
         inner.itimer_expire - now
@@ -1500,7 +1558,7 @@ pub fn sys_getitimer(which: usize, curr_value_ptr: *mut u8) -> isize {
 }
 
 pub fn sys_setitimer(which: usize, new_value: *const u8, old_value: *mut u8) -> isize {
-    if which != ITIMER_REAL {
+    if which > ITIMER_PROF {
         return -22;
     }
 

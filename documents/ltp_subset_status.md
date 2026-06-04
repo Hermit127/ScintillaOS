@@ -1,7 +1,87 @@
 # LTP 子集测试状态报告
 
-> 统计截止：2026-06-04  
-> 架构：riscv64  
+> 统计截止：2026-06-04
+> 架构：riscv64
+
+---
+
+## 第二批子集（当前）
+
+共 **54** 个测试，覆盖新实现的 syscall 族。
+
+```
+chmod01, fchmod01, fchmod02,
+chown01, chown02, fchown01, fchown02,
+mmap15,
+mremap01, mremap02, mremap03,
+mincore01, mincore02,
+msync01, msync02, msync03,
+mlock01, mlock02, munlock01, mlockall01, munlockall01,
+flock01,
+fallocate01, fallocate02, fallocate03,
+sync01, fsync01, fdatasync01, syncfs01,
+sysinfo01, sysinfo02,
+getresuid01, getresgid01, setresuid01, setresgid01, setreuid01, setregid01,
+getpriority01, setpriority01,
+sigaltstack01, sigaltstack02, sigsuspend01,
+pread01, pwrite01, preadv01, pwritev01,
+copy_file_range01, copy_file_range02,
+memfd_create01, memfd_create02,
+close_range01, close_range02,
+readahead01, sendfile04_64
+```
+
+---
+
+## 第三批子集（当前）
+
+共 **56** 个测试，覆盖网络 socket、poll/select、epoll、eventfd、statfs、mmap 变体等。
+
+```
+socket01, socket02, bind01, listen01, accept01, accept02,
+connect01, connect02, sendto01, sendto02, recvfrom01,
+getsockname01, getpeername01,
+sendmsg01, sendmsg02, recvmsg01, recvmsg02,
+setsockopt01, getsockopt01,
+poll01, poll02, select01, select02, select03, select04,
+epoll_create1_01, epoll_ctl01, epoll_wait01,
+eventfd01, eventfd2_01,
+statfs01, statfs02, fstatfs01, fstatfs02,
+pread02, pwrite02, preadv02, pwritev02,
+mmap01, mmap02, mmap03, mmap04, mmap06,
+mmap08, mmap09, mmap10, mmap11, mmap12, mmap13,
+sigtimedwait01, getitimer01, getitimer02,
+setitimer01, setitimer02,
+read03, clock_getres01
+```
+
+---
+
+## 第四批子集（当前）
+
+共 **54** 个测试，覆盖 fork/wait/pipe/dup/fcntl/mmap/ftruncate/getdents/rename 等深层变体。
+
+```
+fork04, fork05, fork08, fork09, fork10, fork13,
+waitpid01, waitpid03, waitpid04,
+open03, open04, open06, open07, open08,
+read04, write04, write05,
+pipe03, pipe04, pipe05, pipe06, pipe07, pipe08,
+dup03, dup04, dup05, dup06, dup07,
+ftruncate01, ftruncate03, ftruncate04,
+getdents01, getdents02,
+rename03, rename04, rename05,
+mknodat01, mknodat02,
+mmap14, mmap16, mmap17, mmap18, mmap19,
+fcntl03, fcntl04, fcntl05,
+fcntl07, fcntl08, fcntl09, fcntl10, fcntl11,
+fcntl12, fcntl13, fcntl14
+```
+
+---
+
+## 第一批子集（历史）
+
 > 子集测试数量：56  
 > 子集来源：`user/src/bin/ltp_runner.rs` SUBSET_LIST
 
