@@ -315,7 +315,6 @@ pub fn sys_sigreturn() -> isize {
 
 fn check_sigaction_error(signal: SignalFlags, action: usize, old_action: usize) -> bool {
     if action == 0
-        || old_action == 0
         || signal == SignalFlags::SIGKILL
         || signal == SignalFlags::SIGSTOP
     {
@@ -341,7 +340,9 @@ pub fn sys_sigaction(
             return -1;
         }
         let prev_action = inner.signal_actions.table[signum as usize];
-        *translated_refmut(token, old_action) = prev_action;
+        if !old_action.is_null() {
+            *translated_refmut(token, old_action) = prev_action;
+        }
         inner.signal_actions.table[signum as usize] = *translated_ref(token, action);
         0
     } else {
@@ -967,8 +968,13 @@ pub fn sys_getrlimit(resource: usize, rlim_ptr: *mut u8) -> isize {
     }
     let token = current_user_token();
     let rlim = crate::mm::translated_refmut(token, rlim_ptr as *mut RLimit);
-    rlim.rlim_cur = RLIM_INFINITY;
-    rlim.rlim_max = RLIM_INFINITY;
+    if resource == RLIMIT_NOFILE {
+        rlim.rlim_cur = 1024;
+        rlim.rlim_max = 1024;
+    } else {
+        rlim.rlim_cur = RLIM_INFINITY;
+        rlim.rlim_max = RLIM_INFINITY;
+    }
     0
 }
 

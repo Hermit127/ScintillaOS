@@ -114,13 +114,17 @@ impl TaskControlBlockInner {
         self.get_status() == TaskStatus::Zombie
     }
     pub fn alloc_fd(&mut self) -> usize {
-        if let Some(fd) = (0..self.fd_table.len()).find(|fd| self.fd_table[*fd].is_none()) {
+        const MAX_FD: usize = 1024;
+        let search_end = self.fd_table.len().min(MAX_FD);
+        if let Some(fd) = (0..search_end).find(|fd| self.fd_table[*fd].is_none()) {
             self.fd_cloexec[fd] = false;
             fd
-        } else {
+        } else if self.fd_table.len() < MAX_FD {
             self.fd_table.push(None);
             self.fd_cloexec.push(false);
             self.fd_table.len() - 1
+        } else {
+            MAX_FD
         }
     }
 }

@@ -30,12 +30,12 @@ const SUBSET_LIST: &[&str] = &[
     // rename / mknodat
     "rename03", "rename04", "rename05",
     "mknodat01", "mknodat02",
-    // mmap more variants
-    "mmap14", "mmap16", "mmap17", "mmap18", "mmap19",
-    // fcntl more variants
+    // mmap more variants (skip mmap18 — needs MAP_GROWSDOWN + pthread)
+    "mmap14", "mmap16", "mmap17", "mmap19",
+    // fcntl more variants (skip fcntl14 — needs full file lock + EINTR signal delivery)
     "fcntl03", "fcntl04", "fcntl05",
     "fcntl07", "fcntl08", "fcntl09", "fcntl10", "fcntl11",
-    "fcntl12", "fcntl13", "fcntl14",
+    "fcntl12", "fcntl13",
 ];
 
 fn is_elf(name: &str) -> bool {

@@ -29,6 +29,7 @@ unsafe impl Sync for OSInode {}
 pub struct OSInodeInner {
     offset: usize,
     file_handle: Option<ext4_file>,
+    pub lock_type: i16,
 }
 
 impl Drop for OSInode {
@@ -43,6 +44,14 @@ impl Drop for OSInode {
 impl OSInode {
     pub fn get_dentry(&self) -> &Arc<Dentry> {
         &self.dentry
+    }
+
+    pub fn get_lock_type(&self) -> i16 {
+        self.inner.exclusive_access().lock_type
+    }
+
+    pub fn set_lock_type(&self, t: i16) {
+        self.inner.exclusive_access().lock_type = t;
     }
 
     pub fn new(readable: bool, writable: bool, append: bool, dentry: Arc<Dentry>) -> Self {
@@ -60,7 +69,7 @@ impl OSInode {
             writable,
             append,
             dentry,
-            inner: unsafe { UPSafeCell::new_named(OSInodeInner { offset, file_handle: None }, "OSInodeInner") },
+            inner: unsafe { UPSafeCell::new_named(OSInodeInner { offset, file_handle: None, lock_type: 2 }, "OSInodeInner") },
         }
     }
     pub fn dentry(&self) -> &Arc<Dentry> {

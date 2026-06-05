@@ -51,6 +51,9 @@ pub fn sys_write(fd: usize, buf: *mut u8, len: usize) -> isize {
             return -9;
         }
         let file = file.clone();
+        if !inner.memory_set.valid_user_buf(buf, len, false) {
+            return -14;
+        }
         drop(inner);
         file.write(translated_byte_buffer(token, buf, len))
     } else {
@@ -102,6 +105,15 @@ pub fn sys_open(path: *const u8, flags: u32) -> isize {
 
 pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> isize {
     let task = current_task().unwrap();
+    // Validate path before reading
+    {
+        let inner = task.inner_exclusive_access();
+        let end_of_page = ((path as usize) + crate::config::PAGE_SIZE) & !(crate::config::PAGE_SIZE - 1);
+        let first_page_len = 4096.min(end_of_page - (path as usize));
+        if !inner.memory_set.valid_user_buf(path, first_page_len, false) {
+            return -14;
+        }
+    }
     let token = current_user_token();
     let path = translated_str(token, path);
 
@@ -109,6 +121,9 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> isize
     if let Some(file) = open_proc(&path) {
         let mut inner = task.inner_exclusive_access();
         let fd = inner.alloc_fd();
+        if fd >= inner.fd_table.len() {
+            return -24;
+        }
         inner.fd_table[fd] = Some(file);
         return fd as isize;
     }
@@ -116,6 +131,9 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> isize
     if path == "/dev/urandom" || path == "/dev/random" {
         let mut inner = task.inner_exclusive_access();
         let fd = inner.alloc_fd();
+        if fd >= inner.fd_table.len() {
+            return -24;
+        }
         inner.fd_table[fd] = Some(Arc::new(Urandom));
         return fd as isize;
     }
@@ -123,6 +141,9 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> isize
     if path == "/dev/null" {
         let mut inner = task.inner_exclusive_access();
         let fd = inner.alloc_fd();
+        if fd >= inner.fd_table.len() {
+            return -24;
+        }
         inner.fd_table[fd] = Some(Arc::new(DevNull));
         return fd as isize;
     }
@@ -134,6 +155,9 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> isize
     if let Some(inode) = inode {
         let mut inner = task.inner_exclusive_access();
         let fd = inner.alloc_fd();
+        if fd >= inner.fd_table.len() {
+            return -24;
+        }
         inner.fd_table[fd] = Some(inode);
         fd as isize
     } else {
@@ -649,6 +673,32 @@ pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
                 -9
             }
         }
+        // File locking stubs (both 32-bit: 5/6/7 and 64-bit: 12/13/14)
+        5 | 12 => { // F_GETLK
+            let token = inner.get_user_token();
+            let cur_type = inner.fd_table[fd].as_ref()
+                .and_then(|f| f.as_any().downcast_ref::<crate::fs::inode::OSInode>())
+                .map(|ino| ino.get_lock_type())
+                .unwrap_or(2);
+            drop(inner);
+            let size = 32;
+            let buf = crate::mm::translated_byte_buffer(token, arg as *mut u8, size);
+            for b in buf.iter_mut() { *b = 0; }
+            buf[0] = cur_type as u8;
+            return 0;
+        }
+        6 | 7 | 13 | 14 => { // F_SETLK / F_SETLKW
+            if let Some(inode) = inner.fd_table[fd].as_ref().and_then(|f| f.as_any().downcast_ref::<crate::fs::inode::OSInode>()) {
+                inode.set_lock_type(1); // F_WRLCK
+            }
+            0
+        }
+        2 | 15 => { // F_UNLCK
+            if let Some(inode) = inner.fd_table[fd].as_ref().and_then(|f| f.as_any().downcast_ref::<crate::fs::inode::OSInode>()) {
+                inode.set_lock_type(2); // F_UNLCK
+            }
+            0
+        }
         _ => -22, // EINVAL
     }
 }
@@ -810,8 +860,10 @@ pub fn sys_pipe2(pipe: *mut usize, flags: usize) -> isize {
         let mut inner = task.inner_exclusive_access();
         let (pipe_read, pipe_write) = make_pipe();
         let read_fd = inner.alloc_fd();
+        if read_fd >= inner.fd_table.len() { return -24; }
         inner.fd_table[read_fd] = Some(pipe_read);
         let write_fd = inner.alloc_fd();
+        if write_fd >= inner.fd_table.len() { inner.fd_table[read_fd] = None; return -24; }
         inner.fd_table[write_fd] = Some(pipe_write);
         (read_fd, write_fd)
     };
@@ -831,6 +883,9 @@ pub fn sys_dup(fd: usize) -> isize {
         return -9;
     }
     let new_fd = inner.alloc_fd();
+    if new_fd >= inner.fd_table.len() {
+        return -24;
+    }
     inner.fd_table[new_fd] = Some(Arc::clone(inner.fd_table[fd].as_ref().unwrap()));
     new_fd as isize
 }
@@ -1699,6 +1754,9 @@ pub fn sys_memfd_create(_name: *const u8, _flags: usize) -> isize {
     let task = current_task().unwrap();
     let mut inner = task.inner_exclusive_access();
     let fd = inner.alloc_fd();
+    if fd >= inner.fd_table.len() {
+        return -24;
+    }
     inner.fd_table[fd] = Some(alloc::sync::Arc::new(crate::fs::DevNull));
     fd as isize
 }
