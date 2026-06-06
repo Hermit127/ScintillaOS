@@ -57,7 +57,55 @@ read03, clock_getres01
 
 ---
 
-## 第四批子集（当前）
+---
+
+## 第六批子集（当前）
+
+共 **59** 个测试，覆盖 socket 扩展、kill 变体、prctl/ioctl、mprotect/madvise、getrandom/getrusage、nice、mount/chroot/umount。
+
+> **kill10** 已从子集移除 — 依赖跨进程组信号同步（Master/Manager/Child 通过 SIGUSR1/SIGUSR2/SIGALRM 协调），需要完整的用户态信号投递重构。
+
+```
+accept03, accept4_01, bind02, bind03,
+sendto03, sendmsg03, recvmsg03,
+getsockopt02, setsockopt02, socketpair01, socketpair02,
+fcntl27, fcntl29-36,
+kill07-kill12,
+prctl01-05, ioctl01-03,
+mprotect04/05, madvise01-03,
+getrandom01-04, getrusage01/02,
+setfsgid01, setfsuid01, getegid01, geteuid01,
+nice01-03, mount01-03, chroot01/03, umount01/02
+```
+
+---
+
+## 第五批子集（历史）
+
+共 **53** 个测试，覆盖 link/symlink、信号变体、alarm/pause、clock、pathconf、open/mmap/fcntl 扩展。
+
+```
+link02, link04, link05,
+symlink01, symlink02, symlink03, symlink04,
+fork14,
+pipe09, pipe10, pipe11,
+sigaction01, sigaction02,
+sigsuspend01, sigwait01, sigtimedwait01,
+kill03, kill05, kill06,
+alarm02, alarm03, alarm05, alarm06, alarm07,
+pause01, pause02, pause03,
+pathconf01, fpathconf01,
+clock_gettime01, clock_gettime02, clock_gettime03, clock_gettime04,
+clock_nanosleep01, clock_nanosleep02,
+open09, open10, open11, open12, open13,
+mmap20,
+fcntl15, fcntl16, fcntl17, fcntl18, fcntl19, fcntl20,
+fcntl21, fcntl22, fcntl23, fcntl24, fcntl25, fcntl26
+```
+
+---
+
+## 第四批子集（历史）
 
 共 **53** 个测试，覆盖 fork/wait/pipe/dup/fcntl/mmap/ftruncate/getdents/rename 等深层变体。
 

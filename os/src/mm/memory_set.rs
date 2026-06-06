@@ -278,10 +278,13 @@ impl MemorySet {
         start_addr: polyhal::VirtAddr,
         end_addr: polyhal::VirtAddr,
         permission: MapPermission,
-    ) {
+    ) -> bool {
         let mut map_area = MapArea::new(start_addr, end_addr, MapType::Framed, permission);
-        map_area.map(&self.page_table);
+        if map_area.map(&self.page_table).is_err() {
+            return false;
+        }
         self.areas.push(map_area);
+        true
     }
 
     pub fn insert_file_area(
@@ -292,7 +295,9 @@ impl MemorySet {
         file: alloc::sync::Arc<dyn crate::fs::File>,
         offset: usize,
     ) -> bool {
-        self.insert_framed_area(start_addr, end_addr, permission);
+        if !self.insert_framed_area(start_addr, end_addr, permission) {
+            return false;
+        }
 
         file.seek(offset);
         let area_idx = self.areas.len() - 1;

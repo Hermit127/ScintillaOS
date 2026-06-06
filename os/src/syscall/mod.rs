@@ -42,6 +42,7 @@ const SYSCALL_GETITIMER: usize = 102;
 const SYSCALL_SETITIMER: usize = 103;
 const SYSCALL_CLOCK_GETTIME: usize = 113;
 const SYSCALL_CLOCK_GETRES: usize = 114;
+const SYSCALL_CLOCK_NANOSLEEP: usize = 115;
 const SYSCALL_SYSLOG: usize = 116;
 const SYSCALL_GETRESUID: usize = 117;
 const SYSCALL_GETRESGID: usize = 120;
@@ -316,6 +317,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_NANOSLEEP => sys_nanosleep(args[0], args[1]),
         SYSCALL_CLOCK_GETTIME => sys_clock_gettime(args[0], args[1] as *mut u8),
         SYSCALL_CLOCK_GETRES => sys_clock_getres(args[0], args[1] as *mut u8),
+        SYSCALL_CLOCK_NANOSLEEP => sys_clock_nanosleep(args[0], args[1], args[2], args[3]),
         SYSCALL_MOUNT => sys_mount(args[0] as *const u8, args[1] as *const u8, args[2] as *const u8, args[3], args[4] as *const u8),
         SYSCALL_UMOUNT2 => sys_umount2(args[0] as *const u8, args[1]),
         SYSCALL_UTIMENSAT => sys_utimensat(args[0] as isize, args[1] as *const u8, args[2] as *const u8, args[3]),

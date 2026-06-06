@@ -175,7 +175,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
 
 lazy_static! {
     pub static ref INITPROC: Arc<TaskControlBlock> = Arc::new({
-        let inode = open_file("/bin/contest_runner", OpenFlags::RDONLY).unwrap();
+        let inode = open_file("/bin/ltp_runner", OpenFlags::RDONLY).unwrap();
         let v = inode.read_all();
         TaskControlBlock::new(v.as_slice())
     });
@@ -273,6 +273,7 @@ fn call_user_signal_handler(sig: usize, signal: SignalFlags) {
                 | SignalFlags::SIGFPE
                 | SignalFlags::SIGBUS
                 | SignalFlags::SIGSYS
+                | SignalFlags::SIGTRAP
                 | SignalFlags::SIGALRM
                 | SignalFlags::SIGVTALRM
                 | SignalFlags::SIGPROF
@@ -282,12 +283,18 @@ fn call_user_signal_handler(sig: usize, signal: SignalFlags) {
                 | SignalFlags::SIGHUP
                 | SignalFlags::SIGPIPE
                 | SignalFlags::SIGUSR1
-                | SignalFlags::SIGUSR2,
+                | SignalFlags::SIGUSR2
+                | SignalFlags::SIGXCPU
+                | SignalFlags::SIGXFSZ
+                | SignalFlags::SIGIO
+                | SignalFlags::SIGPWR,
         );
         if fatal {
             task_inner.killed = true;
             task_inner.signals ^= signal;
             task_inner.exit_signal = -(sig as i32);
+        } else {
+            task_inner.signals ^= signal;
         }
     }
 }

@@ -680,8 +680,12 @@ pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
                 .and_then(|f| f.as_any().downcast_ref::<crate::fs::inode::OSInode>())
                 .map(|ino| ino.get_lock_type())
                 .unwrap_or(2);
-            drop(inner);
             let size = 32;
+            if !inner.memory_set.valid_user_buf(arg as *const u8, size, true) {
+                return -14;
+            }
+            let token = inner.get_user_token();
+            drop(inner);
             let buf = crate::mm::translated_byte_buffer(token, arg as *mut u8, size);
             for b in buf.iter_mut() { *b = 0; }
             buf[0] = cur_type as u8;
