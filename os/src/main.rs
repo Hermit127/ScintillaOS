@@ -63,7 +63,7 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             // cx is changed during sys_exec, so we have to call it again
             ctx[TrapFrameArgs::RET] = result as usize;
         }
-        StorePageFault(bad_addr) => {
+        StorePageFault(bad_addr) | LoadPageFault(bad_addr) => {
             let vaddr = polyhal::VirtAddr::from(bad_addr);
             let task = crate::task::current_task().unwrap();
             let mut inner = task.inner_exclusive_access();
@@ -72,7 +72,7 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
                 current_add_signal(SignalFlags::SIGSEGV);
             }
         }
-        LoadPageFault(_paddr) | InstructionPageFault(_paddr) => {
+        InstructionPageFault(_paddr) => {
             current_add_signal(SignalFlags::SIGSEGV);
         }
         IllegalInstruction(_) => {

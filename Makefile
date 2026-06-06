@@ -244,6 +244,7 @@ fs-img: $(APPS)
 			printf '%s\n' 'echo context switch overhead'; \
 			printf '%s\n' '/lmbench_all lat_ctx -P 1 -s 32 2 4 8 16 24 32 64 96'; \
 			printf '%s\n' ''; \
+			printf '%s\n' '/busybox sync'; \
 			printf '%s\n' 'echo "#### OS COMP TEST GROUP END lmbench ####"'; \
 		} > "$(ROOTFS_DIR)/lmbench_testcode.sh"; \
 	fi

@@ -216,6 +216,27 @@ pub fn sys_exec(path: *const u8, mut args: *const usize, mut envp: *const usize)
     });
     if let Some(app_inode) = app_inode {
         let all_data = app_inode.read_all();
+        if all_data.len() >= 2 && &all_data[..2] == b"#!" {
+            let end = all_data.iter().position(|&b| b == b'\n').unwrap_or(all_data.len());
+            let line = core::str::from_utf8(&all_data[2..end]).unwrap_or("");
+            let parts: alloc::vec::Vec<&str> = line.split_whitespace().collect();
+            if !parts.is_empty() {
+                let ipath = if parts[0].starts_with('/') { alloc::string::String::from(parts[0]) }
+                           else { alloc::format!("/bin/{}", parts[0]) };
+                let mut new_args = alloc::vec![ipath.clone()];
+                if parts.len() > 1 { new_args.push(alloc::string::String::from(parts[1])); }
+                new_args.push(path);
+                for a in args_vec.iter().skip(1) { new_args.push(a.clone()); }
+                drop(app_inode);
+                if let Some(i2) = open_file(&ipath, OpenFlags::RDONLY)
+                    .or_else(|| open_file(&alloc::format!("/bin/{}", ipath), OpenFlags::RDONLY)) {
+                    let d2 = i2.read_all();
+                    current_task().unwrap().exec(&d2, new_args, env_vec);
+                    return 0;
+                }
+            }
+            return -1;
+        }
         let task = current_task().unwrap();
         task.exec(all_data.as_slice(), args_vec, env_vec);
         0
@@ -497,7 +518,7 @@ pub fn sys_mmap(
         let start_addr = polyhal::VirtAddr::from(real_start);
         let end_addr = polyhal::VirtAddr::from(real_start + len);
         if (flags & MAP_FIXED) != 0 && inner.memory_set.is_overlap(start_addr, end_addr) {
-            return -1;
+            inner.memory_set.munmap(start_addr, end_addr);
         }
         if !inner.memory_set.insert_framed_area(start_addr, end_addr, permission) {
             return -12;
@@ -506,6 +527,9 @@ pub fn sys_mmap(
     } else {
         let start_addr = polyhal::VirtAddr::from(real_start);
         let end_addr = polyhal::VirtAddr::from(real_start + len);
+        if (flags & MAP_FIXED) != 0 && inner.memory_set.is_overlap(start_addr, end_addr) {
+            inner.memory_set.munmap(start_addr, end_addr);
+        }
 
         if fd < 0 || fd as usize >= inner.fd_table.len() {
             return -1;
@@ -542,6 +566,18 @@ pub fn sys_munmap(start: usize, len: usize) -> isize {
     } else {
         -1
     }
+}
+
+pub fn sys_msync(start: usize, len: usize, flags: usize) -> isize {
+    if (len > 0 && start as u64 + len as u64 > usize::MAX as u64)
+        || start % crate::config::PAGE_SIZE != 0
+    {
+        return -22;
+    }
+    let task = crate::task::current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    let start_addr = polyhal::VirtAddr::from(start);
+    inner.memory_set.msync(start_addr, len, flags)
 }
 
 pub fn sys_times(tms_ptr: usize) -> isize {
@@ -888,21 +924,6 @@ pub fn sys_ppoll(
 
 pub fn sys_mprotect(_start: usize, _len: usize, _prot: usize) -> isize {
     0
-}
-
-pub fn sys_msync(start: usize, len: usize, _flags: usize) -> isize {
-    if (len > 0 && start as u64 + len as u64 > usize::MAX as u64) || start % crate::config::PAGE_SIZE != 0 {
-        return -22;
-    }
-    let task = current_task().unwrap();
-    let inner = task.inner_exclusive_access();
-    let start_addr = polyhal::VirtAddr::from(start);
-    let end_addr = polyhal::VirtAddr::from(start + len);
-    if inner.memory_set.msync(start_addr, end_addr) {
-        0
-    } else {
-        -14
-    }
 }
 
 // ---- mremap (216) ----

@@ -203,7 +203,7 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
 
 lazy_static! {
     pub static ref INITPROC: Arc<TaskControlBlock> = Arc::new({
-        let inode = open_file("/bin/ltp_runner", OpenFlags::RDONLY).unwrap();
+        let inode = open_file("/bin/initproc", OpenFlags::RDONLY).unwrap();
         let v = inode.read_all();
         TaskControlBlock::new(v.as_slice())
     });
@@ -290,13 +290,11 @@ fn call_user_signal_handler(sig: usize, signal: SignalFlags) {
 
         // modify trapframe
         trap_ctx[TrapFrameArgs::SEPC] = handler;
-        trap_ctx[TrapFrameArgs::RA] = saved_sepc;
-
-        // set ra to restorer (sigreturn trampoline)
-        let restorer = task_inner.signal_actions.table[sig].restorer;
-        if restorer != 0 {
-            trap_ctx[TrapFrameArgs::RA] = restorer;
-        }
+        trap_ctx[TrapFrameArgs::RA] = if action.restorer != 0 {
+            action.restorer
+        } else {
+            saved_sepc
+        };
 
         // put args (a0)
         trap_ctx[TrapFrameArgs::ARG0] = sig;

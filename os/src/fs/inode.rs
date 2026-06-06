@@ -350,6 +350,69 @@ impl File for OSInode {
         rw_count as isize
     }
 
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> isize {
+        let need_open = {
+            let inner = self.inner.exclusive_access();
+            inner.file_handle.is_none()
+        };
+        if need_open {
+            self.open_handle();
+        }
+        let mut inner = self.inner.exclusive_access();
+        if let Some(ref mut file) = inner.file_handle {
+            unsafe {
+                ext4_fseek(file, offset as i64, SEEK_SET as u32);
+            }
+            let mut total = 0usize;
+            while total < buf.len() {
+                let mut rw_count: usize = 0;
+                let rc = unsafe {
+                    ext4_fread(
+                        file,
+                        buf[total..].as_mut_ptr() as *mut core::ffi::c_void,
+                        buf.len() - total,
+                        &mut rw_count,
+                    )
+                };
+                if rc != EOK as i32 || rw_count == 0 {
+                    break;
+                }
+                total += rw_count;
+            }
+            return total as isize;
+        }
+        -1
+    }
+
+    fn write_at(&self, offset: usize, buf: &mut [u8]) -> isize {
+        let need_open = {
+            let inner = self.inner.exclusive_access();
+            inner.file_handle.is_none()
+        };
+        if need_open {
+            self.open_handle();
+        }
+        let mut inner = self.inner.exclusive_access();
+        if let Some(ref mut file) = inner.file_handle {
+            unsafe {
+                ext4_fseek(file, offset as i64, SEEK_SET as u32);
+            }
+            let mut rw_count: usize = 0;
+            let rc = unsafe {
+                ext4_fwrite(
+                    file,
+                    buf.as_ptr() as *const core::ffi::c_void,
+                    buf.len(),
+                    &mut rw_count,
+                )
+            };
+            if rc == EOK as i32 {
+                return rw_count as isize;
+            }
+        }
+        -1
+    }
+
     fn write(&self, buf: &mut [u8]) -> isize {
         let need_open = {
             let inner = self.inner.exclusive_access();

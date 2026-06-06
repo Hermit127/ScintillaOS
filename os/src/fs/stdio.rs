@@ -49,11 +49,13 @@ impl File for Stdin {
         if user_buf.is_empty() {
             return 0;
         }
-        if let Some(c) = DebugConsole::getchar() {
-            user_buf[0] = c;
-            1
-        } else {
-            0
+        loop {
+            if let Some(c) = DebugConsole::getchar() {
+                user_buf[0] = c;
+                return 1;
+            }
+            stdout_release_if_owner();
+            suspend_current_and_run_next();
         }
     }
     fn write(&self, _user_buf: &mut [u8]) -> isize {

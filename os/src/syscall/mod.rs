@@ -79,6 +79,7 @@ const SYSCALL_CLONE: usize = 220;
 const SYSCALL_FORK: usize = 401;
 const SYSCALL_EXEC: usize = 221;
 const SYSCALL_MMAP: usize = 222;
+const SYSCALL_MSYNC: usize = 227;
 const SYSCALL_WAITPID: usize = 260;
 
 const SYSCALL_GETDENTS64: usize = 61;
@@ -237,9 +238,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_WAITPID => sys_waitpid(args[0] as isize, args[1] as *mut i32, args[2]),
         //added
         SYSCALL_FSTAT => sys_fstat(args[0], args[1] as *mut u8),
-        SYSCALL_SYNC => 0,
-        SYSCALL_FSYNC => 0,
-        SYSCALL_FDATASYNC => 0,
+        SYSCALL_SYNC => sys_sync(),
+        SYSCALL_FSYNC => sys_fsync(args[0]),
+        SYSCALL_FDATASYNC => sys_fdatasync(args[0]),
         SYSCALL_FSTATAT => sys_fstatat(
             args[0] as isize,
             args[1] as *const u8,
@@ -258,6 +259,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_DUP2 => sys_dup2(args[0], args[1]),
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4] as i32, args[5]),
         SYSCALL_MUNMAP => sys_munmap(args[0], args[1]),
+        SYSCALL_MSYNC => sys_msync(args[0], args[1], args[2]),
         SYSCALL_SOCKET => sys_socket(args[0], args[1], args[2]),
         SYSCALL_BIND => sys_bind(args[0], args[1] as *const u8, args[2]),
         SYSCALL_LISTEN => sys_listen(args[0], args[1]),
