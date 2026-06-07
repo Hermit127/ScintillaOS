@@ -2,6 +2,7 @@ const SYSCALL_DUP: usize = 23;
 const SYSCALL_DUP3: usize = 24;
 const SYSCALL_FCNTL: usize = 25;
 const SYSCALL_FACCESSAT: usize = 48;
+const SYSCALL_FACCESSAT2: usize = 439;
 const SYSCALL_FCHMOD: usize = 52;
 const SYSCALL_FCHMODAT: usize = 53;
 const SYSCALL_FCHOWNAT: usize = 54;
@@ -162,6 +163,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_DUP3 => sys_dup3(args[0], args[1], args[2]),
         SYSCALL_FCNTL => sys_fcntl(args[0], args[1], args[2]),
         SYSCALL_FACCESSAT => sys_faccessat(args[0] as isize, args[1] as *const u8, args[2], args[3]),
+        SYSCALL_FACCESSAT2 => {
+            sys_faccessat2(args[0] as isize, args[1] as *const u8, args[2], args[3])
+        }
         SYSCALL_FCHMOD => sys_fchmod(args[0], args[1] as u32),
         SYSCALL_FCHMODAT => sys_fchmodat(args[0] as isize, args[1] as *const u8, args[2] as u32),
         SYSCALL_FCHOWNAT => sys_fchownat(args[0] as isize, args[1] as *const u8, args[2] as u32, args[3] as u32, args[4] as u32),
@@ -211,7 +215,12 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[1] as *const SignalAction,
             args[2] as *mut SignalAction,
         ),
-        SYSCALL_SIGPROCMASK => sys_sigprocmask(args[0] as u32),
+        SYSCALL_SIGPROCMASK => sys_sigprocmask(
+            args[0] as i32,
+            args[1] as *const u8,
+            args[2] as *mut u8,
+            args[3],
+        ),
         SYSCALL_SIGRETURN => sys_sigreturn(),
         SYSCALL_GETITIMER => sys_getitimer(args[0], args[1] as *mut u8),
         SYSCALL_SETITIMER => sys_setitimer(args[0], args[1] as *const u8, args[2] as *mut u8),

@@ -350,18 +350,32 @@ pub fn sys_kill(pid: usize, signum: i32) -> isize {
     }
 }
 
-pub fn sys_sigprocmask(mask: u32) -> isize {
+pub fn sys_sigprocmask(how: i32, set: *const u8, old_set: *mut u8, _sigsetsize: usize) -> isize {
+    const SIG_BLOCK: i32 = 0;
+    const SIG_UNBLOCK: i32 = 1;
+    const SIG_SETMASK: i32 = 2;
     if let Some(task) = current_task() {
+        let token = current_user_token();
         let mut inner = task.inner_exclusive_access();
         let old_mask = inner.signal_mask;
-        if let Some(flag) = SignalFlags::from_bits(mask) {
-            inner.signal_mask = flag;
-            old_mask.bits() as isize
-        } else {
-            -1
+        if !old_set.is_null() {
+            *translated_refmut(token, old_set as *mut u64) = old_mask.bits() as u64;
         }
+        if set.is_null() {
+            return 0;
+        }
+        let raw_mask = *translated_ref(token, set as *const u64) as u32;
+        let mut new_mask = SignalFlags::from_bits_truncate(raw_mask);
+        new_mask.remove(SignalFlags::SIGKILL | SignalFlags::SIGSTOP);
+        inner.signal_mask = match how {
+            SIG_BLOCK => old_mask | new_mask,
+            SIG_UNBLOCK => old_mask & !new_mask,
+            SIG_SETMASK => new_mask,
+            _ => return -22,
+        };
+        0
     } else {
-        -1
+        -3
     }
 }
 
@@ -369,9 +383,12 @@ pub fn sys_sigreturn() -> isize {
     if let Some(task) = current_task() {
         let mut inner = task.inner_exclusive_access();
         inner.handling_sig = -1;
+        if let Some(mask) = inner.signal_mask_backup.take() {
+            inner.signal_mask = mask;
+        }
         // restore the trap context
         let trap_ctx = inner.get_trap_cx();
-        *trap_ctx = inner.trap_ctx_backup.clone().unwrap();
+        *trap_ctx = inner.trap_ctx_backup.take().unwrap();
         // Here we return the value of a0 in the trap_ctx,
         // otherwise it will be overwritten after we trap
         // back to the original execution of the application.

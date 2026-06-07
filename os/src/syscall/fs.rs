@@ -76,24 +76,12 @@ pub fn sys_read(fd: usize, buf: *mut u8, len: usize) -> isize {
         if !file.readable() {
             return -9;
         }
-        drop(inner);
-
-        let chunk = len.min(4096);
-        let mut kbuf = [0u8; 4096];
-        let n = file.read(&mut kbuf[..chunk]);
-        if n <= 0 {
-            return n;
-        }
-
-        let task2 = current_task().unwrap();
-        let inner2 = task2.inner_exclusive_access();
-        if !inner2.memory_set.valid_user_buf(buf, n as usize, true) {
+        if !inner.memory_set.valid_user_buf(buf, len, true) {
             return -14;
         }
-        drop(inner2);
-        let user_buf = translated_byte_buffer(token, buf, n as usize);
-        user_buf[..n as usize].copy_from_slice(&kbuf[..n as usize]);
-        n
+        drop(inner);
+
+        file.read(translated_byte_buffer(token, buf, len))
     } else {
         -9
     }
@@ -157,6 +145,22 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> isize
 
     let open_flags = OpenFlags::from_raw(flags);
     let base_dir = resolve_base_dir(dirfd);
+    let Some(base) = base_dir.clone() else {
+        return -2;
+    };
+    if path.is_empty() {
+        return -2;
+    }
+    if let Some(existing) = vfs_resolve_with_fallback(&base, path.as_str()) {
+        if open_flags.directory_requested() && !existing.is_dir {
+            return -20;
+        }
+        if open_flags.create_requested() && open_flags.excl_requested() {
+            return -17;
+        }
+    } else if !open_flags.create_requested() {
+        return -2;
+    }
     let inode = open_file_at(base_dir, path.as_str(), open_flags, mode as u32);
 
     if let Some(inode) = inode {
@@ -168,7 +172,7 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> isize
         inner.fd_table[fd] = Some(inode);
         fd as isize
     } else {
-        -1
+        -2
     }
 }
 
@@ -211,7 +215,7 @@ pub fn sys_mkdirat(dirfd: isize, path: *const u8, _mode: u32) -> isize {
     let path = translated_str(token, path);
     let base_dir = match resolve_base_dir(dirfd) {
         Some(base) => base,
-        None => return -1,
+        None => return -2,
     };
     if mkdir_at(Some(base_dir), path.as_str()) {
         0
@@ -408,16 +412,33 @@ pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const u8, _flags: us
 }
 
 pub fn sys_faccessat(dirfd: isize, path: *const u8, mode: usize, _flags: usize) -> isize {
+    sys_faccessat2(dirfd, path, mode, _flags)
+}
+
+pub fn sys_faccessat2(dirfd: isize, path: *const u8, mode: usize, flags: usize) -> isize {
     const F_OK: usize = 0;
     const R_OK: usize = 4;
     const W_OK: usize = 2;
     const X_OK: usize = 1;
+    const AT_SYMLINK_NOFOLLOW: usize = 0x100;
+    const AT_EACCESS: usize = 0x200;
+    const AT_EMPTY_PATH: usize = 0x1000;
 
     let token = current_user_token();
     let path_str = translated_str(token, path);
+    if mode & !(R_OK | W_OK | X_OK) != 0 {
+        return -22;
+    }
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EACCESS | AT_EMPTY_PATH) != 0 {
+        return -22;
+    }
+
+    if path_str.is_empty() && flags & AT_EMPTY_PATH == 0 {
+        return -2;
+    }
     let base = match resolve_base_dir(dirfd) {
         Some(b) => b,
-        None => return -2, // ENOENT
+        None => return -2,
     };
     let dentry = match vfs_resolve_with_fallback(&base, &path_str) {
         Some(d) => d,
@@ -469,7 +490,7 @@ pub fn sys_faccessat(dirfd: isize, path: *const u8, mode: usize, _flags: usize) 
         0
     } else {
         -13
-    } // EACCES
+    }
 }
 
 pub fn sys_fchmodat(dirfd: isize, path: *const u8, mode: u32) -> isize {
@@ -1785,7 +1806,7 @@ pub fn sys_close_range(first: usize, last: usize, _flags: usize) -> isize {
     let mut inner = task.inner_exclusive_access();
     let last = last.min(inner.fd_table.len().saturating_sub(1));
     for fd in first..=last {
-        inner.fd_table[fd].take();
+        inner.close_fd(fd);
     }
     0
 }

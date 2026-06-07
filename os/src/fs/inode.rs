@@ -2,7 +2,7 @@ use super::vfs::{
     vfs_create, vfs_resolve_parent_and_name, vfs_resolve_path, vfs_resolve_with_fallback, Dentry,
     DirEntry,
 };
-use super::{File, Kstat};
+use super::{File, Kstat, S_IFDIR, S_IFREG};
 use crate::sync::UPSafeCell;
 use alloc::ffi::CString;
 use alloc::string::String;
@@ -140,7 +140,13 @@ impl OSInode {
         let info = self.dentry.super_block.get_inode_info(&self.dentry.fs_path);
         match info {
             Some(info) => {
-                let mut st = Kstat::new(info.mode);
+                let file_type = if self.dentry.is_dir || info.is_dir {
+                    S_IFDIR
+                } else {
+                    info.mode & 0o170000
+                };
+                let file_type = if file_type == 0 { S_IFREG } else { file_type };
+                let mut st = Kstat::new(file_type | (info.mode & 0o7777));
                 st.st_ino = info.inode_num as u64;
                 st.st_size = info.size as i64;
                 st.st_blksize = EXT4_BLOCK_SIZE;
@@ -152,7 +158,11 @@ impl OSInode {
                 st
             }
             None => {
-                let st = Kstat::new(0o100000);
+                let st = if self.dentry.is_dir {
+                    Kstat::new(S_IFDIR | 0o755)
+                } else {
+                    Kstat::new(S_IFREG | 0o644)
+                };
                 drop(inner);
                 st
             }
@@ -172,6 +182,7 @@ bitflags! {
         const WRONLY = 1 << 0;
         const RDWR = 1 << 1;
         const CREATE = 0x40;
+        const EXCL = 0x80;
         const TRUNC = 0x200;
         const APPEND = 0x400;
         const DIRECTORY = 0x10000;
@@ -187,6 +198,10 @@ impl OpenFlags {
 
     pub fn create_requested(&self) -> bool {
         self.contains(Self::CREATE)
+    }
+
+    pub fn excl_requested(&self) -> bool {
+        self.contains(Self::EXCL)
     }
 
     pub fn trunc_requested(&self) -> bool {
@@ -239,6 +254,9 @@ fn open_file_new(
 
         if let Some(dentry) = vfs_resolve_with_fallback(&start, path) {
             if !dentry.is_dir {
+                if flags.excl_requested() {
+                    return None;
+                }
                 if flags.trunc_requested() {
                     let truncated = dentry.super_block.truncate_file(&dentry.fs_path, 0);
                     if !truncated {

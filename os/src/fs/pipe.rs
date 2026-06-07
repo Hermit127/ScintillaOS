@@ -1,5 +1,7 @@
 use super::{File, Kstat, S_IFIFO};
 use crate::sync::UPSafeCell;
+use alloc::vec;
+use alloc::vec::Vec;
 use alloc::sync::Arc;
 
 use crate::task::{current_task, suspend_current_and_run_next, wake_poll_wait_tasks};
@@ -35,7 +37,7 @@ impl Pipe {
     }
 }
 
-const RING_BUFFER_SIZE: usize = 4096;
+const RING_BUFFER_SIZE: usize = 65536;
 
 #[derive(Copy, Clone, PartialEq)]
 enum RingBufferStatus {
@@ -45,7 +47,7 @@ enum RingBufferStatus {
 }
 
 pub struct PipeRingBuffer {
-    arr: [u8; RING_BUFFER_SIZE],
+    arr: Vec<u8>,
     head: usize,
     tail: usize,
     status: RingBufferStatus,
@@ -56,7 +58,7 @@ pub struct PipeRingBuffer {
 impl PipeRingBuffer {
     pub fn new() -> Self {
         Self {
-            arr: [0; RING_BUFFER_SIZE],
+            arr: vec![0; RING_BUFFER_SIZE],
             head: 0,
             tail: 0,
             status: RingBufferStatus::Empty,
@@ -64,22 +66,45 @@ impl PipeRingBuffer {
             write_open: 1,
         }
     }
-    pub fn write_byte(&mut self, byte: u8) {
-        self.status = RingBufferStatus::Normal;
-        self.arr[self.tail] = byte;
-        self.tail = (self.tail + 1) % RING_BUFFER_SIZE;
-        if self.tail == self.head {
-            self.status = RingBufferStatus::Full;
+    pub fn write_buf(&mut self, src: &[u8]) -> usize {
+        let count = src.len().min(self.available_write());
+        if count == 0 {
+            return 0;
         }
+        let first = count.min(RING_BUFFER_SIZE - self.tail);
+        self.arr[self.tail..self.tail + first].copy_from_slice(&src[..first]);
+        self.tail = (self.tail + first) % RING_BUFFER_SIZE;
+        if count > first {
+            let second = count - first;
+            self.arr[..second].copy_from_slice(&src[first..count]);
+            self.tail = second;
+        }
+        self.status = if self.tail == self.head {
+            RingBufferStatus::Full
+        } else {
+            RingBufferStatus::Normal
+        };
+        count
     }
-    pub fn read_byte(&mut self) -> u8 {
-        self.status = RingBufferStatus::Normal;
-        let c = self.arr[self.head];
-        self.head = (self.head + 1) % RING_BUFFER_SIZE;
-        if self.head == self.tail {
-            self.status = RingBufferStatus::Empty;
+    pub fn read_buf(&mut self, dst: &mut [u8]) -> usize {
+        let count = dst.len().min(self.available_read());
+        if count == 0 {
+            return 0;
         }
-        c
+        let first = count.min(RING_BUFFER_SIZE - self.head);
+        dst[..first].copy_from_slice(&self.arr[self.head..self.head + first]);
+        self.head = (self.head + first) % RING_BUFFER_SIZE;
+        if count > first {
+            let second = count - first;
+            dst[first..count].copy_from_slice(&self.arr[..second]);
+            self.head = second;
+        }
+        self.status = if self.head == self.tail {
+            RingBufferStatus::Empty
+        } else {
+            RingBufferStatus::Normal
+        };
+        count
     }
     pub fn available_read(&self) -> usize {
         if self.status == RingBufferStatus::Empty {
@@ -142,7 +167,6 @@ impl File for Pipe {
         if want_to_read == 0 {
             return 0;
         }
-        let mut buf_iter = buf.into_iter();
         let mut already_read = 0usize;
         loop {
             if current_task_killed() {
@@ -166,28 +190,14 @@ impl File for Pipe {
                 continue;
             }
             let mut ring_buffer = self.buffer.exclusive_access();
-            let mut made_progress = false;
-            for _ in 0..loop_read {
-                if let Some(byte_ref) = buf_iter.next() {
-                    *byte_ref = ring_buffer.read_byte();
-                    already_read += 1;
-                    made_progress = true;
-                    if already_read == want_to_read {
-                        drop(ring_buffer);
-                        wake_poll_wait_tasks();
-                        return want_to_read as isize;
-                    }
-                } else {
-                    drop(ring_buffer);
-                    if made_progress {
-                        wake_poll_wait_tasks();
-                    }
-                    return already_read as isize;
-                }
-            }
+            let n = ring_buffer.read_buf(&mut buf[already_read..want_to_read]);
+            already_read += n;
             drop(ring_buffer);
-            if made_progress {
+            if n > 0 {
                 wake_poll_wait_tasks();
+            }
+            if already_read == want_to_read || already_read > 0 {
+                return already_read as isize;
             }
         }
     }
@@ -197,7 +207,6 @@ impl File for Pipe {
         if want_to_write == 0 {
             return 0;
         }
-        let mut buf_iter = buf.into_iter();
         let mut already_write = 0usize;
         loop {
             if current_task_killed() {
@@ -211,31 +220,19 @@ impl File for Pipe {
                 return -32;
             }
             if loop_write == 0 {
-                return already_write as isize;
+                stdout_release_if_owner();
+                suspend_current_and_run_next();
+                continue;
             }
             let mut ring_buffer = self.buffer.exclusive_access();
-            let mut made_progress = false;
-            for _ in 0..loop_write {
-                if let Some(byte_ref) = buf_iter.next() {
-                    ring_buffer.write_byte(*byte_ref);
-                    already_write += 1;
-                    made_progress = true;
-                    if already_write == want_to_write {
-                        drop(ring_buffer);
-                        wake_poll_wait_tasks();
-                        return want_to_write as isize;
-                    }
-                } else {
-                    drop(ring_buffer);
-                    if made_progress {
-                        wake_poll_wait_tasks();
-                    }
-                    return already_write as isize;
-                }
-            }
+            let n = ring_buffer.write_buf(&buf[already_write..want_to_write]);
+            already_write += n;
             drop(ring_buffer);
-            if made_progress {
+            if n > 0 {
                 wake_poll_wait_tasks();
+            }
+            if already_write == want_to_write {
+                return want_to_write as isize;
             }
         }
     }

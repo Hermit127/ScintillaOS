@@ -3,7 +3,7 @@
 
 extern crate user_lib;
 
-use user_lib::{chdir, exec, exit, fork, shutdown, sys_mkdir, sys_mount, waitpid};
+use user_lib::{chdir, exec, exit, fork, open, shutdown, sys_mkdir, sys_mount, waitpid, OpenFlags};
 
 const NULL: *const u8 = core::ptr::null::<u8>();
 const SH: *const u8 = b"sh\0".as_ptr();
@@ -70,13 +70,23 @@ fn run_root_fallback() {
         "/busybox-glibc\0",
         &[SH, b"/busybox_glibc_testcode.sh\0".as_ptr(), NULL],
     );
-    run_exec("/\0", "/busybox\0", &[SH, b"/lua_musl_testcode.sh\0".as_ptr(), NULL]);
+    run_exec("/\0", "/busybox\0", &[SH, b"/lmbench_musl_testcode.sh\0".as_ptr(), NULL]);
+    run_exec("/\0", "/busybox-glibc\0", &[SH, b"/lmbench_glibc_testcode.sh\0".as_ptr(), NULL]);
+    run_exec("/\0", "/busybox\0", &[SH, b"/lua_testcode.sh\0".as_ptr(), NULL]);
     run_exec("/\0", "/busybox-glibc\0", &[SH, b"/lua_testcode.sh\0".as_ptr(), NULL]);
-    run_exec("/\0", "/busybox\0", &[SH, b"/lua_standalone_testcode.sh\0".as_ptr(), NULL]);
 }
 
 #[no_mangle]
 fn main() -> i32 {
+    if open("/lmbench_glibc_only\0", OpenFlags::RDONLY) >= 0 {
+        run_exec("/\0", "/busybox-glibc\0", &[SH, b"/lmbench_glibc_testcode.sh\0".as_ptr(), NULL]);
+        shutdown();
+    }
+    if open("/lmbench_only\0", OpenFlags::RDONLY) >= 0 {
+        run_exec("/\0", "/busybox\0", &[SH, b"/lmbench_testcode.sh\0".as_ptr(), NULL]);
+        shutdown();
+    }
+
     sys_mkdir(b"/mnt\0".as_ptr(), 0o777);
     sys_mount("", "/mnt", "ext4", 0, &[]);
 

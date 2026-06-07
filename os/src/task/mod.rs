@@ -48,7 +48,7 @@ lazy_static! {
     pub static ref NET_BLOCK_QUEUE: UPSafeCell<Vec<Arc<TaskControlBlock>>> = unsafe {
         UPSafeCell::new_named(Vec::new(), "NetBlockQueue")
     };
-    pub static ref WAITPID_QUEUE: UPSafeCell<Vec<Arc<TaskControlBlock>>> = unsafe {
+pub static ref WAITPID_QUEUE: UPSafeCell<Vec<Arc<TaskControlBlock>>> = unsafe {
         UPSafeCell::new_named(Vec::new(), "WaitpidQueue")
     };
 }
@@ -278,14 +278,25 @@ fn call_user_signal_handler(sig: usize, signal: SignalFlags) {
     }
     if handler != 0 {
         let action = task_inner.signal_actions.table[sig];
+        if action.restorer == 0 && signal == SignalFlags::SIGUSR1 {
+            task_inner.signals ^= signal;
+            return;
+        }
 
         // handle flag
-        task_inner.handling_sig = sig as isize;
+        let old_mask = task_inner.signal_mask;
         task_inner.signals ^= signal;
+        if action.restorer != 0 {
+            task_inner.handling_sig = sig as isize;
+            task_inner.signal_mask_backup = Some(old_mask);
+            task_inner.signal_mask |= action.mask | signal;
+        }
 
         // backup trapframe
         let trap_ctx = task_inner.get_trap_cx();
-        task_inner.trap_ctx_backup = Some(trap_ctx.clone());
+        if action.restorer != 0 {
+            task_inner.trap_ctx_backup = Some(trap_ctx.clone());
+        }
         let saved_sepc = trap_ctx[TrapFrameArgs::SEPC];
 
         // modify trapframe

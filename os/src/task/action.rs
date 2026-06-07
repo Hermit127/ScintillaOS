@@ -17,7 +17,7 @@ impl Default for SignalAction {
             handler: 0,
             flags: 0,
             restorer: 0,
-            mask: SignalFlags::from_bits(40).unwrap(),
+            mask: SignalFlags::empty(),
         }
     }
 }

@@ -68,6 +68,7 @@ pub struct TaskControlBlockInner {
     pub umask: u32,
     pub signals: SignalFlags,
     pub signal_mask: SignalFlags,
+    pub signal_mask_backup: Option<SignalFlags>,
     // the signal which is being handling
     pub handling_sig: isize,
     // Signal actions
@@ -233,6 +234,7 @@ impl TaskControlBlock {
                     umask: 0o022,
                     signals: SignalFlags::empty(),
                     signal_mask: SignalFlags::empty(),
+                    signal_mask_backup: None,
                     handling_sig: -1,
                     signal_actions: SignalActions::default(),
                     killed: false,
@@ -513,6 +515,7 @@ impl TaskControlBlock {
                     umask,
                     signals: SignalFlags::empty(),
                     signal_mask,
+                    signal_mask_backup: None,
                     handling_sig: -1,
                     signal_actions,
                     killed: false,

@@ -148,7 +148,7 @@ impl MemorySet {
         Some(memory_set)
     }
 
-    pub fn handle_page_fault(&mut self, vaddr: polyhal::VirtAddr) -> bool {
+    pub fn handle_page_fault(&mut self, vaddr: polyhal::VirtAddr, write_fault: bool) -> bool {
         let vpn = vaddr.floor();
         let area = match self.areas.iter_mut().find(|a| {
             a.vaddr_range.get_start() <= vpn && vpn < a.vaddr_range.get_end()
@@ -156,7 +156,6 @@ impl MemorySet {
             Some(a) => a,
             None => return false,
         };
-        let translated = self.page_table.translate(vpn);
         let in_frames = area.data_frames.contains_key(&vpn);
         if !in_frames {
             let f = match frame_alloc() { Some(f) => f, None => return false };
@@ -165,25 +164,27 @@ impl MemorySet {
                 let buf = f.paddr.slice_mut_with_len(crate::config::PAGE_SIZE);
                 let _ = file.read_at(off, buf);
             }
-            if self.page_table.translate(vpn).is_some() {
-                self.page_table.unmap_page(vpn);
-            }
             self.page_table.map_page(vpn, f.paddr, area.map_perm.into(), MappingSize::Page4KB);
+            unsafe { core::arch::asm!("sfence.vma {}, x0", in(reg) vpn.raw()) };
             area.data_frames.insert(vpn, f);
             return true;
         }
-        if translated.is_none() {
-            let frame = area.data_frames.get(&vpn).unwrap();
-            if self.page_table.translate(vpn).is_some() {
-                self.page_table.unmap_page(vpn);
-            }
-            self.page_table.map_page(vpn, frame.paddr, area.map_perm.into(), MappingSize::Page4KB);
+        // Write fault on read-only area → SIGSEGV
+        if write_fault && !area.map_perm.contains(MapPermission::W) { return false; }
+        // Read fault on already-mapped read-only page — re-establish PTE
+        if !write_fault && !area.map_perm.contains(MapPermission::W) {
+            let paddr = match area.data_frames.get(&vpn) { Some(f) => f.paddr, None => return false };
+            self.page_table.unmap_page(vpn);
+            self.page_table.map_page(vpn, paddr, area.map_perm.into(), MappingSize::Page4KB);
             return true;
         }
-        // COW: writable area, page exists, shared frame
-        if !area.map_perm.contains(MapPermission::W) { return false; }
-        let (paddr, _) = translated.unwrap();
-        let old = area.data_frames.get(&vpn).unwrap();
+        // COW or permission upgrade for writable pages
+        let (paddr, _) = match self.page_table.translate(vpn) {
+            Some(x) => x, None => return false,
+        };
+        let old = match area.data_frames.get(&vpn) {
+            Some(f) => f, None => return false,
+        };
         if old.is_shared() {
             let f = match frame_alloc() { Some(f) => f, None => return false };
             unsafe { core::ptr::copy_nonoverlapping(paddr.get_ptr::<u8>(), f.paddr.get_mut_ptr(), PAGE_SIZE); }
@@ -192,11 +193,10 @@ impl MemorySet {
             area.data_frames.insert(vpn, f);
         } else {
             self.page_table.unmap_page(vpn);
-            self.page_table.map_page(vpn, paddr, area.map_perm.into(), MappingSize::Page4KB);
+            self.page_table.map_page(vpn, old.paddr, area.map_perm.into(), MappingSize::Page4KB);
         }
         true
     }
-
     pub fn from_shared(user_space: &MemorySet) -> MemorySet {
         MemorySet {
             page_table: user_space.page_table.clone(),
@@ -338,10 +338,18 @@ impl MemorySet {
         file: alloc::sync::Arc<dyn crate::fs::File>,
         offset: usize,
     ) -> bool {
-        let mut map_area = MapArea::new(start_addr, end_addr, MapType::Framed, permission);
-        map_area.file = Some(file);
-        map_area.file_offset = offset;
-        self.areas.push(map_area);
+        self.insert_framed_area(start_addr, end_addr, permission);
+        let area = self.areas.last_mut().unwrap();
+        area.file = Some(file.clone());
+        area.file_offset = offset;
+        file.seek(offset);
+        for vaddr in area.vaddr_range.clone() {
+            let (paddr, _) = match self.page_table.translate(vaddr) {
+                Some(x) => x, None => break,
+            };
+            let page = paddr.slice_mut_with_len(crate::config::PAGE_SIZE);
+            if file.read(page) <= 0 { break; }
+        }
         true
     }
 

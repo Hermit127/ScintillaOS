@@ -176,7 +176,19 @@ impl VfsSuperBlock {
                 ext4_fclose(&mut file);
             }
 
-            let is_dir = (mode & 0x4000) != 0;
+            let mut is_dir = (mode & 0x4000) != 0;
+            if !is_dir {
+                let mut dir: ext4_dir = unsafe { core::mem::zeroed() };
+                let c_path_dir = CString::new(fs_path).ok()?;
+                let rc = unsafe { ext4_dir_open(&mut dir, c_path_dir.as_ptr() as *const c_char) };
+                if rc == EOK as i32 {
+                    is_dir = true;
+                    mode = (mode & 0o7777) | 0o040000;
+                    unsafe {
+                        ext4_dir_close(&mut dir);
+                    }
+                }
+            }
             Some(InodeInfo {
                 inode_num,
                 is_dir,
@@ -713,7 +725,8 @@ pub fn vfs_create(parent: &Arc<Dentry>, name: &str, is_dir: bool, mode: u32) -> 
     let umask = crate::task::current_task()
         .map(|t| t.inner_exclusive_access().umask)
         .unwrap_or(0o22);
-    let effective_mode = mode & !umask;
+    let file_type = if is_dir { 0o040000 } else { 0o100000 };
+    let effective_mode = file_type | (mode & !umask & 0o7777);
     let fs_path = child.fs_path.clone();
     child.super_block.set_mode(&fs_path, effective_mode);
 
