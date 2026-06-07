@@ -156,10 +156,7 @@ impl MemorySet {
             Some(a) => a,
             None => return false,
         };
-        let translated = self
-            .page_table
-            .translate(vpn)
-            .filter(|(_, flags)| flags.contains(MappingFlags::P));
+        let translated = self.page_table.translate(vpn);
         let in_frames = area.data_frames.contains_key(&vpn);
         if !in_frames {
             let f = match frame_alloc() { Some(f) => f, None => return false };
@@ -234,20 +231,27 @@ impl MemorySet {
         }
         let mut vpn = start;
         while vpn < end {
-            if let Some((_pa, flags)) = self.translate(VirtAddr::from(vpn)) {
-                if !flags.contains(MappingFlags::U) {
+            let vaddr = VirtAddr::from(vpn);
+            let Some(area) = self
+                .areas
+                .iter()
+                .find(|area| {
+                    area.vaddr_range.get_start() <= vaddr && vaddr < area.vaddr_range.get_end()
+                })
+            else {
+                return false;
+            };
+            if !area.map_perm.contains(MapPermission::U) {
+                return false;
+            }
+            if need_write {
+                if !area.map_perm.contains(MapPermission::W) {
                     return false;
                 }
-                if need_write {
-                    if !flags.contains(MappingFlags::W) {
-                        return false;
-                    }
-                } else {
-                    if !flags.contains(MappingFlags::R) {
-                        return false;
-                    }
-                }
-            } else {
+            } else if !area.map_perm.contains(MapPermission::R) {
+                return false;
+            }
+            if self.translate(vaddr).is_none() {
                 return false;
             }
             vpn += crate::config::PAGE_SIZE;

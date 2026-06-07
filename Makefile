@@ -176,8 +176,11 @@ fs-img: $(APPS)
 		cp -f tmp/busybox-glibc-riscv64 $(ROOTFS_BIN_DIR)/busybox-glibc 2>/dev/null || true; \
 		cp -f tmp/busybox-glibc-riscv64 $(ROOTFS_DIR)/busybox-glibc 2>/dev/null || true; \
 		cp -f tmp/lmbench-riscv64/lmbench_all $(ROOTFS_DIR)/lmbench_all 2>/dev/null || true; \
+		cp -f tmp/lmbench-riscv64-glibc/lmbench_all $(ROOTFS_DIR)/lmbench_all-glibc 2>/dev/null || true; \
 		printf '#!/bin/sh\n/lmbench_all hello "$$@"\n' > $(ROOTFS_DIR)/hello 2>/dev/null || true; \
 		printf '#!/bin/sh\n/lmbench_all lat_sig "$$@"\n' > $(ROOTFS_DIR)/lat_sig 2>/dev/null || true; \
+		printf '#!/bin/sh\n/lmbench_all-glibc hello "$$@"\n' > $(ROOTFS_DIR)/hello-glibc 2>/dev/null || true; \
+		printf '#!/bin/sh\n/lmbench_all-glibc lat_sig "$$@"\n' > $(ROOTFS_DIR)/lat_sig-glibc 2>/dev/null || true; \
 		cp -f tmp/lmbench-riscv64/lmbench_testcode.sh $(ROOTFS_DIR)/lmbench_testcode.sh 2>/dev/null || true; \
 		cat testsuits-for-oskernel/scripts/busybox/busybox_cmd.txt > $(ROOTFS_DIR)/busybox_cmd.txt 2>/dev/null || cat tmp/busybox_cmd.txt > $(ROOTFS_DIR)/busybox_cmd.txt 2>/dev/null || true; \
 		sed 's|\./busybox|./busybox-glibc|g' $(ROOTFS_DIR)/busybox_cmd.txt > $(ROOTFS_DIR)/busybox_glibc_cmd.txt 2>/dev/null || true; \
@@ -191,10 +194,13 @@ fs-img: $(APPS)
 		cp -f tmp/busybox-musl-loongarch64 $(ROOTFS_DIR)/busybox 2>/dev/null || true; \
 		cp -f tmp/busybox-glibc-loongarch64 $(ROOTFS_BIN_DIR)/busybox-glibc 2>/dev/null || true; \
 		cp -f tmp/busybox-glibc-loongarch64 $(ROOTFS_DIR)/busybox-glibc 2>/dev/null || true; \
-		cp -f tmp/lmbench-loongarch64/lmbench_all $(ROOTFS_DIR)/lmbench_all 2>/dev/null || true; \
+		cp -f tmp/lmbench-loongarch64-musl/lmbench_all $(ROOTFS_DIR)/lmbench_all 2>/dev/null || cp -f tmp/lmbench-loongarch64/lmbench_all $(ROOTFS_DIR)/lmbench_all 2>/dev/null || true; \
+		cp -f tmp/lmbench-loongarch64-glibc/lmbench_all $(ROOTFS_DIR)/lmbench_all-glibc 2>/dev/null || true; \
 		printf '#!/bin/sh\n/lmbench_all hello "$$@"\n' > $(ROOTFS_DIR)/hello 2>/dev/null || true; \
 		printf '#!/bin/sh\n/lmbench_all lat_sig "$$@"\n' > $(ROOTFS_DIR)/lat_sig 2>/dev/null || true; \
-		cp -f tmp/lmbench-loongarch64/lmbench_testcode.sh $(ROOTFS_DIR)/lmbench_testcode.sh 2>/dev/null || true; \
+		printf '#!/bin/sh\n/lmbench_all-glibc hello "$$@"\n' > $(ROOTFS_DIR)/hello-glibc 2>/dev/null || true; \
+		printf '#!/bin/sh\n/lmbench_all-glibc lat_sig "$$@"\n' > $(ROOTFS_DIR)/lat_sig-glibc 2>/dev/null || true; \
+		cp -f tmp/lmbench-loongarch64-musl/lmbench_testcode.sh $(ROOTFS_DIR)/lmbench_testcode.sh 2>/dev/null || cp -f tmp/lmbench-loongarch64/lmbench_testcode.sh $(ROOTFS_DIR)/lmbench_testcode.sh 2>/dev/null || true; \
 		cat testsuits-for-oskernel/scripts/busybox/busybox_cmd.txt > $(ROOTFS_DIR)/busybox_cmd.txt 2>/dev/null || cat tmp/busybox_cmd.txt > $(ROOTFS_DIR)/busybox_cmd.txt 2>/dev/null || true; \
 		sed 's|\./busybox|./busybox-glibc|g' $(ROOTFS_DIR)/busybox_cmd.txt > $(ROOTFS_DIR)/busybox_glibc_cmd.txt 2>/dev/null || true; \
 		printf '#!/bin/sh\n./busybox-glibc --install -s /bin 2>/dev/null\necho "#### OS COMP TEST GROUP START busybox-glibc ####"\nwhile IFS= read -r line; do case "$$line" in ""|\\#*) continue ;; esac; eval "./busybox-glibc $$line"; RTN=$$?; if [ $$RTN -ne 0 ] && [ "$$line" != "false" ]; then echo "testcase busybox $$line fail"; else echo "testcase busybox $$line success"; fi; done < ./busybox_glibc_cmd.txt\necho "#### OS COMP TEST GROUP END busybox-glibc ####"\n' > $(ROOTFS_DIR)/busybox_glibc_testcode.sh; \
@@ -248,7 +254,17 @@ fs-img: $(APPS)
 			printf '%s\n' 'echo "#### OS COMP TEST GROUP END lmbench ####"'; \
 		} > "$(ROOTFS_DIR)/lmbench_testcode.sh"; \
 	fi
-	@chmod +x $(ROOTFS_DIR)/hello $(ROOTFS_DIR)/lat_sig $(ROOTFS_DIR)/lmbench_testcode.sh 2>/dev/null || true
+	@if [ -f "$(ROOTFS_DIR)/lmbench_all-glibc" ]; then \
+		sed \
+			-e 's|#### OS COMP TEST GROUP START lmbench ####|#### OS COMP TEST GROUP START lmbench-glibc ####|' \
+			-e 's|#### OS COMP TEST GROUP END lmbench ####|#### OS COMP TEST GROUP END lmbench-glibc ####|' \
+			-e 's|/busybox cp /hello /tmp/hello|/busybox cp /hello-glibc /tmp/hello|' \
+			-e 's|/busybox|/busybox-glibc|g' \
+			-e 's|/lmbench_all|/lmbench_all-glibc|g' \
+			-e 's|/lat_sig|/lat_sig-glibc|g' \
+			"$(ROOTFS_DIR)/lmbench_testcode.sh" > "$(ROOTFS_DIR)/lmbench_glibc_testcode.sh"; \
+	fi
+	@chmod +x $(ROOTFS_DIR)/hello $(ROOTFS_DIR)/lat_sig $(ROOTFS_DIR)/hello-glibc $(ROOTFS_DIR)/lat_sig-glibc $(ROOTFS_DIR)/lmbench_testcode.sh $(ROOTFS_DIR)/lmbench_glibc_testcode.sh 2>/dev/null || true
 	@cp -f tmp/debug_test.sh $(ROOTFS_DIR)/debug_test.sh 2>/dev/null || true
 	@cp -f tmp/run_all.sh $(ROOTFS_DIR)/run_all.sh 2>/dev/null || true
 	@cp -f tmp/basic_testcode.sh $(ROOTFS_DIR)/basic_testcode.sh 2>/dev/null || true
