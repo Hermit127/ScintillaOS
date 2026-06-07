@@ -1809,6 +1809,160 @@ pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset_ptr: *mut usize, count: 
     total
 }
 
+pub fn sys_rt_sigtimedwait(set: *const u8, info: *mut u8, timeout: *const u8, sigsetsize: usize) -> isize {
+    if set.is_null() || sigsetsize != 8 {
+        return -22;
+    }
+    let token = current_user_token();
+    let mask = *crate::mm::translated_ref(token, set as *const u64) as u32;
+    let mask = SignalFlags::from_bits_truncate(mask);
+
+    let timeout_ns: Option<u64> = if !timeout.is_null() {
+        let ts = *crate::mm::translated_ref(token, timeout as *const crate::task::TimeSpec);
+        if ts.tv_sec == 0 && ts.tv_nsec == 0 {
+            // immediate timeout — check once
+            let task = current_task().unwrap();
+            let mut inner = task.inner_exclusive_access();
+            let pending = inner.signals & mask;
+            if !pending.is_empty() {
+                // Find the lowest signal number
+                for sig in 1..=MAX_SIG {
+                    let flag = SignalFlags::from_bits(1 << sig).unwrap();
+                    if pending.contains(flag) {
+                        inner.signals ^= flag;
+                        if !info.is_null() {
+                            #[repr(C)]
+                            struct SiginfoT {
+                                si_signo: i32,
+                                si_errno: i32,
+                                si_code: i32,
+                                _pad: [u8; 108],
+                            }
+                            let siginfo = crate::mm::translated_refmut(token, info as *mut SiginfoT);
+                            siginfo.si_signo = sig as i32;
+                            siginfo.si_errno = 0;
+                            siginfo.si_code = 0;
+                        }
+                        return sig as isize;
+                    }
+                }
+            }
+            return -11; // EAGAIN
+        }
+        Some(ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64)
+    } else {
+        None
+    };
+
+    let timeout_deadline = timeout_ns.map(|ns| {
+        polyhal::time::Time::now().to_nsec() as u64 + ns
+    });
+
+    let task = current_task().unwrap();
+    let saved_mask = {
+        let mut inner = task.inner_exclusive_access();
+        let old = inner.signal_mask;
+        inner.signal_mask = !mask;
+        old
+    };
+
+    // Loop waiting for a signal
+    loop {
+        {
+            let task = current_task().unwrap();
+            let mut inner = task.inner_exclusive_access();
+            let pending = inner.signals & mask;
+            if !pending.is_empty() {
+                for sig in 1..=MAX_SIG {
+                    let flag = SignalFlags::from_bits(1 << sig).unwrap();
+                    if pending.contains(flag) {
+                        inner.signals ^= flag;
+                        if !info.is_null() {
+                            #[repr(C)]
+                            struct SiginfoT {
+                                si_signo: i32,
+                                si_errno: i32,
+                                si_code: i32,
+                                _pad: [u8; 108],
+                            }
+                            let siginfo = crate::mm::translated_refmut(token, info as *mut SiginfoT);
+                            siginfo.si_signo = sig as i32;
+                            siginfo.si_errno = 0;
+                            siginfo.si_code = 0;
+                        }
+                        inner.signal_mask = saved_mask;
+                        return sig as isize;
+                    }
+                }
+            }
+            if inner.killed {
+                inner.signal_mask = saved_mask;
+                return -4; // EINTR
+            }
+        }
+
+        if let Some(deadline) = timeout_deadline {
+            let now = polyhal::time::Time::now().to_nsec() as u64;
+            if now >= deadline {
+                let task = current_task().unwrap();
+                let mut inner = task.inner_exclusive_access();
+                inner.signal_mask = saved_mask;
+                return -11; // EAGAIN
+            }
+        }
+
+        crate::fs::stdio::stdout_release_if_owner();
+        crate::task::suspend_current_and_run_next();
+    }
+}
+
+pub fn sys_tgkill(tgid: usize, tid: usize, sig: i32) -> isize {
+    if sig < 0 || sig as usize > MAX_SIG {
+        return -22;
+    }
+    if let Some(task) = pid2task(tid) {
+        let target_tgid = task.getpid();
+        // In our implementation, tgid is the main thread's pid
+        // For single-threaded, tgid == tid
+        if tgid != 0 && tgid != target_tgid {
+            // Check if this task belongs to tgid (simplified)
+            // We just allow if tgid matches or is 0
+        }
+        if sig == 0 {
+            return 0;
+        }
+        let flag = SignalFlags::from_bits(1u32 << sig as usize).unwrap();
+        let mut task_ref = task.inner_exclusive_access();
+        if task_ref.signals.contains(flag) {
+            return 0;
+        }
+        task_ref.signals.insert(flag);
+        if flag == SignalFlags::SIGKILL || flag == SignalFlags::SIGTERM {
+            task_ref.killed = true;
+            task_ref.exit_signal = -(sig as i32);
+        } else if task_ref.signal_actions.table[sig as usize].handler == 0 {
+            let fatal = flag.intersects(
+                SignalFlags::SIGSEGV | SignalFlags::SIGABRT | SignalFlags::SIGILL
+                | SignalFlags::SIGFPE | SignalFlags::SIGBUS | SignalFlags::SIGSYS
+                | SignalFlags::SIGTRAP
+                | SignalFlags::SIGALRM | SignalFlags::SIGVTALRM | SignalFlags::SIGPROF
+                | SignalFlags::SIGTERM | SignalFlags::SIGINT | SignalFlags::SIGQUIT
+                | SignalFlags::SIGHUP | SignalFlags::SIGPIPE | SignalFlags::SIGUSR1
+                | SignalFlags::SIGUSR2
+                | SignalFlags::SIGXCPU | SignalFlags::SIGXFSZ
+                | SignalFlags::SIGIO | SignalFlags::SIGPWR,
+            );
+            if fatal {
+                task_ref.killed = true;
+                task_ref.exit_signal = -(sig as i32);
+            }
+        }
+        0
+    } else {
+        -3 // ESRCH
+    }
+}
+
 pub fn sys_getrusage(who: usize, usage: *mut u8) -> isize {
     const RUSAGE_SELF: usize = 0;
     const RUSAGE_CHILDREN: usize = usize::MAX;

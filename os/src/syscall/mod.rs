@@ -34,6 +34,8 @@ const SYSCALL_CLOCK_NANOSLEEP: usize = 115;
 const SYSCALL_SYSLOG: usize = 116;
 const SYSCALL_YIELD: usize = 124;
 const SYSCALL_KILL: usize = 129;
+const SYSCALL_RT_SIGTIMEDWAIT: usize = 137;
+const SYSCALL_TGKILL: usize = 131;
 const SYSCALL_SIGACTION: usize = 134;
 const SYSCALL_SIGPROCMASK: usize = 135;
 const SYSCALL_SIGRETURN: usize = 139;
@@ -53,6 +55,8 @@ const SYSCALL_GETRUSAGE: usize = 165;
 const SYSCALL_UMASK: usize = 166;
 const SYSCALL_SETUID: usize = 146;
 const SYSCALL_SETGID: usize = 144;
+const SYSCALL_GETRLIMIT: usize = 163;
+const SYSCALL_SETRLIMIT: usize = 164;
 const SYSCALL_BRK: usize = 214;
 const SYSCALL_MUNMAP: usize = 215;
 const SYSCALL_READV: usize = 65;
@@ -206,10 +210,17 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_YIELD => sys_yield(),
         SYSCALL_SYSLOG => sys_syslog(args[0], args[1] as *mut u8, args[2]),
         SYSCALL_KILL => sys_kill(args[0], args[1] as i32),
+        SYSCALL_TGKILL => sys_tgkill(args[0], args[1], args[2] as i32),
         SYSCALL_SIGACTION => sys_sigaction(
             args[0] as i32,
             args[1] as *const SignalAction,
             args[2] as *mut SignalAction,
+        ),
+        SYSCALL_RT_SIGTIMEDWAIT => sys_rt_sigtimedwait(
+            args[0] as *const u8,
+            args[1] as *mut u8,
+            args[2] as *const u8,
+            args[3],
         ),
         SYSCALL_SIGPROCMASK => sys_sigprocmask(args[0] as u32),
         SYSCALL_SIGRETURN => sys_sigreturn(),
@@ -322,6 +333,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_FSTATFS => sys_fstatfs(args[0], args[1] as *mut u8),
         SYSCALL_PRCTL => 0,
         SYSCALL_PRLIMIT64 => 0,
+        SYSCALL_GETRLIMIT => sys_getrlimit(args[0], args[1] as *mut u8),
+        SYSCALL_SETRLIMIT => sys_setrlimit(args[0], args[1] as *const u8),
         SYSCALL_SYSINFO => -38,
         SYSCALL_SCHED_GETAFFINITY => -38,
         SYSCALL_EPOLL_CREATE1 => -38,
