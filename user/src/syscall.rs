@@ -243,8 +243,8 @@ pub fn sys_sigaction(
     )
 }
 
-pub fn sys_sigprocmask(mask: u32) -> isize {
-    syscall(SYSCALL_SIGPROCMASK, [mask as usize, 0, 0, 0, 0, 0])
+pub fn sys_sigprocmask(how: usize, set: usize, oldset: usize, sigsetsize: usize) -> isize {
+    syscall(SYSCALL_SIGPROCMASK, [how, set, oldset, sigsetsize, 0, 0])
 }
 
 pub fn sys_sigreturn() -> isize {

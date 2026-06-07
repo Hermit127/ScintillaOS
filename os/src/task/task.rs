@@ -95,6 +95,7 @@ pub struct TaskControlBlockInner {
     pub alt_stack_flags: u32,
     pub in_syscall: bool,
     pub exit_signal: i32,
+    pub clone_vm: bool,
 }
 
 impl TaskControlBlockInner {
@@ -257,6 +258,7 @@ impl TaskControlBlock {
                     alt_stack_flags: 0,
                     in_syscall: false,
                     exit_signal: 0,
+                    clone_vm: false,
                 }, "TaskInner")
             },
         };
@@ -431,10 +433,16 @@ impl TaskControlBlock {
         trap_cx[TrapFrameArgs::ARG1] = argv_base;
         *inner.get_trap_cx() = trap_cx;
     }
-    pub fn fork(self: &Arc<TaskControlBlock>) -> Option<Arc<TaskControlBlock>> {
-        trace!("os::task::TaskControlBlock::fork");
-        // Copy the user address space before collecting the remaining task state.
-        let memory_set = {
+    pub fn fork_with_flags(self: &Arc<TaskControlBlock>, flags: usize) -> Option<Arc<TaskControlBlock>> {
+        const CLONE_VM: usize = 0x100;
+        const CLONE_FILES: usize = 0x400;
+        const CLONE_SIGHAND: usize = 0x800;
+
+        trace!("os::task::TaskControlBlock::fork_with_flags");
+        let memory_set = if flags & CLONE_VM != 0 {
+            let parent_inner = self.inner_exclusive_access();
+            MemorySet::clone_shared(&parent_inner.memory_set)
+        } else {
             let parent_inner = self.inner_exclusive_access();
             MemorySet::from_existed_user(&parent_inner.memory_set)?
         };
@@ -536,6 +544,7 @@ impl TaskControlBlock {
                     alt_stack_flags: 0,
                     in_syscall: false,
                     exit_signal: 0,
+                    clone_vm: flags & CLONE_VM != 0,
                 }, "TaskInner")
             },
         });
@@ -545,6 +554,9 @@ impl TaskControlBlock {
             parent_inner.children.push(task_control_block.clone());
         }
         Some(task_control_block)
+    }
+    pub fn fork(self: &Arc<TaskControlBlock>) -> Option<Arc<TaskControlBlock>> {
+        self.fork_with_flags(0)
     }
     pub fn getpid(&self) -> usize {
         self.pid.0

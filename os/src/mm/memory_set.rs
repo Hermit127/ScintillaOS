@@ -122,26 +122,41 @@ impl MemorySet {
         }
     }
     pub fn from_existed_user(user_space: &MemorySet) -> Option<MemorySet> {
+        Self::from_existed_user_shared(user_space, false)
+    }
+
+    pub fn clone_shared(user_space: &MemorySet) -> MemorySet {
+        Self::from_existed_user_shared(user_space, true).unwrap()
+    }
+
+    fn from_existed_user_shared(user_space: &MemorySet, shared: bool) -> Option<MemorySet> {
         trace!("os::mm::MemorySet::from_existed_user");
         let mut memory_set = Self::new_bare();
+        if shared {
+            memory_set.page_table = user_space.page_table.clone();
+        }
         for area in user_space.areas.iter() {
             let mut new_area = MapArea::from_another(area);
             for (&vpn, frame) in area.data_frames.iter() {
-                let new_frame = frame_alloc()?;
-                memory_set.page_table.map_page(
-                    vpn,
-                    new_frame.paddr,
-                    area.map_perm.into(),
-                    MappingSize::Page4KB,
-                );
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        frame.paddr.get_ptr::<u8>(),
-                        new_frame.paddr.get_mut_ptr(),
-                        PAGE_SIZE,
+                if !shared {
+                    let new_frame = frame_alloc()?;
+                    memory_set.page_table.map_page(
+                        vpn,
+                        new_frame.paddr,
+                        area.map_perm.into(),
+                        MappingSize::Page4KB,
                     );
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            frame.paddr.get_ptr::<u8>(),
+                            new_frame.paddr.get_mut_ptr(),
+                            PAGE_SIZE,
+                        );
+                    }
+                    new_area.data_frames.insert(vpn, new_frame);
+                } else {
+                    new_area.data_frames.insert(vpn, frame.shared_clone());
                 }
-                new_area.data_frames.insert(vpn, new_frame);
             }
             memory_set.areas.push(new_area);
         }

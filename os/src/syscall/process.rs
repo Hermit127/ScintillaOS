@@ -139,7 +139,7 @@ const CLONE_CHILD_SETTID: usize = 0x01000000;
 
 pub fn sys_clone(flags: usize, stack: usize, ptid: usize, tls: usize, ctid: usize) -> isize {
     let current_task = current_task().unwrap();
-    let Some(new_task) = current_task.fork() else {
+    let Some(new_task) = current_task.fork_with_flags(flags) else {
         return -12;
     };
     let new_pid = new_task.pid.0;
@@ -207,11 +207,18 @@ pub fn sys_exec(path: *const u8, mut args: *const usize, mut envp: *const usize)
             }
         }
     }
-    let app_inode = open_file(path.as_str(), OpenFlags::RDONLY).or_else(|| {
-        if path.starts_with('/') {
-            None
-        } else {
+    let cwd = crate::task::current_task()
+        .map(|t| t.inner_exclusive_access().cwd.clone());
+    let app_inode = if path.starts_with('/') {
+        open_file(path.as_str(), OpenFlags::RDONLY)
+    } else {
+        crate::fs::open_file_at(cwd, path.as_str(), OpenFlags::RDONLY, 0)
+    };
+    let app_inode = app_inode.or_else(|| {
+        if !path.starts_with('/') {
             open_file(format!("/bin/{}", path).as_str(), OpenFlags::RDONLY)
+        } else {
+            None
         }
     });
     if let Some(app_inode) = app_inode {
@@ -221,16 +228,28 @@ pub fn sys_exec(path: *const u8, mut args: *const usize, mut envp: *const usize)
             let line = core::str::from_utf8(&all_data[2..end]).unwrap_or("");
             let parts: alloc::vec::Vec<&str> = line.split_whitespace().collect();
             if !parts.is_empty() {
-                let ipath = if parts[0].starts_with('/') { alloc::string::String::from(parts[0]) }
-                           else { alloc::format!("/bin/{}", parts[0]) };
+                let ipath = alloc::string::String::from(parts[0]);
                 let mut new_args = alloc::vec![ipath.clone()];
                 if parts.len() > 1 { new_args.push(alloc::string::String::from(parts[1])); }
                 new_args.push(path);
                 for a in args_vec.iter().skip(1) { new_args.push(a.clone()); }
                 drop(app_inode);
-                if let Some(i2) = open_file(&ipath, OpenFlags::RDONLY)
-                    .or_else(|| open_file(&alloc::format!("/bin/{}", ipath), OpenFlags::RDONLY)) {
-                    let d2 = i2.read_all();
+                let i2 = if ipath.starts_with('/') {
+                    open_file(ipath.as_str(), OpenFlags::RDONLY)
+                } else {
+                    let cwd2 = crate::task::current_task()
+                        .map(|t| t.inner_exclusive_access().cwd.clone());
+                    crate::fs::open_file_at(cwd2, ipath.as_str(), OpenFlags::RDONLY, 0)
+                };
+                if i2.is_some() || {
+                    if !ipath.starts_with('/') {
+                        open_file(format!("/bin/{}", ipath).as_str(), OpenFlags::RDONLY)
+                    } else {
+                        None
+                    }
+                }.is_some() {
+                    let real_i2 = i2.or_else(|| open_file(format!("/bin/{}", ipath).as_str(), OpenFlags::RDONLY)).unwrap();
+                    let d2 = real_i2.read_all();
                     current_task().unwrap().exec(&d2, new_args, env_vec);
                     return 0;
                 }
@@ -350,16 +369,42 @@ pub fn sys_kill(pid: usize, signum: i32) -> isize {
     }
 }
 
-pub fn sys_sigprocmask(mask: u32) -> isize {
+pub fn sys_sigprocmask(how: usize, set: *const u8, oldset: *mut u8, sigsetsize: usize) -> isize {
+    const SIG_BLOCK: usize = 0;
+    const SIG_UNBLOCK: usize = 1;
+    const SIG_SETMASK: usize = 2;
+
+    if sigsetsize != 8 {
+        return -22;
+    }
+
     if let Some(task) = current_task() {
         let mut inner = task.inner_exclusive_access();
-        let old_mask = inner.signal_mask;
-        if let Some(flag) = SignalFlags::from_bits(mask) {
-            inner.signal_mask = flag;
-            old_mask.bits() as isize
-        } else {
-            -1
+        let token = inner.get_user_token();
+        let old = inner.signal_mask.bits();
+
+        if !oldset.is_null() {
+            *translated_refmut(token, oldset as *mut u32) = old;
         }
+
+        if !set.is_null() {
+            let new_mask = *translated_ref(token, set as *const u32);
+            let new_flags = SignalFlags::from_bits_truncate(new_mask);
+            match how {
+                SIG_BLOCK => {
+                    inner.signal_mask |= new_flags;
+                }
+                SIG_UNBLOCK => {
+                    inner.signal_mask &= !new_flags;
+                }
+                SIG_SETMASK => {
+                    inner.signal_mask = new_flags;
+                }
+                _ => return -22,
+            }
+        }
+
+        old as isize
     } else {
         -1
     }
@@ -1540,16 +1585,50 @@ pub fn sys_futex(
     let token = current_user_token();
     let cur = *translated_ref(token, uaddr);
     let op = futex_op & 0x0F;
+    let addr = uaddr as usize;
     match op {
         0 | 9 => {
             if cur == val as u32 {
-                suspend_current_and_run_next();
+                let task = current_task().unwrap();
+                crate::task::FUTEX_QUEUE.exclusive_access().push((addr, task.clone()));
+                crate::task::suspend_current_and_run_next();
                 0
             } else {
                 -11
             }
         }
-        1 | 10 => 0,
+        1 | 10 => {
+            let max_wake = if op == 10 { _val3 } else { val };
+            if max_wake == 0 {
+                return 0;
+            }
+            let count = if max_wake == usize::MAX || max_wake > 128 {
+                128
+            } else {
+                max_wake
+            };
+            let mut woken = 0;
+            let mut queue = crate::task::FUTEX_QUEUE.exclusive_access();
+            let mut to_wake = Vec::new();
+            let mut remaining = Vec::new();
+            for (a, task) in queue.drain(..) {
+                if woken < count && (a == addr || (op == 10 && (a & !(4096 - 1)) == (addr & !(4096 - 1)))) {
+                    to_wake.push(task);
+                    woken += 1;
+                } else {
+                    remaining.push((a, task));
+                }
+            }
+            *queue = remaining;
+            drop(queue);
+            for task in to_wake {
+                let mut inner = task.inner_exclusive_access();
+                inner.task_status = TaskStatus::Ready;
+                drop(inner);
+                crate::task::add_task(task);
+            }
+            woken as isize
+        }
         6..=8 | 11..=13 => 0,
         _ => -38,
     }

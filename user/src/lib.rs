@@ -280,8 +280,8 @@ pub fn sigaction(
     )
 }
 
-pub fn sigprocmask(mask: u32) -> isize {
-    sys_sigprocmask(mask)
+pub fn sigprocmask(how: i32, set: *const SignalFlags, oldset: *mut SignalFlags) -> isize {
+    sys_sigprocmask(how as usize, set as usize, oldset as usize, 8)
 }
 
 pub fn sigreturn() -> isize {

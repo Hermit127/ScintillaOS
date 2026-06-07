@@ -900,6 +900,9 @@ pub fn sys_dup(fd: usize) -> isize {
         return -9;
     }
     let new_fd = inner.alloc_fd();
+    if new_fd >= inner.fd_table.len() {
+        return -24;
+    }
     let file = Arc::clone(inner.fd_table[fd].as_ref().unwrap());
     file.dup_ref();
     inner.fd_table[new_fd] = Some(file);
@@ -1091,6 +1094,16 @@ pub fn sys_fstatat(dirfd: isize, path: *const u8, stat_buf: *mut u8, flags: usiz
         return -2; // ENOENT
     }
 
+    // Special device files
+    if path_str == "/dev/null" || path_str == "/dev/zero" || path_str == "/dev/null/invalid"
+        || path_str == "/dev/urandom" || path_str == "/dev/random" || path_str == "/dev/rtc"
+        || path_str == "/dev/misc/rtc"
+    {
+        let st = Kstat::new(crate::fs::S_IFCHR);
+        *translated_refmut(token, stat_buf as *mut Kstat) = st;
+        return 0;
+    }
+
     let base = match resolve_base_dir(dirfd) {
         Some(b) => b,
         None => return -2,
@@ -1138,6 +1151,16 @@ pub fn sys_statx(
     let path_str = translated_str(token, path);
     if path_str.is_empty() {
         return -2;
+    }
+
+    // Special device files
+    if path_str == "/dev/null" || path_str == "/dev/zero" || path_str == "/dev/null/invalid"
+        || path_str == "/dev/urandom" || path_str == "/dev/random" || path_str == "/dev/rtc"
+        || path_str == "/dev/misc/rtc"
+    {
+        let st = Kstat::new(crate::fs::S_IFCHR);
+        write_statx(statx_buf, &st, mask);
+        return 0;
     }
 
     let base = match resolve_base_dir(dirfd) {

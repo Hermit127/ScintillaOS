@@ -222,7 +222,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[2] as *const u8,
             args[3],
         ),
-        SYSCALL_SIGPROCMASK => sys_sigprocmask(args[0] as u32),
+        SYSCALL_SIGPROCMASK => sys_sigprocmask(args[0], args[1] as *const u8, args[2] as *mut u8, args[3]),
         SYSCALL_SIGRETURN => sys_sigreturn(),
         SYSCALL_GETITIMER => sys_getitimer(args[0], args[1] as *mut u8),
         SYSCALL_SETITIMER => sys_setitimer(args[0], args[1] as *const u8, args[2] as *mut u8),

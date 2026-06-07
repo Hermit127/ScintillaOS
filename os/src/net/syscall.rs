@@ -36,7 +36,7 @@ const SHUT_WR: usize = 1;
 const SHUT_RDWR: usize = 2;
 
 fn net_ready() -> bool {
-    false
+    true
 }
 
 #[repr(C)]

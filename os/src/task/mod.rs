@@ -51,6 +51,9 @@ lazy_static! {
     pub static ref WAITPID_QUEUE: UPSafeCell<Vec<Arc<TaskControlBlock>>> = unsafe {
         UPSafeCell::new_named(Vec::new(), "WaitpidQueue")
     };
+    pub static ref FUTEX_QUEUE: UPSafeCell<Vec<(usize, Arc<TaskControlBlock>)>> = unsafe {
+        UPSafeCell::new_named(Vec::new(), "FutexQueue")
+    };
 }
 
 pub fn suspend_current_and_run_next() {
@@ -161,8 +164,10 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
         inner.exit_code = exit_code;
         let parent = inner.parent.as_ref().and_then(|w| w.upgrade());
         let orphan_children = core::mem::take(&mut inner.children);
-        // deallocate user space
-        inner.memory_set.recycle_data_pages();
+        // deallocate user space (skip for threads sharing vm)
+        if !inner.clone_vm {
+            inner.memory_set.recycle_data_pages();
+        }
         // drop file descriptors
         inner.clear_fd_table();
         (parent, orphan_children)
@@ -203,7 +208,7 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
 
 lazy_static! {
     pub static ref INITPROC: Arc<TaskControlBlock> = Arc::new({
-        let inode = open_file("/bin/initproc", OpenFlags::RDONLY).unwrap();
+        let inode = open_file("/bin/contest_runner", OpenFlags::RDONLY).unwrap();
         let v = inode.read_all();
         TaskControlBlock::new(v.as_slice())
     });
