@@ -4,6 +4,12 @@
 
 使用中文回复用户
 
+## Branch Migration Rule
+
+- 从 `MachineTest` 向 `main` 迁移修改时，默认迁移除 `user/src/bin/initproc.rs` 和磁盘镜像/磁盘产物之外的所有修改。
+- 在 `main` 分支测试时，默认 `initproc` 保持 shell 入口；不要迁移或改成自动跑测试的入口，用户会自己输入命令测试。
+- 除非用户明确要求，不要上传或 `push`；构建和测试只做本地操作。
+
 ## Build & Run
 
 ```bash

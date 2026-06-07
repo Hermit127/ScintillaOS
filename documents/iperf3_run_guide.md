@@ -233,3 +233,174 @@ QEMU SLIRP 用户态网络下单核 RISC-V：
 | iperf3 源码 + 编译脚本 | `testsuits-for-oskernel/iperf/` |
 | 测试脚本 | `testsuits-for-oskernel/scripts/iperf/iperf_testcode.sh` |
 | 本文档 | `documents/iperf3_run_guide.md` |
+
+# iperf3 测试指南
+
+## 前置条件
+
+- Rust toolchain: `nightly-2025-02-01`（`rust-toolchain.toml` 已指定）
+- QEMU: `qemu-system-riscv64`
+- `debugfs`（e2fsprogs，用于修改 ext4 镜像）
+- 工作目录: `oskernel2026test/`
+
+---
+
+## 快捷方式（推荐）
+
+完整构建+运行只需一行：
+
+```bash
+make run ARCH=riscv64
+```
+
+这条命令等价于：
+1. 检查/安装 Rust 工具链 → `env`
+2. 构建用户空间 + 文件系统镜像 → `fs-img`
+3. 编译内核 → `cargo build --release`
+4. 启动 QEMU → `qemu-system-riscv64 ...`
+
+`make run` 内部构造的 QEMU 参数：
+
+```
+qemu-system-riscv64 -machine virt \
+  -kernel kernel-rv \
+  -nographic -m 256M -smp 1 \
+  -drive file=fs.img,id=x0,bus=virtio-mmio-bus.0 \
+  -drive file=fs.img,id=x1,bus=virtio-mmio-bus.1 \
+  -netdev user,id=net0,hostfwd=tcp::5555-:5001,hostfwd=tcp::5556-:5201 \
+  -device virtio-net-device,netdev=net0,bus=virtio-mmio-bus.2
+```
+
+如果 `make run` 因 cmake 缺失（`basic/user` 的 Makefile 调用了 cmake）无法构建 `fs-img`，
+可以分两步启动：
+
+```bash
+# 只编译内核
+make kernel ARCH=riscv64
+
+# 手动启动 QEMU（跳过 make run 的 fs-img 依赖）
+qemu-system-riscv64 \
+  -machine virt -kernel kernel-rv -nographic -m 256M -smp 1 \
+  -drive file=target/riscv64gc-unknown-none-elf/release/fs.img,if=none,format=raw,id=x0,file.locking=off \
+  -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
+  -drive file=target/riscv64gc-unknown-none-elf/release/fs.img,if=none,format=raw,id=x1,file.locking=off \
+  -device virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1 \
+  -netdev user,id=net0,hostfwd=tcp::5555-:5001,hostfwd=tcp::5556-:5201 \
+  -device virtio-net-device,netdev=net0,bus=virtio-mmio-bus.2
+```
+
+---
+
+## 完整操作流程
+
+### 1. 准备 iperf_test 测试程序
+
+预编译的 `iperf_test` 位于 `target/riscv64gc-unknown-none-elf/release/iperf_test`。
+
+写入文件系统镜像：
+
+```bash
+cp target/riscv64gc-unknown-none-elf/release/fs.img /tmp/fs_iperf.img
+
+debugfs -w /tmp/fs_iperf.img <<EOF
+rm /bin/iperf_test
+write target/riscv64gc-unknown-none-elf/release/iperf_test /bin/iperf_test
+EOF
+
+cp /tmp/fs_iperf.img target/riscv64gc-unknown-none-elf/release/fs.img
+```
+
+### 2. 编译 & 启动
+
+**方式 A：一键（cmake 可用时）**
+
+```bash
+make run ARCH=riscv64
+```
+
+**方式 B：分步（cmake 不可用时）**
+
+```bash
+make kernel ARCH=riscv64
+cp target/riscv64gc-unknown-none-elf/release/os.bin kernel-rv
+
+qemu-system-riscv64 \
+  -machine virt -kernel kernel-rv -nographic -m 256M -smp 1 \
+  -drive file=target/riscv64gc-unknown-none-elf/release/fs.img,if=none,format=raw,id=x0,file.locking=off \
+  -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
+  -drive file=target/riscv64gc-unknown-none-elf/release/fs.img,if=none,format=raw,id=x1,file.locking=off \
+  -device virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1 \
+  -netdev user,id=net0,hostfwd=tcp::5555-:5001,hostfwd=tcp::5556-:5201 \
+  -device virtio-net-device,netdev=net0,bus=virtio-mmio-bus.2
+```
+
+> **端口说明**：`hostfwd` 把 QEMU 内部的 127.0.0.1:5001 映射到宿主机的 5555 端口。
+> iperf3 在 QEMU 内部用 127.0.0.1:5001 通信，`hostfwd` 仅在需要从外部访问时才用到。
+> 如果端口 5555/5556 被占用，换一个端口号即可（如 `6666-:5001`）。
+
+### 3. 退出 QEMU
+
+- 按 `Ctrl-A` 然后按 `x`
+- 或：`timeout 120 qemu-system-riscv64 ...`（120 秒后自动终止）
+
+---
+
+## 预期输出
+
+内核启动后，`initproc` 自动运行 `iperf_test`：
+
+```
+#### OS COMP TEST GROUP START iperf ####
+-----------------------------------------------------------
+Server listening on 5001 (test #1)
+-----------------------------------------------------------
+Server running (pid=2)
+[1] BASIC_TCP
+Connecting to host 127.0.0.1, port 5001
+Accepted connection from 127.0.0.1, port 64444
+[  5] local 127.0.0.1 port 39596 connected to 127.0.0.1 port 5001
+  PASS
+...
+[6] REVERSE_UDP
+  PASS
+#### RESULT: 6/6 passed ####
+#### OS COMP TEST GROUP END iperf ####
+```
+
+---
+
+## 当前已有内核修改
+
+以下修改已在 working tree 中，无需额外操作：
+
+| 文件 | 改动 |
+|------|------|
+| `os/src/net/mod.rs` | `net_poll()` 提前释放 RefCell 锁；唤醒后强制调度 |
+| `os/src/net/syscall.rs` | `sys_accept` 检测打印 |
+| `os/src/syscall/fs.rs` | 实现 `sys_ftruncate`；`sys_unlinkat` 跳过 `/tmp/iperf3.*` |
+| `os/src/syscall/mod.rs` | 添加 `SYSCALL_FTRUNCATE` |
+| `os/src/syscall/process.rs` | `pselect6`/`ppoll` 调试打印 |
+| `os/src/task/manager.rs` | `add_priority`/`fetch` 调试打印 |
+| `user/src/bin/initproc.rs` | 改为运行 `iperf_test` |
+| `lwext4_rust/src/blockdev.rs` | 添加 `get_fs_ptr()` |
+
+---
+
+## 恢复 user_shell
+
+```rust
+// user/src/bin/initproc.rs
+exec("user_shell\0", &[core::ptr::null::<u8>()]);
+```
+
+重新编译 user 空间并更新 fs.img。
+
+---
+
+## 当前状态
+
+- [x] 控制连接 TCP + cookie/JSON 交换
+- [x] 数据连接 TCP 握手（connect ret=0）
+- [x] server accept 返回
+- [x] 流创建（mkstemp/ftruncate/mmap）
+- [ ] 数据通道调度/事件循环（排查中）

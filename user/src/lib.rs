@@ -18,7 +18,7 @@ use syscall::*;
 
 pub use syscall::*;
 
-const USER_HEAP_SIZE: usize = 32768;
+const USER_HEAP_SIZE: usize = 8 * 1024 * 1024; // 8MB for iperf3
 
 static mut HEAP_SPACE: [u8; USER_HEAP_SIZE] = [0; USER_HEAP_SIZE];
 
@@ -67,6 +67,7 @@ bitflags! {
         const RDWR = 1 << 1;
         const CREATE = 0x40;
         const TRUNC = 0x200;
+        const APPEND = 0x400;
         const DIRECTORY = 0x10000;
     }
 }
@@ -85,6 +86,9 @@ pub fn openat(dirfd: isize, path: &str, flags: OpenFlags, mode: u32) -> isize {
 }
 pub fn close(fd: usize) -> isize {
     sys_close(fd)
+}
+pub fn getdents64(fd: usize, buf: &mut [u8]) -> isize {
+    sys_getdents64(fd, buf)
 }
 pub fn pipe(pipe_fd: &mut [u32]) -> isize {
     sys_pipe(pipe_fd)
@@ -132,7 +136,10 @@ pub fn fork() -> isize {
     sys_fork()
 }
 pub fn exec(path: &str, args: &[*const u8]) -> isize {
-    sys_exec(path, args)
+    sys_exec(path, args, &[core::ptr::null::<u8>()])
+}
+pub fn execve(path: &str, args: &[*const u8], envs: &[*const u8]) -> isize {
+    sys_exec(path, args, envs)
 }
 pub fn wait(exit_code: &mut i32) -> isize {
     loop {
@@ -182,7 +189,7 @@ impl Default for SignalAction {
     fn default() -> Self {
         Self {
             handler: 0,
-            mask: SignalFlags::empty(),
+            mask: SignalFlags::from_bits(40).unwrap(),
         }
     }
 }
@@ -299,4 +306,12 @@ pub fn times(tms: &mut Tms) -> isize {
 
 pub fn shutdown() -> isize {
     sys_shutdown()
+}
+
+pub fn mount(source: &str, target: &str, fstype: &str, flags: usize, data: &[u8]) -> isize {
+    sys_mount(source, target, fstype, flags, data)
+}
+
+pub fn umount2(target: &str, flags: usize) -> isize {
+    sys_umount2(target, flags)
 }

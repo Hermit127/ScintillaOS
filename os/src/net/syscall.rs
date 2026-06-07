@@ -8,7 +8,7 @@ use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
 
 use crate::mm::{translated_ref, translated_refmut};
 use crate::net::socket::{SocketFile, SocketType};
-use crate::task::{block_current_and_run_next, current_task, current_user_token, BlockReason};
+use crate::task::{block_current_and_run_next, current_task, current_user_token, suspend_current_and_run_next, BlockReason};
 use alloc::sync::Arc;
 
 const SOCKET_BUFFER_SIZE: usize = 65536;
@@ -34,6 +34,10 @@ const TCP_NODELAY: usize = 1;
 const SHUT_RD: usize = 0;
 const SHUT_WR: usize = 1;
 const SHUT_RDWR: usize = 2;
+
+fn net_ready() -> bool {
+    false
+}
 
 #[repr(C)]
 struct SockAddrIn {
@@ -169,6 +173,9 @@ pub fn sys_socket(domain: usize, type_: usize, _protocol: usize) -> isize {
     if domain != AF_INET {
         return -97;
     }
+    if !net_ready() {
+        return -97;
+    }
 
     let st = match type_ & 0x0F {
         SOCK_STREAM => SocketType::Tcp,
@@ -192,6 +199,9 @@ pub fn sys_socket(domain: usize, type_: usize, _protocol: usize) -> isize {
 }
 
 pub fn sys_bind(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
+    if !net_ready() {
+        return -97;
+    }
     if addr.is_null() || addrlen < 8 {
         return -14;
     }
@@ -214,17 +224,28 @@ pub fn sys_bind(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
     crate::net::with_net_iface(|iface| match st {
         SocketType::Tcp => {
             let sock: &mut TcpSocket = iface.sockets.get_mut(handle);
-            sock.listen(endpoint).map(|_| 0).unwrap_or(-22)
+            sock.listen(if ip == 0 {
+                IpListenEndpoint { addr: None, port }
+            } else {
+                IpListenEndpoint { addr: Some(endpoint.addr), port }
+            }).map(|_| 0).unwrap_or(-22)
         }
         SocketType::Udp => {
             let sock: &mut UdpSocket = iface.sockets.get_mut(handle);
-            sock.bind(endpoint).map(|_| 0).unwrap_or(-22)
+            sock.bind(if ip == 0 {
+                IpListenEndpoint { addr: None, port }
+            } else {
+                IpListenEndpoint { addr: Some(endpoint.addr), port }
+            }).map(|_| 0).unwrap_or(-22)
         }
     })
     .unwrap_or(-1)
 }
 
 pub fn sys_connect(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
+    if !net_ready() {
+        return -97;
+    }
     if addr.is_null() || addrlen < 8 {
         return -14;
     }
@@ -266,7 +287,10 @@ pub fn sys_connect(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
         port: 32768 + ((sockfd as u16).wrapping_mul(7919) % 32767), // non-zero ephemeral port
     };
 
-    crate::net::with_net_iface_tcp_connect(handle, remote, local);
+    let connect_ret = crate::net::with_net_iface_tcp_connect(handle, remote, local);
+    if connect_ret < 0 {
+        return connect_ret;
+    }
     crate::net::net_poll();
 
     if !nonblock {
@@ -299,6 +323,9 @@ pub fn sys_connect(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
 }
 
 pub fn sys_listen(sockfd: usize, _backlog: usize) -> isize {
+    if !net_ready() {
+        return -97;
+    }
     let (handle, st, _nonblock) = match sock_lookup(sockfd) {
         Some(v) => v,
         None => return -9,
@@ -333,6 +360,9 @@ pub fn sys_listen(sockfd: usize, _backlog: usize) -> isize {
 }
 
 pub fn sys_accept(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
+    if !net_ready() {
+        return -97;
+    }
     let task = current_task().unwrap();
     let inner = task.inner_exclusive_access();
 
@@ -467,6 +497,9 @@ pub fn sys_sendto(
     dest_addr: *const u8,
     addrlen: usize,
 ) -> isize {
+    if !net_ready() {
+        return -97;
+    }
     let (handle, st, nonblock) = match sock_lookup(sockfd) {
         Some(v) => v,
         None => return -9,
@@ -506,6 +539,9 @@ pub fn sys_recvfrom(
     src_addr: *mut u8,
     addrlen: *mut usize,
 ) -> isize {
+    if !net_ready() {
+        return -97;
+    }
     let (handle, st, nonblock) = match sock_lookup(sockfd) {
         Some(v) => v,
         None => return -9,
@@ -543,6 +579,9 @@ pub fn sys_recvfrom(
 }
 
 pub fn sys_sendmsg(sockfd: usize, msg: *const u8, flags: usize) -> isize {
+    if !net_ready() {
+        return -97;
+    }
     let token = current_user_token();
     let msghdr: &Msghdr = translated_ref(token, msg as *const Msghdr);
 
@@ -588,6 +627,9 @@ pub fn sys_sendmsg(sockfd: usize, msg: *const u8, flags: usize) -> isize {
 }
 
 pub fn sys_recvmsg(sockfd: usize, msg: *mut u8, flags: usize) -> isize {
+    if !net_ready() {
+        return -97;
+    }
     let token = current_user_token();
     let msghdr: &Msghdr = translated_ref(token, msg as *const Msghdr);
 
@@ -653,6 +695,9 @@ pub fn sys_setsockopt(
     optval: *const u8,
     optlen: usize,
 ) -> isize {
+    if !net_ready() {
+        return -97;
+    }
     let (handle, st, _nonblock) = match sock_lookup(sockfd) {
         Some(v) => v,
         None => return -9,
@@ -717,6 +762,9 @@ pub fn sys_getsockopt(
     optval: *mut u8,
     optlen: *mut usize,
 ) -> isize {
+    if !net_ready() {
+        return -97;
+    }
     if optval.is_null() || optlen.is_null() {
         return -14;
     }
@@ -752,11 +800,31 @@ pub fn sys_getsockopt(
             *translated_refmut(token, optval as *mut i32) = if nagle { 1 } else { 0 };
             0
         }
+        (IPPROTO_TCP, 2) => {
+            // TCP_MAXSEG - return typical Ethernet MSS
+            if st != SocketType::Tcp { return -95; }
+            *translated_refmut(token, optlen as *mut u32) = 4;
+            *translated_refmut(token, optval as *mut i32) = 1460;
+            0
+        }
+        (IPPROTO_TCP, 11) | (IPPROTO_TCP, 13) => {
+            *translated_refmut(token, optlen as *mut u32) = 4;
+            *translated_refmut(token, optval as *mut i32) = 65536;
+            0
+        }
+        (IPPROTO_TCP, 14) => {
+            *translated_refmut(token, optlen as *mut u32) = 4;
+            *translated_refmut(token, optval as *mut u32) = u32::from_be_bytes(*b"reno");
+            0
+        }
         _ => -92, // ENOPROTOOPT
     }
 }
 
 pub fn sys_sock_shutdown(sockfd: usize, how: usize) -> isize {
+    if !net_ready() {
+        return -97;
+    }
     let (handle, st, _nonblock) = match sock_lookup(sockfd) {
         Some(v) => v,
         None => return -9,
@@ -780,6 +848,9 @@ pub fn sys_sock_shutdown(sockfd: usize, how: usize) -> isize {
 }
 
 pub fn sys_getpeername(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
+    if !net_ready() {
+        return -97;
+    }
     if addr.is_null() || addrlen.is_null() {
         return -14;
     }
@@ -819,6 +890,9 @@ pub fn sys_getpeername(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isi
 }
 
 pub fn sys_getsockname(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
+    if !net_ready() {
+        return -97;
+    }
     if addr.is_null() || addrlen.is_null() {
         return -14;
     }
@@ -865,7 +939,7 @@ pub(crate) fn tcp_send(handle: SocketHandle, nonblock: bool, data: &[u8]) -> isi
     }
     if nonblock {
         crate::net::net_poll();
-        return crate::net::with_net_iface(|iface| {
+        let result = crate::net::with_net_iface(|iface| {
             let sock: &mut TcpSocket = iface.sockets.get_mut(handle);
             if !sock.is_active() {
                 return -32;
@@ -877,6 +951,9 @@ pub(crate) fn tcp_send(handle: SocketHandle, nonblock: bool, data: &[u8]) -> isi
             }
         })
         .unwrap_or(-1);
+        crate::net::net_poll();
+        suspend_current_and_run_next();
+        return result;
     }
 
     let mut offset = 0usize;
@@ -897,14 +974,14 @@ pub(crate) fn tcp_send(handle: SocketHandle, nonblock: bool, data: &[u8]) -> isi
             offset += sent as usize;
         } else if sent == 0 {
             if !sock_can_send_tcp(handle) {
-                block_current_and_run_next(BlockReason::TcpSend(unsafe {
-                    core::mem::transmute(handle)
-                }));
+                suspend_current_and_run_next();
             }
         } else {
             return sent;
         }
     }
+    crate::net::net_poll();
+    suspend_current_and_run_next();
     offset as isize
 }
 
@@ -946,9 +1023,7 @@ pub(crate) fn tcp_recv(handle: SocketHandle, nonblock: bool, buf: &mut [u8]) -> 
                 if !sock_is_active_tcp(handle) && sock_recv_queue_tcp(handle) == 0 {
                     return 0;
                 }
-                block_current_and_run_next(BlockReason::TcpRecv(unsafe {
-                    core::mem::transmute(handle)
-                }));
+                suspend_current_and_run_next();
             }
             None => return -1,
         }
@@ -996,6 +1071,8 @@ pub(crate) fn udp_recv(handle: SocketHandle, nonblock: bool, buf: &mut [u8]) -> 
     }
 
     loop {
+        crate::net::net_poll();
+        crate::net::net_poll();
         crate::net::net_poll();
         let result = crate::net::with_net_iface(|iface| {
             let sock: &mut UdpSocket = iface.sockets.get_mut(handle);

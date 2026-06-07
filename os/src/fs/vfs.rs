@@ -62,16 +62,16 @@ impl VfsSuperBlock {
         blk_device: Arc<dyn crate::drivers::BlockDevice>,
         fs_type: &'static str,
     ) -> Option<Arc<Self>> {
-        const DISK_SIZE_128M: u64 = 128 * 1024 * 1024;
+        const DISK_SIZE_512M: u64 = 512 * 1024 * 1024;
         let stream = BlockDeviceStream {
             inner: blk_device,
             pos: 0,
-            total_size: DISK_SIZE_128M,
+            total_size: DISK_SIZE_512M,
         };
         let ext4 = Ext4BlockWrapper::<BlockDeviceStreamOp>::new(stream).ok()?;
         Some(Arc::new(VfsSuperBlock {
             fs_type,
-            fs_data: unsafe { UPSafeCell::new(FsInner::Ext4(Ext4Wrapper(ext4))) },
+            fs_data: unsafe { UPSafeCell::new_named(FsInner::Ext4(Ext4Wrapper(ext4)), "VfsFsData") },
         }))
     }
 
@@ -216,27 +216,44 @@ impl VfsSuperBlock {
                 return 0;
             }
 
+            let file_size = unsafe { ext4_fsize(&mut file) as usize };
+            if offset >= file_size {
+                unsafe {
+                    ext4_fclose(&mut file);
+                }
+                return 0;
+            }
+            let max_read = core::cmp::min(buf.len(), file_size - offset);
+
             unsafe {
                 ext4_fseek(&mut file, offset as i64, SEEK_SET as u32);
             }
 
-            let mut rw_count: usize = 0;
-            let read_rc = unsafe {
-                ext4_fread(
-                    &mut file,
-                    buf.as_mut_ptr() as *mut core::ffi::c_void,
-                    buf.len(),
-                    &mut rw_count,
-                )
-            };
+            let mut total = 0usize;
+            while total < max_read {
+                let chunk_len = core::cmp::min(128, max_read - total);
+                let mut rw_count: usize = 0;
+                let read_rc = unsafe {
+                    ext4_fread(
+                        &mut file,
+                        buf[total..total + chunk_len].as_mut_ptr() as *mut core::ffi::c_void,
+                        chunk_len,
+                        &mut rw_count,
+                    )
+                };
+                if read_rc != EOK as i32 || rw_count == 0 {
+                    break;
+                }
+                total += rw_count;
+                if rw_count < chunk_len {
+                    break;
+                }
+            }
             unsafe {
                 ext4_fclose(&mut file);
             }
 
-            if read_rc != EOK as i32 {
-                return 0;
-            }
-            rw_count
+            total
         })
     }
 
@@ -403,6 +420,45 @@ impl VfsSuperBlock {
                     ext4_ctime_set(c_path.as_ptr() as *const c_char, ctime);
                 }
             }
+        })
+    }
+
+    pub fn set_mode(&self, fs_path: &str, mode: u32) -> i32 {
+        self.with_fs(|_fs| {
+            if let Ok(c_path) = CString::new(fs_path) {
+                let r = unsafe { ext4_mode_set(c_path.as_ptr() as *const c_char, mode) };
+                r
+            } else {
+                -1
+            }
+        })
+    }
+
+    pub fn set_owner(&self, fs_path: &str, uid: u32, gid: u32) -> i32 {
+        self.with_fs(|_fs| {
+            if let Ok(c_path) = CString::new(fs_path) {
+                let r = unsafe { ext4_owner_set(c_path.as_ptr() as *const c_char, uid, gid) };
+                r
+            } else {
+                -1
+            }
+        })
+    }
+
+    pub fn fsync(&self, fs_path: &str) -> i32 {
+        self.with_fs(|_fs| {
+            if let Ok(c_path) = CString::new(fs_path) {
+                unsafe { ext4_cache_flush(c_path.as_ptr() as *const c_char) }
+            } else {
+                -1
+            }
+        })
+    }
+
+    pub fn sync_all(&self) -> i32 {
+        self.with_fs(|_fs| {
+            let root = CString::new("/").unwrap();
+            unsafe { ext4_cache_flush(root.as_ptr() as *const c_char) }
         })
     }
 
@@ -647,12 +703,19 @@ pub fn vfs_resolve_parent_and_name(
 
 // ==================== File Creation ====================
 
-pub fn vfs_create(parent: &Arc<Dentry>, name: &str, is_dir: bool) -> Option<Arc<Dentry>> {
+pub fn vfs_create(parent: &Arc<Dentry>, name: &str, is_dir: bool, mode: u32) -> Option<Arc<Dentry>> {
     let inode_num = parent
         .super_block
         .create_file(&parent.fs_path, name, is_dir)?;
 
     let child = Dentry::new_child(parent, name, inode_num, is_dir);
+
+    let umask = crate::task::current_task()
+        .map(|t| t.inner_exclusive_access().umask)
+        .unwrap_or(0o22);
+    let effective_mode = mode & !umask;
+    let fs_path = child.fs_path.clone();
+    child.super_block.set_mode(&fs_path, effective_mode);
 
     {
         let mut children = parent.children.exclusive_access();

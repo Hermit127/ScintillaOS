@@ -36,6 +36,10 @@ pub struct Ext4BlockWrapper<K: KernelDevOp> {
 }
 
 impl<K: KernelDevOp> Ext4BlockWrapper<K> {
+    pub fn get_fs_ptr(&self) -> *mut ext4_fs {
+        self.value.fs
+    }
+
     pub fn new(block_dev: K::DevType) -> Result<Self, i32> {
         Self::new_with_name(block_dev, "ext4_fs", "/mp/")
     }
@@ -259,7 +263,7 @@ impl<K: KernelDevOp> Ext4BlockWrapper<K> {
         }
         if !skip_recovery {
             let r = ext4_recover(c_mountpoint);
-            if (r != EOK as i32) && (r != ENOTSUP as i32) {
+            if (r != EOK as i32) && (r != ENOTSUP as i32) && (r != EINVAL as i32) {
                 error!("ext4_recover: rc = {:?}\n", r);
                 return Err(r);
             }

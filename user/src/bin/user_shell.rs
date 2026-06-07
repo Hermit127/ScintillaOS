@@ -18,21 +18,51 @@ use alloc::vec::Vec;
 use user_lib::console::getchar;
 use user_lib::{chdir, close, dup, exec, fork, open, pipe, waitpid, OpenFlags};
 
+fn parse_args(command: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+
+    for ch in command.chars() {
+        match ch {
+            '\'' if !in_double_quote => {
+                in_single_quote = !in_single_quote;
+            }
+            '"' if !in_single_quote => {
+                in_double_quote = !in_double_quote;
+            }
+            ' ' | '\t' if !in_single_quote && !in_double_quote => {
+                if !current.is_empty() {
+                    args.push(current);
+                    current = String::new();
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    if !current.is_empty() {
+        args.push(current);
+    }
+    args
+}
+
 #[derive(Debug)]
 struct ProcessArguments {
     input: String,
     output: String,
+    output_append: bool,
     args_copy: Vec<String>,
     args_addr: Vec<*const u8>,
 }
 
 impl ProcessArguments {
     pub fn new(command: &str) -> Self {
-        let args: Vec<_> = command.split(' ').collect();
+        let args = parse_args(command);
         let mut args_copy: Vec<String> = args
             .iter()
-            .filter(|&arg| !arg.is_empty())
-            .map(|&arg| {
+            .map(|arg| {
                 let mut string = String::new();
                 string.push_str(arg);
                 string.push('\0');
@@ -53,7 +83,16 @@ impl ProcessArguments {
 
         // redirect output
         let mut output = String::new();
+        let mut output_append = false;
         if let Some((idx, _)) = args_copy
+            .iter()
+            .enumerate()
+            .find(|(_, arg)| arg.as_str() == ">>\0")
+        {
+            output_append = true;
+            output = args_copy[idx + 1].clone();
+            args_copy.drain(idx..=idx + 1);
+        } else if let Some((idx, _)) = args_copy
             .iter()
             .enumerate()
             .find(|(_, arg)| arg.as_str() == ">\0")
@@ -68,6 +107,7 @@ impl ProcessArguments {
         Self {
             input,
             output,
+            output_append,
             args_copy,
             args_addr,
         }
@@ -126,13 +166,17 @@ pub fn main() -> i32 {
                             if pid == 0 {
                                 let input = &process_argument.input;
                                 let output = &process_argument.output;
+                                let output_append = process_argument.output_append;
                                 let args_copy = &process_argument.args_copy;
                                 let args_addr = &process_argument.args_addr;
                                 // redirect input
                                 if !input.is_empty() {
                                     let input_fd = open(input.as_str(), OpenFlags::RDONLY);
                                     if input_fd == -1 {
-                                        println!("Error when opening file {}", input);
+                                        let msg = "Error when opening file ";
+                                        user_lib::write(2, msg.as_bytes());
+                                        user_lib::write(2, input.as_bytes());
+                                        user_lib::write(2, b"\n");
                                         return -4;
                                     }
                                     let input_fd = input_fd as usize;
@@ -142,12 +186,17 @@ pub fn main() -> i32 {
                                 }
                                 // redirect output
                                 if !output.is_empty() {
-                                    let output_fd = open(
-                                        output.as_str(),
-                                        OpenFlags::CREATE | OpenFlags::WRONLY,
-                                    );
+                                    let flags = if output_append {
+                                        OpenFlags::CREATE | OpenFlags::WRONLY | OpenFlags::APPEND
+                                    } else {
+                                        OpenFlags::CREATE | OpenFlags::WRONLY | OpenFlags::TRUNC
+                                    };
+                                    let output_fd = open(output.as_str(), flags);
                                     if output_fd == -1 {
-                                        println!("Error when opening file {}", output);
+                                        let msg = "Error when opening file ";
+                                        user_lib::write(2, msg.as_bytes());
+                                        user_lib::write(2, output.as_bytes());
+                                        user_lib::write(2, b"\n");
                                         return -4;
                                     }
                                     let output_fd = output_fd as usize;
@@ -196,7 +245,7 @@ pub fn main() -> i32 {
                                     exec_path.push('\0');
                                 }
                                 if exec(exec_path.as_str(), args_addr.as_slice()) == -1 {
-                                    println!("Error when executing!");
+                                    user_lib::write(2, b"Error when executing!\n");
                                     return -4;
                                 }
                                 unreachable!();

@@ -176,5 +176,13 @@ iperf服务端可以正常启动，和busybox兼容性有问题，数据收发�
 2026/5/23 hermit
 write的输出有进程冲突问题，增加了进城所有权锁
 
-2026/5/28 hermit
-现在busybox完全适配loongarch了。但是修改内容太多了我这里写不下，开了专门的文档。
+2026/5/24-2026/6/1 hermit
+主要在修复busybox glibc与loongarch的适配问题
+
+2026/6/2 hermit
+尝试适配lmbench
+添加getrusage系统调用
+文件读取有问题：我进行了修改 os/src/fs/inode.rs (line 324)
+OSInode::read 不再直接走 ext4_fread，改为 dentry.super_block.read_at(...)
+os/src/fs/vfs.rs (line 197)
+read_at 先用 ext4_fsize 截断读取长度，再按 128 字节小块读，避免大块读污染用户缓冲

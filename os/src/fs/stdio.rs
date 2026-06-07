@@ -46,18 +46,17 @@ impl File for Stdin {
         false
     }
     fn read(&self, user_buf: &mut [u8]) -> isize {
-        assert_eq!(user_buf.len(), 1);
-        let c: u8;
+        if user_buf.is_empty() {
+            return 0;
+        }
         loop {
-            if let Some(ch) = DebugConsole::getchar() {
-                c = ch;
-                break;
+            if let Some(c) = DebugConsole::getchar() {
+                user_buf[0] = c;
+                return 1;
             }
             stdout_release_if_owner();
             suspend_current_and_run_next();
         }
-        user_buf[0] = c as u8;
-        1
     }
     fn write(&self, _user_buf: &mut [u8]) -> isize {
         panic!("Cannot write to stdin!");
@@ -85,8 +84,11 @@ impl File for Stdout {
         while STDOUT_BUSY.swap(true, Ordering::Acquire) {
             core::hint::spin_loop();
         }
-        print!("{}", core::str::from_utf8(user_buf).unwrap());
+        for byte in user_buf.iter() {
+            DebugConsole::putchar(*byte);
+        }
         STDOUT_BUSY.store(false, Ordering::Release);
+        stdout_release_if_owner();
         user_buf.len() as isize
     }
     fn stat(&self) -> Kstat {
@@ -140,6 +142,32 @@ impl File for DevNull {
     }
     fn read(&self, _buf: &mut [u8]) -> isize {
         0
+    }
+    fn write(&self, buf: &mut [u8]) -> isize {
+        buf.len() as isize
+    }
+    fn stat(&self) -> Kstat {
+        Kstat::new(S_IFCHR)
+    }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+pub struct DevZero;
+
+impl File for DevZero {
+    fn readable(&self) -> bool {
+        true
+    }
+    fn writable(&self) -> bool {
+        true
+    }
+    fn read(&self, buf: &mut [u8]) -> isize {
+        for b in buf.iter_mut() {
+            *b = 0;
+        }
+        buf.len() as isize
     }
     fn write(&self, buf: &mut [u8]) -> isize {
         buf.len() as isize

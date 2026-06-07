@@ -65,7 +65,15 @@ pub trait File: Send + Sync {
     fn readable(&self) -> bool;
     fn writable(&self) -> bool;
     fn read(&self, buf: &mut [u8]) -> isize;
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> isize {
+        self.seek(offset);
+        self.read(buf)
+    }
     fn write(&self, buf: &mut [u8]) -> isize;
+    fn write_at(&self, offset: usize, buf: &mut [u8]) -> isize {
+        self.seek(offset);
+        self.write(buf)
+    }
     fn stat(&self) -> Kstat;
     fn is_dir(&self) -> bool {
         false
@@ -95,10 +103,12 @@ pub trait File: Send + Sync {
     fn poll(&self) -> (bool, bool, bool) {
         (true, true, false)
     }
+    fn dup_ref(&self) {}
+    fn close_ref(&self) {}
     fn as_any(&self) -> &dyn core::any::Any;
 }
 
 pub use inode::{mkdir_at, open_file, open_file_at, rename_at, symlink_at, unlink_at, OpenFlags};
 pub use pipe::make_pipe;
-pub use stdio::{DevNull, Stdin, Stdout, Urandom};
+pub use stdio::{DevNull, DevZero, Stdin, Stdout, Urandom};
 pub use vfs::{list_apps, mount_root};

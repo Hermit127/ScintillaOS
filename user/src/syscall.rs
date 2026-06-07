@@ -38,6 +38,8 @@ const SYSCALL_NANOSLEEP: usize = 101;
 const SYSCALL_MOUNT: usize = 40;
 const SYSCALL_UMOUNT2: usize = 39;
 
+const SYSCALL_GETDENTS64: usize = 61;
+
 const SYSCALL_SHUTDOWN: usize = 403;
 
 const AT_FDCWD: isize = -100;
@@ -202,10 +204,17 @@ pub fn sys_fork() -> isize {
     syscall(SYSCALL_FORK, [0, 0, 0, 0, 0, 0])
 }
 
-pub fn sys_exec(path: &str, args: &[*const u8]) -> isize {
+pub fn sys_exec(path: &str, args: &[*const u8], envs: &[*const u8]) -> isize {
     syscall(
         SYSCALL_EXEC,
-        [path.as_ptr() as usize, args.as_ptr() as usize, 0, 0, 0, 0],
+        [
+            path.as_ptr() as usize,
+            args.as_ptr() as usize,
+            envs.as_ptr() as usize,
+            0,
+            0,
+            0,
+        ],
     )
 }
 
@@ -255,10 +264,10 @@ pub fn sys_chdir(path: &str) -> isize {
 }
 
 pub fn sys_getcwd(buf: &mut [u8]) -> isize {
-    syscall(
-        SYSCALL_GETCWD,
-        [buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0, 0],
-    )
+    syscall(SYSCALL_GETCWD, [buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0, 0])
+}
+pub fn sys_getdents64(fd: usize, buf: &mut [u8]) -> isize {
+    syscall(SYSCALL_GETDENTS64, [fd, buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0])
 }
 
 #[repr(C)]

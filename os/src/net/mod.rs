@@ -191,6 +191,13 @@ use imp::NET_IFACE;
 #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
 use imp::NET_INITED;
 
+#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
+const VIRTIO_NET_MMIO: usize = 0x10003000;
+#[cfg(target_arch = "aarch64")]
+const VIRTIO_NET_MMIO: usize = 0xa00_0300;
+const VIRTIO_MMIO_DEVICE_ID: usize = 0x08;
+const VIRTIO_NET_DEVICE_ID: u32 = 1;
+
 pub fn net_init() {
     #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
     {
@@ -204,6 +211,7 @@ pub fn net_init() {
             );
             println!("[net] Static IPs: loopback 127.0.0.0/8 + 10.0.2.15/24");
         } else {
+            NET_INITED.store(false, core::sync::atomic::Ordering::Relaxed);
             println!("[net] No virtio-net device available, networking disabled");
         }
     }
@@ -215,15 +223,16 @@ pub fn net_poll() {
         if !NET_INITED.load(core::sync::atomic::Ordering::Relaxed) {
             return;
         }
-        let mut state = NET_IFACE.exclusive_access();
-        if let Some(state) = state.as_mut() {
-            if !state.inited {
-                return;
-            }
-            state.clock_ms += 10;
-            let clock = state.clock_ms;
-            let timestamp = smoltcp::time::Instant::from_millis(clock as i64);
-            let NetworkState {
+        {
+            let mut state = NET_IFACE.exclusive_access();
+            if let Some(state) = state.as_mut() {
+                if !state.inited {
+                    return;
+                }
+                state.clock_ms += 10;
+                let clock = state.clock_ms;
+                let timestamp = smoltcp::time::Instant::from_millis(clock as i64);
+                let NetworkState {
                 ref mut iface,
                 ref mut device,
                 ref mut sockets,
@@ -231,18 +240,39 @@ pub fn net_poll() {
                 ref mut dhcp_logged,
                 ..
             } = state;
-            iface.poll(timestamp, device, sockets);
+                iface.poll(timestamp, device, sockets);
 
-            if !*dhcp_logged && iface.ip_addrs().len() > 2 {
-                *dhcp_logged = true;
-                println!("[net] DHCP assigned additional IP, total IPs:");
-                for addr in iface.ip_addrs() {
-                    println!("[net]   {}", addr);
+                if !*dhcp_logged && iface.ip_addrs().len() > 2 {
+                    *dhcp_logged = true;
+                    println!("[net] DHCP assigned additional IP, total IPs:");
+                    for addr in iface.ip_addrs() {
+                        println!("[net]   {}", addr);
+                    }
                 }
             }
         }
         wake_net_blocked_tasks();
     }
+}
+
+#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+pub fn net_device_present() -> bool {
+    let ptr = polyhal::PhysAddr::new(VIRTIO_NET_MMIO + VIRTIO_MMIO_DEVICE_ID).get_mut_ptr();
+    let device_id = unsafe {
+        core::ptr::read_volatile(ptr as *const u32)
+    };
+    device_id == VIRTIO_NET_DEVICE_ID
+}
+
+#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+pub fn net_available() -> bool {
+    let guard = NET_IFACE.exclusive_access();
+    guard.as_ref().map(|state| state.inited).unwrap_or(false)
+}
+
+#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+pub fn net_available_fast() -> bool {
+    NET_INITED.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
@@ -259,12 +289,21 @@ pub fn with_net_iface_tcp_connect(
     handle: smoltcp::iface::SocketHandle,
     remote: smoltcp::wire::IpEndpoint,
     local: smoltcp::wire::IpListenEndpoint,
-) {
+) -> isize {
     let mut guard = NET_IFACE.exclusive_access();
     if let Some(state) = guard.as_mut() {
         let sock: &mut smoltcp::socket::tcp::Socket = state.sockets.get_mut(handle);
         let cx: &mut smoltcp::iface::Context = unsafe { core::mem::transmute(&mut state.iface) };
-        let result = sock.connect(cx, remote, local);
+        match sock.connect(cx, remote, local) {
+            Ok(()) => {
+                0
+            }
+            Err(e) => {
+                -111
+            }
+        }
+    } else {
+        -1
     }
 }
 
@@ -275,14 +314,11 @@ pub fn wake_net_blocked_tasks() {
     use smoltcp::socket::tcp::Socket as TcpSocket;
     use smoltcp::socket::udp::Socket as UdpSocket;
 
-    let inited = NET_INITED.load(core::sync::atomic::Ordering::Relaxed);
-    if !inited {
-        return;
-    }
-
     let mut to_wake = alloc::vec::Vec::new();
+    let orig_blocked;
     {
         let mut queue = NET_BLOCK_QUEUE.exclusive_access();
+        orig_blocked = queue.len();
         let mut i = 0;
         while i < queue.len() {
             let should_wake = {
@@ -339,12 +375,13 @@ pub fn wake_net_blocked_tasks() {
             }
         }
     }
+    if !to_wake.is_empty() {
+    } else if orig_blocked > 0 {
+    }
+    if !to_wake.is_empty() {
+    }
     for task in &to_wake {
-        let mut inner = task.inner_exclusive_access();
-        inner.task_status = TaskStatus::Ready;
-        inner.block_reason = None;
-        drop(inner);
-        add_priority_task(task.clone());
+        add_task(task.clone());
     }
 }
 

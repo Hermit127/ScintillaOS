@@ -2,11 +2,16 @@ const SYSCALL_DUP: usize = 23;
 const SYSCALL_DUP3: usize = 24;
 const SYSCALL_FCNTL: usize = 25;
 const SYSCALL_FACCESSAT: usize = 48;
+const SYSCALL_FCHMOD: usize = 52;
+const SYSCALL_FCHMODAT: usize = 53;
+const SYSCALL_FCHOWNAT: usize = 54;
+const SYSCALL_FCHOWN: usize = 55;
 const SYSCALL_IOCTL: usize = 29;
 const SYSCALL_GETCWD: usize = 17;
 const SYSCALL_MKDIRAT: usize = 34;
 const SYSCALL_UNLINKAT: usize = 35;
 const SYSCALL_SYMLINKAT: usize = 36;
+const SYSCALL_FTRUNCATE: usize = 46;
 const SYSCALL_CHDIR: usize = 49;
 const SYSCALL_OPENAT: usize = 56;
 const SYSCALL_CLOSE: usize = 57;
@@ -16,16 +21,24 @@ const SYSCALL_READ: usize = 63;
 const SYSCALL_WRITE: usize = 64;
 const SYSCALL_SENDFILE: usize = 71;
 const SYSCALL_WRITEV: usize = 66;
+const SYSCALL_PREAD64: usize = 67;
+const SYSCALL_PWRITE64: usize = 68;
+const SYSCALL_PREADV: usize = 69;
+const SYSCALL_PWRITEV: usize = 70;
 const SYSCALL_EXIT: usize = 93;
 const SYSCALL_FUTEX: usize = 98;
 const SYSCALL_NANOSLEEP: usize = 101;
 const SYSCALL_CLOCK_GETTIME: usize = 113;
+const SYSCALL_CLOCK_GETRES: usize = 114;
+const SYSCALL_CLOCK_NANOSLEEP: usize = 115;
 const SYSCALL_SYSLOG: usize = 116;
 const SYSCALL_YIELD: usize = 124;
 const SYSCALL_KILL: usize = 129;
 const SYSCALL_SIGACTION: usize = 134;
 const SYSCALL_SIGPROCMASK: usize = 135;
 const SYSCALL_SIGRETURN: usize = 139;
+const SYSCALL_GETITIMER: usize = 102;
+const SYSCALL_SETITIMER: usize = 103;
 const SYSCALL_TIMES: usize = 153;
 const SYSCALL_UNAME: usize = 160;
 const SYSCALL_GET_TIME: usize = 169;
@@ -66,12 +79,16 @@ const SYSCALL_CLONE: usize = 220;
 const SYSCALL_FORK: usize = 401;
 const SYSCALL_EXEC: usize = 221;
 const SYSCALL_MMAP: usize = 222;
+const SYSCALL_MSYNC: usize = 227;
 const SYSCALL_WAITPID: usize = 260;
 
 const SYSCALL_GETDENTS64: usize = 61;
 const SYSCALL_FSTATAT: usize = 79;
 const SYSCALL_READLINKAT: usize = 78;
 const SYSCALL_FSTAT: usize = 80;
+const SYSCALL_SYNC: usize = 81;
+const SYSCALL_FSYNC: usize = 82;
+const SYSCALL_FDATASYNC: usize = 83;
 const SYSCALL_SLEEP: usize = 300;
 const SYSCALL_DUP2: usize = 33;
 
@@ -110,19 +127,45 @@ use crate::net::syscall::{
     sys_sock_shutdown, sys_socket,
 };
 use crate::task::SignalAction;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use fs::*;
-use log::*;
 use process::*;
 
+#[no_mangle]
+pub static LAST_SYSCALL_ID: AtomicUsize = AtomicUsize::new(0);
+#[no_mangle]
+pub static LAST_SYSCALL_ARG0: AtomicUsize = AtomicUsize::new(0);
+#[no_mangle]
+pub static LAST_SYSCALL_ARG1: AtomicUsize = AtomicUsize::new(0);
+#[no_mangle]
+pub static LAST_SYSCALL_ARG2: AtomicUsize = AtomicUsize::new(0);
+#[no_mangle]
+pub static LAST_SYSCALL_RET: AtomicUsize = AtomicUsize::new(0);
+#[no_mangle]
+pub static LAST_SYSCALL_PID: AtomicUsize = AtomicUsize::new(0);
+
 pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
-    trace!("syscall: id: {}, args: {:?}", syscall_id, args);
-    match syscall_id {
+    if syscall_id == SYSCALL_SHUTDOWN {
+        return sys_shutdown();
+    }
+    let current_pid = crate::task::current_task()
+        .map(|task| task.getpid())
+        .unwrap_or(0);
+    LAST_SYSCALL_ID.store(syscall_id, Ordering::Relaxed);
+    LAST_SYSCALL_ARG0.store(args[0], Ordering::Relaxed);
+    LAST_SYSCALL_ARG1.store(args[1], Ordering::Relaxed);
+    LAST_SYSCALL_ARG2.store(args[2], Ordering::Relaxed);
+    LAST_SYSCALL_PID.store(current_pid, Ordering::Relaxed);
+    // Avoid formatting on the syscall hot path; lmbench is very sensitive to this.
+    let ret = match syscall_id {
         SYSCALL_DUP => sys_dup(args[0]),
         SYSCALL_DUP3 => sys_dup3(args[0], args[1], args[2]),
         SYSCALL_FCNTL => sys_fcntl(args[0], args[1], args[2]),
-        SYSCALL_FACCESSAT => {
-            sys_faccessat(args[0] as isize, args[1] as *const u8, args[2], args[3])
-        }
+        SYSCALL_FACCESSAT => sys_faccessat(args[0] as isize, args[1] as *const u8, args[2], args[3]),
+        SYSCALL_FCHMOD => sys_fchmod(args[0], args[1] as u32),
+        SYSCALL_FCHMODAT => sys_fchmodat(args[0] as isize, args[1] as *const u8, args[2] as u32),
+        SYSCALL_FCHOWNAT => sys_fchownat(args[0] as isize, args[1] as *const u8, args[2] as u32, args[3] as u32, args[4] as u32),
+        SYSCALL_FCHOWN => sys_fchown(args[0], args[1] as u32, args[2] as u32),
         SYSCALL_IOCTL => sys_ioctl(args[0], args[1], args[2]),
         SYSCALL_GETCWD => sys_getcwd(args[0] as *mut u8, args[1]),
         SYSCALL_MKDIRAT => sys_mkdirat(args[0] as isize, args[1] as *const u8, args[2] as u32),
@@ -145,6 +188,10 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_WRITE => sys_write(args[0], args[1] as *mut u8, args[2]),
         SYSCALL_READV => sys_readv(args[0], args[1] as *const u8, args[2]),
         SYSCALL_WRITEV => sys_writev(args[0], args[1] as *const u8, args[2]),
+        SYSCALL_PREAD64 => sys_pread64(args[0], args[1] as *mut u8, args[2], args[3]),
+        SYSCALL_PWRITE64 => sys_pwrite64(args[0], args[1] as *mut u8, args[2], args[3]),
+        SYSCALL_PREADV => sys_preadv(args[0], args[1] as *const u8, args[2], args[3]),
+        SYSCALL_PWRITEV => sys_pwritev(args[0], args[1] as *const u8, args[2], args[3]),
         SYSCALL_SENDFILE => sys_sendfile(args[0], args[1], args[2] as *mut usize, args[3]),
         SYSCALL_FUTEX => sys_futex(
             args[0] as *mut u32,
@@ -166,6 +213,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         ),
         SYSCALL_SIGPROCMASK => sys_sigprocmask(args[0] as u32),
         SYSCALL_SIGRETURN => sys_sigreturn(),
+        SYSCALL_GETITIMER => sys_getitimer(args[0], args[1] as *mut u8),
+        SYSCALL_SETITIMER => sys_setitimer(args[0], args[1] as *const u8, args[2] as *mut u8),
         SYSCALL_GET_TIME => sys_get_time(args[0], args[1]),
         SYSCALL_GETPID => sys_getpid(),
         SYSCALL_GETPPID => sys_getppid(),
@@ -181,10 +230,17 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SET_TID_ADDRESS => sys_set_tid_address(args[0] as *mut i32),
         SYSCALL_CLONE => sys_clone(args[0], args[1], args[2], args[3], args[4]),
         SYSCALL_FORK => sys_fork(),
-        SYSCALL_EXEC => sys_exec(args[0] as *const u8, args[1] as *const usize),
+        SYSCALL_EXEC => sys_exec(
+            args[0] as *const u8,
+            args[1] as *const usize,
+            args[2] as *const usize,
+        ),
         SYSCALL_WAITPID => sys_waitpid(args[0] as isize, args[1] as *mut i32, args[2]),
         //added
         SYSCALL_FSTAT => sys_fstat(args[0], args[1] as *mut u8),
+        SYSCALL_SYNC => sys_sync(),
+        SYSCALL_FSYNC => sys_fsync(args[0]),
+        SYSCALL_FDATASYNC => sys_fdatasync(args[0]),
         SYSCALL_FSTATAT => sys_fstatat(
             args[0] as isize,
             args[1] as *const u8,
@@ -203,6 +259,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_DUP2 => sys_dup2(args[0], args[1]),
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4] as i32, args[5]),
         SYSCALL_MUNMAP => sys_munmap(args[0], args[1]),
+        SYSCALL_MSYNC => sys_msync(args[0], args[1], args[2]),
         SYSCALL_SOCKET => sys_socket(args[0], args[1], args[2]),
         SYSCALL_BIND => sys_bind(args[0], args[1] as *const u8, args[2]),
         SYSCALL_LISTEN => sys_listen(args[0], args[1]),
@@ -282,6 +339,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_UNAME => sys_uname(args[0]),
         SYSCALL_NANOSLEEP => sys_nanosleep(args[0], args[1]),
         SYSCALL_CLOCK_GETTIME => sys_clock_gettime(args[0], args[1] as *mut u8),
+        SYSCALL_CLOCK_GETRES => sys_clock_getres(args[0], args[1] as *mut u8),
+        SYSCALL_CLOCK_NANOSLEEP => sys_clock_nanosleep(args[0], args[1], args[2], args[3]),
         SYSCALL_MOUNT => sys_mount(
             args[0] as *const u8,
             args[1] as *const u8,
@@ -296,7 +355,6 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[2] as *const u8,
             args[3],
         ),
-        SYSCALL_SHUTDOWN => sys_shutdown(),
         SYSCALL_RENAMEAT2 => sys_renameat2(
             args[0] as isize,
             args[1] as *const u8,
@@ -304,6 +362,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3] as *const u8,
             args[4],
         ),
+        SYSCALL_FTRUNCATE => sys_ftruncate(args[0], args[1] as u64),
         _ => -38,
-    }
+    };
+    LAST_SYSCALL_RET.store(ret as usize, Ordering::Relaxed);
+    ret
 }
