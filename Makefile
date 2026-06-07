@@ -253,6 +253,7 @@ fs-img: $(APPS)
 			printf '%s\n' '/busybox sync'; \
 			printf '%s\n' 'echo "#### OS COMP TEST GROUP END lmbench ####"'; \
 		} > "$(ROOTFS_DIR)/lmbench_testcode.sh"; \
+		cp "$(ROOTFS_DIR)/lmbench_testcode.sh" "$(ROOTFS_DIR)/lmbench_musl_testcode.sh"; \
 	fi
 	@if [ -f "$(ROOTFS_DIR)/lmbench_all-glibc" ]; then \
 		sed \
