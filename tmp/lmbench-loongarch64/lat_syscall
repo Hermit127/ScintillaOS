@@ -1,0 +1,1 @@
+/coursegrader/submit/testsuits-for-oskernel/lmbench_src/bin/build/lmbench_all lat_syscall "$@"

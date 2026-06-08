@@ -62,6 +62,18 @@ tmp/*
 !tmp/busybox_cmd.txt
 !tmp/busybox_glibc_testcode.sh
 !tmp/busybox_testcode.sh
+!tmp/lmbench-riscv64
+!tmp/lmbench-riscv64-glibc
+!tmp/lmbench-loongarch64
+!tmp/lmbench-loongarch64-glibc
+!tmp/lmbench-loongarch64-musl
+!tmp/lmbench-riscv64-musl
+!tmp/lua-riscv64-musl
+!tmp/lua-riscv64-glibc
+!tmp/lua-loongarch64-musl
+!tmp/lua-loongarch64-glibc
+!tmp/lua_testcode.sh
+!tmp/*.lua
 
 # lwext4 build artifacts
 lwext4_rust/c/lwext4/liblwext4-*.a
