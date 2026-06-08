@@ -4,7 +4,10 @@ use alloc::vec;
 use alloc::vec::Vec;
 use alloc::sync::Arc;
 
-use crate::task::{current_task, suspend_current_and_run_next, wake_poll_wait_tasks};
+use crate::task::{
+    block_current_and_run_next, current_task, wake_pipe_read_tasks, wake_pipe_write_tasks,
+    wake_poll_wait_tasks, BlockReason,
+};
 
 use crate::fs::stdio::stdout_release_if_owner;
 
@@ -34,6 +37,9 @@ impl Pipe {
             writable: true,
             buffer,
         }
+    }
+    fn wait_key(&self) -> usize {
+        Arc::as_ptr(&self.buffer) as usize
     }
 }
 
@@ -134,15 +140,17 @@ impl PipeRingBuffer {
     pub fn add_write_end(&mut self) {
         self.write_open += 1;
     }
-    pub fn close_read_end(&mut self) {
+    pub fn close_read_end(&mut self) -> bool {
         if self.read_open > 0 {
             self.read_open -= 1;
         }
+        self.read_open == 0
     }
-    pub fn close_write_end(&mut self) {
+    pub fn close_write_end(&mut self) -> bool {
         if self.write_open > 0 {
             self.write_open -= 1;
         }
+        self.write_open == 0
     }
 }
 
@@ -186,7 +194,7 @@ impl File for Pipe {
                     return already_read as isize;
                 }
                 stdout_release_if_owner();
-                suspend_current_and_run_next();
+                block_current_and_run_next(BlockReason::PipeRead(self.wait_key()));
                 continue;
             }
             let mut ring_buffer = self.buffer.exclusive_access();
@@ -194,6 +202,7 @@ impl File for Pipe {
             already_read += n;
             drop(ring_buffer);
             if n > 0 {
+                wake_pipe_write_tasks(self.wait_key());
                 wake_poll_wait_tasks();
             }
             if already_read == want_to_read || already_read > 0 {
@@ -221,7 +230,7 @@ impl File for Pipe {
             }
             if loop_write == 0 {
                 stdout_release_if_owner();
-                suspend_current_and_run_next();
+                block_current_and_run_next(BlockReason::PipeWrite(self.wait_key()));
                 continue;
             }
             let mut ring_buffer = self.buffer.exclusive_access();
@@ -229,6 +238,7 @@ impl File for Pipe {
             already_write += n;
             drop(ring_buffer);
             if n > 0 {
+                wake_pipe_read_tasks(self.wait_key());
                 wake_poll_wait_tasks();
             }
             if already_write == want_to_write {
@@ -262,17 +272,23 @@ impl File for Pipe {
     }
     fn close_ref(&self) {
         let mut ring_buffer = self.buffer.exclusive_access();
-        let mut changed = false;
+        let mut last_read_closed = false;
+        let mut last_write_closed = false;
         if self.readable {
-            ring_buffer.close_read_end();
-            changed = true;
+            last_read_closed = ring_buffer.close_read_end();
         }
         if self.writable {
-            ring_buffer.close_write_end();
-            changed = true;
+            last_write_closed = ring_buffer.close_write_end();
         }
         drop(ring_buffer);
-        if changed {
+        if last_read_closed || last_write_closed {
+            let key = self.wait_key();
+            if last_read_closed {
+                wake_pipe_write_tasks(key);
+            }
+            if last_write_closed {
+                wake_pipe_read_tasks(key);
+            }
             wake_poll_wait_tasks();
         }
     }

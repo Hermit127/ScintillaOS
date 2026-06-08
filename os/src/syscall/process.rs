@@ -6,7 +6,7 @@ use crate::mm::{
 use crate::task::{
     add_task, block_current_and_run_next, current_task, current_user_token,
     exit_current_and_run_next, pid2task, pid_alloc, sleep_current_and_run_next, suspend_current_and_run_next,
-    BlockReason, SignalAction, SignalFlags, MAX_SIG,
+    force_exit_task, wake_blocked_task, BlockReason, SignalAction, SignalFlags, MAX_SIG,
     blank_kcontext, KernelStack, TaskControlBlock, TaskControlBlockInner, TaskStatus,
 };
 use alloc::format;
@@ -318,31 +318,44 @@ pub fn sys_kill(pid: usize, signum: i32) -> isize {
         if signum == 0 {
             return 0;
         }
-        let flag = SignalFlags::from_bits(1u32 << signum as usize).unwrap();
-        let mut task_ref = task.inner_exclusive_access();
-        if task_ref.signals.contains(flag) {
+        if signum == 9 && current_task().map(|t| t.getpid() != target).unwrap_or(true) {
+            force_exit_task(&task, -9);
             return 0;
         }
-        task_ref.signals.insert(flag);
-        if flag == SignalFlags::SIGTERM || flag == SignalFlags::SIGKILL {
-            task_ref.killed = true;
-            task_ref.exit_signal = -(signum as i32);
-        } else if task_ref.signal_actions.table[signum as usize].handler == 0 {
-            let fatal = flag.intersects(
-                SignalFlags::SIGSEGV | SignalFlags::SIGABRT | SignalFlags::SIGILL
-                | SignalFlags::SIGFPE | SignalFlags::SIGBUS | SignalFlags::SIGSYS
-                | SignalFlags::SIGTRAP
-                | SignalFlags::SIGALRM | SignalFlags::SIGVTALRM | SignalFlags::SIGPROF
-                | SignalFlags::SIGTERM | SignalFlags::SIGINT | SignalFlags::SIGQUIT
-                | SignalFlags::SIGHUP | SignalFlags::SIGPIPE | SignalFlags::SIGUSR1
-                | SignalFlags::SIGUSR2
-                | SignalFlags::SIGXCPU | SignalFlags::SIGXFSZ
-                | SignalFlags::SIGIO | SignalFlags::SIGPWR,
-            );
-            if fatal {
+        let flag = SignalFlags::from_bits(1u32 << signum as usize).unwrap();
+        let fatal_signal = {
+            let mut task_ref = task.inner_exclusive_access();
+            if task_ref.signals.contains(flag) {
+                return 0;
+            }
+            task_ref.signals.insert(flag);
+            if flag == SignalFlags::SIGTERM || flag == SignalFlags::SIGKILL {
                 task_ref.killed = true;
                 task_ref.exit_signal = -(signum as i32);
+                true
+            } else if task_ref.signal_actions.table[signum as usize].handler == 0 {
+                let fatal = flag.intersects(
+                    SignalFlags::SIGSEGV | SignalFlags::SIGABRT | SignalFlags::SIGILL
+                    | SignalFlags::SIGFPE | SignalFlags::SIGBUS | SignalFlags::SIGSYS
+                    | SignalFlags::SIGTRAP
+                    | SignalFlags::SIGALRM | SignalFlags::SIGVTALRM | SignalFlags::SIGPROF
+                    | SignalFlags::SIGTERM | SignalFlags::SIGINT | SignalFlags::SIGQUIT
+                    | SignalFlags::SIGHUP | SignalFlags::SIGPIPE | SignalFlags::SIGUSR1
+                    | SignalFlags::SIGUSR2
+                    | SignalFlags::SIGXCPU | SignalFlags::SIGXFSZ
+                    | SignalFlags::SIGIO | SignalFlags::SIGPWR,
+                );
+                if fatal {
+                    task_ref.killed = true;
+                    task_ref.exit_signal = -(signum as i32);
+                }
+                fatal
+            } else {
+                false
             }
+        };
+        if fatal_signal {
+            wake_blocked_task(&task);
         }
         0
     } else {

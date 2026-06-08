@@ -84,6 +84,7 @@ pub fn sleep_current_and_run_next() {
     let task = current_task().unwrap();
     task.record_time_suspend();
     let mut task_inner = task.inner_exclusive_access();
+    task_inner.task_status = TaskStatus::Blocked;
     let task_cx_ptr = &mut task_inner.task_cx as *mut KContext;
     drop(task_inner);
     take_current_task();
@@ -95,13 +96,18 @@ pub fn block_current_and_run_next(block_reason: BlockReason) {
     static mut C: u64 = 0;
     crate::fs::stdio::stdout_release_if_owner();
     let task = current_task().unwrap();
+    let pid = task.getpid();
     task.record_time_suspend();
     let mut task_inner = task.inner_exclusive_access();
     task_inner.block_reason = Some(block_reason);
+    task_inner.task_status = TaskStatus::Blocked;
     let task_cx_ptr = &mut task_inner.task_cx as *mut KContext;
     drop(task_inner);
     take_current_task();
-    NET_BLOCK_QUEUE.exclusive_access().push(task.clone());
+    let mut queue = NET_BLOCK_QUEUE.exclusive_access();
+    queue.retain(|queued| queued.getpid() != pid);
+    queue.push(task.clone());
+    drop(queue);
     schedule(task_cx_ptr);
     task.record_time_resume();
 }
@@ -129,6 +135,127 @@ pub fn wake_poll_wait_tasks() {
         inner.block_reason = None;
         drop(inner);
         add_priority_task(task);
+    }
+}
+
+pub fn wake_pipe_read_tasks(pipe_id: usize) {
+    wake_pipe_tasks(pipe_id, true);
+}
+
+pub fn wake_pipe_write_tasks(pipe_id: usize) {
+    wake_pipe_tasks(pipe_id, false);
+}
+
+fn wake_pipe_tasks(pipe_id: usize, read_waiters: bool) {
+    let mut to_wake = Vec::new();
+    {
+        let mut queue = NET_BLOCK_QUEUE.exclusive_access();
+        let mut i = 0;
+        while i < queue.len() {
+            let should_wake = {
+                let inner = queue[i].inner_exclusive_access();
+                match inner.block_reason {
+                    Some(BlockReason::PipeRead(id)) => read_waiters && id == pipe_id,
+                    Some(BlockReason::PipeWrite(id)) => !read_waiters && id == pipe_id,
+                    _ => false,
+                }
+            };
+            if should_wake {
+                to_wake.push(queue.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+    }
+    for task in to_wake {
+        let mut inner = task.inner_exclusive_access();
+        inner.task_status = TaskStatus::Ready;
+        inner.block_reason = None;
+        drop(inner);
+        add_priority_task(task);
+    }
+}
+
+pub fn wake_blocked_task(task: &Arc<TaskControlBlock>) {
+    let pid = task.getpid();
+    let removed = remove_task_from_block_queues(pid);
+    let mut inner = task.inner_exclusive_access();
+    let should_wake = inner.task_status == TaskStatus::Blocked || removed;
+    if should_wake && inner.task_status != TaskStatus::Zombie {
+            inner.task_status = TaskStatus::Ready;
+            inner.block_reason = None;
+            drop(inner);
+            add_priority_task(task.clone());
+    }
+}
+
+fn remove_task_from_block_queues(pid: usize) -> bool {
+    let mut removed = false;
+    {
+        let mut queue = NET_BLOCK_QUEUE.exclusive_access();
+        let old_len = queue.len();
+        queue.retain(|t| t.getpid() != pid);
+        if queue.len() != old_len {
+            removed = true;
+        }
+    }
+    {
+        let mut queue = WAITPID_QUEUE.exclusive_access();
+        let old_len = queue.len();
+        queue.retain(|t| t.getpid() != pid);
+        if queue.len() != old_len {
+            removed = true;
+        }
+    }
+    {
+        let mut queue = SLEEP_QUEUE.exclusive_access();
+        let old_len = queue.len();
+        queue.retain(|sleep_task| sleep_task.task.getpid() != pid);
+        if queue.len() != old_len {
+            removed = true;
+        }
+    }
+    removed
+}
+
+pub fn force_exit_task(task: &Arc<TaskControlBlock>, exit_code: i32) {
+    let pid = task.getpid();
+    remove_task_from_block_queues(pid);
+    remove_from_pid2task(pid);
+
+    let (parent, orphan_children) = {
+        let mut inner = task.inner_exclusive_access();
+        if inner.task_status == TaskStatus::Zombie {
+            return;
+        }
+        inner.task_status = TaskStatus::Zombie;
+        inner.exit_code = exit_code;
+        inner.block_reason = None;
+        let parent = inner.parent.as_ref().and_then(|w| w.upgrade());
+        let orphan_children = core::mem::take(&mut inner.children);
+        inner.memory_set.recycle_data_pages();
+        inner.clear_fd_table();
+        (parent, orphan_children)
+    };
+
+    if let Some(parent) = parent {
+        let mut queue = WAITPID_QUEUE.exclusive_access();
+        if let Some(idx) = queue.iter().position(|t| t.getpid() == parent.getpid()) {
+            let parent_task = queue.remove(idx);
+            drop(queue);
+            let mut pinner = parent_task.inner_exclusive_access();
+            pinner.task_status = TaskStatus::Ready;
+            drop(pinner);
+            add_task(parent_task);
+        }
+    }
+
+    if !orphan_children.is_empty() {
+        let mut initproc_inner = INITPROC.inner_exclusive_access();
+        for child in orphan_children.iter() {
+            child.inner_exclusive_access().parent = Some(Arc::downgrade(&INITPROC));
+            initproc_inner.children.push(child.clone());
+        }
     }
 }
 

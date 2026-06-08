@@ -592,11 +592,14 @@ pub enum BlockReason {
     TcpConnect(usize),
     UdpRecv(usize),
     PollWait,
+    PipeRead(usize),
+    PipeWrite(usize),
 }
 
 #[derive(Copy, Clone, PartialEq)]
 pub enum TaskStatus {
     Ready,
     Running,
+    Blocked,
     Zombie,
 }

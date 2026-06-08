@@ -1,4 +1,4 @@
-use super::TaskControlBlock;
+use super::{TaskControlBlock, TaskStatus};
 use crate::sync::UPSafeCell;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
@@ -47,7 +47,16 @@ pub fn add_priority_task(task: Arc<TaskControlBlock>) {
 
 pub fn fetch_task() -> Option<Arc<TaskControlBlock>> {
     //trace!("os::task::manager::fetch_task");
-    TASK_MANAGER.exclusive_access().fetch()
+    loop {
+        let task = TASK_MANAGER.exclusive_access().fetch()?;
+        let is_ready = task
+            .try_inner_borrow()
+            .map(|inner| inner.task_status == TaskStatus::Ready)
+            .unwrap_or(false);
+        if is_ready {
+            return Some(task);
+        }
+    }
 }
 
 pub fn ready_queue_len() -> usize {

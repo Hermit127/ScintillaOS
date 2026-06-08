@@ -897,7 +897,10 @@ pub fn sys_pipe2(pipe: *mut usize, flags: usize) -> isize {
         if read_fd >= inner.fd_table.len() { return -24; }
         inner.fd_table[read_fd] = Some(pipe_read);
         let write_fd = inner.alloc_fd();
-        if write_fd >= inner.fd_table.len() { inner.fd_table[read_fd] = None; return -24; }
+        if write_fd >= inner.fd_table.len() {
+            inner.close_fd(read_fd);
+            return -24;
+        }
         inner.fd_table[write_fd] = Some(pipe_write);
         if flags & O_CLOEXEC != 0 {
             inner.fd_cloexec[read_fd] = true;

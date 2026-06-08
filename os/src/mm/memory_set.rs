@@ -127,20 +127,24 @@ impl MemorySet {
         for area in user_space.areas.iter() {
             let mut new_area = MapArea::from_another(area);
             for (&vpn, frame) in area.data_frames.iter() {
-                let new_frame = frame_alloc()?;
+                let new_frame = frame.shared_clone();
+                let mut child_perm = area.map_perm;
+                if child_perm.contains(MapPermission::W) {
+                    child_perm.remove(MapPermission::W);
+                    user_space.page_table.unmap_page(vpn);
+                    user_space.page_table.map_page(
+                        vpn,
+                        frame.paddr,
+                        child_perm.into(),
+                        MappingSize::Page4KB,
+                    );
+                }
                 memory_set.page_table.map_page(
                     vpn,
                     new_frame.paddr,
-                    area.map_perm.into(),
+                    child_perm.into(),
                     MappingSize::Page4KB,
                 );
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        frame.paddr.get_ptr::<u8>(),
-                        new_frame.paddr.get_mut_ptr(),
-                        PAGE_SIZE,
-                    );
-                }
                 new_area.data_frames.insert(vpn, new_frame);
             }
             memory_set.areas.push(new_area);
@@ -165,7 +169,6 @@ impl MemorySet {
                 let _ = file.read_at(off, buf);
             }
             self.page_table.map_page(vpn, f.paddr, area.map_perm.into(), MappingSize::Page4KB);
-            unsafe { core::arch::asm!("sfence.vma {}, x0", in(reg) vpn.raw()) };
             area.data_frames.insert(vpn, f);
             return true;
         }
