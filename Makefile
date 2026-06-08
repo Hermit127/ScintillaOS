@@ -172,10 +172,21 @@ endif
 	fi
 	@cp -f tmp/hello_riscv64_musl $(ROOTFS_BIN_DIR)/hello 2>/dev/null || true
 	@cp -f tmp/lua-riscv64-musl $(ROOTFS_BIN_DIR)/lua 2>/dev/null || true
-	@cp -f testsuits-for-oskernel/scripts/lua/*.lua $(ROOTFS_DIR)/ 2>/dev/null || true
-	@cp -f tmp/strings.lua $(ROOTFS_DIR)/strings.lua 2>/dev/null || true
-	@cp -f tmp/hello.lua $(ROOTFS_DIR)/hello.lua 2>/dev/null || true
+	@cp -f tmp/*.lua $(ROOTFS_DIR)/ 2>/dev/null || true
 	@printf '#!/bin/sh\nfor f in strings sort sin30 round_num max_min file_io remove date random; do ./lua /$$f.lua; if [ $$? = 0 ]; then echo "testcase lua $$f success"; else echo "testcase lua $$f fail"; fi; done\n' > $(ROOTFS_DIR)/lua_testcode.sh 2>/dev/null || true
+	@if [ -f "$(ROOTFS_DIR)/lua-glibc" ]; then \
+		{ \
+			printf '%s\n' '#!/bin/sh'; \
+			printf '%s\n' 'echo "#### OS COMP TEST GROUP START lua-musl ####"'; \
+			printf '%s\n' 'for f in strings sort sin30 round_num max_min file_io remove date random; do ./lua /$$f.lua; if [ $$? = 0 ]; then echo "testcase lua $$f success"; else echo "testcase lua $$f fail"; fi; done'; \
+			printf '%s\n' 'echo "#### OS COMP TEST GROUP END lua-musl ####"'; \
+		} > "$(ROOTFS_DIR)/lua_musl_testcode.sh"; \
+		sed \
+			-e 's|#### OS COMP TEST GROUP START lua-musl ####|#### OS COMP TEST GROUP START lua-glibc ####|' \
+			-e 's|#### OS COMP TEST GROUP END lua-musl ####|#### OS COMP TEST GROUP END lua-glibc ####|' \
+			-e 's|\./lua |./lua-glibc |g' \
+			"$(ROOTFS_DIR)/lua_musl_testcode.sh" > "$(ROOTFS_DIR)/lua_glibc_testcode.sh"; \
+	fi
 	@if [ "$(ARCH)" = "riscv64" ]; then \
 		cp -f tmp/busybox-musl $(ROOTFS_BIN_DIR)/busybox 2>/dev/null || true; \
 		cp -f tmp/busybox-musl $(ROOTFS_DIR)/busybox 2>/dev/null || true; \
