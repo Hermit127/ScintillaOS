@@ -60,6 +60,7 @@ pub fn suspend_current_and_run_next() {
 
     //added for kernel time accounting
     task.record_time_suspend();
+    crate::fs::stdio::stdout_release_if_owner();
 
     // ---- access current TCB exclusively
     let mut task_inner = task.inner_exclusive_access();
