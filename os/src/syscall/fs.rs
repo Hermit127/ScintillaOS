@@ -1289,7 +1289,8 @@ pub fn sys_getdents64(fd: usize, dirp: *mut u8, len: usize) -> isize {
 
 // ==================== mount / umount ====================
 
-use crate::drivers::BLOCK_DEVICE;
+use crate::drivers::{BLOCK_DEVICE, ROOT_BLOCK_DEVICE};
+use crate::drivers::block::VirtIOBlock;
 use crate::fs::vfs::{vfs_mount, vfs_umount};
 
 pub fn sys_mount(
@@ -1340,10 +1341,12 @@ pub fn sys_mount(
             }
         }
 
-        let blk_dev = if source_str.as_str() == "vdb" {
-            crate::drivers::ROOT_BLOCK_DEVICE.clone()
-        } else {
-            BLOCK_DEVICE.clone()
+        let blk_dev = match source_str.as_str() {
+            "vda" => BLOCK_DEVICE.clone(),
+            "vdb" => crate::drivers::ROOT_BLOCK_DEVICE.clone(),
+            "vdc" => Arc::new(VirtIOBlock::new_at(polyhal::PhysAddr::new(0x10003000))),
+            "vdd" => Arc::new(VirtIOBlock::new_at(polyhal::PhysAddr::new(0x10004000))),
+            _ => BLOCK_DEVICE.clone(),
         };
         let sb = match VfsSuperBlock::new_ext4(blk_dev, "ext4") {
             Some(sb) => sb,

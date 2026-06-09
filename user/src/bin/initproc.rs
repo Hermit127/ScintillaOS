@@ -80,17 +80,22 @@ fn scan_and_run(mount: &str) -> bool {
 
 #[no_mangle]
 fn main() -> i32 {
-    // Mount bus 0 (BLOCK_DEVICE) at /mnt
-    if try_mount("/mnt\0", "vda\0") {
-        if scan_and_run("/mnt") {
-            shutdown();
-            return 0;
+    let devices = ["vda\0", "vdb\0", "vdc\0", "vdd\0"];
+    let mounts = ["/mnt\0", "/mnt2\0", "/mnt3\0", "/mnt4\0"];
+    let mut found = false;
+
+    for i in 0..4 {
+        if try_mount(mounts[i], devices[i]) {
+            if scan_and_run(mounts[i]) {
+                found = true;
+                break;
+            }
         }
     }
-    // If no tests found, try mounting bus 1 (ROOT_BLOCK_DEVICE) at /mnt2
-    println!("[initproc] no tests on /mnt, trying /mnt2 (vdb)...");
-    try_mount("/mnt2\0", "vdb\0");
-    scan_and_run("/mnt2");
+
+    if !found {
+        println!("[initproc] no tests found on any device!");
+    }
     shutdown();
     0
 }
