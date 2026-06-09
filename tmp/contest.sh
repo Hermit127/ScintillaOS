@@ -1,56 +1,50 @@
 #!/bin/sh
-# Contest test runner - dynamically scan test disk
-
 echo "===== OS AUTO TEST START ====="
 
-# Debug: show mount
-echo "[DBG] listing /mnt:"
-/busybox ls /mnt/ 2>&1 | head -5
-echo "[DBG] listing /:"
-/busybox ls / 2>&1 | head -5
-
-# Find and copy busybox
-for bb in /mnt/busybox /mnt/*/busybox /busybox /bin/busybox; do
-    [ -x "$bb" ] && { echo "[DBG] found busybox at $bb"; cp "$bb" /busybox 2>/dev/null; break; }
+# Bind dynamic loaders from contest disk
+for dir in musl glibc; do
+    [ -d "/mnt/$dir/lib" ] || continue
+    mkdir -p /lib
+    for src in "/mnt/$dir/lib/"*; do
+        name=$(basename "$src")
+        [ -f "/lib/$name" ] || cp "$src" "/lib/$name" 2>/dev/null
+    done
 done
+
+# Copy busybox from contest disk
+[ -x /mnt/musl/busybox ] && cp /mnt/musl/busybox /busybox 2>/dev/null
+[ -x /mnt/glibc/busybox ] && cp /mnt/glibc/busybox /busybox-glibc 2>/dev/null
 
 skip_group() {
     case "$1" in
-        libctest|libcbench|unixbench|cyclictest|netperf|iperf|ltp)
-            return 0 ;;
-        *)
-            return 1 ;;
+        libctest|libcbench|unixbench|cyclictest|netperf|iperf|ltp) return 0 ;;
+        *) return 1 ;;
     esac
 }
 
-found=0
-# Scan both /mnt/xxx_testcode.sh and /mnt/*/xxx_testcode.sh
-for pattern in "/mnt/*_testcode.sh" "/mnt/*/*_testcode.sh"; do
-    for script in $pattern; do
+# Scan /mnt/musl/ and /mnt/glibc/ for test scripts
+for variant_dir in /mnt/musl /mnt/glibc; do
+    [ ! -d "$variant_dir" ] && continue
+    variant=$(basename "$variant_dir")
+    [ "$variant" = "glibc" ] && bb="/busybox-glibc" || bb="/busybox"
+    [ -x "$bb" ] || bb="/busybox"
+
+    # List all *_testcode.sh in this variant directory
+    for script in "$variant_dir"/*_testcode.sh; do
         [ -f "$script" ] || continue
-        found=1
-        dir=$(dirname "$script")
         name=$(basename "$script")
         group=${name%_testcode.sh}
-        runtime=$(basename "$dir")
-        [ "$runtime" = "mnt" ] && runtime="musl"
 
         if skip_group "$group"; then
-            echo "[SKIP] $group ($runtime)"
+            echo "[SKIP] $group ($variant)"
             continue
         fi
 
-        echo "[RUN] $group ($runtime)"
-        case "$runtime" in
-            glibc|*glibc*) bb="/busybox-glibc" ;;
-            *) bb="/busybox" ;;
-        esac
-        [ -x "$bb" ] || bb="/busybox"
-
-        cd "$dir" && "$bb" sh "$name" 2>&1
+        echo "[RUN] $group ($variant)"
+        export LD_LIBRARY_PATH="$variant_dir/lib:/lib"
+        cd "$variant_dir" && "$bb" timeout -s KILL 60 "$bb" sh "$name" 2>&1
         cd /
     done
 done
 
-[ $found -eq 0 ] && echo "[DBG] no test scripts found!"
 echo "===== ALL TESTS COMPLETE ====="
