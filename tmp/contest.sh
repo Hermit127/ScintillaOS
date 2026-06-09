@@ -1,13 +1,16 @@
 #!/bin/sh
-# Contest test runner - dynamically scan test disk and run all tests
+# Contest test runner - dynamically scan test disk
 
 echo "===== OS AUTO TEST START ====="
 
-# Copy busybox from contest disk
-[ -x /mnt/musl/busybox ]  && cp /mnt/musl/busybox /busybox 2>/dev/null
-[ -x /mnt/glibc/busybox ] && cp /mnt/glibc/busybox /busybox-glibc 2>/dev/null
+# Find and copy busybox
+for bb in /mnt/busybox /mnt/*/busybox; do
+    [ -x "$bb" ] && cp "$bb" /busybox 2>/dev/null && break
+done
+for bb in /mnt/busybox-glibc /mnt/*/busybox-glibc /mnt/*/busybox; do
+    [ -x "$bb" ] && cp "$bb" /busybox-glibc 2>/dev/null && break
+done
 
-# Skip list (tests that crash or OOM)
 skip_group() {
     case "$1" in
         libctest|libcbench|unixbench|cyclictest|netperf|iperf|ltp)
@@ -17,15 +20,15 @@ skip_group() {
     esac
 }
 
-# Scan and run all test scripts
-for script in /mnt/*/*_testcode.sh; do
-    [ -f "$script" ] || continue
+# Scan both /mnt/xxx_testcode.sh and /mnt/*/xxx_testcode.sh
+find /mnt -maxdepth 2 -name "*_testcode.sh" 2>/dev/null | sort | while read script; do
+    dir=$(dirname "$script")
+    name=$(basename "$script")
+    group=${name%_testcode.sh}
 
-    runtime=${script#/mnt/}
-    runtime=${runtime%%/*}
-    group=${script##*/}
-    group=${group%_testcode.sh}
-    dir=${script%/*}
+    # guess runtime from directory name
+    runtime=$(basename "$dir")
+    [ "$runtime" = "mnt" ] && runtime="musl"
 
     if skip_group "$group"; then
         echo "[SKIP] $group ($runtime)"
@@ -33,13 +36,14 @@ for script in /mnt/*/*_testcode.sh; do
     fi
 
     echo "[RUN] $group ($runtime)"
-    cd "$dir" || continue
+    # Use appropriate busybox: musl dir -> /busybox, glibc dir -> /busybox-glibc  
+    case "$runtime" in
+        glibc|*glibc*) bb="/busybox-glibc" ;;
+        *) bb="/busybox" ;;
+    esac
+    [ -x "$bb" ] || bb="/busybox"
 
-    if [ "$runtime" = "musl" ]; then
-        /busybox sh "${script##*/}" 2>&1
-    else
-        /busybox-glibc sh "${script##*/}" 2>&1
-    fi
+    cd "$dir" && "$bb" sh "$name" 2>&1
     cd /
 done
 
