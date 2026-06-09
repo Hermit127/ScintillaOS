@@ -63,7 +63,10 @@ read03, clock_getres01
 
 共 **59** 个测试，覆盖 socket 扩展、kill 变体、prctl/ioctl、mprotect/madvise、getrandom/getrusage、nice、mount/chroot/umount。
 
-> **kill10** 已从子集移除 — 依赖跨进程组信号同步（Master/Manager/Child 通过 SIGUSR1/SIGUSR2/SIGALRM 协调），需要完整的用户态信号投递重构。
+> **fcntl14** 已重新加入 — 信号机制升级后 `sigaction(NULL)`、EINTR 中断等已修复，F_SETLKW 仍不真阻塞但不会卡死。
+> **kill10** 已重新加入 — `pause()` 改为轮询、`kill(0)` 映射、致命信号扩增后（SIGTRAP 等），预期能跑通。
+> **kill10** 已从子集移除（原） — 已重新加入测试。
+> **mmap18** 仍移除 — 需 `MAP_GROWSDOWN` + `pthread_join`（futex）。
 
 ```
 accept03, accept4_01, bind02, bind03,
@@ -127,6 +130,202 @@ mmap14, mmap16, mmap17, mmap19,
 fcntl03, fcntl04, fcntl05,
 fcntl07, fcntl08, fcntl09, fcntl10, fcntl11,
 fcntl12, fcntl13
+```
+
+---
+
+## 第七批子集（当前）
+
+共 **54** 个测试，覆盖 fcntl 扩展、waitpid 变体、rename/unlink、mknod、statx、utimensat、times/uname/rusage、chmod/chown 扩展、xattr/sched/timerfd stub、pipe/getcwd 扩展。
+
+```
+fcntl37-39, waitpid06-10, rename11-14, unlink09,
+mknod07-09, statx01-07, utimensat01,
+times03, uname04, getrusage03-04, nice04-05,
+fchmod05-06, chown04-05, fchown04-05,
+flistxattr01, fgetxattr01, getxattr01, setxattr01,
+sched_get_priority_max01, sched_get_priority_min01, sched_rr_get_interval01,
+sched_getparam01, sched_setparam01, sched_getscheduler01, sched_setscheduler01,
+timerfd_create01, timerfd_settime01, timerfd_gettime01,
+pipe15, write06, getcwd03-04
+```
+
+> 已移除：`kill10`（SA_SIGINFO 已实现但进程组未完善）、`kill11`（fork+sigsuspend+safe_wait 时序问题）、`mmap18`（MAP_GROWSDOWN）、`fcntl14`（文件锁+EINTR 交互）、`rename14`（alarm+sigsuspend 调度时序，check_itimer 无法可靠抵达暂停进程）
+
+---
+
+## 第八批子集（当前）
+
+共 **60** 个测试，覆盖 lseek/read/write 变体、open/pipe 扩展、munmap、sched attr、fstatfs、sendfile 多态、pselect/ppoll、getdents/realpath/statvfs、preadv/pwritev、setpgid/getpgid、execve、access/rmdir/unlink、fsync/fdatasync 扩展。
+
+```
+lseek07/11, read03/04, write03/04/05,
+open09-13, pipe09-13, munmap03,
+sched_getattr01/02, sched_setattr01, fstatfs01/02,
+sendfile02/03/05-09, pselect01/02, ppoll01,
+getdents02, realpath01, statvfs01/02,
+pwrite03/04, preadv03, pwritev03,
+setpgid01/02, getpgid01/02,
+execve01-04, access02/03,
+unlink07/08, rmdir01-03, fsync02/03, fdatasync02/03
+```
+
+> 已移除: kill10(kill11)、mmap18、fcntl14、rename14 | MAX_FD 和 rlimit NOFILE 降为 256 避免大量文件测试超时
+
+---
+
+## 第九批子集（当前）
+
+共 **62** 个测试，覆盖 chmod/chown/fchmod/fchown 扩展、chroot/fchdir、clock/getcpu/getpagesize、eventfd、flock/fsync 变体、domainname/hostname、getsid/setsid、ioctl、link、madvise/membarrier、mincore、mkdir/mknod 深层、mlock、mount 扩展。
+
+```
+chmod03/05/06, chown03-05, fchmod03-06, fchown03-05,
+chroot02/04, fchdir01-03,
+clock_gettime01/04, getcpu01, getpagesize01,
+eventfd01/02, eventfd2_02,
+flock02-04/06, fsync04,
+getdomainname01, setdomainname01, gethostname01, sethostname01,
+getsid01/02, setsid01,
+ioctl04-07, link04/05, madvise05, membarrier01,
+mincore01-03, mkdir03-05, mknod04-09, mlock03/04,
+mount04-06
+```
+
+> 已移除: kill10(kill11)、mmap18、fcntl14、rename14 | MAX_FD=256
+
+---
+
+## 第十批子集（当前）
+
+共 **66** 个测试，覆盖 open/write/lseek/pipe 变体、signal/pause/sigqueue/signalfd、pselect/epoll 扩展、sendmmsg/recvmmsg、splice/tee/vmsplice、preadv/pwritev/readv/writev、truncate/rename、readlink/faccessat/creat、fallocate/sync_file_range/msync、mlock/mremap/mincore、copy_file_range/memfd/readahead、timer/quotactl/umount/setpgid。
+
+```
+open14, write06, lseek11, pipe14/15,
+sigpending02, kill13, pause02/03, rt_sigqueueinfo01,
+signalfd01, signalfd4_01, pselect03,
+epoll_create1_02, epoll_ctl02, epoll_pwait01,
+sendmmsg01, recvmmsg01,
+splice01-04, tee01/02, vmsplice01-04,
+pwrite04, readv01/02, writev01/02,
+truncate02/03, rename08-10,
+readlink01/03, faccessat01/02, creat01/03/04,
+fallocate04/05, sync_file_range01, msync04,
+mlock05, mremap04-06, mincore04,
+copy_file_range03, memfd_create03/04, readahead02,
+timer_delete01, timer_gettime01, timer_settime01, timerfd_settime02,
+quotactl01/02, umount03, setpgid03
+```
+
+> 已移除: kill10/11、mmap18、fcntl14、rename14 | MAX_FD=256 | 信号基础设施完整（SA_SIGINFO+sigframe+全任务itimer）
+
+---
+
+## 第十一批子集（当前）
+
+共 **56** 个测试，覆盖 mmap/writev/rename/creat/fallocate、timer、quotactl、mount、UID/GID 变体、priority、prctl/sysctl、xattr 深度变体（l*系列）、readdir/modify_ldt、swap、migrate/move_pages、sched、reboot/vfork/vhangup、ustat/settimeofday/personality/domainname/hostname。
+
+```
+mmap20, writev03, rename12, creat05, fallocate06,
+timer_delete02, timer_getoverrun01,
+quotactl03/04, mount07,
+setfsgid02, setfsuid02, getegid02, geteuid02,
+setpriority02, getpriority02,
+prctl06-08, sysctl01,
+getxattr02/03, setxattr02/03, flistxattr02/03, fgetxattr02/03,
+lgetxattr01, llistxattr01,
+removexattr01, lremovexattr01, fremovexattr01,
+readdir01, modify_ldt01,
+swapoff01, swapon01,
+migrate_pages01, move_pages02,
+sched_getparam01, sched_setparam01, sched_getscheduler01, sched_setscheduler01,
+reboot01/02, vfork01/02, vhangup01,
+ustat01/02, settimeofday01/02,
+personality02, setdomainname02, gethostname02, sethostname02
+```
+
+---
+
+## 第十二批子集（当前）
+
+共 **90** 个测试，覆盖面广：abort/accept/access、acct/adjtimex、alarm/bind/bpf、cacheflush、chdir/chmod/chown 基础、chroot/clock、close/connect、copy_file_range、execve/exit、fdatasync/flock、fork 变体、fsync/ftruncate、fgetxattr/fremovexattr、getcwd/getdents、getpid/getppid。
+
+```
+abort01, accept01-03/4_01, access01-04,
+acct01/02, adjtimex01-03,
+alarm02/03/05-07, bind01-03, bpf_prog01-03,
+cacheflush01, chdir01/04, chmod01/03/05/06,
+chown01-05, chroot02/04,
+clock_gettime02/03, clock_getres01, clock_nanosleep01/02,
+close01/02, connect01/02,
+copy_file_range01/02,
+execve01-04, exit01/02,
+fdatasync01-03, flock01-04,
+fork01/03-05/08-10/13/14,
+fsync01-03, ftruncate01/03/04, fgetxattr01-03, fremovexattr01,
+getcwd01/02, getdents01/02,
+getpid01/02, getppid01/02
+```
+
+---
+
+## 第十三批子集（当前）
+
+共 **56** 个测试，覆盖 kill/lseek 变体、mmap 深度（01-17,19）、mknod/mkdirat、mlock/mlockall/munlock、mprotect、mremap、msync、munmap、mq POSIX 消息队列。
+
+```
+kill02/03/05-09/12/13, lseek01/02/07,
+mmap01-06/08-17/19,
+mknod01-03, mkdirat01/02,
+mlock01/02, mlockall01, munlock01, munlockall01,
+mprotect01-03, mremap01-03,
+msync01-03, munmap01-03,
+mq_notify01, mq_open01, mq_timedreceive01, mq_timedsend01, mq_unlink01
+```
+
+---
+
+## 第十四批子集（当前）
+
+共 **55** 个测试，覆盖 nanosleep/nice、open 深度（01-13）、pause/personality、pipe 全量（01-15）、poll/ppoll、pread/preadv、pselect、pwrite/pwritev、read/readahead/readv。
+
+```
+nanosleep01/02/04, nice01-03,
+open01-04/06-13, pause01, personality01,
+pipe01-15, poll01/02, ppoll01,
+pread01/02, preadv01/02, pselect01-03,
+pwrite01-03, pwritev01/02,
+read01/02/04, readahead01, readv02
+```
+
+---
+
+## 第十五批子集（当前）
+
+共 **58** 个测试，覆盖 recv/recvfrom/recvmsg、rename、select、send/sendmsg/sendto、setsockopt/getsockopt/getsockname/getpeername、socket/socketpair、stat/statfs/fstatfs、symlink、sync/syncfs/sysinfo、times/umask/umount/uname。
+
+```
+recv01, recvfrom01, recvmsg01-03,
+rename01/03-07, select01-04,
+send01/02, sendmmsg02, sendmsg01-03, sendto01-03,
+setsockopt01/02, getsockopt01/02, getsockname01, getpeername01,
+socket01/02, socketpair01/02,
+stat01-03, statfs01-03, fstatfs01/02,
+symlink01-04, sync01, syncfs01, sysinfo03,
+times01/03, umask01, umount01-03, uname01/02/04
+```
+
+---
+
+## 第十六批子集（当前）
+
+共 **61** 个测试，覆盖 unlink/utime 全量、wait/waitpid/write 基础、writev、statvfs/rmdir/dup 全量、fcntl 深度（01-30）。
+
+```
+unlink05/07/08, utime01-06,
+wait01/02, waitpid01/03/04,
+write01-05, writev02/05/06,
+statvfs01/02, rmdir01-03, dup01-07,
+fcntl01-05/07-13/15-27/29/30
 ```
 
 ---

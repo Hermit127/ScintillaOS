@@ -95,6 +95,7 @@ pub struct TaskControlBlockInner {
     pub alt_stack_flags: u32,
     pub in_syscall: bool,
     pub exit_signal: i32,
+    pub saved_signal_mask: SignalFlags,
 }
 
 impl TaskControlBlockInner {
@@ -114,7 +115,7 @@ impl TaskControlBlockInner {
         self.get_status() == TaskStatus::Zombie
     }
     pub fn alloc_fd(&mut self) -> usize {
-        const MAX_FD: usize = 1024;
+        const MAX_FD: usize = 256;
         let search_end = self.fd_table.len().min(MAX_FD);
         if let Some(fd) = (0..search_end).find(|fd| self.fd_table[*fd].is_none()) {
             self.fd_cloexec[fd] = false;
@@ -241,6 +242,7 @@ impl TaskControlBlock {
                     alt_stack_flags: 0,
                     in_syscall: false,
                     exit_signal: 0,
+                    saved_signal_mask: SignalFlags::empty(),
                 }, "TaskInner")
             },
         };
@@ -498,6 +500,7 @@ impl TaskControlBlock {
                     alt_stack_flags: 0,
                     in_syscall: false,
                     exit_signal: 0,
+                    saved_signal_mask: SignalFlags::empty(),
                 }, "TaskInner")
             },
         });

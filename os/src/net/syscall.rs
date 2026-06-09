@@ -554,6 +554,9 @@ pub fn sys_recvfrom(
 }
 
 pub fn sys_sendmsg(sockfd: usize, msg: *const u8, flags: usize) -> isize {
+    if msg.is_null() {
+        return -14;
+    }
     let token = current_user_token();
     let msghdr: &Msghdr = translated_ref(token, msg as *const Msghdr);
 

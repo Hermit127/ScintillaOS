@@ -82,7 +82,9 @@ impl File for Stdout {
         while STDOUT_BUSY.swap(true, Ordering::Acquire) {
             core::hint::spin_loop();
         }
-        print!("{}", core::str::from_utf8(user_buf).unwrap());
+        for &b in user_buf.iter() {
+            print!("{}", b as char);
+        }
         STDOUT_BUSY.store(false, Ordering::Release);
         user_buf.len() as isize
     }
