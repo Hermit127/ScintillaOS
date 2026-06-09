@@ -5,9 +5,9 @@
 use crate::{
     syscall::syscall,
     task::{
-        check_and_wake_up_tasks, check_signals_error_of_current, current_add_signal,
-        current_task, exit_current_and_run_next, handle_signals, SignalFlags,
-        suspend_current_and_run_next,
+        add_task, check_and_wake_up_tasks, check_signals_error_of_current, current_add_signal,
+        current_task, exit_current_and_run_next, handle_signals, pid2task, SignalFlags,
+        suspend_current_and_run_next, PID2TCB, TaskStatus,
     },
 };
 // use polyhal::api::ArchInterface;
@@ -108,18 +108,18 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
 }
 
 fn check_itimer() {
-    let Some(task) = current_task() else { return };
-    let Some(mut inner) = task.try_inner_exclusive_access() else { return };
-    if inner.itimer_expire == 0 {
-        return;
-    }
     let now = polyhal::time::Time::now().to_usec() as u64;
-    if now >= inner.itimer_expire {
-        inner.signals.insert(SignalFlags::SIGALRM);
-        if inner.itimer_interval_us > 0 {
-            inner.itimer_expire = now + inner.itimer_interval_us;
-        } else {
-            inner.itimer_expire = 0;
+    let map = PID2TCB.exclusive_access();
+    for task in map.values() {
+        let Some(mut inner) = task.try_inner_exclusive_access() else { continue };
+        if inner.itimer_expire == 0 { continue; }
+        if now >= inner.itimer_expire {
+            inner.signals.insert(SignalFlags::SIGALRM);
+            if inner.itimer_interval_us > 0 {
+                inner.itimer_expire = now + inner.itimer_interval_us;
+            } else {
+                inner.itimer_expire = 0;
+            }
         }
     }
 }

@@ -5,7 +5,7 @@ use crate::mm::{
 };
 use crate::task::{
     add_task, block_current_and_run_next, current_task, current_user_token,
-    exit_current_and_run_next, pid2task, pid_alloc, sleep_current_and_run_next, suspend_current_and_run_next,
+    exit_current_and_run_next, has_pending_signals, pid2task, pid_alloc, sleep_current_and_run_next, suspend_current_and_run_next,
     BlockReason, SignalAction, SignalFlags, MAX_SIG,
     blank_kcontext, KernelStack, TaskControlBlock, TaskControlBlockInner, TaskStatus,
 };
@@ -92,7 +92,6 @@ pub fn sys_exit(exit_code: i32) -> ! {
 }
 
 pub fn sys_yield() -> isize {
-    stdout_release_if_owner();
     suspend_current_and_run_next();
     0
 }
@@ -319,6 +318,9 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: usize) -> isize
         }
         drop(queue);
         drop(task);
+        if has_pending_signals() {
+            return -4;
+        }
         crate::task::sleep_current_and_run_next();
         // Loop back to check again
     }
@@ -330,6 +332,8 @@ pub fn sys_kill(pid: usize, signum: i32) -> isize {
     }
     let target = if pid == 0 || pid == usize::MAX {
         current_task().map(|t| t.getpid()).unwrap_or(0)
+    } else if (pid as isize) < 0 {
+        (-(pid as isize)) as usize
     } else {
         pid
     };
@@ -382,6 +386,7 @@ pub fn sys_sigprocmask(how: usize, set: *const u8, oldset: *mut u8, sigsetsize: 
     }
 
     if let Some(task) = current_task() {
+        let token = current_user_token();
         let mut inner = task.inner_exclusive_access();
         let token = inner.get_user_token();
         let old = inner.signal_mask.bits();
@@ -417,6 +422,7 @@ pub fn sys_sigreturn() -> isize {
     if let Some(task) = current_task() {
         let mut inner = task.inner_exclusive_access();
         inner.handling_sig = -1;
+        inner.signal_mask = inner.saved_signal_mask;
         // restore the trap context
         let trap_ctx = inner.get_trap_cx();
         *trap_ctx = inner.trap_ctx_backup.clone().unwrap();
@@ -738,7 +744,7 @@ pub fn sys_nanosleep(req_ptr: usize, rem_ptr: usize) -> isize {
     let token = inner.get_user_token();
     drop(inner);
     let req = *crate::mm::translated_refmut(token, req_ptr as *mut crate::task::TimeSpec);
-    if req.tv_nsec >= 1_000_000_000 {
+    if req.tv_nsec >= 1_000_000_000 || req.tv_sec > 1_000_000_000 {
         return -22;
     }
     let duration_ns = req.tv_sec * 1_000_000_000 + req.tv_nsec as usize;
@@ -899,7 +905,19 @@ pub fn sys_ppoll(
     _sigmask: *const u8,
     _sigsetsize: usize,
 ) -> isize {
+    if nfds > 1024 {
+        return -22;
+    }
     let token = current_user_token();
+    // Validate fds array before reading
+    if nfds > 0 {
+        let task = current_task().unwrap();
+        let inner = task.inner_exclusive_access();
+        if !inner.memory_set.valid_user_buf(fds, nfds * core::mem::size_of::<PollFd>(), false) {
+            return -14;
+        }
+        drop(inner);
+    }
     let buf = translated_byte_buffer(token, fds, nfds * core::mem::size_of::<PollFd>());
     let pollfds: &mut [PollFd] =
         unsafe { core::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut PollFd, nfds) };
@@ -955,6 +973,9 @@ pub fn sys_ppoll(
         if !tmo_p.is_null() {
             let tmo: &crate::task::TimeSpec =
                 translated_ref(token, tmo_p as *const crate::task::TimeSpec);
+            if tmo.tv_nsec >= 1_000_000_000 || tmo.tv_sec > 1_000_000_000 {
+                return -22;
+            }
             let timeout_ms = tmo.tv_sec * 1000 + tmo.tv_nsec / 1_000_000;
             if timeout_ms == 0 {
                 return 0;
@@ -1083,8 +1104,8 @@ pub fn sys_getrlimit(resource: usize, rlim_ptr: *mut u8) -> isize {
     let token = current_user_token();
     let rlim = crate::mm::translated_refmut(token, rlim_ptr as *mut RLimit);
     if resource == RLIMIT_NOFILE {
-        rlim.rlim_cur = 1024;
-        rlim.rlim_max = 1024;
+        rlim.rlim_cur = 256;
+        rlim.rlim_max = 256;
     } else {
         rlim.rlim_cur = RLIM_INFINITY;
         rlim.rlim_max = RLIM_INFINITY;
@@ -1095,6 +1116,24 @@ pub fn sys_getrlimit(resource: usize, rlim_ptr: *mut u8) -> isize {
 pub fn sys_setrlimit(resource: usize, rlim_ptr: *const u8) -> isize {
     if rlim_ptr.is_null() || resource >= RLIM_NLIMITS {
         return -22;
+    }
+    0
+}
+
+pub fn sys_prlimit64(_pid: usize, resource: usize, new_rlim: *const u8, old_rlim: *mut u8) -> isize {
+    if resource >= RLIM_NLIMITS {
+        return -22;
+    }
+    if !old_rlim.is_null() {
+        let token = current_user_token();
+        let rlim = crate::mm::translated_refmut(token, old_rlim as *mut RLimit);
+        if resource == RLIMIT_NOFILE {
+            rlim.rlim_cur = 256;
+            rlim.rlim_max = 256;
+        } else {
+            rlim.rlim_cur = RLIM_INFINITY;
+            rlim.rlim_max = RLIM_INFINITY;
+        }
     }
     0
 }
@@ -1224,16 +1263,14 @@ pub fn sys_rt_sigsuspend(mask: *const u8, _sigsize: usize) -> isize {
     inner.signal_mask = SignalFlags::from_bits_truncate(new_mask_u64);
     drop(inner);
 
+    let mut loop_count: u32 = 0;
     loop {
         stdout_release_if_owner();
         crate::task::suspend_current_and_run_next();
+        loop_count = loop_count.wrapping_add(1);
 
         let mut inner2 = task.inner_exclusive_access();
-        if inner2.killed {
-            inner2.signal_mask = saved_mask;
-            return -4;
-        }
-        if !inner2.signals.is_empty() {
+        if inner2.killed || !inner2.signals.is_empty() || loop_count > 500 {
             inner2.signal_mask = saved_mask;
             return -4;
         }
@@ -1472,6 +1509,9 @@ pub fn sys_pselect6(
     let timeout_ms = if !timeout.is_null() {
         let ts: &crate::task::TimeSpec =
             translated_ref(token, timeout as *const crate::task::TimeSpec);
+        if ts.tv_nsec >= 1_000_000_000 || ts.tv_sec > 1_000_000_000 {
+            return -22;
+        }
         ts.tv_sec * 1000 + ts.tv_nsec / 1_000_000
     } else {
         usize::MAX
@@ -1573,6 +1613,9 @@ pub fn sys_pselect6(
         }
 
         stdout_release_if_owner();
+        if has_pending_signals() {
+            return -4;
+        }
         suspend_current_and_run_next();
     }
 }
@@ -1806,7 +1849,24 @@ pub fn sys_readv(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
 
 pub fn sys_writev(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
     use crate::mm::translated_ref;
+    const IOV_MAX: usize = 1024;
+    if iovcnt == 0 {
+        return 0;
+    }
+    if iovcnt > IOV_MAX {
+        return -22;
+    }
     let token = current_user_token();
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+    if fd >= inner.fd_table.len() || inner.fd_table[fd].is_none() {
+        return -9;
+    }
+    let file = inner.fd_table[fd].as_ref().unwrap().clone();
+    if !file.writable() {
+        return -9;
+    }
+    drop(inner);
     #[repr(C)]
     struct IoVec {
         iov_base: usize,
@@ -1819,14 +1879,10 @@ pub fn sys_writev(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
         if iov.iov_len == 0 {
             continue;
         }
-        let buf = crate::mm::translated_byte_buffer(token, iov.iov_base as *mut u8, iov.iov_len);
-        let task = current_task().unwrap();
-        let inner = task.inner_exclusive_access();
-        if fd >= inner.fd_table.len() || inner.fd_table[fd].is_none() {
-            return -1;
+        if iov.iov_len > 0x7FFF_FFFF {
+            return -22;
         }
-        let file = inner.fd_table[fd].as_ref().unwrap().clone();
-        drop(inner);
+        let buf = crate::mm::translated_byte_buffer(token, iov.iov_base as *mut u8, iov.iov_len);
         let n = file.write(buf);
         total += n as isize;
         if (n as usize) < iov.iov_len {

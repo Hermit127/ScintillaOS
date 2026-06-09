@@ -228,25 +228,40 @@ const AT_REMOVEDIR: u32 = 0x200;
 
 pub fn sys_unlinkat(dirfd: isize, path: *const u8, flags: u32) -> isize {
     if path.is_null() {
-        return -1;
+        return -14;
     }
     let is_dir = (flags & AT_REMOVEDIR) != 0;
     if flags != 0 && !is_dir {
-        return -1;
+        return -22;
     }
-    let token = current_user_token();
-    let path = translated_str(token, path);
-    let base_dir = match resolve_base_dir(dirfd) {
-        Some(base) => base,
-        None => return -1,
-    };
-    if path.starts_with("/tmp/iperf3.") {
+    // Validate path before reading
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+    let end_of_page = ((path as usize) + crate::config::PAGE_SIZE) & !(crate::config::PAGE_SIZE - 1);
+    let first_page_len = 4096.min(end_of_page - (path as usize));
+    if !inner.memory_set.valid_user_buf(path, first_page_len, false) {
+        return -14;
+    }
+    let token = inner.get_user_token();
+    drop(inner);
+    let path_str = translated_str(token, path);
+    if path_str.is_empty() {
+        return -2;
+    }
+    if path_str.len() > 255 {
+        return -36;
+    }
+    if path_str.starts_with("/tmp/iperf3.") {
         return 0;
     }
-    if unlink_at(Some(base_dir), path.as_str(), is_dir) {
+    let base_dir = match resolve_base_dir(dirfd) {
+        Some(base) => base,
+        None => return -9,
+    };
+    if unlink_at(Some(base_dir), path_str.as_str(), is_dir) {
         0
     } else {
-        -1
+        -2
     }
 }
 
@@ -1123,7 +1138,7 @@ pub fn sys_statx(
     dirfd: isize,
     path: *const u8,
     flags: u32,
-    mask: u32,
+    _mask: u32,
     statx_buf: *mut u8,
 ) -> isize {
     const AT_EMPTY_PATH: u32 = 0x1000;
@@ -1143,8 +1158,19 @@ pub fn sys_statx(
         drop(inner);
         let st = file.stat();
         let token = current_user_token();
-        write_statx(statx_buf, &st, mask);
+        write_statx(statx_buf, &st, _mask);
         return 0;
+    }
+
+    // Validate path pointer
+    if !path.is_null() {
+        let task = current_task().unwrap();
+        let inner = task.inner_exclusive_access();
+        let end_of_page = ((path as usize) + crate::config::PAGE_SIZE) & !(crate::config::PAGE_SIZE - 1);
+        let first_page_len = 256.min(end_of_page - (path as usize));
+        if !inner.memory_set.valid_user_buf(path, first_page_len, false) {
+            return -14;
+        }
     }
 
     let token = current_user_token();
@@ -1159,13 +1185,38 @@ pub fn sys_statx(
         || path_str == "/dev/misc/rtc"
     {
         let st = Kstat::new(crate::fs::S_IFCHR);
-        write_statx(statx_buf, &st, mask);
+        write_statx(statx_buf, &st, _mask);
         return 0;
     }
+    if path_str.len() > 255 {
+        return -36;
+    }
 
-    let base = match resolve_base_dir(dirfd) {
-        Some(b) => b,
-        None => return -2,
+    // Resolve dirfd manually to get proper error codes
+    let base = if dirfd == AT_FDCWD {
+        let task = current_task().unwrap();
+        let inner = task.inner_exclusive_access();
+        inner.cwd.clone()
+    } else if dirfd < 0 {
+        return -9;
+    } else {
+        let task = current_task().unwrap();
+        let inner = task.inner_exclusive_access();
+        let fd = dirfd as usize;
+        if fd >= inner.fd_table.len() || inner.fd_table[fd].is_none() {
+            return -9;
+        }
+        let file = inner.fd_table[fd].as_ref().unwrap().clone();
+        if !file.is_dir() {
+            return -20;
+        }
+        let path = file.path().unwrap_or_default();
+        let cwd = inner.cwd.clone();
+        drop(inner);
+        match vfs_resolve_path(&cwd, &path) {
+            Some(d) => d,
+            None => return -2,
+        }
     };
     let dentry = match vfs_resolve_path(&base, &path_str) {
         Some(d) => d,
@@ -1174,7 +1225,13 @@ pub fn sys_statx(
 
     let inode = crate::fs::inode::OSInode::new(false, false, false, dentry);
     let st = inode.stat();
-    write_statx(statx_buf, &st, mask);
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+    if !inner.memory_set.valid_user_buf(statx_buf, core::mem::size_of::<Statx>(), true) {
+        return -14;
+    }
+    drop(inner);
+    write_statx(statx_buf, &st, _mask);
     0
 }
 
@@ -1733,18 +1790,42 @@ pub fn sys_flock(_fd: usize, _op: usize) -> isize {
 // ---- mknodat (33) ----
 
 pub fn sys_mknodat(dirfd: isize, path: *const u8, mode: u32, _dev: usize) -> isize {
-    let token = current_user_token();
+    if path.is_null() {
+        return -14;
+    }
+    // Validate path before reading
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+    let end_of_page = ((path as usize) + crate::config::PAGE_SIZE) & !(crate::config::PAGE_SIZE - 1);
+    let first_page_len = 256.min(end_of_page - (path as usize));
+    if !inner.memory_set.valid_user_buf(path, first_page_len, false) {
+        return -14;
+    }
+    let token = inner.get_user_token();
+    drop(inner);
     let path_str = translated_str(token, path);
+    if path_str.is_empty() {
+        return -2;
+    }
+    if path_str.len() > 255 {
+        return -36;
+    }
     let base = match resolve_base_dir(dirfd) {
         Some(b) => b,
         None => return -2,
     };
+    // Check if already exists
+    if crate::fs::vfs::vfs_resolve_path(&base, &path_str).is_some() {
+        return -17;
+    }
     let (parent, name) = match crate::fs::vfs::vfs_resolve_parent_and_name(&base, &path_str) {
         Some(p) => p,
         None => return -2,
     };
-    crate::fs::vfs::vfs_create(&parent, &name, false, 0o666);
-    0
+    match crate::fs::vfs::vfs_create(&parent, &name, false, 0o666) {
+        Some(_) => 0,
+        None => -2,
+    }
 }
 
 // ---- readahead (213) ----

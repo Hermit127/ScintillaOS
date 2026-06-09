@@ -8,6 +8,7 @@ mod task;
 
 use crate::fs::{open_file, OpenFlags};
 use crate::mm::translated_refmut;
+use crate::mm::translated_byte_buffer;
 use crate::sync::UPSafeCell;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -211,7 +212,7 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
     };
     // **** release current PCB before touching parent/initproc
 
-    // wake parent waiting in waitpid
+    // wake parent waiting in waitpid and send SIGCHLD
     if let Some(parent) = parent {
         let mut queue = WAITPID_QUEUE.exclusive_access();
         if let Some(idx) = queue.iter().position(|t| t.getpid() == parent.getpid()) {
@@ -221,6 +222,15 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
             pinner.task_status = TaskStatus::Ready;
             drop(pinner);
             add_task(parent_task);
+        } else {
+            drop(queue);
+        }
+        // Send SIGCHLD to parent
+        {
+            let mut pinner = parent.inner_exclusive_access();
+            if !pinner.signal_mask.contains(SignalFlags::SIGCHLD) {
+                pinner.signals.insert(SignalFlags::SIGCHLD);
+            }
         }
     }
 
@@ -336,6 +346,12 @@ fn call_user_signal_handler(sig: usize, signal: SignalFlags) {
         task_inner.handling_sig = sig as isize;
         task_inner.signals ^= signal;
 
+        // Block current signal + handler's sa_mask during handler execution
+        let handler_mask = task_inner.signal_actions.table[sig].mask;
+        task_inner.saved_signal_mask = task_inner.signal_mask;
+        task_inner.signal_mask |= signal;
+        task_inner.signal_mask |= handler_mask;
+
         // backup trapframe
         let trap_ctx = task_inner.get_trap_cx();
         task_inner.trap_ctx_backup = Some(trap_ctx.clone());
@@ -349,8 +365,32 @@ fn call_user_signal_handler(sig: usize, signal: SignalFlags) {
             saved_sepc
         };
 
-        // put args (a0)
-        trap_ctx[TrapFrameArgs::ARG0] = sig;
+        // Check SA_SIGINFO flag
+        let sa_flags = task_inner.signal_actions.table[sig].flags;
+        const SA_SIGINFO: usize = 0x00000004;
+        if sa_flags & SA_SIGINFO != 0 {
+            // Build siginfo_t on user stack
+            let sigframe_size: usize = 128;
+            let old_sp = trap_ctx[TrapFrameArgs::SP];
+            let new_sp = (old_sp - sigframe_size) & !0xF; // 16-byte aligned
+            trap_ctx[TrapFrameArgs::SP] = new_sp;
+
+            // Write siginfo to user stack: si_signo(0-3), si_code(8-11)=0, si_pid(16-19)
+            let token = task_inner.memory_set.token();
+            let sigbuf = crate::mm::translated_byte_buffer(token, new_sp as *mut u8, sigframe_size);
+            for b in sigbuf.iter_mut() { *b = 0; }
+            let sender_pid = task.getpid() as u32;
+            sigbuf[0..4].copy_from_slice(&(sig as u32).to_ne_bytes());
+            sigbuf[16..20].copy_from_slice(&sender_pid.to_ne_bytes());
+
+            // a0=signum, a1=siginfo*, a2=NULL
+            trap_ctx[TrapFrameArgs::ARG0] = sig;
+            trap_ctx[TrapFrameArgs::ARG1] = new_sp;
+            trap_ctx[TrapFrameArgs::ARG2] = 0;
+        } else {
+            // put args (a0)
+            trap_ctx[TrapFrameArgs::ARG0] = sig;
+        }
     } else {
         // default action: fatal signals kill the process, others are ignored
         let fatal = signal.intersects(
@@ -492,4 +532,12 @@ pub fn check_and_wake_up_tasks() {
             i += 1;
         }
     }
+}
+
+/// Check if current task has pending non-masked signals that should interrupt blocking syscalls
+pub fn has_pending_signals() -> bool {
+    let Some(task) = current_task() else { return false };
+    let Some(inner) = task.try_inner_borrow() else { return false };
+    let pending = inner.signals.bits() & !inner.signal_mask.bits();
+    pending != 0
 }

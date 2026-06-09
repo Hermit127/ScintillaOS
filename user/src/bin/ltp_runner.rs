@@ -11,34 +11,25 @@ use user_lib::{exec, fork, waitpid, open, close, read, getdents64, OpenFlags};
 const LTP_DIR: &str = "/ltp/testcases/bin/";
 
 const SUBSET_LIST: &[&str] = &[
-    // Socket more variants
-    "accept03", "accept4_01",
-    "bind02", "bind03",
-    "sendto03", "sendmsg03", "recvmsg03",
-    "getsockopt02", "setsockopt02",
-    "socketpair01", "socketpair02",
-    // fcntl more
-    "fcntl27", "fcntl29", "fcntl30", "fcntl31", "fcntl32",
-    "fcntl33", "fcntl34", "fcntl35", "fcntl36",
-    // Kill more (skip kill10 — needs full multi-process signal sync)
-    "kill07", "kill08", "kill09", "kill11", "kill12",
-    // prctl / ioctl
-    "prctl01", "prctl02", "prctl03", "prctl04", "prctl05",
-    "ioctl01", "ioctl02", "ioctl03",
-    // Memory
-    "mprotect04", "mprotect05",
-    "madvise01", "madvise02", "madvise03",
-    // getrandom / getrusage
-    "getrandom01", "getrandom02", "getrandom03", "getrandom04",
-    "getrusage01", "getrusage02",
-    // UID/GID more
-    "setfsgid01", "setfsuid01", "getegid01", "geteuid01",
-    // nice
-    "nice01", "nice02", "nice03",
-    // mount / chroot
-    "mount01", "mount02", "mount03",
-    "chroot01", "chroot03",
-    "umount01", "umount02",
+    // unlink / utime
+    "unlink05", "unlink07", "unlink08",
+    "utime01", "utime02", "utime03", "utime04", "utime05", "utime06",
+    // wait / waitpid / write
+    "wait01", "wait02",
+    "waitpid01", "waitpid03", "waitpid04",
+    "write01", "write02", "write03", "write04", "write05",
+    "writev02", "writev05", "writev06",
+    // statvfs / rmdir / dup
+    "statvfs01", "statvfs02",
+    "rmdir01", "rmdir02", "rmdir03",
+    "dup01", "dup02", "dup03", "dup04", "dup05", "dup06", "dup07",
+    // fcntl large batch
+    "fcntl01", "fcntl02", "fcntl03", "fcntl04", "fcntl05",
+    "fcntl07", "fcntl08", "fcntl09", "fcntl10", "fcntl11",
+    "fcntl12", "fcntl13", "fcntl15", "fcntl16", "fcntl17",
+    "fcntl18", "fcntl19", "fcntl20", "fcntl21", "fcntl22",
+    "fcntl23", "fcntl24", "fcntl25", "fcntl26", "fcntl27",
+    "fcntl29", "fcntl30",
 ];
 
 fn is_elf(name: &str) -> bool {

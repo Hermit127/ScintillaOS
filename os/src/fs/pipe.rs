@@ -1,8 +1,9 @@
 use super::{File, Kstat, S_IFIFO};
 use crate::sync::UPSafeCell;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 
 use crate::task::{current_task, suspend_current_and_run_next, wake_poll_wait_tasks};
+use crate::task::has_pending_signals;
 
 use crate::fs::stdio::stdout_release_if_owner;
 
@@ -51,6 +52,8 @@ pub struct PipeRingBuffer {
     status: RingBufferStatus,
     read_open: usize,
     write_open: usize,
+    write_end: Option<Weak<Pipe>>,
+    read_end: Option<Weak<Pipe>>,
 }
 
 impl PipeRingBuffer {
@@ -62,7 +65,15 @@ impl PipeRingBuffer {
             status: RingBufferStatus::Empty,
             read_open: 1,
             write_open: 1,
+            write_end: None,
+            read_end: None,
         }
+    }
+    pub fn set_write_end(&mut self, write_end: &Arc<Pipe>) {
+        self.write_end = Some(Arc::downgrade(write_end));
+    }
+    pub fn set_read_end(&mut self, read_end: &Arc<Pipe>) {
+        self.read_end = Some(Arc::downgrade(read_end));
     }
     pub fn write_byte(&mut self, byte: u8) {
         self.status = RingBufferStatus::Normal;
@@ -98,10 +109,10 @@ impl PipeRingBuffer {
         }
     }
     pub fn all_write_ends_closed(&self) -> bool {
-        self.write_open == 0
+        self.write_end.as_ref().unwrap().upgrade().is_none() && self.write_open == 0
     }
     pub fn all_read_ends_closed(&self) -> bool {
-        self.read_open == 0
+        self.read_end.as_ref().map_or(true, |r| r.upgrade().is_none()) && self.read_open == 0
     }
     pub fn add_read_end(&mut self) {
         self.read_open += 1;
@@ -126,6 +137,7 @@ pub fn make_pipe() -> (Arc<Pipe>, Arc<Pipe>) {
     let buffer = Arc::new(unsafe { UPSafeCell::new_named(PipeRingBuffer::new(), "PipeRingBuffer") });
     let read_end = Arc::new(Pipe::read_end_with_buffer(buffer.clone()));
     let write_end = Arc::new(Pipe::write_end_with_buffer(buffer.clone()));
+    buffer.exclusive_access().set_read_end(&read_end);
     (read_end, write_end)
 }
 
@@ -155,10 +167,13 @@ impl File for Pipe {
                 (n, closed)
             };
             if loop_read == 0 {
+                if write_end_closed {
+                    return already_read as isize;
+                }
                 if already_read > 0 {
                     return already_read as isize;
                 }
-                if write_end_closed {
+                if has_pending_signals() {
                     return already_read as isize;
                 }
                 stdout_release_if_owner();
@@ -193,12 +208,16 @@ impl File for Pipe {
     }
     fn write(&self, buf: &mut [u8]) -> isize {
         assert!(self.writable());
+        let mut already_write = 0usize;
+        // Check if read end is closed → EPIPE
+        if self.buffer.exclusive_access().all_read_ends_closed() {
+            return -32;
+        }
         let want_to_write = buf.len();
         if want_to_write == 0 {
             return 0;
         }
         let mut buf_iter = buf.into_iter();
-        let mut already_write = 0usize;
         loop {
             if current_task_killed() {
                 return -4;

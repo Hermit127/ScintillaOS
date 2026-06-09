@@ -332,7 +332,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_STATFS => sys_statfs(args[0] as *const u8, args[1] as *mut u8),
         SYSCALL_FSTATFS => sys_fstatfs(args[0], args[1] as *mut u8),
         SYSCALL_PRCTL => 0,
-        SYSCALL_PRLIMIT64 => 0,
+        SYSCALL_PRLIMIT64 => sys_prlimit64(args[0], args[1], args[2] as *const u8, args[3] as *mut u8),
         SYSCALL_GETRLIMIT => sys_getrlimit(args[0], args[1] as *mut u8),
         SYSCALL_SETRLIMIT => sys_setrlimit(args[0], args[1] as *const u8),
         SYSCALL_SYSINFO => -38,
