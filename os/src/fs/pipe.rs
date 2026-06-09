@@ -1,6 +1,6 @@
 use super::{File, Kstat, S_IFIFO};
 use crate::sync::UPSafeCell;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 
 use crate::task::{current_task, suspend_current_and_run_next, wake_poll_wait_tasks};
 use crate::task::has_pending_signals;
@@ -109,12 +109,10 @@ impl PipeRingBuffer {
         }
     }
     pub fn all_write_ends_closed(&self) -> bool {
-        self.write_end.as_ref().unwrap().upgrade().is_none()
-        self.write_open == 0
+        self.write_end.as_ref().unwrap().upgrade().is_none() && self.write_open == 0
     }
     pub fn all_read_ends_closed(&self) -> bool {
-        self.read_end.as_ref().map_or(true, |r| r.upgrade().is_none())
-        self.read_open == 0
+        self.read_end.as_ref().map_or(true, |r| r.upgrade().is_none()) && self.read_open == 0
     }
     pub fn add_read_end(&mut self) {
         self.read_open += 1;

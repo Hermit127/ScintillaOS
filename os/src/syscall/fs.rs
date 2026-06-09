@@ -1185,7 +1185,7 @@ pub fn sys_statx(
         || path_str == "/dev/misc/rtc"
     {
         let st = Kstat::new(crate::fs::S_IFCHR);
-        write_statx(statx_buf, &st, mask);
+        write_statx(statx_buf, &st, _mask);
         return 0;
     }
     if path_str.len() > 255 {
