@@ -29,7 +29,7 @@ use ram_blk::RamDiskBlock;
 ))]
 lazy_static! {
     /// Test disk on virtio bus 0 (provided by evaluation system)
-    pub static ref BLOCK_DEVICE: Arc<dyn BlockDevice> = Arc::new(VirtIOBlock::new());
+    pub static ref BLOCK_DEVICE: Arc<dyn BlockDevice> = Arc::new(VirtIOBlock::new_at(VIRTIO1));
 }
 
 #[cfg(any(
@@ -39,14 +39,7 @@ lazy_static! {
 ))]
 lazy_static! {
     /// Root filesystem disk on virtio bus 1 (user's disk.img)
-    pub static ref ROOT_BLOCK_DEVICE: Arc<dyn BlockDevice> = {
-    let addr = if cfg!(target_arch = "aarch64") {
-        polyhal::pa!(0xa00_0200)
-    } else {
-        polyhal::pa!(0x10002000)
-    };
-        Arc::new(VirtIOBlock::new_at(addr))
-    };
+    pub static ref ROOT_BLOCK_DEVICE: Arc<dyn BlockDevice> = Arc::new(VirtIOBlock::new_at(VIRTIO0));
 }
 
 #[cfg(target_arch = "x86_64")]
