@@ -1302,6 +1302,7 @@ pub fn sys_mount(
     let token = current_user_token();
     let target_path = translated_str(token, target);
     let fstype_str = translated_str(token, fstype);
+    let source_str = translated_str(token, _source);
 
     if fstype_str.as_str() != "ext4" && fstype_str.as_str() != "vfat" {
         return -22;
@@ -1339,15 +1340,14 @@ pub fn sys_mount(
             }
         }
 
-        let sb = match VfsSuperBlock::new_ext4(BLOCK_DEVICE.clone(), "ext4") {
-            Some(sb) => {
-                // Debug: read first block to identify which disk
-                let mut buf = [0u8; 16];
-                BLOCK_DEVICE.read_block(0, &mut buf);
-                println!("[mount] BLOCK_DEVICE block0: {:02x?}", buf);
-                sb
-            },
-            None => return -17, // EBUSY
+        let blk_dev = if source_str.as_str() == "vdb" {
+            crate::drivers::ROOT_BLOCK_DEVICE.clone()
+        } else {
+            BLOCK_DEVICE.clone()
+        };
+        let sb = match VfsSuperBlock::new_ext4(blk_dev, "ext4") {
+            Some(sb) => sb,
+            None => return -17,
         };
 
         if vfs_mount(mnt_point, sb) {
