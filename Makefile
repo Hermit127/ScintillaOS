@@ -162,6 +162,10 @@ ifdef LOCAL
 	done
 	@cp -f tmp/busybox-musl $(ROOTFS_DIR)/musl/busybox 2>/dev/null || true
 	@cp -f tmp/busybox-glibc-riscv64 $(ROOTFS_DIR)/glibc/busybox 2>/dev/null || true
+else
+	@mkdir -p $(ROOTFS_DIR)/musl $(ROOTFS_DIR)/glibc
+	@cp -f tmp/busybox-musl $(ROOTFS_DIR)/musl/busybox 2>/dev/null || true
+	@cp -f tmp/busybox-glibc-riscv64 $(ROOTFS_DIR)/glibc/busybox 2>/dev/null || true
 endif
 ifdef IOZONE_ONLY
 	@touch $(ROOTFS_DIR)/iozone_only
