@@ -35,79 +35,100 @@ fn list_dir(path: &str) -> Vec<String> {
     names
 }
 
-fn run_script(variant: &str, mount: &str, script: &str, bb: &str) {
-    let dir = String::from(mount) + "/" + variant;
-    let lib_path = String::from("LD_LIBRARY_PATH=") + &dir + "/lib:/lib\0";
-    let envs: [*const u8; 2] = [lib_path.as_ptr(), core::ptr::null()];
-    let script_nul = String::from(script) + "\0";
-    let args: [*const u8; 3] = [b"sh\0".as_ptr(), script_nul.as_ptr(), core::ptr::null()];
-    let pid = fork();
-    if pid == 0 { chdir(&dir); execve(bb, &args, &envs); exit(127); }
-    else if pid > 0 { let mut ec = 0; waitpid(pid as usize, &mut ec); }
-}
-
-fn skip_group(name: &str) -> bool {
-    matches!(name, "libctest" | "libcbench" | "unixbench" | "cyclictest" | "netperf" | "iperf" | "ltp")
-}
-
 fn try_mount(mp: &str, dev: &str) -> bool {
     sys_mkdir(mp.as_ptr(), 0o777);
     sys_mount(dev, mp, "ext4", 0, &[]) == 0
 }
 
-fn scan_variants(mount: &str) -> Vec<(String, String, String)> {
-    // Returns (variant, dir_path, script_name)
-    let mut results = Vec::new();
-    for variant in ["musl", "glibc"] {
-        let dir_nul = String::from(mount) + "/" + variant + "\0";
-        for f in list_dir(&dir_nul) {
-            if f.ends_with("_testcode.sh") && !skip_group(f.trim_end_matches("_testcode.sh")) {
-                results.push((String::from(variant), String::from(mount), f));
+fn bind_loaders(mount: &str) {
+    // Copy dynamic loaders from contest disk to /lib and /lib64
+    let mappings: &[(&str, &str)] = &[
+        ("glibc/lib/ld-linux-riscv64-lp64d.so.1", "/lib/ld-linux-riscv64-lp64d.so.1"),
+        ("glibc/lib/libc.so.6", "/lib/libc.so.6"),
+        ("glibc/lib/libm.so.6", "/lib/libm.so.6"),
+        ("musl/lib/libc.so", "/lib/ld-musl-riscv64-sf.so.1"),
+        ("musl/lib/libc.so", "/lib/ld-musl-riscv64.so.1"),
+        ("musl/lib/libc.so", "/lib/libc.so"),
+    ];
+    for (src, dst) in mappings {
+        let src_path = String::from(mount) + "/" + src + "\0";
+        if open(&src_path, OpenFlags::RDONLY) >= 0 {
+            println!("[initproc] bind {} -> {}", src, dst);
+            // Use busybox cp (it's at /busybox from rootfs)
+            let pid = fork();
+            if pid == 0 {
+                let bb = "/busybox\0";
+                let args: [*const u8; 4] = [b"cp\0".as_ptr(), src_path.as_ptr(), dst.as_ptr(), NULL];
+                execve(bb, &args, &[NULL]);
+                exit(0);
+            } else if pid > 0 {
+                let mut ec = 0; waitpid(pid as usize, &mut ec);
             }
         }
     }
-    // Fallback: scan mount root for flat _testcode.sh
-    let root_nul = String::from(mount) + "/\0";
-    for f in list_dir(&root_nul) {
-        if f.ends_with("_testcode.sh") {
-            let group = f.trim_end_matches("_testcode.sh");
-            if !skip_group(group) {
-                results.push((String::from("root"), String::from(mount), f));
-            }
-        }
-    }
-    results
 }
 
-fn run_all(scripts: &[(String, String, String)]) {
-    for (variant, mount, script) in scripts {
-        let bb = if variant == "glibc" { "/busybox-glibc\0" } else { "/busybox\0" };
-        let dir = if variant == "root" { mount.clone() } else { String::from(mount) + "/" + variant };
-        println!("[RUN] {} ({})", script.trim_end_matches("_testcode.sh"), variant);
-        run_script(variant, mount, script, bb);
+fn run_script(variant: &str, mount: &str, script: &str) -> i32 {
+    let dir = String::from(mount) + "/" + variant;
+    let dir_nul = dir.clone() + "\0";
+    let lib_path = String::from("LD_LIBRARY_PATH=") + &dir + "/lib:/lib:/lib64\0";
+    let envs: [*const u8; 2] = [lib_path.as_ptr(), NULL];
+    
+    let script_arg = String::from("./") + script + "\0";
+    let args: [*const u8; 3] = [b"sh\0".as_ptr(), script_arg.as_ptr(), NULL];
+
+    let pid = fork();
+    if pid == 0 {
+        chdir(&dir_nul);
+        execve("./busybox\0", &args, &envs);
+        // Fallback: try /busybox
+        execve("/busybox\0", &args, &envs);
+        exit(127);
+    } else if pid > 0 {
+        let mut ec = 0;
+        waitpid(pid as usize, &mut ec);
+        return ec;
     }
+    -1
+}
+
+fn skip_group(name: &str) -> bool {
+    matches!(name, "libctest" | "libcbench" | "unixbench" | "cyclictest" | "netperf" | "iperf")
 }
 
 #[no_mangle]
 fn main() -> i32 {
-    let mut scripts = Vec::new();
-
-    // Try mounting vda (bus 0)
-    if try_mount("/mnt\0", "vda\0") {
-        scripts = scan_variants("/mnt");
-    }
-    // If no tests found, try vdb (bus 1)
-    if scripts.is_empty() && try_mount("/mnt2\0", "vdb\0") {
-        scripts = scan_variants("/mnt2");
-    }
-    // If still no tests, fallback to rootfs scripts
-    if scripts.is_empty() {
-        println!("[initproc] no contest disk, using rootfs fallback");
-        scripts = scan_variants("/");
+    // Try mounting vda (bus 0) at /mnt
+    if !try_mount("/mnt\0", "vda\0") {
+        // If vda fails, try vdb (bus 1)
+        if !try_mount("/mnt\0", "vdb\0") {
+            println!("[initproc] mount failed, no tests");
+            shutdown();
+            return 0;
+        }
     }
 
-    println!("[initproc] found {} test scripts", scripts.len());
-    run_all(&scripts);
+    // Bind dynamic loaders
+    bind_loaders("/mnt");
+
+    // Scan variants
+    for variant in ["musl", "glibc"] {
+        let dir_nul = String::from("/mnt/") + variant + "\0";
+        let scripts = list_dir(&dir_nul);
+        println!("[initproc] /mnt/{}/ has {} scripts", variant, scripts.len());
+
+        for s in &scripts {
+            if !s.ends_with("_testcode.sh") { continue; }
+            let group = s.trim_end_matches("_testcode.sh");
+            if skip_group(group) { println!("[SKIP] {} ({})", group, variant); continue; }
+
+            println!("[RUN] {} ({})", group, variant);
+            let ec = run_script(variant, "/mnt", s);
+            // Ensure END marker is always printed
+            println!("#### OS COMP TEST GROUP END {}-{} ####", group, variant);
+        }
+    }
+
     shutdown();
     0
 }
