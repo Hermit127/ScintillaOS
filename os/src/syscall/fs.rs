@@ -1340,7 +1340,13 @@ pub fn sys_mount(
         }
 
         let sb = match VfsSuperBlock::new_ext4(BLOCK_DEVICE.clone(), "ext4") {
-            Some(sb) => sb,
+            Some(sb) => {
+                // Debug: read first block to identify which disk
+                let mut buf = [0u8; 16];
+                BLOCK_DEVICE.read_block(0, &mut buf);
+                info!("[mount] BLOCK_DEVICE block0: {:02x?}", buf);
+                sb
+            },
             None => return -17, // EBUSY
         };
 

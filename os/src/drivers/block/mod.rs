@@ -40,11 +40,11 @@ lazy_static! {
 lazy_static! {
     /// Root filesystem disk on virtio bus 1 (user's disk.img)
     pub static ref ROOT_BLOCK_DEVICE: Arc<dyn BlockDevice> = {
-        let addr = if cfg!(target_arch = "aarch64") {
-            polyhal::pa!(0xa00_0200)
-        } else {
-            polyhal::pa!(0x10002000)
-        };
+    let addr = if cfg!(target_arch = "aarch64") {
+        polyhal::pa!(0xa00_0200)
+    } else {
+        polyhal::pa!(0x10002000)
+    };
         Arc::new(VirtIOBlock::new_at(addr))
     };
 }
