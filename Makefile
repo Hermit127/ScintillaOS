@@ -160,6 +160,9 @@ endif
 ifdef IOZONE_GLIBC_ONLY
 	@touch $(ROOTFS_DIR)/iozone_glibc_only
 endif
+ifdef LUA_ONLY
+	@touch $(ROOTFS_DIR)/lua_only
+endif
 	@printf "Hi, this is a text file.\nsyscalls testing success!\n" > $(ROOTFS_DIR)/text.txt
 	@for src in user/src/bin/*.rs; do \
 		app=$$(basename $$src .rs); \
@@ -186,7 +189,7 @@ endif
 		cp -f tmp/iozone-loongarch64-glibc $(ROOTFS_BIN_DIR)/iozone-glibc 2>/dev/null || true; \
 	fi
 	@cp -f tmp/*.lua $(ROOTFS_DIR)/ 2>/dev/null || true
-	@printf '#!/bin/sh\nfor f in strings sort sin30 round_num max_min file_io remove date random; do /bin/lua /$$f.lua; if [ $$? = 0 ]; then echo "testcase lua $$f success"; else echo "testcase lua $$f fail"; fi; done\n' > $(ROOTFS_DIR)/lua_testcode.sh 2>/dev/null || true
+	@printf '#!/bin/sh\n/bin/lua -v\necho "lua -v exit: $$?"\n/bin/lua -e "print(123)"\necho "lua print exit: $$?"\n/bin/lua -e "print(type(print))"\necho "lua type exit: $$?"\nfor f in strings sort sin30 round_num max_min file_io remove date random; do /bin/lua /$$f.lua; if [ $$? = 0 ]; then echo "testcase lua $$f success"; else echo "testcase lua $$f fail"; fi; done\n' > $(ROOTFS_DIR)/lua_testcode.sh 2>/dev/null || true
 	@if [ -f "$(ROOTFS_DIR)/lua-glibc" ]; then \
 		{ \
 			printf '%s\n' '#!/bin/sh'; \

@@ -74,6 +74,8 @@ fn run_root_fallback() {
     run_exec("/\0", "/busybox-glibc\0", &[SH, b"/lmbench_glibc_testcode.sh\0".as_ptr(), NULL]);
     run_exec("/\0", "/busybox\0", &[SH, b"/lua_testcode.sh\0".as_ptr(), NULL]);
     run_exec("/\0", "/busybox-glibc\0", &[SH, b"/lua_testcode.sh\0".as_ptr(), NULL]);
+    run_exec("/\0", "/busybox\0", &[SH, b"/iozone_testcode.sh\0".as_ptr(), NULL]);
+    run_exec("/\0", "/busybox-glibc\0", &[SH, b"/iozone_glibc_testcode.sh\0".as_ptr(), NULL]);
 }
 
 #[no_mangle]
@@ -85,6 +87,10 @@ fn main() -> i32 {
     if open("/iozone_only\0", OpenFlags::RDONLY) >= 0 {
         run_exec("/\0", "/busybox\0", &[SH, b"/iozone_testcode.sh\0".as_ptr(), NULL]);
         run_exec("/\0", "/busybox-glibc\0", &[SH, b"/iozone_glibc_testcode.sh\0".as_ptr(), NULL]);
+        shutdown();
+    }
+    if open("/lua_only\0", OpenFlags::RDONLY) >= 0 {
+        run_exec("/\0", "/busybox\0", &[SH, b"/lua_testcode.sh\0".as_ptr(), NULL]);
         shutdown();
     }
     if open("/lmbench_glibc_only\0", OpenFlags::RDONLY) >= 0 {
@@ -105,6 +111,13 @@ fn main() -> i32 {
 
     if !ran_tests {
         run_root_fallback();
+    } else {
+        if open("/mnt/musl/iozone_testcode.sh\0", OpenFlags::RDONLY) < 0 {
+            run_exec("/\0", "/busybox\0", &[SH, b"/iozone_testcode.sh\0".as_ptr(), NULL]);
+        }
+        if open("/mnt/glibc/iozone_glibc_testcode.sh\0", OpenFlags::RDONLY) < 0 {
+            run_exec("/\0", "/busybox-glibc\0", &[SH, b"/iozone_glibc_testcode.sh\0".as_ptr(), NULL]);
+        }
     }
 
     shutdown();
