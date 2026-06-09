@@ -179,64 +179,21 @@ endif
 		fi; \
 		mkdir -p "$(ROOTFS_MNT_DIR)"; \
 	fi
-	@cp -f tmp/hello_riscv64_musl $(ROOTFS_BIN_DIR)/hello 2>/dev/null || true
-	@cp -f tmp/lua-riscv64-musl $(ROOTFS_BIN_DIR)/lua 2>/dev/null || true
-	@if [ "$(ARCH)" = "riscv64" ]; then \
-		cp -f tmp/iozone-riscv64-musl $(ROOTFS_BIN_DIR)/iozone 2>/dev/null || true; \
-		cp -f tmp/iozone-riscv64-glibc $(ROOTFS_BIN_DIR)/iozone-glibc 2>/dev/null || true; \
-	elif [ "$(ARCH)" = "loongarch64" ]; then \
-		cp -f tmp/iozone-loongarch64-musl $(ROOTFS_BIN_DIR)/iozone 2>/dev/null || true; \
-		cp -f tmp/iozone-loongarch64-glibc $(ROOTFS_BIN_DIR)/iozone-glibc 2>/dev/null || true; \
-	fi
-	@cp -f tmp/*.lua $(ROOTFS_DIR)/ 2>/dev/null || true
-	@printf '#!/bin/sh\n/bin/lua -v\necho "lua -v exit: $$?"\n/bin/lua -e "print(123)"\necho "lua print exit: $$?"\n/bin/lua -e "print(type(print))"\necho "lua type exit: $$?"\nfor f in strings sort sin30 round_num max_min file_io remove date random; do /bin/lua /$$f.lua; if [ $$? = 0 ]; then echo "testcase lua $$f success"; else echo "testcase lua $$f fail"; fi; done\n' > $(ROOTFS_DIR)/lua_testcode.sh 2>/dev/null || true
-	@if [ -f "$(ROOTFS_DIR)/lua-glibc" ]; then \
-		{ \
-			printf '%s\n' '#!/bin/sh'; \
-			printf '%s\n' 'echo "#### OS COMP TEST GROUP START lua-musl ####"'; \
-			printf '%s\n' 'for f in strings sort sin30 round_num max_min file_io remove date random; do /bin/lua /$$f.lua; if [ $$? = 0 ]; then echo "testcase lua $$f success"; else echo "testcase lua $$f fail"; fi; done'; \
-		} > "$(ROOTFS_DIR)/lua_musl_testcode.sh"; \
-		sed \
-			-e 's|#### OS COMP TEST GROUP START lua-musl ####|#### OS COMP TEST GROUP START lua-glibc ####|' \
-			-e 's|#### OS COMP TEST GROUP END lua-musl ####|#### OS COMP TEST GROUP END lua-glibc ####|' \
-			-e 's|/bin/lua |/bin/lua-glibc |g' \
-			"$(ROOTFS_DIR)/lua_musl_testcode.sh" > "$(ROOTFS_DIR)/lua_glibc_testcode.sh"; \
-	fi
 	@if [ "$(ARCH)" = "riscv64" ]; then \
 		cp -f tmp/busybox-musl $(ROOTFS_BIN_DIR)/busybox 2>/dev/null || true; \
 		cp -f tmp/busybox-musl $(ROOTFS_DIR)/busybox 2>/dev/null || true; \
 		cp -f tmp/busybox-glibc-riscv64 $(ROOTFS_BIN_DIR)/busybox-glibc 2>/dev/null || true; \
 		cp -f tmp/busybox-glibc-riscv64 $(ROOTFS_DIR)/busybox-glibc 2>/dev/null || true; \
-		cp -f tmp/lua-riscv64-glibc $(ROOTFS_BIN_DIR)/lua-glibc 2>/dev/null || true; \
-		cp -f tmp/lua-riscv64-glibc $(ROOTFS_DIR)/lua-glibc 2>/dev/null || true; \
-		cp -f tmp/lmbench-riscv64/lmbench_all $(ROOTFS_DIR)/lmbench_all 2>/dev/null || true; \
-		cp -f tmp/lmbench-riscv64-glibc/lmbench_all $(ROOTFS_DIR)/lmbench_all-glibc 2>/dev/null || true; \
-		printf '#!/bin/sh\n/lmbench_all hello "$$@"\n' > $(ROOTFS_DIR)/hello 2>/dev/null || true; \
-		printf '#!/bin/sh\n/lmbench_all lat_sig "$$@"\n' > $(ROOTFS_DIR)/lat_sig 2>/dev/null || true; \
-		printf '#!/bin/sh\n/lmbench_all-glibc hello "$$@"\n' > $(ROOTFS_DIR)/hello-glibc 2>/dev/null || true; \
-		printf '#!/bin/sh\n/lmbench_all-glibc lat_sig "$$@"\n' > $(ROOTFS_DIR)/lat_sig-glibc 2>/dev/null || true; \
-		cp -f tmp/lmbench-riscv64/lmbench_testcode.sh $(ROOTFS_DIR)/lmbench_testcode.sh 2>/dev/null || true; \
 		cat testsuits-for-oskernel/scripts/busybox/busybox_cmd.txt > $(ROOTFS_DIR)/busybox_cmd.txt 2>/dev/null || cat tmp/busybox_cmd.txt > $(ROOTFS_DIR)/busybox_cmd.txt 2>/dev/null || true; \
 		sed 's|\./busybox|./busybox-glibc|g' $(ROOTFS_DIR)/busybox_cmd.txt > $(ROOTFS_DIR)/busybox_glibc_cmd.txt 2>/dev/null || true; \
 		printf '#!/bin/sh\n./busybox-glibc --install -s /bin 2>/dev/null\necho "#### OS COMP TEST GROUP START busybox-glibc ####"\nwhile IFS= read -r line; do case "$$line" in ""|\\#*) continue ;; esac; eval "./busybox-glibc $$line"; RTN=$$?; if [ $$RTN -ne 0 ] && [ "$$line" != "false" ]; then echo "testcase busybox $$line fail"; else echo "testcase busybox $$line success"; fi; done < ./busybox_glibc_cmd.txt\necho "#### OS COMP TEST GROUP END busybox-glibc ####"\n' > $(ROOTFS_DIR)/busybox_glibc_testcode.sh; \
 		ln -sf busybox $(ROOTFS_BIN_DIR)/ls 2>/dev/null || true; \
 		printf '#!/bin/sh\n./busybox --install -s /bin 2>/dev/null\necho "#### OS COMP TEST GROUP START busybox-musl ####"\nwhile IFS= read -r line; do case "$$line" in ""|\\#*) continue ;; esac; eval "./busybox $$line"; RTN=$$?; if [ $$RTN -ne 0 ] && [ "$$line" != "false" ]; then echo "testcase busybox $$line fail"; else echo "testcase busybox $$line success"; fi; done < ./busybox_cmd.txt\necho "#### OS COMP TEST GROUP END busybox-musl ####"\n' > $(ROOTFS_DIR)/busybox_testcode.sh; \
-	fi
-	@if [ "$(ARCH)" = "loongarch64" ]; then \
-		cp -f tmp/lua-loongarch64-musl $(ROOTFS_BIN_DIR)/lua 2>/dev/null || true; \
+	elif [ "$(ARCH)" = "loongarch64" ]; then \
 		cp -f tmp/busybox-musl-loongarch64 $(ROOTFS_BIN_DIR)/busybox 2>/dev/null || true; \
 		cp -f tmp/busybox-musl-loongarch64 $(ROOTFS_DIR)/busybox 2>/dev/null || true; \
 		cp -f tmp/busybox-glibc-loongarch64 $(ROOTFS_BIN_DIR)/busybox-glibc 2>/dev/null || true; \
 		cp -f tmp/busybox-glibc-loongarch64 $(ROOTFS_DIR)/busybox-glibc 2>/dev/null || true; \
-		cp -f tmp/lua-loongarch64-glibc $(ROOTFS_BIN_DIR)/lua-glibc 2>/dev/null || true; \
-		cp -f tmp/lua-loongarch64-glibc $(ROOTFS_DIR)/lua-glibc 2>/dev/null || true; \
-		cp -f tmp/lmbench-loongarch64-musl/lmbench_all $(ROOTFS_DIR)/lmbench_all 2>/dev/null || cp -f tmp/lmbench-loongarch64/lmbench_all $(ROOTFS_DIR)/lmbench_all 2>/dev/null || true; \
-		cp -f tmp/lmbench-loongarch64-glibc/lmbench_all $(ROOTFS_DIR)/lmbench_all-glibc 2>/dev/null || true; \
-		printf '#!/bin/sh\n/lmbench_all hello "$$@"\n' > $(ROOTFS_DIR)/hello 2>/dev/null || true; \
-		printf '#!/bin/sh\n/lmbench_all lat_sig "$$@"\n' > $(ROOTFS_DIR)/lat_sig 2>/dev/null || true; \
-		printf '#!/bin/sh\n/lmbench_all-glibc hello "$$@"\n' > $(ROOTFS_DIR)/hello-glibc 2>/dev/null || true; \
-		printf '#!/bin/sh\n/lmbench_all-glibc lat_sig "$$@"\n' > $(ROOTFS_DIR)/lat_sig-glibc 2>/dev/null || true; \
-		cp -f tmp/lmbench-loongarch64-musl/lmbench_testcode.sh $(ROOTFS_DIR)/lmbench_testcode.sh 2>/dev/null || cp -f tmp/lmbench-loongarch64/lmbench_testcode.sh $(ROOTFS_DIR)/lmbench_testcode.sh 2>/dev/null || true; \
 		cat testsuits-for-oskernel/scripts/busybox/busybox_cmd.txt > $(ROOTFS_DIR)/busybox_cmd.txt 2>/dev/null || cat tmp/busybox_cmd.txt > $(ROOTFS_DIR)/busybox_cmd.txt 2>/dev/null || true; \
 		sed 's|\./busybox|./busybox-glibc|g' $(ROOTFS_DIR)/busybox_cmd.txt > $(ROOTFS_DIR)/busybox_glibc_cmd.txt 2>/dev/null || true; \
 		printf '#!/bin/sh\n./busybox-glibc --install -s /bin 2>/dev/null\necho "#### OS COMP TEST GROUP START busybox-glibc ####"\nwhile IFS= read -r line; do case "$$line" in ""|\\#*) continue ;; esac; eval "./busybox-glibc $$line"; RTN=$$?; if [ $$RTN -ne 0 ] && [ "$$line" != "false" ]; then echo "testcase busybox $$line fail"; else echo "testcase busybox $$line success"; fi; done < ./busybox_glibc_cmd.txt\necho "#### OS COMP TEST GROUP END busybox-glibc ####"\n' > $(ROOTFS_DIR)/busybox_glibc_testcode.sh; \
@@ -329,6 +286,7 @@ endif
 	@chmod +x $(ROOTFS_DIR)/hello $(ROOTFS_DIR)/lat_sig $(ROOTFS_DIR)/hello-glibc $(ROOTFS_DIR)/lat_sig-glibc $(ROOTFS_DIR)/lmbench_testcode.sh $(ROOTFS_DIR)/lmbench_glibc_testcode.sh $(ROOTFS_DIR)/iozone_testcode.sh $(ROOTFS_DIR)/iozone_glibc_testcode.sh 2>/dev/null || true
 	@cp -f tmp/debug_test.sh $(ROOTFS_DIR)/debug_test.sh 2>/dev/null || true
 	@cp -f tmp/run_all.sh $(ROOTFS_DIR)/run_all.sh 2>/dev/null || true
+	@cp -f tmp/contest.sh $(ROOTFS_DIR)/contest.sh 2>/dev/null || true
 	@cp -f tmp/basic_testcode.sh $(ROOTFS_DIR)/basic_testcode.sh 2>/dev/null || true
 	@cp -f tmp/init.sh $(ROOTFS_DIR)/etc/init.sh 2>/dev/null || true
 	@cp -f target/$(TARGET)/release/contest_runner $(ROOTFS_DIR)/contest_runner 2>/dev/null || true

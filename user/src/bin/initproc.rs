@@ -3,31 +3,16 @@
 
 extern crate user_lib;
 
-use user_lib::{chdir, exec, exit, fork, open, shutdown, sys_mkdir, sys_mount, waitpid, OpenFlags};
+use user_lib::{exec, exit, fork, open, shutdown, sys_mkdir, sys_mount, waitpid, OpenFlags};
 
 const NULL: *const u8 = core::ptr::null::<u8>();
 const SH: *const u8 = b"sh\0".as_ptr();
-
-const TEST_SCRIPTS: &[&[u8]] = &[
-    b"./basic_testcode.sh\0",
-    b"./busybox_testcode.sh\0",
-    b"./iozone_testcode.sh\0",
-    b"./libctest_testcode.sh\0",
-    b"./libcbench_testcode.sh\0",
-    b"./lmbench_musl_testcode.sh\0",
-    b"./lmbench_glibc_testcode.sh\0",
-    b"./lua_testcode.sh\0",
-    b"./unixbench_testcode.sh\0",
-    b"./netperf_testcode.sh\0",
-    b"./iperf_testcode.sh\0",
-    b"./cyclictest_testcode.sh\0",
-];
 
 fn run_exec(dir: &str, path: &str, args: &[*const u8]) {
     let pid = fork();
     if pid == 0 {
         if !dir.is_empty() {
-            chdir(dir);
+            user_lib::chdir(dir);
         }
         exec(path, args);
         exit(127);
@@ -37,88 +22,20 @@ fn run_exec(dir: &str, path: &str, args: &[*const u8]) {
     }
 }
 
-fn run_test_dir(dir: &str) -> bool {
-    if chdir(dir) != 0 {
-        return false;
-    }
-    chdir("/\0");
-
-    for script in TEST_SCRIPTS {
-        run_exec(dir, "./busybox\0", &[SH, script.as_ptr(), NULL]);
-    }
-    true
-}
-
-fn run_root_fallback() {
-    run_exec(
-        "/\0",
-        "/bin/contest_runner_musl\0",
-        &[b"contest_runner_musl\0".as_ptr(), NULL],
-    );
-    run_exec(
-        "/\0",
-        "/busybox\0",
-        &[SH, b"/busybox_testcode.sh\0".as_ptr(), NULL],
-    );
-    run_exec(
-        "/\0",
-        "/bin/contest_runner_glibc\0",
-        &[b"contest_runner_glibc\0".as_ptr(), NULL],
-    );
-    run_exec(
-        "/\0",
-        "/busybox-glibc\0",
-        &[SH, b"/busybox_glibc_testcode.sh\0".as_ptr(), NULL],
-    );
-    run_exec("/\0", "/busybox\0", &[SH, b"/lmbench_musl_testcode.sh\0".as_ptr(), NULL]);
-    run_exec("/\0", "/busybox-glibc\0", &[SH, b"/lmbench_glibc_testcode.sh\0".as_ptr(), NULL]);
-    run_exec("/\0", "/busybox\0", &[SH, b"/lua_testcode.sh\0".as_ptr(), NULL]);
-    run_exec("/\0", "/busybox-glibc\0", &[SH, b"/lua_testcode.sh\0".as_ptr(), NULL]);
-    run_exec("/\0", "/busybox\0", &[SH, b"/iozone_testcode.sh\0".as_ptr(), NULL]);
-    run_exec("/\0", "/busybox-glibc\0", &[SH, b"/iozone_glibc_testcode.sh\0".as_ptr(), NULL]);
-}
-
 #[no_mangle]
 fn main() -> i32 {
-    if open("/iozone_glibc_only\0", OpenFlags::RDONLY) >= 0 {
-        run_exec("/\0", "/busybox-glibc\0", &[SH, b"/iozone_glibc_testcode.sh\0".as_ptr(), NULL]);
-        shutdown();
-    }
+    // IOZONE only mode
     if open("/iozone_only\0", OpenFlags::RDONLY) >= 0 {
         run_exec("/\0", "/busybox\0", &[SH, b"/iozone_testcode.sh\0".as_ptr(), NULL]);
         run_exec("/\0", "/busybox-glibc\0", &[SH, b"/iozone_glibc_testcode.sh\0".as_ptr(), NULL]);
-        shutdown();
-    }
-    if open("/lua_only\0", OpenFlags::RDONLY) >= 0 {
-        run_exec("/\0", "/busybox\0", &[SH, b"/lua_testcode.sh\0".as_ptr(), NULL]);
-        shutdown();
-    }
-    if open("/lmbench_glibc_only\0", OpenFlags::RDONLY) >= 0 {
-        run_exec("/\0", "/busybox-glibc\0", &[SH, b"/lmbench_glibc_testcode.sh\0".as_ptr(), NULL]);
-        shutdown();
-    }
-    if open("/lmbench_only\0", OpenFlags::RDONLY) >= 0 {
-        run_exec("/\0", "/busybox\0", &[SH, b"/lmbench_testcode.sh\0".as_ptr(), NULL]);
         shutdown();
     }
 
     sys_mkdir(b"/mnt\0".as_ptr(), 0o777);
     sys_mount("", "/mnt", "ext4", 0, &[]);
 
-    let mut ran_tests = false;
-    ran_tests |= run_test_dir("/mnt/musl\0");
-    ran_tests |= run_test_dir("/mnt/glibc\0");
-
-    if !ran_tests {
-        run_root_fallback();
-    } else {
-        if open("/mnt/musl/iozone_testcode.sh\0", OpenFlags::RDONLY) < 0 {
-            run_exec("/\0", "/busybox\0", &[SH, b"/iozone_testcode.sh\0".as_ptr(), NULL]);
-        }
-        if open("/mnt/glibc/iozone_glibc_testcode.sh\0", OpenFlags::RDONLY) < 0 {
-            run_exec("/\0", "/busybox-glibc\0", &[SH, b"/iozone_glibc_testcode.sh\0".as_ptr(), NULL]);
-        }
-    }
+    // Run the dynamic contest runner
+    run_exec("/\0", "/busybox\0", &[SH, b"/contest.sh\0".as_ptr(), NULL]);
 
     shutdown();
     0
