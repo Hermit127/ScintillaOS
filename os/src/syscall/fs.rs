@@ -1,7 +1,7 @@
 use crate::fs::vfs::{vfs_resolve_path, vfs_resolve_with_fallback, Dentry, VfsSuperBlock};
 use crate::fs::{
-    make_pipe, mkdir_at, open_file_at, rename_at, symlink_at, unlink_at, DevNull, File, Kstat,
-    OpenFlags, Urandom,
+    make_pipe, mkdir_at, open_file_at, rename_at, symlink_at, unlink_at, DevNull, DevZero, File,
+    Kstat, OpenFlags, Urandom,
 };
 use crate::mm::{translated_byte_buffer, translated_refmut, translated_str};
 use crate::task::{current_task, current_user_token};
@@ -145,6 +145,13 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> isize
             return -24;
         }
         inner.fd_table[fd] = Some(Arc::new(DevNull));
+        return fd as isize;
+    }
+
+    if path == "/dev/zero" {
+        let mut inner = task.inner_exclusive_access();
+        let fd = inner.alloc_fd();
+        inner.fd_table[fd] = Some(Arc::new(DevZero));
         return fd as isize;
     }
 
@@ -653,6 +660,7 @@ pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
                     inner.fd_table.len() - 1
                 });
             let file = inner.fd_table[fd].as_ref().unwrap().clone();
+            file.dup_ref();
             inner.fd_table[new_fd] = Some(file);
             if cmd == F_DUPFD_CLOEXEC {
                 inner.fd_cloexec[new_fd] = true;
@@ -858,8 +866,7 @@ pub fn sys_ioctl(fd: usize, request: usize, arg: usize) -> isize {
 pub fn sys_close(fd: usize) -> isize {
     let task = current_task().unwrap();
     let mut inner = task.inner_exclusive_access();
-    if fd < inner.fd_table.len() && inner.fd_table[fd].is_some() {
-        inner.fd_table[fd].take();
+    if inner.close_fd(fd) {
         return 0;
     }
     -9
@@ -870,7 +877,9 @@ pub fn sys_pipe(pipe: *mut usize) -> isize {
 }
 
 pub fn sys_pipe2(pipe: *mut usize, flags: usize) -> isize {
-    if flags != 0 || pipe.is_null() {
+    const O_NONBLOCK: usize = 0x800;
+    const O_CLOEXEC: usize = 0x80000;
+    if pipe.is_null() || flags & !(O_NONBLOCK | O_CLOEXEC) != 0 {
         return -1;
     }
     let task = current_task().unwrap();
@@ -884,6 +893,10 @@ pub fn sys_pipe2(pipe: *mut usize, flags: usize) -> isize {
         let write_fd = inner.alloc_fd();
         if write_fd >= inner.fd_table.len() { inner.fd_table[read_fd] = None; return -24; }
         inner.fd_table[write_fd] = Some(pipe_write);
+        if flags & O_CLOEXEC != 0 {
+            inner.fd_cloexec[read_fd] = true;
+            inner.fd_cloexec[write_fd] = true;
+        }
         (read_fd, write_fd)
     };
     let p = pipe as *mut u8;
@@ -905,7 +918,9 @@ pub fn sys_dup(fd: usize) -> isize {
     if new_fd >= inner.fd_table.len() {
         return -24;
     }
-    inner.fd_table[new_fd] = Some(Arc::clone(inner.fd_table[fd].as_ref().unwrap()));
+    let file = Arc::clone(inner.fd_table[fd].as_ref().unwrap());
+    file.dup_ref();
+    inner.fd_table[new_fd] = Some(file);
     new_fd as isize
 }
 
@@ -933,11 +948,12 @@ pub fn sys_dup3(fd: usize, new_fd: usize, flags: usize) -> isize {
     let Some(file) = inner.fd_table[fd].as_ref().cloned() else {
         return -9;
     };
+    file.dup_ref();
     while inner.fd_table.len() <= new_fd {
         inner.fd_table.push(None);
         inner.fd_cloexec.push(false);
     }
-    inner.fd_table[new_fd].take();
+    inner.close_fd(new_fd);
     inner.fd_table[new_fd] = Some(file);
     inner.fd_cloexec[new_fd] = (flags & O_CLOEXEC) != 0;
     new_fd as isize
@@ -1093,6 +1109,16 @@ pub fn sys_fstatat(dirfd: isize, path: *const u8, stat_buf: *mut u8, flags: usiz
         return -2; // ENOENT
     }
 
+    // Special device files
+    if path_str == "/dev/null" || path_str == "/dev/zero" || path_str == "/dev/null/invalid"
+        || path_str == "/dev/urandom" || path_str == "/dev/random" || path_str == "/dev/rtc"
+        || path_str == "/dev/misc/rtc"
+    {
+        let st = Kstat::new(crate::fs::S_IFCHR);
+        *translated_refmut(token, stat_buf as *mut Kstat) = st;
+        return 0;
+    }
+
     let base = match resolve_base_dir(dirfd) {
         Some(b) => b,
         None => return -2,
@@ -1151,6 +1177,16 @@ pub fn sys_statx(
     let path_str = translated_str(token, path);
     if path_str.is_empty() {
         return -2;
+    }
+
+    // Special device files
+    if path_str == "/dev/null" || path_str == "/dev/zero" || path_str == "/dev/null/invalid"
+        || path_str == "/dev/urandom" || path_str == "/dev/random" || path_str == "/dev/rtc"
+        || path_str == "/dev/misc/rtc"
+    {
+        let st = Kstat::new(crate::fs::S_IFCHR);
+        write_statx(statx_buf, &st, mask);
+        return 0;
     }
     if path_str.len() > 255 {
         return -36;

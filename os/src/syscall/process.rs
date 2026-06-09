@@ -2,7 +2,6 @@ use crate::fs::{open_file, OpenFlags, File};
 use crate::fs::stdio::stdout_release_if_owner;
 use crate::mm::{
     translated_byte_buffer, translated_ref, translated_refmut, translated_str, MapPermission,
-    MapType,
 };
 use crate::task::{
     add_task, block_current_and_run_next, current_task, current_user_token,
@@ -63,13 +62,33 @@ impl UtsName {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct TimeVal {
-    pub sec: u64,
-    pub usec: u64,
+    pub sec: isize,
+    pub usec: isize,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct RUsage {
+    ru_utime: TimeVal,
+    ru_stime: TimeVal,
+    ru_maxrss: isize,
+    ru_ixrss: isize,
+    ru_idrss: isize,
+    ru_isrss: isize,
+    ru_minflt: isize,
+    ru_majflt: isize,
+    ru_nswap: isize,
+    ru_inblock: isize,
+    ru_oublock: isize,
+    ru_msgsnd: isize,
+    ru_msgrcv: isize,
+    ru_nsignals: isize,
+    ru_nvcsw: isize,
+    ru_nivcsw: isize,
 }
 
 pub fn sys_exit(exit_code: i32) -> ! {
-    exit_current_and_run_next(exit_code);
-    panic!("Unreachable in sys_exit!");
+    exit_current_and_run_next(exit_code)
 }
 
 pub fn sys_yield() -> isize {
@@ -78,21 +97,16 @@ pub fn sys_yield() -> isize {
 }
 
 pub fn sys_get_time(ts_ptr: usize, _tz: usize) -> isize {
-    let now_ms = Time::now().to_msec() as u64;
+    let now = Time::now();
     if ts_ptr != 0 {
-        let task = current_task().unwrap();
-        let inner = task.inner_exclusive_access();
-        if !inner.memory_set.valid_user_buf(ts_ptr as *const u8, core::mem::size_of::<TimeVal>(), true) {
-            return -14;
-        }
-        let token = inner.get_user_token();
-        drop(inner);
+        let token = current_user_token();
         let ts = crate::mm::translated_refmut(token, ts_ptr as *mut TimeVal);
-        ts.sec = now_ms / 1000;
-        ts.usec = (now_ms % 1000) * 1000;
+        let nsec = now.to_nsec();
+        ts.sec = (nsec / 1_000_000_000) as isize;
+        ts.usec = ((nsec % 1_000_000_000) / 1000) as isize;
         0
     } else {
-        now_ms as isize
+        now.to_msec() as isize
     }
 }
 
@@ -112,10 +126,6 @@ pub fn sys_getppid() -> isize {
     }
 }
 
-pub fn sys_setsid() -> isize {
-    current_task().map(|t| t.getpid() as isize).unwrap_or(-1)
-}
-
 const CLONE_VM: usize = 0x100;
 const CLONE_FS: usize = 0x200;
 const CLONE_FILES: usize = 0x400;
@@ -128,7 +138,7 @@ const CLONE_CHILD_SETTID: usize = 0x01000000;
 
 pub fn sys_clone(flags: usize, stack: usize, ptid: usize, tls: usize, ctid: usize) -> isize {
     let current_task = current_task().unwrap();
-    let Some(new_task) = current_task.fork() else {
+    let Some(new_task) = current_task.fork_with_flags(flags) else {
         return -12;
     };
     let new_pid = new_task.pid.0;
@@ -167,31 +177,86 @@ pub fn sys_fork() -> isize {
     new_pid as isize
 }
 
-pub fn sys_exec(path: *const u8, mut args: *const usize) -> isize {
+pub fn sys_exec(path: *const u8, mut args: *const usize, mut envp: *const usize) -> isize {
     let token = current_user_token();
     let path = translated_str(token, path);
     let mut args_vec: Vec<String> = Vec::new();
-    loop {
-        let arg_str_ptr = *translated_ref(token, args);
-        if arg_str_ptr == 0 {
-            break;
-        }
-        args_vec.push(translated_str(token, arg_str_ptr as *const u8));
-        unsafe {
-            args = args.add(1);
+    if !args.is_null() {
+        loop {
+            let arg_str_ptr = *translated_ref(token, args);
+            if arg_str_ptr == 0 {
+                break;
+            }
+            args_vec.push(translated_str(token, arg_str_ptr as *const u8));
+            unsafe {
+                args = args.add(1);
+            }
         }
     }
-    let app_inode = open_file(path.as_str(), OpenFlags::RDONLY).or_else(|| {
-        if path.starts_with('/') {
-            None
-        } else {
+    let mut env_vec: Vec<String> = Vec::new();
+    if !envp.is_null() {
+        loop {
+            let env_str_ptr = *translated_ref(token, envp);
+            if env_str_ptr == 0 {
+                break;
+            }
+            env_vec.push(translated_str(token, env_str_ptr as *const u8));
+            unsafe {
+                envp = envp.add(1);
+            }
+        }
+    }
+    let cwd = crate::task::current_task()
+        .map(|t| t.inner_exclusive_access().cwd.clone());
+    let app_inode = if path.starts_with('/') {
+        open_file(path.as_str(), OpenFlags::RDONLY)
+    } else {
+        crate::fs::open_file_at(cwd, path.as_str(), OpenFlags::RDONLY, 0)
+    };
+    let app_inode = app_inode.or_else(|| {
+        if !path.starts_with('/') {
             open_file(format!("/bin/{}", path).as_str(), OpenFlags::RDONLY)
+        } else {
+            None
         }
     });
     if let Some(app_inode) = app_inode {
         let all_data = app_inode.read_all();
+        if all_data.len() >= 2 && &all_data[..2] == b"#!" {
+            let end = all_data.iter().position(|&b| b == b'\n').unwrap_or(all_data.len());
+            let line = core::str::from_utf8(&all_data[2..end]).unwrap_or("");
+            let parts: alloc::vec::Vec<&str> = line.split_whitespace().collect();
+            if !parts.is_empty() {
+                let ipath = alloc::string::String::from(parts[0]);
+                let mut new_args = alloc::vec![ipath.clone()];
+                if parts.len() > 1 { new_args.push(alloc::string::String::from(parts[1])); }
+                new_args.push(path);
+                for a in args_vec.iter().skip(1) { new_args.push(a.clone()); }
+                drop(app_inode);
+                let i2 = if ipath.starts_with('/') {
+                    open_file(ipath.as_str(), OpenFlags::RDONLY)
+                } else {
+                    let cwd2 = crate::task::current_task()
+                        .map(|t| t.inner_exclusive_access().cwd.clone());
+                    crate::fs::open_file_at(cwd2, ipath.as_str(), OpenFlags::RDONLY, 0)
+                };
+                if i2.is_some() || {
+                    if !ipath.starts_with('/') {
+                        open_file(format!("/bin/{}", ipath).as_str(), OpenFlags::RDONLY)
+                    } else {
+                        None
+                    }
+                }.is_some() {
+                    let real_i2 = i2.or_else(|| open_file(format!("/bin/{}", ipath).as_str(), OpenFlags::RDONLY)).unwrap();
+                    let d2 = real_i2.read_all();
+                    current_task().unwrap().exec(&d2, new_args, env_vec);
+                    return 0;
+                }
+            }
+            return -1;
+        }
         let task = current_task().unwrap();
-        task.exec(all_data.as_slice(), args_vec);
+        task.exec(all_data.as_slice(), args_vec, env_vec);
         0
     } else {
         -1
@@ -223,7 +288,7 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: usize) -> isize
                 }
             }
             if !has_child {
-                return -10;
+                return -1;
             }
             zombie_idx.map(|idx| (inner.children.remove(idx), inner.memory_set.token()))
         };
@@ -308,28 +373,43 @@ pub fn sys_kill(pid: usize, signum: i32) -> isize {
     }
 }
 
-pub fn sys_sigprocmask(how: usize, set: *const u8, oldset: *mut u8, _sigsetsize: usize) -> isize {
+pub fn sys_sigprocmask(how: usize, set: *const u8, oldset: *mut u8, sigsetsize: usize) -> isize {
     const SIG_BLOCK: usize = 0;
     const SIG_UNBLOCK: usize = 1;
     const SIG_SETMASK: usize = 2;
+
+    if sigsetsize != 8 {
+        return -22;
+    }
+
     if let Some(task) = current_task() {
         let token = current_user_token();
         let mut inner = task.inner_exclusive_access();
-        let old_mask = inner.signal_mask;
+        let token = inner.get_user_token();
+        let old = inner.signal_mask.bits();
+
         if !oldset.is_null() {
-            *crate::mm::translated_refmut(token, oldset as *mut u64) = old_mask.bits() as u64;
+            *translated_refmut(token, oldset as *mut u32) = old;
         }
-        if set.is_null() {
-            return 0;
+
+        if !set.is_null() {
+            let new_mask = *translated_ref(token, set as *const u32);
+            let new_flags = SignalFlags::from_bits_truncate(new_mask);
+            match how {
+                SIG_BLOCK => {
+                    inner.signal_mask |= new_flags;
+                }
+                SIG_UNBLOCK => {
+                    inner.signal_mask &= !new_flags;
+                }
+                SIG_SETMASK => {
+                    inner.signal_mask = new_flags;
+                }
+                _ => return -22,
+            }
         }
-        let new_mask = *crate::mm::translated_ref(token, set as *const u64);
-        let new_flags = SignalFlags::from_bits_truncate(new_mask as u32);
-        match how {
-            SIG_BLOCK => inner.signal_mask |= new_flags,
-            SIG_UNBLOCK => inner.signal_mask &= !new_flags,
-            _ => inner.signal_mask = new_flags,
-        }
-        0
+
+        old as isize
     } else {
         -1
     }
@@ -352,15 +432,8 @@ pub fn sys_sigreturn() -> isize {
     }
 }
 
-fn check_sigaction_error(signal: SignalFlags, action: usize, old_action: usize) -> bool {
-    if action == 0
-        || signal == SignalFlags::SIGKILL
-        || signal == SignalFlags::SIGSTOP
-    {
-        true
-    } else {
-        false
-    }
+fn check_sigaction_error(signal: SignalFlags, _action: usize, _old_action: usize) -> bool {
+    signal == SignalFlags::SIGKILL || signal == SignalFlags::SIGSTOP
 }
 
 pub fn sys_sigaction(
@@ -378,11 +451,12 @@ pub fn sys_sigaction(
         if check_sigaction_error(flag, action as usize, old_action as usize) {
             return -1;
         }
-        let prev_action = inner.signal_actions.table[signum as usize];
         if !old_action.is_null() {
-            *translated_refmut(token, old_action) = prev_action;
+            *translated_refmut(token, old_action) = inner.signal_actions.table[signum as usize];
         }
-        inner.signal_actions.table[signum as usize] = *translated_ref(token, action);
+        if !action.is_null() {
+            inner.signal_actions.table[signum as usize] = *translated_ref(token, action);
+        }
         0
     } else {
         -1
@@ -491,15 +565,11 @@ pub fn sys_mmap(
         start
     };
 
-    if real_start.checked_add(len).is_none() {
-        return -22;
-    }
-
     if (flags & MAP_ANONYMOUS) != 0 {
         let start_addr = polyhal::VirtAddr::from(real_start);
         let end_addr = polyhal::VirtAddr::from(real_start + len);
         if (flags & MAP_FIXED) != 0 && inner.memory_set.is_overlap(start_addr, end_addr) {
-            return -1;
+            inner.memory_set.munmap(start_addr, end_addr);
         }
         if !inner.memory_set.insert_framed_area(start_addr, end_addr, permission) {
             return -12;
@@ -508,6 +578,9 @@ pub fn sys_mmap(
     } else {
         let start_addr = polyhal::VirtAddr::from(real_start);
         let end_addr = polyhal::VirtAddr::from(real_start + len);
+        if (flags & MAP_FIXED) != 0 && inner.memory_set.is_overlap(start_addr, end_addr) {
+            inner.memory_set.munmap(start_addr, end_addr);
+        }
 
         if fd < 0 || fd as usize >= inner.fd_table.len() {
             return -1;
@@ -518,9 +591,6 @@ pub fn sys_mmap(
                 .memory_set
                 .insert_file_area(start_addr, end_addr, permission, file, offset);
             if ok {
-                if (flags & MAP_SHARED) != 0 {
-                    inner.memory_set.areas_mut().last_mut().unwrap().map_type = MapType::Shared;
-                }
                 return real_start as isize;
             } else {
                 return -1;
@@ -549,6 +619,18 @@ pub fn sys_munmap(start: usize, len: usize) -> isize {
     }
 }
 
+pub fn sys_msync(start: usize, len: usize, flags: usize) -> isize {
+    if (len > 0 && start as u64 + len as u64 > usize::MAX as u64)
+        || start % crate::config::PAGE_SIZE != 0
+    {
+        return -22;
+    }
+    let task = crate::task::current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    let start_addr = polyhal::VirtAddr::from(start);
+    inner.memory_set.msync(start_addr, len, flags)
+}
+
 pub fn sys_times(tms_ptr: usize) -> isize {
     let task = crate::task::current_task().unwrap();
 
@@ -558,30 +640,26 @@ pub fn sys_times(tms_ptr: usize) -> isize {
     if tms_ptr != 0 {
         let inner = task.inner_exclusive_access();
         let tms = Tms {
-            tms_utime: inner.utime as isize,
-            tms_stime: inner.stime as isize,
-            tms_cutime: inner.cutime as isize,
-            tms_cstime: inner.cstime as isize,
+            tms_utime: (inner.utime / 10_000_000) as isize,
+            tms_stime: (inner.stime / 10_000_000) as isize,
+            tms_cutime: (inner.cutime / 10_000_000) as isize,
+            tms_cstime: (inner.cstime / 10_000_000) as isize,
         };
         let token = inner.get_user_token();
         drop(inner);
         *crate::mm::translated_refmut(token, tms_ptr as *mut Tms) = tms;
     }
 
-    polyhal::time::Time::now().to_msec() as isize
+    (polyhal::time::Time::now().to_nsec() / 10_000_000) as isize
 }
 
 pub fn sys_uname(uts_ptr: usize) -> isize {
     if uts_ptr == 0 {
-        return -14;
+        return -1;
     }
+
     let task = crate::task::current_task().unwrap();
-    let inner = task.inner_exclusive_access();
-    if !inner.memory_set.valid_user_buf(uts_ptr as *const u8, core::mem::size_of::<UtsName>(), true) {
-        return -14;
-    }
-    let token = inner.get_user_token();
-    drop(inner);
+    let token = task.inner_exclusive_access().get_user_token();
     let uts = crate::mm::translated_refmut(token, uts_ptr as *mut UtsName);
 
     *uts = UtsName {
@@ -666,17 +744,19 @@ pub fn sys_nanosleep(req_ptr: usize, rem_ptr: usize) -> isize {
     if req.tv_nsec >= 1_000_000_000 || req.tv_sec > 1_000_000_000 {
         return -22;
     }
-    let duration_ms = req.tv_sec * 1000 + req.tv_nsec / 1_000_000;
-    let now = polyhal::time::Time::now().to_msec() as u64;
-    let wakeup_time = now.saturating_add(duration_ms as u64);
+    let duration_ns = req.tv_sec * 1_000_000_000 + req.tv_nsec as usize;
+    let wakeup_time = polyhal::time::Time::now().to_nsec() as u64 + duration_ns as u64;
     loop {
         if task.inner_exclusive_access().killed {
             return -4;
         }
-        if has_pending_signals() {
-            return -4;
+        {
+            let inner = task.inner_exclusive_access();
+            if !inner.signals.is_empty() && !inner.signal_mask.contains(inner.signals) {
+                return -4;
+            }
         }
-        if polyhal::time::Time::now().to_msec() as u64 >= wakeup_time {
+        if polyhal::time::Time::now().to_nsec() as u64 >= wakeup_time {
             break;
         }
         stdout_release_if_owner();
@@ -707,8 +787,7 @@ pub fn sys_exit_group(status: i32) -> ! {
         *translated_refmut(current_user_token(), tid as *mut i32) = 0;
     }
 
-    exit_current_and_run_next(status);
-    panic!("Unreachable in sys_exit_group!");
+    exit_current_and_run_next(status)
 }
 
 pub fn sys_getuid() -> isize {
@@ -878,7 +957,6 @@ pub fn sys_ppoll(
                 }
             }
 
-            // fd not valid
             pfd.revents |= POLLERR;
             ready += 1;
         }
@@ -889,7 +967,6 @@ pub fn sys_ppoll(
             return ready as isize;
         }
 
-        // Check timeout
         if !tmo_p.is_null() {
             let tmo: &crate::task::TimeSpec =
                 translated_ref(token, tmo_p as *const crate::task::TimeSpec);
@@ -913,21 +990,6 @@ pub fn sys_ppoll(
 
 pub fn sys_mprotect(_start: usize, _len: usize, _prot: usize) -> isize {
     0
-}
-
-pub fn sys_msync(start: usize, len: usize, _flags: usize) -> isize {
-    if (len > 0 && start as u64 + len as u64 > usize::MAX as u64) || start % crate::config::PAGE_SIZE != 0 {
-        return -22;
-    }
-    let task = current_task().unwrap();
-    let inner = task.inner_exclusive_access();
-    let start_addr = polyhal::VirtAddr::from(start);
-    let end_addr = polyhal::VirtAddr::from(start + len);
-    if inner.memory_set.msync(start_addr, end_addr) {
-        0
-    } else {
-        -14
-    }
 }
 
 // ---- mremap (216) ----
@@ -1428,7 +1490,6 @@ pub fn sys_pselect6(
     let mut wfds = [0u64; FD_SET_LONGS];
     let mut efds = [0u64; FD_SET_LONGS];
 
-    // Save original fd_sets for resetting each iteration
     if !readfds.is_null() {
         copy_fdset(&mut rfds, readfds);
     }
@@ -1456,7 +1517,6 @@ pub fn sys_pselect6(
     let start_ms = polyhal::time::Time::now().to_msec() as usize;
 
     loop {
-        // Reset fd_sets from saved originals (user-space buffer is modified by write-back)
         rfds = orig_rfds;
         wfds = orig_wfds;
         efds = orig_efds;
@@ -1486,7 +1546,6 @@ pub fn sys_pselect6(
             if fd < inner.fd_table.len() {
                 if let Some(file) = &inner.fd_table[fd] {
                     let file = file.clone();
-                    let is_socket = file.as_any().downcast_ref::<crate::net::socket::SocketFile>().is_some();
                     drop(inner);
                     let (r, w, e) = file.poll();
                     readable = r;
@@ -1528,39 +1587,24 @@ pub fn sys_pselect6(
         drop(task);
 
         if ready > 0 {
-            static mut N: u64 = 0;
             if !readfds.is_null() { write_fdset(readfds, &rfds); }
             if !writefds.is_null() { write_fdset(writefds, &wfds); }
             if !exceptfds.is_null() { write_fdset(exceptfds, &efds); }
             return ready as isize;
         }
 
-        // Check timeout
         if timeout_ms == 0 {
-            // Zero timeout, return immediately with empty sets
-            if !readfds.is_null() {
-                write_fdset(readfds, &rfds);
-            }
-            if !writefds.is_null() {
-                write_fdset(writefds, &wfds);
-            }
-            if !exceptfds.is_null() {
-                write_fdset(exceptfds, &efds);
-            }
+            if !readfds.is_null() { write_fdset(readfds, &rfds); }
+            if !writefds.is_null() { write_fdset(writefds, &wfds); }
+            if !exceptfds.is_null() { write_fdset(exceptfds, &efds); }
             return 0;
         }
         if timeout_ms != usize::MAX {
             let now_ms = polyhal::time::Time::now().to_msec() as usize;
             if now_ms - start_ms >= timeout_ms {
-                if !readfds.is_null() {
-                    write_fdset(readfds, &rfds);
-                }
-                if !writefds.is_null() {
-                    write_fdset(writefds, &wfds);
-                }
-                if !exceptfds.is_null() {
-                    write_fdset(exceptfds, &efds);
-                }
+                if !readfds.is_null() { write_fdset(readfds, &rfds); }
+                if !writefds.is_null() { write_fdset(writefds, &wfds); }
+                if !exceptfds.is_null() { write_fdset(exceptfds, &efds); }
                 return 0;
             }
         }
@@ -1584,16 +1628,50 @@ pub fn sys_futex(
     let token = current_user_token();
     let cur = *translated_ref(token, uaddr);
     let op = futex_op & 0x0F;
+    let addr = uaddr as usize;
     match op {
         0 | 9 => {
             if cur == val as u32 {
-                suspend_current_and_run_next();
+                let task = current_task().unwrap();
+                crate::task::FUTEX_QUEUE.exclusive_access().push((addr, task.clone()));
+                crate::task::suspend_current_and_run_next();
                 0
             } else {
                 -11
             }
         }
-        1 | 10 => 0,
+        1 | 10 => {
+            let max_wake = if op == 10 { _val3 } else { val };
+            if max_wake == 0 {
+                return 0;
+            }
+            let count = if max_wake == usize::MAX || max_wake > 128 {
+                128
+            } else {
+                max_wake
+            };
+            let mut woken = 0;
+            let mut queue = crate::task::FUTEX_QUEUE.exclusive_access();
+            let mut to_wake = Vec::new();
+            let mut remaining = Vec::new();
+            for (a, task) in queue.drain(..) {
+                if woken < count && (a == addr || (op == 10 && (a & !(4096 - 1)) == (addr & !(4096 - 1)))) {
+                    to_wake.push(task);
+                    woken += 1;
+                } else {
+                    remaining.push((a, task));
+                }
+            }
+            *queue = remaining;
+            drop(queue);
+            for task in to_wake {
+                let mut inner = task.inner_exclusive_access();
+                inner.task_status = TaskStatus::Ready;
+                drop(inner);
+                crate::task::add_task(task);
+            }
+            woken as isize
+        }
         6..=8 | 11..=13 => 0,
         _ => -38,
     }
@@ -1627,8 +1705,8 @@ pub fn sys_getitimer(which: usize, curr_value_ptr: *mut u8) -> isize {
         return -14;
     }
     let token = inner.get_user_token();
-    let now = polyhal::time::Time::now().to_msec() as u64;
-    let remaining_ms = if inner.itimer_expire > now {
+    let now = polyhal::time::Time::now().to_usec() as u64;
+    let remaining_usec = if inner.itimer_expire > now {
         inner.itimer_expire - now
     } else {
         0
@@ -1640,16 +1718,15 @@ pub fn sys_getitimer(which: usize, curr_value_ptr: *mut u8) -> isize {
             it_value: TimeVal { sec: 0, usec: 0 },
         }
     } else {
-        let rem_sec = remaining_ms / 1000;
-        let rem_usec = (remaining_ms % 1000) * 1000;
-        let interval_sec = inner.itimer_interval_ms / 1000;
-        let interval_usec = (inner.itimer_interval_ms % 1000) * 1000;
+        let old_interval_sec = (inner.itimer_interval_us / 1_000_000) as isize;
+        let old_interval_usec = (inner.itimer_interval_us % 1_000_000) as isize;
+        let old_rem_sec = (remaining_usec / 1_000_000) as isize;
+        let old_rem_usec = (remaining_usec % 1_000_000) as isize;
         ITimerVal {
-            it_interval: TimeVal { sec: interval_sec, usec: interval_usec },
-            it_value: TimeVal { sec: rem_sec, usec: rem_usec },
+            it_interval: TimeVal { sec: old_interval_sec, usec: old_interval_usec },
+            it_value: TimeVal { sec: old_rem_sec, usec: old_rem_usec },
         }
     };
-
     drop(inner);
     *translated_refmut(token, curr_value_ptr as *mut ITimerVal) = itv;
     0
@@ -1662,26 +1739,19 @@ pub fn sys_setitimer(which: usize, new_value: *const u8, old_value: *mut u8) -> 
 
     let token = current_user_token();
     let task = current_task().unwrap();
-    let now = polyhal::time::Time::now().to_msec() as u64;
+    let now = polyhal::time::Time::now().to_usec() as u64;
 
     if !old_value.is_null() {
-        let ok = {
-            let inner = task.inner_exclusive_access();
-            inner.memory_set.valid_user_buf(old_value, core::mem::size_of::<ITimerVal>(), true)
-        };
-        if !ok {
-            return -14;
-        }
         let mut inner = task.inner_exclusive_access();
-        let remaining_ms = if inner.itimer_expire > now {
+        let remaining_usec = if inner.itimer_expire > now {
             inner.itimer_expire - now
         } else {
             0
         };
-        let old_interval_sec = inner.itimer_interval_ms / 1000;
-        let old_interval_usec = (inner.itimer_interval_ms % 1000) * 1000;
-        let old_rem_sec = remaining_ms / 1000;
-        let old_rem_usec = (remaining_ms % 1000) * 1000;
+        let old_interval_sec = (inner.itimer_interval_us / 1_000_000) as isize;
+        let old_interval_usec = (inner.itimer_interval_us % 1_000_000) as isize;
+        let old_rem_sec = (remaining_usec / 1_000_000) as isize;
+        let old_rem_usec = (remaining_usec % 1_000_000) as isize;
         let old_itv = if inner.itimer_expire == 0 {
             ITimerVal {
                 it_interval: TimeVal { sec: 0, usec: 0 },
@@ -1701,24 +1771,17 @@ pub fn sys_setitimer(which: usize, new_value: *const u8, old_value: *mut u8) -> 
         return 0;
     }
 
-    let ok = {
-        let inner = task.inner_exclusive_access();
-        inner.memory_set.valid_user_buf(new_value, core::mem::size_of::<ITimerVal>(), false)
-    };
-    if !ok {
-        return -14;
-    }
     let new_itv: &ITimerVal = translated_ref(token, new_value as *const ITimerVal);
-    let new_value_ms = new_itv.it_value.sec * 1000 + new_itv.it_value.usec / 1000;
-    let new_interval_ms = new_itv.it_interval.sec * 1000 + new_itv.it_interval.usec / 1000;
+    let new_value_usec = new_itv.it_value.sec * 1_000_000 + new_itv.it_value.usec;
+    let new_interval_usec = new_itv.it_interval.sec * 1_000_000 + new_itv.it_interval.usec;
 
     let mut inner = task.inner_exclusive_access();
-    if new_value_ms == 0 {
+    if new_value_usec == 0 {
         inner.itimer_expire = 0;
     } else {
-        inner.itimer_expire = now + new_value_ms as u64;
+        inner.itimer_expire = now + new_value_usec as u64;
     }
-    inner.itimer_interval_ms = new_interval_ms as u64;
+    inner.itimer_interval_us = new_interval_usec as u64;
     0
 }
 
@@ -1737,10 +1800,11 @@ pub fn sys_clock_gettime(clk_id: usize, ts: *mut u8) -> isize {
     }
     let token = inner.get_user_token();
     drop(inner);
-    let now_ms = polyhal::time::Time::now().to_msec() as u64;
+    let now = polyhal::time::Time::now();
+    let nsec = now.to_nsec();
     let ts_out: &mut crate::task::TimeSpec = translated_refmut(token, ts as *mut crate::task::TimeSpec);
-    ts_out.tv_sec = (now_ms / 1000) as usize;
-    ts_out.tv_nsec = ((now_ms % 1000) * 1_000_000) as usize;
+    ts_out.tv_sec = (nsec / 1_000_000_000) as usize;
+    ts_out.tv_nsec = (nsec % 1_000_000_000) as usize;
     0
 }
 
@@ -1845,9 +1909,6 @@ pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset_ptr: *mut usize, count: 
     }
 
     let saved_in_off = if !offset_ptr.is_null() {
-        if !inner.memory_set.valid_user_buf(offset_ptr as *const u8, core::mem::size_of::<usize>(), false) {
-            return -14;
-        }
         let off = in_file.get_offset();
         let user_off = *translated_ref(token, offset_ptr);
         in_file.seek(user_off);
@@ -1883,6 +1944,188 @@ pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset_ptr: *mut usize, count: 
     total
 }
 
-pub fn sys_getrusage(_who: usize, _usage: *mut u8) -> isize {
+pub fn sys_rt_sigtimedwait(set: *const u8, info: *mut u8, timeout: *const u8, sigsetsize: usize) -> isize {
+    if set.is_null() || sigsetsize != 8 {
+        return -22;
+    }
+    let token = current_user_token();
+    let mask = *crate::mm::translated_ref(token, set as *const u64) as u32;
+    let mask = SignalFlags::from_bits_truncate(mask);
+
+    let timeout_ns: Option<u64> = if !timeout.is_null() {
+        let ts = *crate::mm::translated_ref(token, timeout as *const crate::task::TimeSpec);
+        if ts.tv_sec == 0 && ts.tv_nsec == 0 {
+            // immediate timeout — check once
+            let task = current_task().unwrap();
+            let mut inner = task.inner_exclusive_access();
+            let pending = inner.signals & mask;
+            if !pending.is_empty() {
+                // Find the lowest signal number
+                for sig in 1..=MAX_SIG {
+                    let flag = SignalFlags::from_bits(1 << sig).unwrap();
+                    if pending.contains(flag) {
+                        inner.signals ^= flag;
+                        if !info.is_null() {
+                            #[repr(C)]
+                            struct SiginfoT {
+                                si_signo: i32,
+                                si_errno: i32,
+                                si_code: i32,
+                                _pad: [u8; 108],
+                            }
+                            let siginfo = crate::mm::translated_refmut(token, info as *mut SiginfoT);
+                            siginfo.si_signo = sig as i32;
+                            siginfo.si_errno = 0;
+                            siginfo.si_code = 0;
+                        }
+                        return sig as isize;
+                    }
+                }
+            }
+            return -11; // EAGAIN
+        }
+        Some(ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64)
+    } else {
+        None
+    };
+
+    let timeout_deadline = timeout_ns.map(|ns| {
+        polyhal::time::Time::now().to_nsec() as u64 + ns
+    });
+
+    let task = current_task().unwrap();
+    let saved_mask = {
+        let mut inner = task.inner_exclusive_access();
+        let old = inner.signal_mask;
+        inner.signal_mask = !mask;
+        old
+    };
+
+    // Loop waiting for a signal
+    loop {
+        {
+            let task = current_task().unwrap();
+            let mut inner = task.inner_exclusive_access();
+            let pending = inner.signals & mask;
+            if !pending.is_empty() {
+                for sig in 1..=MAX_SIG {
+                    let flag = SignalFlags::from_bits(1 << sig).unwrap();
+                    if pending.contains(flag) {
+                        inner.signals ^= flag;
+                        if !info.is_null() {
+                            #[repr(C)]
+                            struct SiginfoT {
+                                si_signo: i32,
+                                si_errno: i32,
+                                si_code: i32,
+                                _pad: [u8; 108],
+                            }
+                            let siginfo = crate::mm::translated_refmut(token, info as *mut SiginfoT);
+                            siginfo.si_signo = sig as i32;
+                            siginfo.si_errno = 0;
+                            siginfo.si_code = 0;
+                        }
+                        inner.signal_mask = saved_mask;
+                        return sig as isize;
+                    }
+                }
+            }
+            if inner.killed {
+                inner.signal_mask = saved_mask;
+                return -4; // EINTR
+            }
+        }
+
+        if let Some(deadline) = timeout_deadline {
+            let now = polyhal::time::Time::now().to_nsec() as u64;
+            if now >= deadline {
+                let task = current_task().unwrap();
+                let mut inner = task.inner_exclusive_access();
+                inner.signal_mask = saved_mask;
+                return -11; // EAGAIN
+            }
+        }
+
+        crate::fs::stdio::stdout_release_if_owner();
+        crate::task::suspend_current_and_run_next();
+    }
+}
+
+pub fn sys_tgkill(tgid: usize, tid: usize, sig: i32) -> isize {
+    if sig < 0 || sig as usize > MAX_SIG {
+        return -22;
+    }
+    if let Some(task) = pid2task(tid) {
+        let target_tgid = task.getpid();
+        // In our implementation, tgid is the main thread's pid
+        // For single-threaded, tgid == tid
+        if tgid != 0 && tgid != target_tgid {
+            // Check if this task belongs to tgid (simplified)
+            // We just allow if tgid matches or is 0
+        }
+        if sig == 0 {
+            return 0;
+        }
+        let flag = SignalFlags::from_bits(1u32 << sig as usize).unwrap();
+        let mut task_ref = task.inner_exclusive_access();
+        if task_ref.signals.contains(flag) {
+            return 0;
+        }
+        task_ref.signals.insert(flag);
+        if flag == SignalFlags::SIGKILL || flag == SignalFlags::SIGTERM {
+            task_ref.killed = true;
+            task_ref.exit_signal = -(sig as i32);
+        } else if task_ref.signal_actions.table[sig as usize].handler == 0 {
+            let fatal = flag.intersects(
+                SignalFlags::SIGSEGV | SignalFlags::SIGABRT | SignalFlags::SIGILL
+                | SignalFlags::SIGFPE | SignalFlags::SIGBUS | SignalFlags::SIGSYS
+                | SignalFlags::SIGTRAP
+                | SignalFlags::SIGALRM | SignalFlags::SIGVTALRM | SignalFlags::SIGPROF
+                | SignalFlags::SIGTERM | SignalFlags::SIGINT | SignalFlags::SIGQUIT
+                | SignalFlags::SIGHUP | SignalFlags::SIGPIPE | SignalFlags::SIGUSR1
+                | SignalFlags::SIGUSR2
+                | SignalFlags::SIGXCPU | SignalFlags::SIGXFSZ
+                | SignalFlags::SIGIO | SignalFlags::SIGPWR,
+            );
+            if fatal {
+                task_ref.killed = true;
+                task_ref.exit_signal = -(sig as i32);
+            }
+        }
+        0
+    } else {
+        -3 // ESRCH
+    }
+}
+
+pub fn sys_getrusage(who: usize, usage: *mut u8) -> isize {
+    const RUSAGE_SELF: usize = 0;
+    const RUSAGE_CHILDREN: usize = usize::MAX;
+    if who != RUSAGE_SELF && who != RUSAGE_CHILDREN {
+        return -22;
+    }
+    if usage.is_null() {
+        return -14;
+    }
+    let token = current_user_token();
+    let rusage = RUsage {
+        ru_utime: TimeVal { sec: 0, usec: 0 },
+        ru_stime: TimeVal { sec: 0, usec: 0 },
+        ru_maxrss: 0,
+        ru_ixrss: 0,
+        ru_idrss: 0,
+        ru_isrss: 0,
+        ru_minflt: 0,
+        ru_majflt: 0,
+        ru_nswap: 0,
+        ru_inblock: 0,
+        ru_oublock: 0,
+        ru_msgsnd: 0,
+        ru_msgrcv: 0,
+        ru_nsignals: 0,
+        ru_nvcsw: 0,
+        ru_nivcsw: 0,
+    };
+    *translated_refmut(token, usage as *mut RUsage) = rusage;
     0
 }

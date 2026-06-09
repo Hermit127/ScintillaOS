@@ -35,6 +35,10 @@ const SHUT_RD: usize = 0;
 const SHUT_WR: usize = 1;
 const SHUT_RDWR: usize = 2;
 
+fn net_ready() -> bool {
+    true
+}
+
 #[repr(C)]
 struct SockAddrIn {
     sin_family: u16,
@@ -169,6 +173,9 @@ pub fn sys_socket(domain: usize, type_: usize, _protocol: usize) -> isize {
     if domain != AF_INET {
         return -97;
     }
+    if !net_ready() {
+        return -97;
+    }
 
     let st = match type_ & 0x0F {
         SOCK_STREAM => SocketType::Tcp,
@@ -192,6 +199,9 @@ pub fn sys_socket(domain: usize, type_: usize, _protocol: usize) -> isize {
 }
 
 pub fn sys_bind(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
+    if !net_ready() {
+        return -97;
+    }
     if addr.is_null() || addrlen < 8 {
         return -14;
     }
@@ -233,6 +243,9 @@ pub fn sys_bind(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
 }
 
 pub fn sys_connect(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
+    if !net_ready() {
+        return -97;
+    }
     if addr.is_null() || addrlen < 8 {
         return -14;
     }
@@ -310,6 +323,9 @@ pub fn sys_connect(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
 }
 
 pub fn sys_listen(sockfd: usize, _backlog: usize) -> isize {
+    if !net_ready() {
+        return -97;
+    }
     let (handle, st, _nonblock) = match sock_lookup(sockfd) {
         Some(v) => v,
         None => return -9,
@@ -344,6 +360,9 @@ pub fn sys_listen(sockfd: usize, _backlog: usize) -> isize {
 }
 
 pub fn sys_accept(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
+    if !net_ready() {
+        return -97;
+    }
     let task = current_task().unwrap();
     let inner = task.inner_exclusive_access();
 
@@ -478,6 +497,9 @@ pub fn sys_sendto(
     dest_addr: *const u8,
     addrlen: usize,
 ) -> isize {
+    if !net_ready() {
+        return -97;
+    }
     let (handle, st, nonblock) = match sock_lookup(sockfd) {
         Some(v) => v,
         None => return -9,
@@ -517,6 +539,9 @@ pub fn sys_recvfrom(
     src_addr: *mut u8,
     addrlen: *mut usize,
 ) -> isize {
+    if !net_ready() {
+        return -97;
+    }
     let (handle, st, nonblock) = match sock_lookup(sockfd) {
         Some(v) => v,
         None => return -9,
@@ -554,6 +579,9 @@ pub fn sys_recvfrom(
 }
 
 pub fn sys_sendmsg(sockfd: usize, msg: *const u8, flags: usize) -> isize {
+    if !net_ready() {
+        return -97;
+    }
     if msg.is_null() {
         return -14;
     }
@@ -602,6 +630,9 @@ pub fn sys_sendmsg(sockfd: usize, msg: *const u8, flags: usize) -> isize {
 }
 
 pub fn sys_recvmsg(sockfd: usize, msg: *mut u8, flags: usize) -> isize {
+    if !net_ready() {
+        return -97;
+    }
     let token = current_user_token();
     let msghdr: &Msghdr = translated_ref(token, msg as *const Msghdr);
 
@@ -667,6 +698,9 @@ pub fn sys_setsockopt(
     optval: *const u8,
     optlen: usize,
 ) -> isize {
+    if !net_ready() {
+        return -97;
+    }
     let (handle, st, _nonblock) = match sock_lookup(sockfd) {
         Some(v) => v,
         None => return -9,
@@ -731,6 +765,9 @@ pub fn sys_getsockopt(
     optval: *mut u8,
     optlen: *mut usize,
 ) -> isize {
+    if !net_ready() {
+        return -97;
+    }
     if optval.is_null() || optlen.is_null() {
         return -14;
     }
@@ -788,6 +825,9 @@ pub fn sys_getsockopt(
 }
 
 pub fn sys_sock_shutdown(sockfd: usize, how: usize) -> isize {
+    if !net_ready() {
+        return -97;
+    }
     let (handle, st, _nonblock) = match sock_lookup(sockfd) {
         Some(v) => v,
         None => return -9,
@@ -811,6 +851,9 @@ pub fn sys_sock_shutdown(sockfd: usize, how: usize) -> isize {
 }
 
 pub fn sys_getpeername(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
+    if !net_ready() {
+        return -97;
+    }
     if addr.is_null() || addrlen.is_null() {
         return -14;
     }
@@ -850,6 +893,9 @@ pub fn sys_getpeername(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isi
 }
 
 pub fn sys_getsockname(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
+    if !net_ready() {
+        return -97;
+    }
     if addr.is_null() || addrlen.is_null() {
         return -14;
     }

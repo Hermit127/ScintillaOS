@@ -63,33 +63,20 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             // cx is changed during sys_exec, so we have to call it again
             ctx[TrapFrameArgs::RET] = result as usize;
         }
-        StorePageFault(bad_addr) => {
-            let in_sys = current_task()
-                .map(|t| t.inner_exclusive_access().in_syscall)
-                .unwrap_or(false);
-            if in_sys {
-                warn!("[pagefault-in-syscall] pid={} store at {:#x}", current_task().map_or(0,|t|t.getpid()), bad_addr);
-                ctx[TrapFrameArgs::RET] = (-14isize) as usize;
-            } else {
-                error!("[pagefault] pid={} store at {:#x}", current_task().map_or(0,|t|t.getpid()), bad_addr);
-                exit_current_and_run_next(-11);
+        StorePageFault(bad_addr) | LoadPageFault(bad_addr) => {
+            let vaddr = polyhal::VirtAddr::from(bad_addr);
+            let task = crate::task::current_task().unwrap();
+            let mut inner = task.inner_exclusive_access();
+            if !inner.memory_set.handle_page_fault(vaddr) {
+                drop(inner);
+                current_add_signal(SignalFlags::SIGSEGV);
             }
         }
-        LoadPageFault(bad_addr) | InstructionPageFault(bad_addr) => {
-            let in_sys = current_task()
-                .map(|t| t.inner_exclusive_access().in_syscall)
-                .unwrap_or(false);
-            if in_sys {
-                warn!("[pagefault-in-syscall] pid={} load at {:#x}", current_task().map_or(0,|t|t.getpid()), bad_addr);
-                ctx[TrapFrameArgs::RET] = (-14isize) as usize;
-            } else {
-                error!("[pagefault] pid={} load at {:#x}", current_task().map_or(0,|t|t.getpid()), bad_addr);
-                exit_current_and_run_next(-11);
-            }
+        InstructionPageFault(_paddr) => {
+            current_add_signal(SignalFlags::SIGSEGV);
         }
-        IllegalInstruction(stval) => {
-            error!("[kernel] IllegalInstruction at {:#x}, pid={}", stval, current_task().map_or(0,|t|t.getpid()));
-            exit_current_and_run_next(-4);
+        IllegalInstruction(_) => {
+            current_add_signal(SignalFlags::SIGILL);
         }
         Timer => {
             static mut TICK: usize = 0;
@@ -121,15 +108,15 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
 }
 
 fn check_itimer() {
-    let now = polyhal::time::Time::now().to_msec() as u64;
+    let now = polyhal::time::Time::now().to_usec() as u64;
     let map = PID2TCB.exclusive_access();
     for task in map.values() {
         let Some(mut inner) = task.try_inner_exclusive_access() else { continue };
         if inner.itimer_expire == 0 { continue; }
         if now >= inner.itimer_expire {
             inner.signals.insert(SignalFlags::SIGALRM);
-            if inner.itimer_interval_ms > 0 {
-                inner.itimer_expire = now + inner.itimer_interval_ms;
+            if inner.itimer_interval_us > 0 {
+                inner.itimer_expire = now + inner.itimer_interval_us;
             } else {
                 inner.itimer_expire = 0;
             }
@@ -143,8 +130,6 @@ fn main(hartid: usize) {
         return;
     }
     println!("[kernel] Hello, world!");
-    // Enable FPU for user space (set sstatus.FS = 1)
-    unsafe { core::arch::asm!("csrs sstatus, {}", in(reg) 0x6000u64) };
     mm::init_heap();
     logging::init(option_env!("LOG"));
     println!("init logging");

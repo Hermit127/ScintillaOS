@@ -2,7 +2,7 @@ use super::vfs::{
     vfs_create, vfs_resolve_parent_and_name, vfs_resolve_path, vfs_resolve_with_fallback, Dentry,
     DirEntry,
 };
-use super::{File, Kstat};
+use super::{File, Kstat, S_IFDIR, S_IFREG};
 use crate::sync::UPSafeCell;
 use alloc::ffi::CString;
 use alloc::string::String;
@@ -152,7 +152,12 @@ impl OSInode {
                 st
             }
             None => {
-                let st = Kstat::new(0o100000);
+                let mode = if self.dentry.is_dir {
+                    S_IFDIR | 0o755
+                } else {
+                    S_IFREG | 0o644
+                };
+                let st = Kstat::new(mode);
                 drop(inner);
                 st
             }
@@ -175,6 +180,7 @@ bitflags! {
         const TRUNC = 0x200;
         const APPEND = 0x400;
         const DIRECTORY = 0x10000;
+        const TMPFILE = 0x400000;
     }
 }
 
@@ -231,6 +237,16 @@ fn open_file_new(
 ) -> Option<Arc<OSInode>> {
     let start = base.unwrap_or_else(|| crate::fs::vfs::ROOT_DENTRY.clone());
     let want_dir = flags.directory_requested();
+
+    if flags.contains(OpenFlags::TMPFILE) {
+        let parent = vfs_resolve_with_fallback(&start, path)?;
+        if !parent.is_dir {
+            return None;
+        }
+        let name = alloc::format!("tmp_{}", polyhal::time::Time::now().to_nsec());
+        let dentry = vfs_create(&parent, &name, false, mode)?;
+        return Some(Arc::new(OSInode::new(true, true, false, dentry)));
+    }
 
     if flags.create_requested() {
         if want_dir {
@@ -341,29 +357,72 @@ impl File for OSInode {
     }
 
     fn read(&self, buf: &mut [u8]) -> isize {
-        // Check if we need to open handle
-        {
+        let mut inner = self.inner.exclusive_access();
+        let rw_count = self
+            .dentry
+            .super_block
+            .read_at(&self.dentry.fs_path, inner.offset, buf);
+        inner.offset += rw_count;
+        rw_count as isize
+    }
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> isize {
+        let need_open = {
             let inner = self.inner.exclusive_access();
-            if inner.file_handle.is_some() {
-                drop(inner);
-            } else {
-                drop(inner);
-                self.open_handle();
-            }
+            inner.file_handle.is_none()
+        };
+        if need_open {
+            self.open_handle();
         }
         let mut inner = self.inner.exclusive_access();
         if let Some(ref mut file) = inner.file_handle {
+            unsafe {
+                ext4_fseek(file, offset as i64, SEEK_SET as u32);
+            }
+            let mut total = 0usize;
+            while total < buf.len() {
+                let mut rw_count: usize = 0;
+                let rc = unsafe {
+                    ext4_fread(
+                        file,
+                        buf[total..].as_mut_ptr() as *mut core::ffi::c_void,
+                        buf.len() - total,
+                        &mut rw_count,
+                    )
+                };
+                if rc != EOK as i32 || rw_count == 0 {
+                    break;
+                }
+                total += rw_count;
+            }
+            return total as isize;
+        }
+        -1
+    }
+
+    fn write_at(&self, offset: usize, buf: &mut [u8]) -> isize {
+        let need_open = {
+            let inner = self.inner.exclusive_access();
+            inner.file_handle.is_none()
+        };
+        if need_open {
+            self.open_handle();
+        }
+        let mut inner = self.inner.exclusive_access();
+        if let Some(ref mut file) = inner.file_handle {
+            unsafe {
+                ext4_fseek(file, offset as i64, SEEK_SET as u32);
+            }
             let mut rw_count: usize = 0;
             let rc = unsafe {
-                ext4_fread(
+                ext4_fwrite(
                     file,
-                    buf.as_mut_ptr() as *mut core::ffi::c_void,
+                    buf.as_ptr() as *const core::ffi::c_void,
                     buf.len(),
                     &mut rw_count,
                 )
             };
             if rc == EOK as i32 {
-                inner.offset += rw_count;
                 return rw_count as isize;
             }
         }
@@ -475,7 +534,13 @@ impl File for OSInode {
     }
 
     fn seek(&self, offset: usize) {
-        self.inner.exclusive_access().offset = offset;
+        let mut inner = self.inner.exclusive_access();
+        inner.offset = offset;
+        if let Some(ref mut file) = inner.file_handle {
+            unsafe {
+                ext4_fseek(file, offset as i64, SEEK_SET as u32);
+            }
+        }
     }
 
     fn get_offset(&self) -> usize {

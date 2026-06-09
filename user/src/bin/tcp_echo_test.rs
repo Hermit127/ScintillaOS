@@ -21,6 +21,7 @@ const SOCK_STREAM: usize = 1;
 const SOL_SOCKET: usize = 1;
 const SO_REUSEADDR: usize = 2;
 
+#[cfg(target_arch = "riscv64")]
 fn sys_call(id: usize, args: [usize; 6]) -> isize {
     let mut ret: isize;
     unsafe {
@@ -33,6 +34,24 @@ fn sys_call(id: usize, args: [usize; 6]) -> isize {
             in("x14") args[4],
             in("x15") args[5],
             in("x17") id
+        );
+    }
+    ret
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn sys_call(id: usize, args: [usize; 6]) -> isize {
+    let mut ret: isize;
+    unsafe {
+        core::arch::asm!(
+            "syscall 0",
+            inlateout("$r4") args[0] => ret,
+            in("$r5") args[1],
+            in("$r6") args[2],
+            in("$r7") args[3],
+            in("$r8") args[4],
+            in("$r9") args[5],
+            in("$r11") id
         );
     }
     ret

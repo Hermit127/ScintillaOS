@@ -216,27 +216,44 @@ impl VfsSuperBlock {
                 return 0;
             }
 
+            let file_size = unsafe { ext4_fsize(&mut file) as usize };
+            if offset >= file_size {
+                unsafe {
+                    ext4_fclose(&mut file);
+                }
+                return 0;
+            }
+            let max_read = core::cmp::min(buf.len(), file_size - offset);
+
             unsafe {
                 ext4_fseek(&mut file, offset as i64, SEEK_SET as u32);
             }
 
-            let mut rw_count: usize = 0;
-            let read_rc = unsafe {
-                ext4_fread(
-                    &mut file,
-                    buf.as_mut_ptr() as *mut core::ffi::c_void,
-                    buf.len(),
-                    &mut rw_count,
-                )
-            };
+            let mut total = 0usize;
+            while total < max_read {
+                let chunk_len = core::cmp::min(128, max_read - total);
+                let mut rw_count: usize = 0;
+                let read_rc = unsafe {
+                    ext4_fread(
+                        &mut file,
+                        buf[total..total + chunk_len].as_mut_ptr() as *mut core::ffi::c_void,
+                        chunk_len,
+                        &mut rw_count,
+                    )
+                };
+                if read_rc != EOK as i32 || rw_count == 0 {
+                    break;
+                }
+                total += rw_count;
+                if rw_count < chunk_len {
+                    break;
+                }
+            }
             unsafe {
                 ext4_fclose(&mut file);
             }
 
-            if read_rc != EOK as i32 {
-                return 0;
-            }
-            rw_count
+            total
         })
     }
 
