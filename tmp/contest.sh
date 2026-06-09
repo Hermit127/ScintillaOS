@@ -3,12 +3,15 @@
 
 echo "===== OS AUTO TEST START ====="
 
+# Debug: show mount
+echo "[DBG] listing /mnt:"
+/busybox ls /mnt/ 2>&1 | head -5
+echo "[DBG] listing /:"
+/busybox ls / 2>&1 | head -5
+
 # Find and copy busybox
-for bb in /mnt/busybox /mnt/*/busybox; do
-    [ -x "$bb" ] && cp "$bb" /busybox 2>/dev/null && break
-done
-for bb in /mnt/busybox-glibc /mnt/*/busybox-glibc /mnt/*/busybox; do
-    [ -x "$bb" ] && cp "$bb" /busybox-glibc 2>/dev/null && break
+for bb in /mnt/busybox /mnt/*/busybox /busybox /bin/busybox; do
+    [ -x "$bb" ] && { echo "[DBG] found busybox at $bb"; cp "$bb" /busybox 2>/dev/null; break; }
 done
 
 skip_group() {
@@ -20,31 +23,34 @@ skip_group() {
     esac
 }
 
+found=0
 # Scan both /mnt/xxx_testcode.sh and /mnt/*/xxx_testcode.sh
-find /mnt -maxdepth 2 -name "*_testcode.sh" 2>/dev/null | sort | while read script; do
-    dir=$(dirname "$script")
-    name=$(basename "$script")
-    group=${name%_testcode.sh}
+for pattern in "/mnt/*_testcode.sh" "/mnt/*/*_testcode.sh"; do
+    for script in $pattern; do
+        [ -f "$script" ] || continue
+        found=1
+        dir=$(dirname "$script")
+        name=$(basename "$script")
+        group=${name%_testcode.sh}
+        runtime=$(basename "$dir")
+        [ "$runtime" = "mnt" ] && runtime="musl"
 
-    # guess runtime from directory name
-    runtime=$(basename "$dir")
-    [ "$runtime" = "mnt" ] && runtime="musl"
+        if skip_group "$group"; then
+            echo "[SKIP] $group ($runtime)"
+            continue
+        fi
 
-    if skip_group "$group"; then
-        echo "[SKIP] $group ($runtime)"
-        continue
-    fi
+        echo "[RUN] $group ($runtime)"
+        case "$runtime" in
+            glibc|*glibc*) bb="/busybox-glibc" ;;
+            *) bb="/busybox" ;;
+        esac
+        [ -x "$bb" ] || bb="/busybox"
 
-    echo "[RUN] $group ($runtime)"
-    # Use appropriate busybox: musl dir -> /busybox, glibc dir -> /busybox-glibc  
-    case "$runtime" in
-        glibc|*glibc*) bb="/busybox-glibc" ;;
-        *) bb="/busybox" ;;
-    esac
-    [ -x "$bb" ] || bb="/busybox"
-
-    cd "$dir" && "$bb" sh "$name" 2>&1
-    cd /
+        cd "$dir" && "$bb" sh "$name" 2>&1
+        cd /
+    done
 done
 
+[ $found -eq 0 ] && echo "[DBG] no test scripts found!"
 echo "===== ALL TESTS COMPLETE ====="
