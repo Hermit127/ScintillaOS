@@ -7,6 +7,7 @@ use alloc::vec::Vec;
 use log::*;
 use polyhal::pagetable::{MappingFlags, MappingSize, PageTable, PageTableWrapper};
 use polyhal::{PhysAddr, VirtAddr};
+use xmas_elf::header::Type as ElfType;
 pub struct MemorySet {
     page_table: Arc<PageTableWrapper>,
     areas: Vec<MapArea>,
@@ -19,6 +20,8 @@ pub struct LoadedElf {
     pub ph_addr: usize,
     pub ph_entsize: usize,
     pub ph_num: usize,
+    pub tls_base: usize,
+    pub tls_size: usize,
 }
 
 impl MemorySet {
@@ -51,14 +54,19 @@ impl MemorySet {
         let ph_count = elf_header.pt2.ph_count();
         let e_phoff = elf_header.pt2.ph_offset() as usize;
         let e_phentsize = elf_header.pt2.ph_entry_size() as usize;
+        let is_pie = elf.header.pt2.type_().as_type() == ElfType::SharedObject;
+        let pie_base: usize = if is_pie { 0x1_0000 } else { 0 };
         let mut max_end_va = VirtAddr::new(0);
         let mut ph_addr = 0usize;
         let mut first_load = true;
+        let mut tls_base: usize = 0;
+        let mut tls_size: usize = 0;
         for i in 0..ph_count {
             let ph = elf.program_header(i).unwrap();
+            let va_offset = pie_base;
             if ph.get_type().unwrap() == xmas_elf::program::Type::Load {
-                let start_va: VirtAddr = (ph.virtual_addr() as usize).into();
-                let end_va: VirtAddr = ((ph.virtual_addr() + ph.mem_size()) as usize).into();
+                let start_va: VirtAddr = (ph.virtual_addr() as usize + va_offset).into();
+                let end_va: VirtAddr = ((ph.virtual_addr() + ph.mem_size()) as usize + va_offset).into();
                 if first_load {
                     ph_addr = start_va.raw() + e_phoff;
                     first_load = false;
@@ -95,6 +103,9 @@ impl MemorySet {
                         0,
                     );
                 }
+            } else if ph.get_type().unwrap() == xmas_elf::program::Type::Tls {
+                tls_base = ph.virtual_addr() as usize + va_offset;
+                tls_size = ph.mem_size() as usize;
             }
         }
         // map user stack with U flags
@@ -115,10 +126,12 @@ impl MemorySet {
         LoadedElf {
             memory_set,
             user_sp: user_stack_top,
-            entry_point: elf.header.pt2.entry_point() as usize,
+            entry_point: elf.header.pt2.entry_point() as usize + pie_base,
             ph_addr,
             ph_entsize: e_phentsize,
             ph_num: ph_count as usize,
+            tls_base,
+            tls_size,
         }
     }
     pub fn from_existed_user(user_space: &MemorySet) -> Option<MemorySet> {

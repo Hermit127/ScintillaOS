@@ -154,6 +154,12 @@ endif
 ifdef LM_GLIBC_ONLY
 	@touch $(ROOTFS_DIR)/lmbench_glibc_only
 endif
+ifdef IOZONE_ONLY
+	@touch $(ROOTFS_DIR)/iozone_only
+endif
+ifdef IOZONE_GLIBC_ONLY
+	@touch $(ROOTFS_DIR)/iozone_glibc_only
+endif
 	@printf "Hi, this is a text file.\nsyscalls testing success!\n" > $(ROOTFS_DIR)/text.txt
 	@for src in user/src/bin/*.rs; do \
 		app=$$(basename $$src .rs); \
@@ -172,19 +178,25 @@ endif
 	fi
 	@cp -f tmp/hello_riscv64_musl $(ROOTFS_BIN_DIR)/hello 2>/dev/null || true
 	@cp -f tmp/lua-riscv64-musl $(ROOTFS_BIN_DIR)/lua 2>/dev/null || true
+	@if [ "$(ARCH)" = "riscv64" ]; then \
+		cp -f tmp/iozone-riscv64-musl $(ROOTFS_BIN_DIR)/iozone 2>/dev/null || true; \
+		cp -f tmp/iozone-riscv64-glibc $(ROOTFS_BIN_DIR)/iozone-glibc 2>/dev/null || true; \
+	elif [ "$(ARCH)" = "loongarch64" ]; then \
+		cp -f tmp/iozone-loongarch64-musl $(ROOTFS_BIN_DIR)/iozone 2>/dev/null || true; \
+		cp -f tmp/iozone-loongarch64-glibc $(ROOTFS_BIN_DIR)/iozone-glibc 2>/dev/null || true; \
+	fi
 	@cp -f tmp/*.lua $(ROOTFS_DIR)/ 2>/dev/null || true
-	@printf '#!/bin/sh\nfor f in strings sort sin30 round_num max_min file_io remove date random; do ./lua /$$f.lua; if [ $$? = 0 ]; then echo "testcase lua $$f success"; else echo "testcase lua $$f fail"; fi; done\n' > $(ROOTFS_DIR)/lua_testcode.sh 2>/dev/null || true
+	@printf '#!/bin/sh\nfor f in strings sort sin30 round_num max_min file_io remove date random; do /bin/lua /$$f.lua; if [ $$? = 0 ]; then echo "testcase lua $$f success"; else echo "testcase lua $$f fail"; fi; done\n' > $(ROOTFS_DIR)/lua_testcode.sh 2>/dev/null || true
 	@if [ -f "$(ROOTFS_DIR)/lua-glibc" ]; then \
 		{ \
 			printf '%s\n' '#!/bin/sh'; \
 			printf '%s\n' 'echo "#### OS COMP TEST GROUP START lua-musl ####"'; \
-			printf '%s\n' 'for f in strings sort sin30 round_num max_min file_io remove date random; do ./lua /$$f.lua; if [ $$? = 0 ]; then echo "testcase lua $$f success"; else echo "testcase lua $$f fail"; fi; done'; \
-			printf '%s\n' 'echo "#### OS COMP TEST GROUP END lua-musl ####"'; \
+			printf '%s\n' 'for f in strings sort sin30 round_num max_min file_io remove date random; do /bin/lua /$$f.lua; if [ $$? = 0 ]; then echo "testcase lua $$f success"; else echo "testcase lua $$f fail"; fi; done'; \
 		} > "$(ROOTFS_DIR)/lua_musl_testcode.sh"; \
 		sed \
 			-e 's|#### OS COMP TEST GROUP START lua-musl ####|#### OS COMP TEST GROUP START lua-glibc ####|' \
 			-e 's|#### OS COMP TEST GROUP END lua-musl ####|#### OS COMP TEST GROUP END lua-glibc ####|' \
-			-e 's|\./lua |./lua-glibc |g' \
+			-e 's|/bin/lua |/bin/lua-glibc |g' \
 			"$(ROOTFS_DIR)/lua_musl_testcode.sh" > "$(ROOTFS_DIR)/lua_glibc_testcode.sh"; \
 	fi
 	@if [ "$(ARCH)" = "riscv64" ]; then \
@@ -286,7 +298,32 @@ endif
 			-e 's|/lat_sig|/lat_sig-glibc|g' \
 			"$(ROOTFS_DIR)/lmbench_testcode.sh" > "$(ROOTFS_DIR)/lmbench_glibc_testcode.sh"; \
 	fi
-	@chmod +x $(ROOTFS_DIR)/hello $(ROOTFS_DIR)/lat_sig $(ROOTFS_DIR)/hello-glibc $(ROOTFS_DIR)/lat_sig-glibc $(ROOTFS_DIR)/lmbench_testcode.sh $(ROOTFS_DIR)/lmbench_glibc_testcode.sh 2>/dev/null || true
+	@if [ -f "$(ROOTFS_BIN_DIR)/iozone" ]; then \
+		{ \
+			printf '%s\n' '#!/bin/sh'; \
+			printf '%s\n' 'echo "#### OS COMP TEST GROUP START iozone-musl ####"'; \
+			printf '%s\n' 'echo iozone throughput write/read measurements'; \
+			printf '%s\n' '/bin/iozone -i 0 -i 1 -r 1k -s 1m 2>&1; echo "iozone exit: $$?"'; \
+			printf '%s\n' 'echo iozone throughput random-read measurements'; \
+			printf '%s\n' '/bin/iozone -i 0 -i 2 -r 1k -s 1m 2>&1'; \
+			printf '%s\n' 'echo iozone throughput read-backwards measurements'; \
+			printf '%s\n' '/bin/iozone -i 0 -i 3 -r 1k -s 1m 2>&1'; \
+			printf '%s\n' 'echo iozone throughput stride-read measurements'; \
+			printf '%s\n' '/bin/iozone -i 0 -i 5 -r 1k -s 1m 2>&1'; \
+			printf '%s\n' 'echo iozone throughput fwrite/fread measurements'; \
+			printf '%s\n' '/bin/iozone -i 6 -i 7 -r 1k -s 1m 2>&1'; \
+			printf '%s\n' 'echo iozone throughput pwrite/pread measurements'; \
+			printf '%s\n' '/bin/iozone -i 9 -i 10 -r 1k -s 1m 2>&1'; \
+			printf '%s\n' 'echo iozone throughtput pwritev/preadv measurements'; \
+			printf '%s\n' '/bin/iozone -i 11 -i 12 -r 1k -s 1m 2>&1'; \
+			printf '%s\n' 'echo "#### OS COMP TEST GROUP END iozone-musl ####"'; \
+		} > "$(ROOTFS_DIR)/iozone_testcode.sh"; \
+		sed \
+			-e 's|iozone-musl|iozone-glibc|g' \
+			-e 's|/bin/iozone |/bin/iozone-glibc |g' \
+			"$(ROOTFS_DIR)/iozone_testcode.sh" > "$(ROOTFS_DIR)/iozone_glibc_testcode.sh"; \
+	fi
+	@chmod +x $(ROOTFS_DIR)/hello $(ROOTFS_DIR)/lat_sig $(ROOTFS_DIR)/hello-glibc $(ROOTFS_DIR)/lat_sig-glibc $(ROOTFS_DIR)/lmbench_testcode.sh $(ROOTFS_DIR)/lmbench_glibc_testcode.sh $(ROOTFS_DIR)/iozone_testcode.sh $(ROOTFS_DIR)/iozone_glibc_testcode.sh 2>/dev/null || true
 	@cp -f tmp/debug_test.sh $(ROOTFS_DIR)/debug_test.sh 2>/dev/null || true
 	@cp -f tmp/run_all.sh $(ROOTFS_DIR)/run_all.sh 2>/dev/null || true
 	@cp -f tmp/basic_testcode.sh $(ROOTFS_DIR)/basic_testcode.sh 2>/dev/null || true

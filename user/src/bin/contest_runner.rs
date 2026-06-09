@@ -75,6 +75,25 @@ fn run_iozone() {
     println!("#### OS COMP TEST GROUP END iozone ####");
 }
 
+const LUA_TESTS: &[&str] = &[
+    "strings", "sort", "sin30", "round_num", "max_min",
+    "file_io", "remove", "date", "random",
+];
+
+fn run_lua(bin: &str, group_name: &str) {
+    println!("#### OS COMP TEST GROUP START {} ####", group_name);
+    for test in LUA_TESTS {
+        let script = format!("/{}.lua\0", test);
+        let ret = run_cmd(bin, &[script.as_str()]);
+        if ret == 0 {
+            println!("testcase lua {} success", test);
+        } else {
+            println!("testcase lua {} fail", test);
+        }
+    }
+    println!("#### OS COMP TEST GROUP END {} ####", group_name);
+}
+
 #[no_mangle]
 pub fn main() -> i32 {
     mount("", "/mnt\0", "ext4\0", 0, &[]);
@@ -92,6 +111,9 @@ pub fn main() -> i32 {
     println!("#### OS COMP TEST GROUP END basic-glibc ####");
 
     run_iozone();
+
+    run_lua("/bin/lua\0", "lua-musl");
+    run_lua("/bin/lua-glibc\0", "lua-glibc");
 
     println!("===== ALL TESTS DONE =====");
     shutdown();

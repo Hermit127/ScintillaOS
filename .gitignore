@@ -74,6 +74,10 @@ tmp/*
 !tmp/lua-loongarch64-glibc
 !tmp/lua_testcode.sh
 !tmp/*.lua
+!tmp/iozone-riscv64-musl
+!tmp/iozone-riscv64-glibc
+!tmp/iozone-loongarch64-musl
+!tmp/iozone-loongarch64-glibc
 
 # lwext4 build artifacts
 lwext4_rust/c/lwext4/liblwext4-*.a

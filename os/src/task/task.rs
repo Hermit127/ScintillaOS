@@ -196,6 +196,8 @@ impl TaskControlBlock {
             memory_set,
             user_sp,
             entry_point,
+            tls_base,
+            tls_size,
             ..
         } = MemorySet::from_elf(elf_data);
 
@@ -263,9 +265,25 @@ impl TaskControlBlock {
             },
         };
         // prepare TrapContext in user space
+        let tp_val = {
+            let mut inner = task_control_block.inner_exclusive_access();
+            inner.trap_cx[TrapFrameArgs::SEPC] = entry_point;
+            inner.trap_cx[TrapFrameArgs::SP] = user_sp;
+            if tls_size > 0 {
+                tls_base + tls_size
+            } else {
+                let max_va: usize = inner.memory_set.max_end_vaddr().into();
+                let tls_va = (max_va + crate::config::PAGE_SIZE - 1) / crate::config::PAGE_SIZE * crate::config::PAGE_SIZE;
+                let ok = inner.memory_set.insert_framed_area(
+                    tls_va.into(),
+                    (tls_va + crate::config::PAGE_SIZE).into(),
+                    crate::mm::MapPermission::R | crate::mm::MapPermission::W | crate::mm::MapPermission::U,
+                );
+                if ok { tls_va + crate::config::PAGE_SIZE } else { 0 }
+            }
+        };
         let trap_cx = task_control_block.inner_exclusive_access().get_trap_cx();
-        trap_cx[TrapFrameArgs::SEPC] = entry_point;
-        trap_cx[TrapFrameArgs::SP] = user_sp;
+        trap_cx[TrapFrameArgs::TLS] = tp_val;
         task_control_block
     }
     pub fn exec(&self, elf_data: &[u8], args: Vec<String>, envs: Vec<String>) {
@@ -277,6 +295,8 @@ impl TaskControlBlock {
             ph_addr,
             ph_entsize,
             ph_num,
+            tls_base,
+            tls_size,
         } = MemorySet::from_elf(elf_data);
         let heap_bottom = stack_top;
 
@@ -429,8 +449,20 @@ impl TaskControlBlock {
         let mut trap_cx = TrapFrame::new();
         trap_cx[TrapFrameArgs::SEPC] = entry_point;
         trap_cx[TrapFrameArgs::SP] = crt_sp;
-        trap_cx[TrapFrameArgs::ARG0] = 0; // a0 = 0: argc on stack only, so rtld_fini=NULL for glibc
+        trap_cx[TrapFrameArgs::ARG0] = 0;
         trap_cx[TrapFrameArgs::ARG1] = argv_base;
+        if tls_size > 0 {
+            trap_cx[TrapFrameArgs::TLS] = tls_base + tls_size;
+        } else {
+            let max_va: usize = inner.memory_set.max_end_vaddr().into();
+            let tls_va = (max_va + crate::config::PAGE_SIZE - 1) / crate::config::PAGE_SIZE * crate::config::PAGE_SIZE;
+            let ok = inner.memory_set.insert_framed_area(
+                tls_va.into(),
+                (tls_va + crate::config::PAGE_SIZE).into(),
+                crate::mm::MapPermission::R | crate::mm::MapPermission::W | crate::mm::MapPermission::U,
+            );
+            if ok { trap_cx[TrapFrameArgs::TLS] = tls_va + crate::config::PAGE_SIZE; }
+        }
         *inner.get_trap_cx() = trap_cx;
     }
     pub fn fork(self: &Arc<TaskControlBlock>) -> Option<Arc<TaskControlBlock>> {
