@@ -337,7 +337,7 @@ pub fn sys_kill(pid: usize, signum: i32) -> isize {
         if signum == 0 {
             return 0;
         }
-        let flag = SignalFlags::from_bits(1u32 << signum as usize).unwrap();
+        let flag = SignalFlags::from_bits(1u64 << signum as usize).unwrap();
         let mut task_ref = task.inner_exclusive_access();
         if task_ref.signals.contains(flag) {
             return 0;
@@ -363,6 +363,9 @@ pub fn sys_kill(pid: usize, signum: i32) -> isize {
                 task_ref.exit_signal = -(signum as i32);
             }
         }
+        drop(task_ref);
+        // Wake target so it can process the signal
+        crate::task::wake_futex_for_task(&task);
         0
     } else {
         0 // kill to non-existent pid: silently succeed (POSIX)
@@ -384,11 +387,11 @@ pub fn sys_sigprocmask(how: usize, set: *const u8, oldset: *mut u8, sigsetsize: 
         let old = inner.signal_mask.bits();
 
         if !oldset.is_null() {
-            *translated_refmut(token, oldset as *mut u32) = old;
+            *translated_refmut(token, oldset as *mut u64) = old as u64;
         }
 
         if !set.is_null() {
-            let new_mask = *translated_ref(token, set as *const u32);
+            let new_mask = *translated_ref(token, set as *const u64);
             let new_flags = SignalFlags::from_bits_truncate(new_mask);
             match how {
                 SIG_BLOCK => {
@@ -1218,7 +1221,7 @@ pub fn sys_rt_sigsuspend(mask: *const u8, _sigsize: usize) -> isize {
 
     let saved_mask = inner.signal_mask;
     let new_mask_u64 = *crate::mm::translated_ref(token, mask as *const u64);
-    inner.signal_mask = SignalFlags::from_bits_truncate(new_mask_u64 as u32);
+    inner.signal_mask = SignalFlags::from_bits_truncate(new_mask_u64);
     drop(inner);
 
     loop {
@@ -1893,7 +1896,7 @@ pub fn sys_rt_sigtimedwait(set: *const u8, info: *mut u8, timeout: *const u8, si
         return -22;
     }
     let token = current_user_token();
-    let mask = *crate::mm::translated_ref(token, set as *const u64) as u32;
+    let mask = *crate::mm::translated_ref(token, set as *const u64);
     let mask = SignalFlags::from_bits_truncate(mask);
 
     let timeout_ns: Option<u64> = if !timeout.is_null() {
@@ -2000,17 +2003,12 @@ pub fn sys_tgkill(tgid: usize, tid: usize, sig: i32) -> isize {
         return -22;
     }
     if let Some(task) = pid2task(tid) {
-        let target_tgid = task.getpid();
-        // In our implementation, tgid is the main thread's pid
-        // For single-threaded, tgid == tid
-        if tgid != 0 && tgid != target_tgid {
-            // Check if this task belongs to tgid (simplified)
-            // We just allow if tgid matches or is 0
+        if tgid != 0 && tgid != task.getpid() {
         }
         if sig == 0 {
             return 0;
         }
-        let flag = SignalFlags::from_bits(1u32 << sig as usize).unwrap();
+        let flag = SignalFlags::from_bits(1u64 << sig as usize).unwrap();
         let mut task_ref = task.inner_exclusive_access();
         if task_ref.signals.contains(flag) {
             return 0;
@@ -2036,6 +2034,9 @@ pub fn sys_tgkill(tgid: usize, tid: usize, sig: i32) -> isize {
                 task_ref.exit_signal = -(sig as i32);
             }
         }
+        drop(task_ref);
+        // Wake target from futex so it can process the signal
+        crate::task::wake_futex_for_task(&task);
         0
     } else {
         -3 // ESRCH

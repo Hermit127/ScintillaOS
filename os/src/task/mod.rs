@@ -56,6 +56,40 @@ lazy_static! {
     };
 }
 
+pub fn wake_futex(addr: usize, count: usize) {
+    let mut queue = FUTEX_QUEUE.exclusive_access();
+    let mut woken = 0;
+    let mut remaining = Vec::new();
+    for (a, task) in queue.drain(..) {
+        if woken < count && a == addr {
+            let mut inner = task.inner_exclusive_access();
+            inner.task_status = TaskStatus::Ready;
+            drop(inner);
+            add_task(task);
+            woken += 1;
+        } else {
+            remaining.push((a, task));
+        }
+    }
+    *queue = remaining;
+}
+
+pub fn wake_futex_for_task(target: &Arc<TaskControlBlock>) {
+    let mut queue = FUTEX_QUEUE.exclusive_access();
+    let mut remaining = Vec::new();
+    for (a, task) in queue.drain(..) {
+        if Arc::ptr_eq(&task, target) {
+            let mut inner = task.inner_exclusive_access();
+            inner.task_status = TaskStatus::Ready;
+            drop(inner);
+            add_task(task);
+        } else {
+            remaining.push((a, task));
+        }
+    }
+    *queue = remaining;
+}
+
 pub fn suspend_current_and_run_next() {
     //trace!("os::task::suspend_current_and_run_next");
     // There must be an application running.
@@ -155,7 +189,7 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
 
     // remove from pid2task
     remove_from_pid2task(task.getpid());
-    let (parent, orphan_children) = {
+    let (parent, orphan_children, is_thread, tid_ptr, token) = {
         // **** access current TCB exclusively
         let mut inner = task.inner_exclusive_access();
         // Change status to Zombie
@@ -164,13 +198,16 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
         inner.exit_code = exit_code;
         let parent = inner.parent.as_ref().and_then(|w| w.upgrade());
         let orphan_children = core::mem::take(&mut inner.children);
+        let tid_ptr = inner.tid_ptr;
+        let is_thread = inner.clone_vm;
+        let token = inner.memory_set.token();
         // deallocate user space (skip for threads sharing vm)
-        if !inner.clone_vm {
+        if !is_thread {
             inner.memory_set.recycle_data_pages();
         }
         // drop file descriptors
         inner.clear_fd_table();
-        (parent, orphan_children)
+        (parent, orphan_children, is_thread, tid_ptr, token)
     };
     // **** release current PCB before touching parent/initproc
 
@@ -196,6 +233,11 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
         }
     }
     // ++++++ release parent PCB
+    // Thread exit: clear child tid and wake futex waiter
+    if is_thread && tid_ptr != 0 {
+        *translated_refmut(token, tid_ptr as *mut i32) = 0;
+        wake_futex(tid_ptr, 1);
+    }
     // drop task manually to maintain rc correctly
     drop(task);
     // we do not have to save task context
@@ -257,16 +299,17 @@ fn call_kernel_signal_handler(signal: SignalFlags) {
                 task_inner.frozen = false;
             }
         }
-        SignalFlags::SIGTERM | SignalFlags::SIGKILL => {
-            task_inner.killed = true;
+        SignalFlags::SIGCHLD | SignalFlags::SIGURG | SignalFlags::SIGWINCH
+        | SignalFlags::SIGIO => {
+            task_inner.signals ^= signal;
+        }
+        SignalFlags::SIGTSTP | SignalFlags::SIGTTIN | SignalFlags::SIGTTOU => {
+            task_inner.frozen = true;
             task_inner.signals ^= signal;
         }
         _ => {
-            // println!(
-            //     "[K] call_kernel_signal_handler:: current task sigflag {:?}",
-            //     task_inner.signals
-            // );
             task_inner.killed = true;
+            task_inner.signals ^= signal;
         }
     }
 }
@@ -284,7 +327,12 @@ fn call_user_signal_handler(sig: usize, signal: SignalFlags) {
     if handler != 0 {
         let action = task_inner.signal_actions.table[sig];
 
-        // handle flag
+        // SA_NODEFER: block this signal during handler
+        const SA_NODEFER: usize = 0x40000000;
+        if action.flags & SA_NODEFER == 0 {
+            task_inner.signal_mask |= signal;
+            task_inner.signal_mask |= action.mask_flags();
+        }
         task_inner.handling_sig = sig as isize;
         task_inner.signals ^= signal;
 
@@ -356,7 +404,7 @@ fn check_pending_signals() {
                 m = false;
             } else {
                 let hs = task_inner.handling_sig as usize;
-                if !task_inner.signal_actions.table[hs].mask.contains(signal) {
+                if !task_inner.signal_actions.table[hs].mask_flags().contains(signal) {
                     m = false;
                 }
             }

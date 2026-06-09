@@ -75,7 +75,7 @@ fn user_sig_test_restore() {
 fn kernel_sig_test_ignore() {
     let mask = SignalFlags::from_bits_truncate(SignalFlags::SIGSTOP.bits());
     sigprocmask(2, &mask as *const SignalFlags, core::ptr::null_mut()); // SIG_SETMASK
-    if kill(getpid() as usize, SignalFlags::SIGSTOP.bits()) < 0 {
+    if kill(getpid() as usize, SignalFlags::SIGSTOP.bits() as i32) < 0 {
         println!("kill faild\n");
         exit(-1);
     }

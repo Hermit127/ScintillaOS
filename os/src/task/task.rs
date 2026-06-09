@@ -437,6 +437,7 @@ impl TaskControlBlock {
         const CLONE_VM: usize = 0x100;
         const CLONE_FILES: usize = 0x400;
         const CLONE_SIGHAND: usize = 0x800;
+        const CLONE_THREAD: usize = 0x10000;
 
         trace!("os::task::TaskControlBlock::fork_with_flags");
         let memory_set = if flags & CLONE_VM != 0 {
@@ -469,17 +470,25 @@ impl TaskControlBlock {
             (
                 parent_inner.trap_cx.clone(),
                 parent_inner.base_size,
-                parent_inner
-                    .fd_table
-                    .iter()
-                    .map(|f| {
-                        f.as_ref().map(|x| {
-                            x.dup_ref();
-                            x.clone()
+                if flags & CLONE_FILES != 0 {
+                    parent_inner.fd_table.clone()
+                } else {
+                    parent_inner
+                        .fd_table
+                        .iter()
+                        .map(|f| {
+                            f.as_ref().map(|x| {
+                                x.dup_ref();
+                                x.clone()
+                            })
                         })
-                    })
-                    .collect::<Vec<_>>(),
-                parent_inner.fd_cloexec.clone(),
+                        .collect::<Vec<_>>()
+                },
+                if flags & CLONE_FILES != 0 {
+                    parent_inner.fd_cloexec.clone()
+                } else {
+                    parent_inner.fd_cloexec.clone()
+                },
                 parent_inner.cwd.clone(),
                 parent_inner.root.clone(),
                 parent_inner.tid_ptr,
@@ -488,8 +497,16 @@ impl TaskControlBlock {
                 parent_inner.gid,
                 parent_inner.egid,
                 parent_inner.umask,
-                parent_inner.signal_mask,
-                parent_inner.signal_actions.clone(),
+                if flags & CLONE_THREAD != 0 {
+                    parent_inner.signal_mask
+                } else {
+                    parent_inner.signal_mask
+                },
+                if flags & CLONE_SIGHAND != 0 {
+                    parent_inner.signal_actions.clone()
+                } else {
+                    parent_inner.signal_actions.clone()
+                },
                 parent_inner.heap_bottom,
                 parent_inner.program_brk,
             )
@@ -544,7 +561,7 @@ impl TaskControlBlock {
                     alt_stack_flags: 0,
                     in_syscall: false,
                     exit_signal: 0,
-                    clone_vm: flags & CLONE_VM != 0,
+                    clone_vm: flags & CLONE_VM != 0 || flags & CLONE_THREAD != 0,
                 }, "TaskInner")
             },
         });
