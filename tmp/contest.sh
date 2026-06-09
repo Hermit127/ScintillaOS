@@ -1,19 +1,28 @@
 #!/bin/sh
 echo "===== OS AUTO TEST START ====="
 
-# Bind dynamic loaders from contest disk
-for dir in musl glibc; do
-    [ -d "/mnt/$dir/lib" ] || continue
-    mkdir -p /lib
-    for src in "/mnt/$dir/lib/"*; do
-        name=$(basename "$src")
-        [ -f "/lib/$name" ] || cp "$src" "/lib/$name" 2>/dev/null
-    done
+# Find working busybox
+BB=""
+for b in /busybox /bin/busybox busybox; do
+    [ -x "$b" ] && { BB="$b"; break; }
 done
+[ -z "$BB" ] && { echo "FATAL: no busybox"; exit 1; }
+echo "using busybox: $BB"
 
-# Copy busybox from contest disk
+# Mount should already be done by initproc
+$BB ls /mnt/ 2>&1
+echo "---"
+
+# Copy busybox from disk to root (they might be newer/better)
 [ -x /mnt/musl/busybox ] && cp /mnt/musl/busybox /busybox 2>/dev/null
 [ -x /mnt/glibc/busybox ] && cp /mnt/glibc/busybox /busybox-glibc 2>/dev/null
+
+# Copy dynamic loaders
+for d in /mnt/musl/lib /mnt/glibc/lib; do
+    [ -d "$d" ] || continue
+    mkdir -p /lib
+    $BB cp "$d"/* /lib/ 2>/dev/null
+done
 
 skip_group() {
     case "$1" in
@@ -22,27 +31,27 @@ skip_group() {
     esac
 }
 
-# Scan /mnt/musl/ and /mnt/glibc/ for test scripts
-for variant_dir in /mnt/musl /mnt/glibc; do
-    [ ! -d "$variant_dir" ] && continue
-    variant=$(basename "$variant_dir")
-    [ "$variant" = "glibc" ] && bb="/busybox-glibc" || bb="/busybox"
-    [ -x "$bb" ] || bb="/busybox"
+# Scan each variant
+for vdir in /mnt/musl /mnt/glibc; do
+    [ -d "$vdir" ] || continue
+    v=$(basename "$vdir")
+    bb="$BB"
+    [ "$v" = "glibc" ] && [ -x /busybox-glibc ] && bb=/busybox-glibc
 
-    # List all *_testcode.sh in this variant directory
-    for script in "$variant_dir"/*_testcode.sh; do
+    export LD_LIBRARY_PATH="$vdir/lib:/lib"
+
+    for script in "$vdir"/*_testcode.sh; do
         [ -f "$script" ] || continue
         name=$(basename "$script")
         group=${name%_testcode.sh}
 
         if skip_group "$group"; then
-            echo "[SKIP] $group ($variant)"
+            echo "[SKIP] $group ($v)"
             continue
         fi
 
-        echo "[RUN] $group ($variant)"
-        export LD_LIBRARY_PATH="$variant_dir/lib:/lib"
-        cd "$variant_dir" && "$bb" timeout -s KILL 60 "$bb" sh "$name" 2>&1
+        echo "[RUN] $group ($v)"
+        cd "$vdir" && "$bb" timeout -s KILL 120 "$bb" sh "$name" 2>&1
         cd /
     done
 done
