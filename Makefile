@@ -154,6 +154,15 @@ endif
 ifdef LM_GLIBC_ONLY
 	@touch $(ROOTFS_DIR)/lmbench_glibc_only
 endif
+ifdef LOCAL
+	@mkdir -p $(ROOTFS_DIR)/musl $(ROOTFS_DIR)/glibc
+	@for g in basic busybox lmbench lua iozone; do \
+		echo "#!/bin/sh\necho \"#### OS COMP TEST GROUP START $$g-musl ####\"\necho \"testcase $$g skipped (no binary)\"\necho \"#### OS COMP TEST GROUP END $$g-musl ####\"" > $(ROOTFS_DIR)/musl/$${g}_testcode.sh; \
+		echo "#!/bin/sh\necho \"#### OS COMP TEST GROUP START $$g-glibc ####\"\necho \"testcase $$g skipped (no binary)\"\necho \"#### OS COMP TEST GROUP END $$g-glibc ####\"" > $(ROOTFS_DIR)/glibc/$${g}_testcode.sh; \
+	done
+	@cp -f tmp/busybox-musl $(ROOTFS_DIR)/musl/busybox 2>/dev/null || true
+	@cp -f tmp/busybox-glibc-riscv64 $(ROOTFS_DIR)/glibc/busybox 2>/dev/null || true
+endif
 ifdef IOZONE_ONLY
 	@touch $(ROOTFS_DIR)/iozone_only
 endif
