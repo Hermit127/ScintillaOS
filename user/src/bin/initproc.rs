@@ -159,6 +159,13 @@ fn run_basic_fallback() {
     run_program("/bin/contest_runner_glibc\0", "basic-glibc");
 }
 
+fn remount_test_disk(reason: &str) -> isize {
+    sys_mkdir(b"/mnt\0".as_ptr(), 0o777);
+    let r = sys_mount("vda\0", "/mnt\0", "ext4\0", 0, &[]);
+    println!("[initproc] remount vda -> /mnt after {}: {}", reason, r);
+    r
+}
+
 #[no_mangle]
 fn main() -> i32 {
     println!("[initproc] === START ===");
@@ -211,6 +218,7 @@ fn main() -> i32 {
             if s == "basic_testcode.sh" {
                 println!("[initproc] root basic_testcode.sh uses arch-suffixed groups; using rootfs basic runners");
                 run_basic_fallback();
+                remount_test_disk("basic fallback");
                 continue;
             }
             run_script("/mnt/\0", s, "/busybox\0");
