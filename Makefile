@@ -154,18 +154,6 @@ endif
 ifdef LM_GLIBC_ONLY
 	@touch $(ROOTFS_DIR)/lmbench_glibc_only
 endif
-	@mkdir -p $(ROOTFS_DIR)/musl $(ROOTFS_DIR)/glibc
-	@cp -f tmp/busybox-musl $(ROOTFS_DIR)/musl/busybox 2>/dev/null || true
-	@cp -f tmp/busybox-glibc-riscv64 $(ROOTFS_DIR)/glibc/busybox 2>/dev/null || true
-	@cp -f testsuits-for-oskernel/scripts/busybox/busybox_cmd.txt $(ROOTFS_DIR)/musl/ 2>/dev/null || true
-	@cp -f testsuits-for-oskernel/scripts/busybox/busybox_cmd.txt $(ROOTFS_DIR)/glibc/ 2>/dev/null || true
-	@chmod +x $(ROOTFS_DIR)/musl/* $(ROOTFS_DIR)/glibc/* 2>/dev/null || true
-	@cat testsuits-for-oskernel/scripts/busybox/busybox_testcode.sh > $(ROOTFS_DIR)/musl/busybox_testcode.sh 2>/dev/null || true
-	@sed 's|\./busybox|./busybox|g' testsuits-for-oskernel/scripts/busybox/busybox_testcode.sh > $(ROOTFS_DIR)/glibc/busybox_testcode.sh 2>/dev/null || true
-ifeq ($(ARCH),riscv64)
-	@echo "#!/bin/sh\n#### OS COMP TEST GROUP START basic-musl ####\ncd /bin\nfor t in brk chdir close dup dup2 execve exit fork fstat getcwd getdents getpid getppid gettimeofday mkdir_ mmap mount munmap openat open pipe read sleep times umount uname unlink wait waitpid write yield; do echo \"========== START test_\$$t ==========\"; ./\$$t; echo \"========== END test_\$$t ==========\"; done\necho \"#### OS COMP TEST GROUP END basic-musl ####\"" > $(ROOTFS_DIR)/musl/basic_testcode.sh
-	@echo "#!/bin/sh\n#### OS COMP TEST GROUP START basic-glibc ####\ncd /bin\nfor t in brk chdir close dup dup2 execve exit fork fstat getcwd getdents getpid getppid gettimeofday mkdir_ mmap mount munmap openat open pipe read sleep times umount uname unlink wait waitpid write yield; do echo \"========== START test_\$$t ==========\"; ./\$$t; echo \"========== END test_\$$t ==========\"; done\necho \"#### OS COMP TEST GROUP END basic-glibc ####\"" > $(ROOTFS_DIR)/glibc/basic_testcode.sh
-endif
 ifdef IOZONE_ONLY
 	@touch $(ROOTFS_DIR)/iozone_only
 endif
@@ -196,11 +184,6 @@ endif
 		cp -f tmp/busybox-musl $(ROOTFS_DIR)/busybox 2>/dev/null || true; \
 		cp -f tmp/busybox-glibc-riscv64 $(ROOTFS_BIN_DIR)/busybox-glibc 2>/dev/null || true; \
 		cp -f tmp/busybox-glibc-riscv64 $(ROOTFS_DIR)/busybox-glibc 2>/dev/null || true; \
-		cat testsuits-for-oskernel/scripts/busybox/busybox_cmd.txt > $(ROOTFS_DIR)/busybox_cmd.txt 2>/dev/null || cat tmp/busybox_cmd.txt > $(ROOTFS_DIR)/busybox_cmd.txt 2>/dev/null || true; \
-		sed 's|\./busybox|./busybox-glibc|g' $(ROOTFS_DIR)/busybox_cmd.txt > $(ROOTFS_DIR)/busybox_glibc_cmd.txt 2>/dev/null || true; \
-		printf '#!/bin/sh\n./busybox-glibc --install -s /bin 2>/dev/null\necho "#### OS COMP TEST GROUP START busybox-glibc ####"\nwhile IFS= read -r line; do case "$$line" in ""|\\#*) continue ;; esac; eval "./busybox-glibc $$line"; RTN=$$?; if [ $$RTN -ne 0 ] && [ "$$line" != "false" ]; then echo "testcase busybox $$line fail"; else echo "testcase busybox $$line success"; fi; done < ./busybox_glibc_cmd.txt\necho "#### OS COMP TEST GROUP END busybox-glibc ####"\n' > $(ROOTFS_DIR)/busybox_glibc_testcode.sh; \
-		ln -sf busybox $(ROOTFS_BIN_DIR)/ls 2>/dev/null || true; \
-		printf '#!/bin/sh\n./busybox --install -s /bin 2>/dev/null\necho "#### OS COMP TEST GROUP START busybox-musl ####"\nwhile IFS= read -r line; do case "$$line" in ""|\\#*) continue ;; esac; eval "./busybox $$line"; RTN=$$?; if [ $$RTN -ne 0 ] && [ "$$line" != "false" ]; then echo "testcase busybox $$line fail"; else echo "testcase busybox $$line success"; fi; done < ./busybox_cmd.txt\necho "#### OS COMP TEST GROUP END busybox-musl ####"\n' > $(ROOTFS_DIR)/busybox_testcode.sh; \
 	elif [ "$(ARCH)" = "loongarch64" ]; then \
 		cp -f tmp/busybox-musl-loongarch64 $(ROOTFS_BIN_DIR)/busybox 2>/dev/null || true; \
 		cp -f tmp/busybox-musl-loongarch64 $(ROOTFS_DIR)/busybox 2>/dev/null || true; \
@@ -378,7 +361,7 @@ TEST_DISK ?= fs-img.img
 QEMU_ARGS_DUAL := -drive file=$(TEST_DISK),if=none,format=raw,id=x0 \
 			-device $(VIRTIO_BLK_DEVICE),drive=x0$(if $(filter loongarch64,$(ARCH)),,bus=$(VIRTIO_BLK_BUS)) \
 			-drive file=disk.img,if=none,format=raw,id=x1 \
-			-device $(VIRTIO_BLK_DEVICE),drive=x1$(if $(filter loongarch64,$(ARCH)),,bus=$(VIRTIO_BLK_BUS))
+			-device $(VIRTIO_BLK_DEVICE),drive=x1$(if $(filter loongarch64,$(ARCH)),,bus=$(VIRTIO_BLK_BUS2))
 
 # virtio-net network configuration (SLIRP user-mode, riscv64/aarch64)
 ifeq ($(ARCH), riscv64)
