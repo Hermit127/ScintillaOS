@@ -1309,93 +1309,81 @@ pub fn sys_mount(
         return -22;
     }
 
-    #[cfg(target_arch = "loongarch64")]
+    let task = current_task().unwrap();
+    let cwd = {
+        let inner = task.inner_exclusive_access();
+        inner.cwd.clone()
+    };
+
+    let mnt_point = match vfs_resolve_path(&cwd, target_path.as_str()) {
+        Some(d) => d,
+        None => return -1,
+    };
+
+    if !mnt_point.is_dir {
+        return -20;
+    }
+
+    if fstype_str.as_str() == "vfat"
+        && matches!(source_str.as_str(), "/dev/vda2" | "vda2")
     {
-        let _ = target_path;
         return 0;
     }
 
-    #[cfg(not(target_arch = "loongarch64"))]
+    // 如果已经挂载，幂等成功
+    use crate::fs::vfs::MOUNT_TABLE;
     {
-        let task = current_task().unwrap();
-        let cwd = {
-            let inner = task.inner_exclusive_access();
-            inner.cwd.clone()
-        };
-
-        let mnt_point = match vfs_resolve_path(&cwd, target_path.as_str()) {
-            Some(d) => d,
-            None => return -1,
-        };
-
-        if !mnt_point.is_dir {
-            return -20;
+        let table = MOUNT_TABLE.exclusive_access();
+        let found = table.iter().any(|m| m.mnt_point.path == mnt_point.path);
+        crate::println!("[sys_mount] dup check: path={} table_len={} found={}", mnt_point.path, table.len(), found);
+        if found {
+            return 0;
         }
+    }
 
-        // 如果已经挂载，幂等成功
-        use crate::fs::vfs::MOUNT_TABLE;
-        {
-            let table = MOUNT_TABLE.exclusive_access();
-            let found = table.iter().any(|m| m.mnt_point.path == mnt_point.path);
-            crate::println!("[sys_mount] dup check: path={} table_len={} found={}", mnt_point.path, table.len(), found);
-            if found {
-                return 0;
-            }
-        }
+    let blk_dev = match source_str.as_str() {
+        "vda" => BLOCK_DEVICE.clone(),
+        "vdb" => crate::drivers::ROOT_BLOCK_DEVICE.clone(),
+        "vdc" => Arc::new(VirtIOBlock::new_at(polyhal::PhysAddr::new(0x10003000))),
+        "vdd" => Arc::new(VirtIOBlock::new_at(polyhal::PhysAddr::new(0x10004000))),
+        _ => BLOCK_DEVICE.clone(),
+    };
+    let sb = match VfsSuperBlock::new_ext4(blk_dev, "ext4") {
+        Some(sb) => sb,
+        None => return -17,
+    };
 
-        let blk_dev = match source_str.as_str() {
-            "vda" => BLOCK_DEVICE.clone(),
-            "vdb" => crate::drivers::ROOT_BLOCK_DEVICE.clone(),
-            "vdc" => Arc::new(VirtIOBlock::new_at(polyhal::PhysAddr::new(0x10003000))),
-            "vdd" => Arc::new(VirtIOBlock::new_at(polyhal::PhysAddr::new(0x10004000))),
-            _ => BLOCK_DEVICE.clone(),
-        };
-        let sb = match VfsSuperBlock::new_ext4(blk_dev, "ext4") {
-            Some(sb) => sb,
-            None => return -17,
-        };
-
-        if vfs_mount(mnt_point, sb) {
-            0
-        } else {
-            -16
-        }
+    if vfs_mount(mnt_point, sb) {
+        0
+    } else {
+        -16
     }
 }
 
 pub fn sys_umount2(target: *const u8, _flags: usize) -> isize {
-    #[cfg(target_arch = "loongarch64")]
-    {
-        let _ = target;
-        return 0;
+    let token = current_user_token();
+    let target_path = translated_str(token, target);
+
+    let task = current_task().unwrap();
+    let cwd = {
+        let inner = task.inner_exclusive_access();
+        inner.cwd.clone()
+    };
+
+    use crate::fs::vfs::{vfs_resolve_path, MOUNT_TABLE};
+
+    let dentry = match vfs_resolve_path(&cwd, target_path.as_str()) {
+        Some(d) => d,
+        None => return -1,
+    };
+
+    let path = &dentry.path;
+    let mut table = MOUNT_TABLE.exclusive_access();
+    if let Some(idx) = table.iter().position(|m| &m.mnt_point.path == path) {
+        let mount = table.remove(idx);
+        mount.mnt_root.super_block.force_umount();
     }
-
-    #[cfg(not(target_arch = "loongarch64"))]
-    {
-        let token = current_user_token();
-        let target_path = translated_str(token, target);
-
-        let task = current_task().unwrap();
-        let cwd = {
-            let inner = task.inner_exclusive_access();
-            inner.cwd.clone()
-        };
-
-        use crate::fs::vfs::{vfs_resolve_path, MOUNT_TABLE};
-
-        let dentry = match vfs_resolve_path(&cwd, target_path.as_str()) {
-            Some(d) => d,
-            None => return -1,
-        };
-
-        let path = &dentry.path;
-        let mut table = MOUNT_TABLE.exclusive_access();
-        if let Some(idx) = table.iter().position(|m| &m.mnt_point.path == path) {
-            let mount = table.remove(idx);
-            mount.mnt_root.super_block.force_umount();
-        }
-        0
-    }
+    0
 }
 
 #[repr(C)]
