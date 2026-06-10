@@ -50,14 +50,19 @@ fn run_script(dir: &str, script: &str, bb: &str) {
 #[no_mangle]
 fn main() -> i32 {
     println!("[initproc] === START ===");
-    
     sys_mkdir(b"/mnt\0".as_ptr(), 0o777);
     let r = sys_mount("vda\0", "/mnt\0", "ext4\0", 0, &[]);
     println!("[initproc] mount vda -> /mnt: {}", r);
 
+    println!("[initproc] listing /mnt/ ...");
+    let root_files = list_dir("/mnt/\0");
+    println!("[initproc] /mnt/ has {} entries", root_files.len());
+
     for v in &["musl", "glibc"] {
         let path = String::from("/mnt/") + v + "/\0";
+        println!("[initproc] listing {} ...", path);
         let scripts = list_dir(&path);
+        println!("[initproc] {}/ has {} scripts", v, scripts.len());
         for s in &scripts {
             if !s.ends_with("_testcode.sh") { continue; }
             let dir = String::from("/mnt/") + v + "\0";
