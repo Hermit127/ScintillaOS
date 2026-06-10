@@ -212,23 +212,27 @@ pub fn probe_all() -> Vec<Arc<dyn BlockDevice>> {
     let mut out = Vec::new();
     for &base in BASES {
         let magic = unsafe { core::ptr::read_volatile(base as *const u32) };
-        if magic != 0x7472_6976 { continue; } // "virt" magic
+        crate::println!("[virtio-blk] probe {:#x}: magic={:#x}", base, magic);
+        if magic != 0x7472_6976 { continue; }
         let device_id = unsafe { core::ptr::read_volatile((base + 0x08) as *const u32) };
-        if device_id != 2 { continue; } // 2 = Block
+        crate::println!("[virtio-blk] probe {:#x}: device_id={}", base, device_id);
+        if device_id != 2 { continue; }
         let header = match unsafe { NonNull::new(base as *mut u8) } {
             Some(h) => h,
             None => continue,
         };
         let transport = match unsafe { MmioTransport::new(header.cast()) } {
             Ok(t) => t,
-            Err(_) => continue,
+            Err(e) => { crate::println!("[virtio-blk] probe {:#x}: transport err {:?}", base, e); continue; }
         };
         let blk = match VirtIOBlk::<VirtioHal, MmioTransport>::new(transport) {
             Ok(b) => b,
-            Err(_) => continue,
+            Err(e) => { crate::println!("[virtio-blk] probe {:#x}: blk err {:?}", base, e); continue; }
         };
         let dev: Arc<dyn BlockDevice> = Arc::new(VirtIOBlock(unsafe { UPSafeCell::new(blk) }));
+        crate::println!("[virtio-blk] probe {:#x}: OK", base);
         out.push(dev);
     }
+    crate::println!("[virtio-blk] probe_all: found {} devices", out.len());
     out
 }
