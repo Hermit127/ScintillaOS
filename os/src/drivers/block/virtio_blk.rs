@@ -211,13 +211,15 @@ pub fn probe_all() -> Vec<Arc<dyn BlockDevice>> {
     ];
     let mut out = Vec::new();
     for &base in BASES {
-        let magic = unsafe { core::ptr::read_volatile(base as *const u32) };
-        crate::println!("[virtio-blk] probe {:#x}: magic={:#x}", base, magic);
+        // Use virtual address (physical | VIRT_ADDR_START) for MMIO access
+        let va = base | VIRT_ADDR_START;
+        let magic = unsafe { core::ptr::read_volatile(va as *const u32) };
+        crate::println!("[virtio-blk] probe {:#x} (va={:#x}): magic={:#x}", base, va, magic);
         if magic != 0x7472_6976 { continue; }
-        let device_id = unsafe { core::ptr::read_volatile((base + 0x08) as *const u32) };
+        let device_id = unsafe { core::ptr::read_volatile((va + 0x08) as *const u32) };
         crate::println!("[virtio-blk] probe {:#x}: device_id={}", base, device_id);
         if device_id != 2 { continue; }
-        let header = match unsafe { NonNull::new(base as *mut u8) } {
+        let header = match unsafe { NonNull::new(va as *mut u8) } {
             Some(h) => h,
             None => continue,
         };
