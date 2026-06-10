@@ -3,6 +3,7 @@ use core::ptr::NonNull;
 use super::BlockDevice;
 use crate::mm::{frame_dealloc, frames_alloc, FrameTracker};
 use crate::sync::UPSafeCell;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use lazy_static::*;
 use polyhal::consts::VIRT_ADDR_START;
@@ -199,4 +200,35 @@ unsafe impl Hal for VirtioHal {
         // Nothing to do, as the host already has access to all memory and we didn't copy the buffer
         // anywhere else.
     }
+}
+
+/// Probe all virtio-mmio addresses (matching xiande-OS). Returns devices in bus order.
+#[cfg(not(target_arch = "loongarch64"))]
+pub fn probe_all() -> Vec<Arc<dyn BlockDevice>> {
+    const BASES: &[usize] = &[
+        0x1000_1000, 0x1000_2000, 0x1000_3000, 0x1000_4000,
+        0x1000_5000, 0x1000_6000, 0x1000_7000, 0x1000_8000,
+    ];
+    let mut out = Vec::new();
+    for &base in BASES {
+        let magic = unsafe { core::ptr::read_volatile(base as *const u32) };
+        if magic != 0x7472_6976 { continue; } // "virt" magic
+        let device_id = unsafe { core::ptr::read_volatile((base + 0x08) as *const u32) };
+        if device_id != 2 { continue; } // 2 = Block
+        let header = match unsafe { NonNull::new(base as *mut u8) } {
+            Some(h) => h,
+            None => continue,
+        };
+        let transport = match unsafe { MmioTransport::new(header.cast()) } {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let blk = match VirtIOBlk::<VirtioHal, MmioTransport>::new(transport) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let dev: Arc<dyn BlockDevice> = Arc::new(VirtIOBlock(unsafe { UPSafeCell::new(blk) }));
+        out.push(dev);
+    }
+    out
 }
