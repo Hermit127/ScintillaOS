@@ -6,7 +6,7 @@ use crate::{
     syscall::syscall,
     task::{
         check_and_wake_up_tasks, check_signals_error_of_current, current_add_signal,
-        current_task, exit_current_and_run_next, handle_signals, SignalFlags,
+        current_task, exit_current_and_run_next, handle_signals, ready_queue_len, SignalFlags,
         suspend_current_and_run_next,
     },
 };
@@ -94,7 +94,9 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             net::wake_net_blocked_tasks();
             check_and_wake_up_tasks();
             check_itimer();
-            suspend_current_and_run_next();
+            if ready_queue_len() > 0 {
+                suspend_current_and_run_next();
+            }
         }
         _ => {
             warn!("unsuspended trap type: {:?}", trap_type);

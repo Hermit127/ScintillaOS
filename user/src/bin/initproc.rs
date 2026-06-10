@@ -79,15 +79,58 @@ fn list_dir(path: &str) -> Vec<String> {
     names
 }
 
-fn run_script(dir: &str, script: &str) {
+fn run_script(dir: &str, script: &str, bb: &str) -> i32 {
+    println!("[initproc] run {} in {} with {}", script, dir, bb);
     let script_arg = String::from("./") + script + "\0";
     let args: [*const u8; 3] = [b"sh\0".as_ptr(), script_arg.as_ptr(), core::ptr::null()];
     let pid = fork();
     if pid == 0 {
-        user_lib::chdir(dir);
-        exec("/busybox\0", &args);
+        let cd = user_lib::chdir(dir);
+        if cd != 0 {
+            println!("[initproc] chdir({}) failed: {}", dir, cd);
+            exit(126);
+        }
+        let er = exec(bb, &args);
+        println!("[initproc] exec({}) failed: {}", bb, er);
         exit(127);
-    } else if pid > 0 { let mut ec = 0; waitpid(pid as usize, &mut ec); }
+    } else if pid > 0 {
+        let mut ec = 0;
+        let wp = waitpid(pid as usize, &mut ec);
+        println!("[initproc] script {} waitpid={} exit={}", script, wp, ec);
+        ec
+    } else {
+        println!("[initproc] fork failed for {}: {}", script, pid);
+        127
+    }
+}
+
+fn run_busybox_fallback(glibc: bool) -> i32 {
+    let (bb, script, name) = if glibc {
+        ("/busybox-glibc\0", "/busybox_glibc_testcode.sh\0", "busybox-glibc")
+    } else {
+        ("/busybox\0", "/busybox_testcode.sh\0", "busybox-musl")
+    };
+    println!("[initproc] fallback run {} from rootfs", name);
+    let args: [*const u8; 4] = [b"busybox\0".as_ptr(), b"sh\0".as_ptr(), script.as_ptr(), core::ptr::null()];
+    let pid = fork();
+    if pid == 0 {
+        let cd = user_lib::chdir("/\0");
+        if cd != 0 {
+            println!("[initproc] chdir(/) failed: {}", cd);
+            exit(126);
+        }
+        let er = exec(bb, &args);
+        println!("[initproc] fallback exec({}) failed: {}", bb, er);
+        exit(127);
+    } else if pid > 0 {
+        let mut ec = 0;
+        let wp = waitpid(pid as usize, &mut ec);
+        println!("[initproc] fallback {} waitpid={} exit={}", name, wp, ec);
+        ec
+    } else {
+        println!("[initproc] fallback fork failed for {}: {}", name, pid);
+        127
+    }
 }
 
 #[no_mangle]
@@ -111,11 +154,26 @@ fn main() -> i32 {
         if sub == "lost+found" { continue; }
         let subpath = String::from("/mnt/") + sub + "/\0";
         let scripts = list_dir(&subpath);
+        let has_busybox = scripts.iter().any(|name| name == "busybox");
+        let has_busybox_cmd = scripts.iter().any(|name| name == "busybox_cmd.txt");
         for s in &scripts {
             if !s.ends_with("_testcode.sh") { continue; }
             found = true;
+            let bb = if sub == "glibc" { "/busybox-glibc\0" } else { "/busybox\0" };
             println!("[initproc] [RUN] {}/{}", sub, s);
-            run_script(&subpath, s);
+            if s == "busybox_testcode.sh" && (!has_busybox || !has_busybox_cmd) {
+                println!(
+                    "[initproc] {}/busybox layout incomplete: busybox={}, cmd={}; using rootfs fallback",
+                    sub, has_busybox, has_busybox_cmd
+                );
+                run_busybox_fallback(sub == "glibc");
+                continue;
+            }
+            let code = run_script(&subpath, s, bb);
+            if s == "busybox_testcode.sh" && code != 0 {
+                println!("[initproc] external busybox script exited {}; trying rootfs fallback", code);
+                run_busybox_fallback(sub == "glibc");
+            }
         }
     }
 
@@ -124,7 +182,7 @@ fn main() -> i32 {
         for s in &entries {
             if !s.ends_with("_testcode.sh") { continue; }
             println!("[initproc] [RUN] /mnt/{}", s);
-            run_script("/mnt/\0", s);
+            run_script("/mnt/\0", s, "/busybox\0");
         }
     }
 

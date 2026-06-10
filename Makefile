@@ -148,6 +148,7 @@ fs-img: $(APPS)
 	@rm -f $(FS_IMG)
 	@rm -rf $(ROOTFS_DIR)
 	@mkdir -p $(ROOTFS_BIN_DIR) $(ROOTFS_MNT_DIR) $(ROOTFS_DIR)/tmp
+	@mkdir -p $(ROOTFS_BIN_DIR)/mnt
 ifdef LM_ONLY
 	@touch $(ROOTFS_DIR)/lmbench_only
 endif
@@ -184,6 +185,11 @@ endif
 		cp -f tmp/busybox-musl $(ROOTFS_DIR)/busybox 2>/dev/null || true; \
 		cp -f tmp/busybox-glibc-riscv64 $(ROOTFS_BIN_DIR)/busybox-glibc 2>/dev/null || true; \
 		cp -f tmp/busybox-glibc-riscv64 $(ROOTFS_DIR)/busybox-glibc 2>/dev/null || true; \
+		cat testsuits-for-oskernel/scripts/busybox/busybox_cmd.txt > $(ROOTFS_DIR)/busybox_cmd.txt 2>/dev/null || cat tmp/busybox_cmd.txt > $(ROOTFS_DIR)/busybox_cmd.txt 2>/dev/null || true; \
+		sed 's|\./busybox|./busybox-glibc|g' $(ROOTFS_DIR)/busybox_cmd.txt > $(ROOTFS_DIR)/busybox_glibc_cmd.txt 2>/dev/null || true; \
+		printf '#!/bin/sh\n./busybox-glibc --install -s /bin 2>/dev/null\necho "#### OS COMP TEST GROUP START busybox-glibc ####"\nwhile IFS= read -r line; do case "$$line" in ""|\\#*) continue ;; esac; eval "./busybox-glibc $$line"; RTN=$$?; if [ $$RTN -ne 0 ] && [ "$$line" != "false" ]; then echo "testcase busybox $$line fail"; else echo "testcase busybox $$line success"; fi; done < ./busybox_glibc_cmd.txt\necho "#### OS COMP TEST GROUP END busybox-glibc ####"\n' > $(ROOTFS_DIR)/busybox_glibc_testcode.sh; \
+		ln -sf busybox $(ROOTFS_BIN_DIR)/ls 2>/dev/null || true; \
+		printf '#!/bin/sh\n./busybox --install -s /bin 2>/dev/null\necho "#### OS COMP TEST GROUP START busybox-musl ####"\nwhile IFS= read -r line; do case "$$line" in ""|\\#*) continue ;; esac; eval "./busybox $$line"; RTN=$$?; if [ $$RTN -ne 0 ] && [ "$$line" != "false" ]; then echo "testcase busybox $$line fail"; else echo "testcase busybox $$line success"; fi; done < ./busybox_cmd.txt\necho "#### OS COMP TEST GROUP END busybox-musl ####"\n' > $(ROOTFS_DIR)/busybox_testcode.sh; \
 	elif [ "$(ARCH)" = "loongarch64" ]; then \
 		cp -f tmp/busybox-musl-loongarch64 $(ROOTFS_BIN_DIR)/busybox 2>/dev/null || true; \
 		cp -f tmp/busybox-musl-loongarch64 $(ROOTFS_DIR)/busybox 2>/dev/null || true; \
@@ -359,9 +365,9 @@ TEST_DISK ?= fs-img.img
 
 # Dual-disk mode (test disk bus 0, disk.img bus 1, for contest)
 QEMU_ARGS_DUAL := -drive file=$(TEST_DISK),if=none,format=raw,id=x0 \
-			-device $(VIRTIO_BLK_DEVICE),drive=x0$(if $(filter loongarch64,$(ARCH)),,bus=$(VIRTIO_BLK_BUS)) \
+			-device $(VIRTIO_BLK_DEVICE),drive=x0$(if $(filter loongarch64,$(ARCH)),,$(COMMA)bus=$(VIRTIO_BLK_BUS)) \
 			-drive file=disk.img,if=none,format=raw,id=x1 \
-			-device $(VIRTIO_BLK_DEVICE),drive=x1$(if $(filter loongarch64,$(ARCH)),,bus=$(VIRTIO_BLK_BUS2))
+			-device $(VIRTIO_BLK_DEVICE),drive=x1$(if $(filter loongarch64,$(ARCH)),,$(COMMA)bus=$(VIRTIO_BLK_BUS2))
 
 # virtio-net network configuration (SLIRP user-mode, riscv64/aarch64)
 ifeq ($(ARCH), riscv64)
@@ -381,6 +387,17 @@ run-dual: build disk.img
 	@echo "Running with dual-disk: $(TEST_DISK) + disk.img"
 	$(QEMU_EXEC) $(QEMU_ARGS_DUAL) $(QEMU_NET_ARGS)
 
+run-dual-prebuilt:
+	@test -f $(if $(filter loongarch64,$(ARCH)),$(KERNEL_ELF),$(KERNEL_BIN)) || { \
+		echo "missing kernel image: $(if $(filter loongarch64,$(ARCH)),$(KERNEL_ELF),$(KERNEL_BIN))"; \
+		echo "run make build ARCH=$(ARCH) first"; \
+		exit 1; \
+	}
+	@test -f disk.img || { echo "missing root disk: disk.img"; exit 1; }
+	@test -f $(TEST_DISK) || { echo "missing test disk: $(TEST_DISK)"; exit 1; }
+	@echo "Running with prebuilt dual-disk: $(TEST_DISK) + disk.img"
+	$(QEMU_EXEC) $(QEMU_ARGS_DUAL) $(QEMU_NET_ARGS)
+
 debug: build
 	@tmux new-session -d \
 		"$(QEMU_EXEC) $(QEMU_ARGS_SINGLE) $(QEMU_NET_ARGS) -s -S" && \
@@ -394,4 +411,4 @@ gdbserver: build
 gdbclient:
 	@gdb -ex 'file $(KERNEL_ELF)' -ex 'set arch riscv:rv64' -ex 'target remote localhost:1234'
 
-.PHONY: all kernel-rv kernel-la disk.img disk-rv.img disk-la.img build env kernel clean disasm disasm-vim run-inner run-dual fs-img gdbserver gdbclient
+.PHONY: all kernel-rv kernel-la disk.img disk-rv.img disk-la.img build env kernel clean disasm disasm-vim run-inner run-dual run-dual-prebuilt fs-img gdbserver gdbclient

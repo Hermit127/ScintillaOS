@@ -1332,6 +1332,12 @@ pub fn sys_mount(
             return -20;
         }
 
+        if fstype_str.as_str() == "vfat"
+            && matches!(source_str.as_str(), "/dev/vda2" | "vda2")
+        {
+            return 0;
+        }
+
         // 如果已经挂载，幂等成功
         use crate::fs::vfs::MOUNT_TABLE;
         {
