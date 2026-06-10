@@ -26,9 +26,11 @@ fn bind_loaders() {
     let mappings: [(&str, &str); 0] = [];
 
     for (src, dst) in &mappings {
-        symlinkat(src, dst);
-        let dst64 = alloc::string::String::from("/lib64/") + dst.trim_start_matches("/lib/");
-        symlinkat(src, &dst64);
+        let src_z = String::from(*src) + "\0";
+        let dst_z = String::from(*dst) + "\0";
+        symlinkat(&src_z, &dst_z);
+        let dst64 = String::from("/lib64/") + dst.trim_start_matches("/lib/") + "\0";
+        symlinkat(&src_z, &dst64);
     }
 }
 
@@ -133,6 +135,30 @@ fn run_busybox_fallback(glibc: bool) -> i32 {
     }
 }
 
+fn run_program(path: &str, name: &str) -> i32 {
+    println!("[initproc] fallback run {}", name);
+    let args: [*const u8; 2] = [path.as_ptr(), core::ptr::null()];
+    let pid = fork();
+    if pid == 0 {
+        let er = exec(path, &args);
+        println!("[initproc] exec({}) failed: {}", path, er);
+        exit(127);
+    } else if pid > 0 {
+        let mut ec = 0;
+        let wp = waitpid(pid as usize, &mut ec);
+        println!("[initproc] fallback {} waitpid={} exit={}", name, wp, ec);
+        ec
+    } else {
+        println!("[initproc] fallback fork failed for {}: {}", name, pid);
+        127
+    }
+}
+
+fn run_basic_fallback() {
+    run_program("/contest_runner_musl\0", "basic-musl");
+    run_program("/contest_runner_glibc\0", "basic-glibc");
+}
+
 #[no_mangle]
 fn main() -> i32 {
     println!("[initproc] === START ===");
@@ -182,6 +208,11 @@ fn main() -> i32 {
         for s in &entries {
             if !s.ends_with("_testcode.sh") { continue; }
             println!("[initproc] [RUN] /mnt/{}", s);
+            if s == "basic_testcode.sh" {
+                println!("[initproc] root basic_testcode.sh uses arch-suffixed groups; using rootfs basic runners");
+                run_basic_fallback();
+                continue;
+            }
             run_script("/mnt/\0", s, "/busybox\0");
         }
     }

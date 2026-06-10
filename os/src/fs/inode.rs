@@ -646,12 +646,12 @@ pub fn symlink_at(base: Option<Arc<Dentry>>, target: &str, linkpath: &str) -> bo
 
     let rc = unsafe {
         ext4_fsymlink(
-            link_cpath.as_ptr() as *const core::ffi::c_char,
             target_cpath.as_ptr() as *const core::ffi::c_char,
+            link_cpath.as_ptr() as *const core::ffi::c_char,
         )
     };
     if rc != EOK as i32 {
-        crate::println!("[symlink_at] ext4_fsymlink({} -> {}) = {}", link_fs_path, target, rc);
+        crate::println!("[symlink_at] ext4_fsymlink({} -> {}) = {}", target, link_fs_path, rc);
     }
     rc == EOK as i32
 }
