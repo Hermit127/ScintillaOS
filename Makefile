@@ -159,6 +159,9 @@ endif
 	@cp -f tmp/busybox-glibc-riscv64 $(ROOTFS_DIR)/glibc/busybox 2>/dev/null || true
 	@cp -f testsuits-for-oskernel/lua/src/lua $(ROOTFS_DIR)/musl/lua 2>/dev/null || true
 	@cp -f testsuits-for-oskernel/lua/src/lua $(ROOTFS_DIR)/glibc/lua 2>/dev/null || true
+	@cp -f testsuits-for-oskernel/scripts/busybox/busybox_cmd.txt $(ROOTFS_DIR)/musl/busybox_cmd.txt 2>/dev/null || cp -f tmp/busybox_cmd.txt $(ROOTFS_DIR)/musl/busybox_cmd.txt 2>/dev/null || true
+	@cp -f testsuits-for-oskernel/scripts/busybox/busybox_cmd.txt $(ROOTFS_DIR)/glibc/busybox_cmd.txt 2>/dev/null || cp -f tmp/busybox_cmd.txt $(ROOTFS_DIR)/glibc/busybox_cmd.txt 2>/dev/null || true
+	@chmod +x $(ROOTFS_DIR)/musl/* $(ROOTFS_DIR)/glibc/* 2>/dev/null || true
 	@for g in basic busybox lua; do \
 		case $$g in \
 			basic) \
