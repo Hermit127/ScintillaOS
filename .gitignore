@@ -86,3 +86,4 @@ lwext4_rust/c/lwext4/*.d
 lwext4_rust/c/ext_images.7z
 T202518123995568-675/
 /sdcard/
+liblwext4-riscv64.a
