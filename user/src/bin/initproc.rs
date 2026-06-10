@@ -214,6 +214,7 @@ fn main() -> i32 {
     if !found {
         for s in &entries {
             if !s.ends_with("_testcode.sh") { continue; }
+            found = true;
             println!("[initproc] [RUN] /mnt/{}", s);
             if s == "basic_testcode.sh" {
                 println!("[initproc] root basic_testcode.sh uses arch-suffixed groups; using rootfs basic runners");
@@ -223,6 +224,13 @@ fn main() -> i32 {
             }
             run_script("/mnt/\0", s, "/busybox\0");
         }
+    }
+
+    if !found {
+        println!("[initproc] no test scripts found on /mnt; using rootfs fallbacks");
+        run_basic_fallback();
+        run_busybox_fallback(false);
+        run_busybox_fallback(true);
     }
 
     println!("[initproc] === DONE ===");
