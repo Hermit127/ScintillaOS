@@ -2,6 +2,7 @@ use super::vpn_range::VAddrRange;
 use super::{frame_alloc, FrameTracker};
 use crate::config::{PAGE_SIZE, USER_STACK_SIZE};
 use alloc::collections::BTreeMap;
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use log::*;
@@ -22,6 +23,33 @@ pub struct LoadedElf {
     pub ph_num: usize,
     pub tls_base: usize,
     pub tls_size: usize,
+    pub interp_path: Option<alloc::string::String>,
+    pub interp_base: usize,
+    pub program_entry: usize,
+}
+
+pub fn get_elf_interp(elf_data: &[u8]) -> Option<String> {
+    let elf = match xmas_elf::ElfFile::new(elf_data) {
+        Ok(e) => e,
+        Err(_) => return None,
+    };
+    let ph_count = elf.header.pt2.ph_count();
+    for i in 0..ph_count {
+        let ph = match elf.program_header(i) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if ph.get_type().unwrap() == xmas_elf::program::Type::Interp {
+            let offset = ph.offset() as usize;
+            let size = ph.file_size() as usize;
+            if offset + size <= elf_data.len() {
+                let raw = &elf_data[offset..offset + size];
+                let end = raw.iter().position(|&b| b == 0).unwrap_or(size);
+                return core::str::from_utf8(&raw[..end]).ok().map(|s| s.into());
+            }
+        }
+    }
+    None
 }
 
 impl MemorySet {
@@ -61,6 +89,8 @@ impl MemorySet {
         let mut first_load = true;
         let mut tls_base: usize = 0;
         let mut tls_size: usize = 0;
+        let mut interp_path: Option<alloc::string::String> = None;
+        let program_entry = elf.header.pt2.entry_point() as usize + pie_base;
         for i in 0..ph_count {
             let ph = elf.program_header(i).unwrap();
             let va_offset = pie_base;
@@ -106,6 +136,14 @@ impl MemorySet {
             } else if ph.get_type().unwrap() == xmas_elf::program::Type::Tls {
                 tls_base = ph.virtual_addr() as usize + va_offset;
                 tls_size = ph.mem_size() as usize;
+            } else if ph.get_type().unwrap() == xmas_elf::program::Type::Interp {
+                let offset = ph.offset() as usize;
+                let size = ph.file_size() as usize;
+                if offset + size <= elf_data.len() {
+                    let raw = &elf_data[offset..offset + size];
+                    let end = raw.iter().position(|&b| b == 0).unwrap_or(size);
+                    interp_path = core::str::from_utf8(&raw[..end]).ok().map(|s| s.into());
+                }
             }
         }
         // map user stack with U flags
@@ -126,14 +164,59 @@ impl MemorySet {
         LoadedElf {
             memory_set,
             user_sp: user_stack_top,
-            entry_point: elf.header.pt2.entry_point() as usize + pie_base,
+            entry_point: program_entry,
             ph_addr,
             ph_entsize: e_phentsize,
             ph_num: ph_count as usize,
             tls_base,
             tls_size,
+            interp_path,
+            interp_base: 0,
+            program_entry,
         }
     }
+
+    /// Load a dynamic linker/interpreter ELF at a fixed base address.
+    /// Returns (entry_point, base_addr).
+    pub fn load_interp_elf(
+        memory_set: &mut MemorySet,
+        interp_data: &[u8],
+        base: usize,
+    ) -> (usize, usize) {
+        let elf = xmas_elf::ElfFile::new(interp_data).unwrap();
+        let entry = elf.header.pt2.entry_point() as usize + base;
+        let ph_count = elf.header.pt2.ph_count();
+        for i in 0..ph_count {
+            let ph = elf.program_header(i).unwrap();
+            if ph.get_type().unwrap() == xmas_elf::program::Type::Load {
+                let start_va: VirtAddr = (ph.virtual_addr() as usize + base).into();
+                let end_va: VirtAddr = ((ph.virtual_addr() + ph.mem_size()) as usize + base).into();
+                let mut map_perm = MapPermission::U;
+                let ph_flags = ph.flags();
+                if ph_flags.is_read() { map_perm |= MapPermission::R; }
+                if ph_flags.is_write() { map_perm |= MapPermission::W; }
+                if ph_flags.is_execute() { map_perm |= MapPermission::X; }
+                let map_area = MapArea::new(start_va, end_va, MapType::Framed, map_perm);
+                let page_off = start_va.raw() % PAGE_SIZE;
+                if page_off > 0 {
+                    let aligned_va = start_va.raw() - page_off;
+                    let file_start = ph.offset() as usize - page_off;
+                    let file_end = (ph.offset() + ph.file_size()) as usize;
+                    let aligned_data = &interp_data[file_start..file_end];
+                    let aligned_map = MapArea::new(aligned_va.into(), end_va, MapType::Framed, map_perm);
+                    memory_set.push(aligned_map, Some(aligned_data), 0);
+                } else {
+                    memory_set.push(
+                        map_area,
+                        Some(&interp_data[ph.offset() as usize..(ph.offset() + ph.file_size()) as usize]),
+                        0,
+                    );
+                }
+            }
+        }
+        (entry, base)
+    }
+
     pub fn from_existed_user(user_space: &MemorySet) -> Option<MemorySet> {
         trace!("os::mm::MemorySet::from_existed_user");
         let mut memory_set = Self::new_bare();

@@ -287,18 +287,39 @@ impl TaskControlBlock {
         task_control_block
     }
     pub fn exec(&self, elf_data: &[u8], args: Vec<String>, envs: Vec<String>) {
-        trace!("os::task::TaskControlBlock::exec");
-        let LoadedElf {
-            memory_set,
-            user_sp: stack_top,
-            entry_point,
-            ph_addr,
-            ph_entsize,
-            ph_num,
-            tls_base,
-            tls_size,
-        } = MemorySet::from_elf(elf_data);
+        self.exec_with_interp(elf_data, None, args, envs);
+    }
+
+    pub fn exec_with_interp(
+        &self,
+        elf_data: &[u8],
+        interp_data: Option<&[u8]>,
+        args: Vec<String>,
+        envs: Vec<String>,
+    ) {
+        trace!("os::task::TaskControlBlock::exec_with_interp");
+        const INTERP_BASE: usize = 0x10_0000_0000;
+
+        let mut loaded = MemorySet::from_elf(elf_data);
+        let mut entry_point = loaded.entry_point;
+        let program_entry = loaded.program_entry;
+
+        // Load dynamic linker/interpreter at a fixed high address
+        if let Some(id) = interp_data {
+            let (interp_entry, interp_base) =
+                MemorySet::load_interp_elf(&mut loaded.memory_set, id, INTERP_BASE);
+            entry_point = interp_entry;
+            loaded.interp_base = interp_base;
+        }
+        let stack_top = loaded.user_sp;
         let heap_bottom = stack_top;
+        let ph_addr = loaded.ph_addr;
+        let ph_entsize = loaded.ph_entsize;
+        let ph_num = loaded.ph_num;
+        let tls_base = loaded.tls_base;
+        let tls_size = loaded.tls_size;
+        let interp_base = loaded.interp_base;
+        let memory_set = loaded.memory_set;
 
         memory_set.activate();
         let token = memory_set.token();
@@ -401,8 +422,8 @@ impl TaskControlBlock {
         auxv_write!(AT_PHENT, ph_entsize as u64);
         auxv_write!(AT_PHNUM, ph_num as u64);
         auxv_write!(AT_PAGESZ, crate::config::PAGE_SIZE as u64);
-        auxv_write!(AT_ENTRY, entry_point as u64);
-        auxv_write!(AT_BASE, 0u64);
+        auxv_write!(AT_ENTRY, program_entry as u64);
+        auxv_write!(AT_BASE, interp_base as u64);
         auxv_write!(AT_FLAGS, 0u64);
         auxv_write!(AT_UID, 0u64);
         auxv_write!(AT_EUID, 0u64);

@@ -7,7 +7,30 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use user_lib::{close, exec, exit, fork, getdents64, open, shutdown, sys_mkdir, sys_mount, waitpid, OpenFlags};
+use user_lib::{close, exec, exit, fork, getdents64, open, shutdown, symlinkat, sys_mkdir, sys_mount, waitpid, OpenFlags};
+
+fn bind_loaders() {
+    sys_mkdir(b"/lib\0".as_ptr(), 0o777);
+    sys_mkdir(b"/lib64\0".as_ptr(), 0o777);
+
+    #[cfg(target_arch = "riscv64")]
+    let mappings: [(&str, &str); 6] = [
+        ("/mnt/glibc/lib/ld-linux-riscv64-lp64d.so.1", "/lib/ld-linux-riscv64-lp64d.so.1"),
+        ("/mnt/glibc/lib/libc.so.6", "/lib/libc.so.6"),
+        ("/mnt/glibc/lib/libm.so.6", "/lib/libm.so.6"),
+        ("/mnt/musl/lib/libc.so", "/lib/ld-musl-riscv64-sf.so.1"),
+        ("/mnt/musl/lib/libc.so", "/lib/ld-musl-riscv64.so.1"),
+        ("/mnt/musl/lib/libc.so", "/lib/libc.so"),
+    ];
+    #[cfg(not(target_arch = "riscv64"))]
+    let mappings: [(&str, &str); 0] = [];
+
+    for (src, dst) in &mappings {
+        symlinkat(src, dst);
+        let dst64 = alloc::string::String::from("/lib64/") + dst.trim_start_matches("/lib/");
+        symlinkat(src, &dst64);
+    }
+}
 
 fn install_busybox() {
     sys_mkdir(b"/bin\0".as_ptr(), 0o777);
@@ -72,6 +95,10 @@ fn main() -> i32 {
     sys_mkdir(b"/mnt\0".as_ptr(), 0o777);
     let r = sys_mount("vda\0", "/mnt\0", "ext4\0", 0, &[]);
     println!("[initproc] mount vda -> /mnt: {}", r);
+
+    if r == 0 {
+        bind_loaders();
+    }
 
     // Scan /mnt for subdirectories containing *_testcode.sh (A20-style)
     let entries = list_dir("/mnt/\0");

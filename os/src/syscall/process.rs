@@ -2,6 +2,7 @@ use crate::fs::{open_file, OpenFlags, File};
 use crate::fs::stdio::stdout_release_if_owner;
 use crate::mm::{
     translated_byte_buffer, translated_ref, translated_refmut, translated_str, MapPermission,
+    get_elf_interp,
 };
 use crate::task::{
     add_task, block_current_and_run_next, current_task, current_user_token,
@@ -238,6 +239,16 @@ pub fn sys_exec(path: *const u8, mut args: *const usize, mut envp: *const usize)
             return -1;
         }
         let task = current_task().unwrap();
+        // Check for dynamically linked ELF (has PT_INTERP)
+        if let Some(interp_path) = crate::mm::get_elf_interp(&all_data) {
+            if let Some(interp_inode) = open_file(&interp_path, OpenFlags::RDONLY)
+                .or_else(|| open_file(&alloc::format!("/usr{}", interp_path), OpenFlags::RDONLY))
+            {
+                let interp_data = interp_inode.read_all();
+                task.exec_with_interp(all_data.as_slice(), Some(&interp_data), args_vec, env_vec);
+                return 0;
+            }
+        }
         task.exec(all_data.as_slice(), args_vec, env_vec);
         0
     } else {

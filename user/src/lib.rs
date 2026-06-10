@@ -315,3 +315,7 @@ pub fn mount(source: &str, target: &str, fstype: &str, flags: usize, data: &[u8]
 pub fn umount2(target: &str, flags: usize) -> isize {
     sys_umount2(target, flags)
 }
+
+pub fn symlinkat(target: &str, linkpath: &str) -> isize {
+    sys_symlinkat(target.as_ptr(), linkpath.as_ptr())
+}

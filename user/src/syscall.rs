@@ -37,6 +37,7 @@ const SYSCALL_NANOSLEEP: usize = 101;
 
 const SYSCALL_MOUNT: usize = 40;
 const SYSCALL_UMOUNT2: usize = 39;
+const SYSCALL_SYMLINKAT: usize = 36;
 
 const SYSCALL_GETDENTS64: usize = 61;
 
@@ -311,6 +312,13 @@ pub fn sys_mkdir(path: *const u8, mode: u32) -> isize {
     syscall(
         SYSCALL_MKDIRAT,
         [AT_FDCWD as usize, path as usize, mode as usize, 0, 0, 0],
+    )
+}
+
+pub fn sys_symlinkat(target: *const u8, linkpath: *const u8) -> isize {
+    syscall(
+        SYSCALL_SYMLINKAT,
+        [target as usize, AT_FDCWD as usize, linkpath as usize, 0, 0, 0],
     )
 }
 
