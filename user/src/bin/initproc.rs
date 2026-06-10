@@ -34,6 +34,9 @@ fn bind_loaders() {
 
 fn install_busybox() {
     sys_mkdir(b"/bin\0".as_ptr(), 0o777);
+    let ret = symlinkat("/busybox\0", "/bin/sh\0");
+    println!("[initproc] symlink /bin/sh -> /busybox: {}", ret);
+    // Also try busybox's own install for full applet set
     let args: [*const u8; 5] = [
         b"/busybox\0".as_ptr(),
         b"--install\0".as_ptr(),
@@ -48,6 +51,7 @@ fn install_busybox() {
     } else if pid > 0 {
         let mut ec = 0;
         waitpid(pid as usize, &mut ec);
+        println!("[initproc] busybox --install exit: {}", ec);
     }
 }
 
