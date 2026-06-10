@@ -28,8 +28,22 @@ use ram_blk::RamDiskBlock;
     target_arch = "aarch64",
     target_arch = "loongarch64"
 ))]
+#[cfg(any(
+    target_arch = "riscv64",
+    target_arch = "aarch64"
+))]
 lazy_static! {
     static ref BLOCK_DEVICES: Vec<Arc<dyn BlockDevice>> = virtio_blk::probe_all();
+}
+
+#[cfg(not(any(target_arch = "riscv64", target_arch = "aarch64")))]
+lazy_static! {
+    static ref BLOCK_DEVICES: Vec<Arc<dyn BlockDevice>> = {
+        let mut v = Vec::new();
+        v.push(Arc::new(VirtIOBlock::new_at(polyhal::pa!(0x10001000))) as Arc<dyn BlockDevice>);
+        v.push(Arc::new(VirtIOBlock::new_at(polyhal::pa!(0x10002000))) as Arc<dyn BlockDevice>);
+        v
+    };
 }
 
 pub fn get_block_device(index: usize) -> Option<Arc<dyn BlockDevice>> {
