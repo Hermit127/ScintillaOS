@@ -232,7 +232,10 @@ pub fn probe_all() -> Vec<Arc<dyn BlockDevice>> {
             Err(e) => { crate::println!("[virtio-blk] probe {:#x}: blk err {:?}", base, e); continue; }
         };
         let dev: Arc<dyn BlockDevice> = Arc::new(VirtIOBlock(unsafe { UPSafeCell::new(blk) }));
-        crate::println!("[virtio-blk] probe {:#x}: OK", base);
+        // Read block 0 to identify the disk
+        let mut id_buf = [0u8; 16];
+        dev.read_block(0, &mut id_buf);
+        crate::println!("[virtio-blk] probe {:#x}: OK, block0={:02x?}", base, id_buf);
         out.push(dev);
     }
     crate::println!("[virtio-blk] probe_all: found {} devices", out.len());
