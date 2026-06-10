@@ -165,19 +165,19 @@ endif
 	@for g in basic busybox lua; do \
 		case $$g in \
 			basic) \
-				echo "#!/bin/sh\necho \"#### OS COMP TEST GROUP START basic-musl ####\"\ncd /bin\n./run-all.sh\necho \"#### OS COMP TEST GROUP END basic-musl ####\"" > $(ROOTFS_DIR)/musl/basic_testcode.sh ;; \
+				echo "#!/bin/sh\necho \"#### OS COMP TEST GROUP START basic-musl ####\"\n/bin/run-all.sh\necho \"#### OS COMP TEST GROUP END basic-musl ####\"" > $(ROOTFS_DIR)/musl/basic_testcode.sh ;; \
 			busybox) \
 				cat testsuits-for-oskernel/scripts/busybox/busybox_testcode.sh > $(ROOTFS_DIR)/musl/busybox_testcode.sh 2>/dev/null || true ;; \
 			lua) \
-				echo "#!/bin/sh\necho \"#### OS COMP TEST GROUP START lua-musl ####\"\nfor f in strings sort sin30 round_num max_min file_io remove date random; do ./lua ./$$f.lua && echo \"testcase lua $$f success\" || echo \"testcase lua $$f fail\"; done\necho \"#### OS COMP TEST GROUP END lua-musl ####\"" > $(ROOTFS_DIR)/musl/lua_testcode.sh ;; \
+				echo "#!/bin/sh\necho \"#### OS COMP TEST GROUP START lua-musl ####\"\nfor f in strings sort sin30 round_num max_min file_io remove date random; do /mnt/musl/lua ./$$f.lua && echo \"testcase lua $$f success\" || echo \"testcase lua $$f fail\"; done\necho \"#### OS COMP TEST GROUP END lua-musl ####\"" > $(ROOTFS_DIR)/musl/lua_testcode.sh ;; \
 		esac; \
 		case $$g in \
 			basic) \
-				echo "#!/bin/sh\necho \"#### OS COMP TEST GROUP START basic-glibc ####\"\ncd /bin\n./run-all.sh\necho \"#### OS COMP TEST GROUP END basic-glibc ####\"" > $(ROOTFS_DIR)/glibc/basic_testcode.sh ;; \
+				echo "#!/bin/sh\necho \"#### OS COMP TEST GROUP START basic-glibc ####\"\n/bin/run-all.sh\necho \"#### OS COMP TEST GROUP END basic-glibc ####\"" > $(ROOTFS_DIR)/glibc/basic_testcode.sh ;; \
 			busybox) \
 				sed 's|\./busybox|./busybox|g' testsuits-for-oskernel/scripts/busybox/busybox_testcode.sh > $(ROOTFS_DIR)/glibc/busybox_testcode.sh 2>/dev/null || true ;; \
 			lua) \
-				echo "#!/bin/sh\necho \"#### OS COMP TEST GROUP START lua-glibc ####\"\nfor f in strings sort sin30 round_num max_min file_io remove date random; do ./lua ./$$f.lua && echo \"testcase lua $$f success\" || echo \"testcase lua $$f fail\"; done\necho \"#### OS COMP TEST GROUP END lua-glibc ####\"" > $(ROOTFS_DIR)/glibc/lua_testcode.sh ;; \
+				echo "#!/bin/sh\necho \"#### OS COMP TEST GROUP START lua-glibc ####\"\nfor f in strings sort sin30 round_num max_min file_io remove date random; do /mnt/glibc/lua ./$$f.lua && echo \"testcase lua $$f success\" || echo \"testcase lua $$f fail\"; done\necho \"#### OS COMP TEST GROUP END lua-glibc ####\"" > $(ROOTFS_DIR)/glibc/lua_testcode.sh ;; \
 		esac; \
 	done
 	@for g in lmbench iozone; do \
