@@ -155,8 +155,8 @@ fn run_program(path: &str, name: &str) -> i32 {
 }
 
 fn run_basic_fallback() {
-    run_program("/contest_runner_musl\0", "basic-musl");
-    run_program("/contest_runner_glibc\0", "basic-glibc");
+    run_program("/bin/contest_runner_musl\0", "basic-musl");
+    run_program("/bin/contest_runner_glibc\0", "basic-glibc");
 }
 
 #[no_mangle]
