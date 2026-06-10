@@ -78,15 +78,9 @@ impl VirtIOBlock {
         }
         #[cfg(not(target_arch = "loongarch64"))]
         unsafe {
-            // Use direct physical address as MMIO pointer, matching xiande-OS.
-            // polyhal's get_mut_ptr() ORs VIRT_ADDR_START which may not be
-            // identity-mapped for MMIO on all platforms.
-            // Use raw physical address (direct MMIO), matching xiande-OS.
-            // polyhal's get_mut_ptr() ORs VIRT_ADDR_START incorrectly for MMIO.
-            let ptr = NonNull::new(addr.raw() as *mut u8).unwrap();
             Self(UPSafeCell::new(
                 VirtIOBlk::<VirtioHal, MmioTransport>::new(
-                    MmioTransport::new(ptr.cast())
+                    MmioTransport::new(NonNull::new_unchecked(addr.get_mut_ptr()))
                         .expect("this is not a valid virtio device"),
                 )
                 .unwrap(),
