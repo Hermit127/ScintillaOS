@@ -14,10 +14,12 @@ fn bind_loaders() {
     sys_mkdir(b"/lib64\0".as_ptr(), 0o777);
 
     #[cfg(target_arch = "riscv64")]
-    let mappings: [(&str, &str); 6] = [
+    let mappings: [(&str, &str); 8] = [
         ("/mnt/glibc/lib/ld-linux-riscv64-lp64d.so.1", "/lib/ld-linux-riscv64-lp64d.so.1"),
         ("/mnt/glibc/lib/libc.so.6", "/lib/libc.so.6"),
+        ("/mnt/glibc/lib/libc.so", "/lib/libc.so.6"),
         ("/mnt/glibc/lib/libm.so.6", "/lib/libm.so.6"),
+        ("/mnt/glibc/lib/libm.so", "/lib/libm.so.6"),
         ("/mnt/musl/lib/libc.so", "/lib/ld-musl-riscv64-sf.so.1"),
         ("/mnt/musl/lib/libc.so", "/lib/ld-musl-riscv64.so.1"),
         ("/mnt/musl/lib/libc.so", "/lib/libc.so"),
@@ -34,9 +36,12 @@ fn bind_loaders() {
 
 fn install_busybox() {
     sys_mkdir(b"/bin\0".as_ptr(), 0o777);
-    let ret = symlinkat("/busybox\0", "/bin/sh\0");
-    println!("[initproc] symlink /bin/sh -> /busybox: {}", ret);
-    // Also try busybox's own install for full applet set
+    let r1 = symlinkat("/busybox\0", "/bin/sh\0");
+    println!("[initproc] symlink 1: {}", r1);
+    let r2 = symlinkat("/busybox\0", "/bin/cat\0");
+    println!("[initproc] symlink 2: {}", r2);
+    let r3 = symlinkat("/busybox\0", "/bin/ls\0");
+    println!("[initproc] symlink 3: {}", r3);
     let args: [*const u8; 5] = [
         b"/busybox\0".as_ptr(),
         b"--install\0".as_ptr(),

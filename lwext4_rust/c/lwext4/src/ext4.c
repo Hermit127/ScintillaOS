@@ -489,6 +489,9 @@ static struct ext4_mountpoint *ext4_get_mount(const char *path)
 		}
 	}
 
+	if (!best) {
+		ext4_dbg(DEBUG_FS, DBG_WARN "ext4_get_mount(%s) NULL\n", path);
+	}
 	return best;
 }
 
@@ -3249,5 +3252,3 @@ void ext4_dir_entry_rewind(ext4_dir *dir)
 }
 
 /**
- * @}
- */
