@@ -154,6 +154,18 @@ endif
 ifdef LM_GLIBC_ONLY
 	@touch $(ROOTFS_DIR)/lmbench_glibc_only
 endif
+	@mkdir -p $(ROOTFS_DIR)/musl $(ROOTFS_DIR)/glibc
+	@cp -f tmp/busybox-musl $(ROOTFS_DIR)/musl/busybox 2>/dev/null || true
+	@cp -f tmp/busybox-glibc-riscv64 $(ROOTFS_DIR)/glibc/busybox 2>/dev/null || true
+	@cp -f testsuits-for-oskernel/scripts/busybox/busybox_cmd.txt $(ROOTFS_DIR)/musl/ 2>/dev/null || true
+	@cp -f testsuits-for-oskernel/scripts/busybox/busybox_cmd.txt $(ROOTFS_DIR)/glibc/ 2>/dev/null || true
+	@chmod +x $(ROOTFS_DIR)/musl/* $(ROOTFS_DIR)/glibc/* 2>/dev/null || true
+	@cat testsuits-for-oskernel/scripts/busybox/busybox_testcode.sh > $(ROOTFS_DIR)/musl/busybox_testcode.sh 2>/dev/null || true
+	@sed 's|\./busybox|./busybox|g' testsuits-for-oskernel/scripts/busybox/busybox_testcode.sh > $(ROOTFS_DIR)/glibc/busybox_testcode.sh 2>/dev/null || true
+ifeq ($(ARCH),riscv64)
+	@echo "#!/bin/sh\n#### OS COMP TEST GROUP START basic-musl ####\ncd /bin\nfor t in brk chdir close dup dup2 execve exit fork fstat getcwd getdents getpid getppid gettimeofday mkdir_ mmap mount munmap openat open pipe read sleep times umount uname unlink wait waitpid write yield; do echo \"========== START test_\$$t ==========\"; ./\$$t; echo \"========== END test_\$$t ==========\"; done\necho \"#### OS COMP TEST GROUP END basic-musl ####\"" > $(ROOTFS_DIR)/musl/basic_testcode.sh
+	@echo "#!/bin/sh\n#### OS COMP TEST GROUP START basic-glibc ####\ncd /bin\nfor t in brk chdir close dup dup2 execve exit fork fstat getcwd getdents getpid getppid gettimeofday mkdir_ mmap mount munmap openat open pipe read sleep times umount uname unlink wait waitpid write yield; do echo \"========== START test_\$$t ==========\"; ./\$$t; echo \"========== END test_\$$t ==========\"; done\necho \"#### OS COMP TEST GROUP END basic-glibc ####\"" > $(ROOTFS_DIR)/glibc/basic_testcode.sh
+endif
 ifdef IOZONE_ONLY
 	@touch $(ROOTFS_DIR)/iozone_only
 endif
