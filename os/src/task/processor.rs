@@ -38,9 +38,14 @@ lazy_static! {
 
 pub fn run_tasks() {
     trace!("os::task::processor::run_tasks");
+    let mut first = true;
     loop {
         let mut processor = PROCESSOR.exclusive_access();
         if let Some(task) = fetch_task() {
+            if first {
+                println!("[kernel] run_tasks: first task pid={}", task.getpid());
+                first = false;
+            }
             let idle_task_cx_ptr = processor.get_idle_task_cx_ptr();
             // access coming task TCB exclusively
             let mut task_inner = task.inner_exclusive_access();

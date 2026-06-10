@@ -260,9 +260,16 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
 
 lazy_static! {
     pub static ref INITPROC: Arc<TaskControlBlock> = Arc::new({
-        let inode = open_file("/bin/contest_runner", OpenFlags::RDONLY).unwrap();
+        println!("[kernel] loading initproc binary...");
+        let inode = match open_file("/bin/contest_runner", OpenFlags::RDONLY) {
+            Some(f) => f,
+            None => panic!("initproc not found!"),
+        };
         let v = inode.read_all();
-        TaskControlBlock::new(v.as_slice())
+        println!("[kernel] initproc binary size: {} bytes", v.len());
+        let tcb = TaskControlBlock::new(v.as_slice());
+        println!("[kernel] initproc TCB created, pid={}", tcb.getpid());
+        tcb
     });
 }
 
@@ -337,7 +344,7 @@ fn call_user_signal_handler(sig: usize, signal: SignalFlags) {
     if handler != 0 {
         let action = task_inner.signal_actions.table[sig];
 
-        // SA_NODEFER: block this signal during handler
+        // SA_NODEFER: block this signal + sa_mask during handler
         const SA_NODEFER: usize = 0x40000000;
         if action.flags & SA_NODEFER == 0 {
             task_inner.signal_mask |= signal;
@@ -345,12 +352,6 @@ fn call_user_signal_handler(sig: usize, signal: SignalFlags) {
         }
         task_inner.handling_sig = sig as isize;
         task_inner.signals ^= signal;
-
-        // Block current signal + handler's sa_mask during handler execution
-        let handler_mask = task_inner.signal_actions.table[sig].mask;
-        task_inner.saved_signal_mask = task_inner.signal_mask;
-        task_inner.signal_mask |= signal;
-        task_inner.signal_mask |= handler_mask;
 
         // backup trapframe
         let trap_ctx = task_inner.get_trap_cx();
@@ -365,32 +366,8 @@ fn call_user_signal_handler(sig: usize, signal: SignalFlags) {
             saved_sepc
         };
 
-        // Check SA_SIGINFO flag
-        let sa_flags = task_inner.signal_actions.table[sig].flags;
-        const SA_SIGINFO: usize = 0x00000004;
-        if sa_flags & SA_SIGINFO != 0 {
-            // Build siginfo_t on user stack
-            let sigframe_size: usize = 128;
-            let old_sp = trap_ctx[TrapFrameArgs::SP];
-            let new_sp = (old_sp - sigframe_size) & !0xF; // 16-byte aligned
-            trap_ctx[TrapFrameArgs::SP] = new_sp;
-
-            // Write siginfo to user stack: si_signo(0-3), si_code(8-11)=0, si_pid(16-19)
-            let token = task_inner.memory_set.token();
-            let sigbuf = crate::mm::translated_byte_buffer(token, new_sp as *mut u8, sigframe_size);
-            for b in sigbuf.iter_mut() { *b = 0; }
-            let sender_pid = task.getpid() as u32;
-            sigbuf[0..4].copy_from_slice(&(sig as u32).to_ne_bytes());
-            sigbuf[16..20].copy_from_slice(&sender_pid.to_ne_bytes());
-
-            // a0=signum, a1=siginfo*, a2=NULL
-            trap_ctx[TrapFrameArgs::ARG0] = sig;
-            trap_ctx[TrapFrameArgs::ARG1] = new_sp;
-            trap_ctx[TrapFrameArgs::ARG2] = 0;
-        } else {
-            // put args (a0)
-            trap_ctx[TrapFrameArgs::ARG0] = sig;
-        }
+        // put args (a0)
+        trap_ctx[TrapFrameArgs::ARG0] = sig;
     } else {
         // default action: fatal signals kill the process, others are ignored
         let fatal = signal.intersects(
