@@ -1336,7 +1336,9 @@ pub fn sys_mount(
         use crate::fs::vfs::MOUNT_TABLE;
         {
             let table = MOUNT_TABLE.exclusive_access();
-            if table.iter().any(|m| m.mnt_point.path == mnt_point.path) {
+            let found = table.iter().any(|m| m.mnt_point.path == mnt_point.path);
+            crate::println!("[sys_mount] dup check: path={} table_len={} found={}", mnt_point.path, table.len(), found);
+            if found {
                 return 0;
             }
         }

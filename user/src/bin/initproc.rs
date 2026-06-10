@@ -106,11 +106,13 @@ fn main() -> i32 {
 
     // Scan /mnt for subdirectories containing *_testcode.sh (A20-style)
     let entries = list_dir("/mnt/\0");
+    println!("[initproc] /mnt/ has {} entries", entries.len());
     let mut found = false;
     for sub in &entries {
         if sub == "lost+found" { continue; }
         let subpath = String::from("/mnt/") + sub + "/\0";
         let scripts = list_dir(&subpath);
+        println!("[initproc] /mnt/{}/ has {} entries", sub, scripts.len());
         for s in &scripts {
             if !s.ends_with("_testcode.sh") { continue; }
             found = true;
