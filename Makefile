@@ -154,36 +154,6 @@ endif
 ifdef LM_GLIBC_ONLY
 	@touch $(ROOTFS_DIR)/lmbench_glibc_only
 endif
-	@mkdir -p $(ROOTFS_DIR)/musl $(ROOTFS_DIR)/glibc
-	@cp -f tmp/busybox-musl $(ROOTFS_DIR)/musl/busybox 2>/dev/null || true
-	@cp -f tmp/busybox-glibc-riscv64 $(ROOTFS_DIR)/glibc/busybox 2>/dev/null || true
-	@cp -f testsuits-for-oskernel/lua/src/lua $(ROOTFS_DIR)/musl/lua 2>/dev/null || true
-	@cp -f testsuits-for-oskernel/lua/src/lua $(ROOTFS_DIR)/glibc/lua 2>/dev/null || true
-	@cp -f testsuits-for-oskernel/scripts/busybox/busybox_cmd.txt $(ROOTFS_DIR)/musl/busybox_cmd.txt 2>/dev/null || cp -f tmp/busybox_cmd.txt $(ROOTFS_DIR)/musl/busybox_cmd.txt 2>/dev/null || true
-	@cp -f testsuits-for-oskernel/scripts/busybox/busybox_cmd.txt $(ROOTFS_DIR)/glibc/busybox_cmd.txt 2>/dev/null || cp -f tmp/busybox_cmd.txt $(ROOTFS_DIR)/glibc/busybox_cmd.txt 2>/dev/null || true
-	@chmod +x $(ROOTFS_DIR)/musl/* $(ROOTFS_DIR)/glibc/* 2>/dev/null || true
-	@for g in basic busybox lua; do \
-		case $$g in \
-			basic) \
-				echo "#!/bin/sh\necho \"#### OS COMP TEST GROUP START basic-musl ####\"\n/bin/run-all.sh\necho \"#### OS COMP TEST GROUP END basic-musl ####\"" > $(ROOTFS_DIR)/musl/basic_testcode.sh ;; \
-			busybox) \
-				cat testsuits-for-oskernel/scripts/busybox/busybox_testcode.sh > $(ROOTFS_DIR)/musl/busybox_testcode.sh 2>/dev/null || true ;; \
-			lua) \
-				echo "#!/bin/sh\necho \"#### OS COMP TEST GROUP START lua-musl ####\"\nfor f in strings sort sin30 round_num max_min file_io remove date random; do /mnt/musl/lua ./$$f.lua && echo \"testcase lua $$f success\" || echo \"testcase lua $$f fail\"; done\necho \"#### OS COMP TEST GROUP END lua-musl ####\"" > $(ROOTFS_DIR)/musl/lua_testcode.sh ;; \
-		esac; \
-		case $$g in \
-			basic) \
-				echo "#!/bin/sh\necho \"#### OS COMP TEST GROUP START basic-glibc ####\"\n/bin/run-all.sh\necho \"#### OS COMP TEST GROUP END basic-glibc ####\"" > $(ROOTFS_DIR)/glibc/basic_testcode.sh ;; \
-			busybox) \
-				sed 's|\./busybox|./busybox|g' testsuits-for-oskernel/scripts/busybox/busybox_testcode.sh > $(ROOTFS_DIR)/glibc/busybox_testcode.sh 2>/dev/null || true ;; \
-			lua) \
-				echo "#!/bin/sh\necho \"#### OS COMP TEST GROUP START lua-glibc ####\"\nfor f in strings sort sin30 round_num max_min file_io remove date random; do /mnt/glibc/lua ./$$f.lua && echo \"testcase lua $$f success\" || echo \"testcase lua $$f fail\"; done\necho \"#### OS COMP TEST GROUP END lua-glibc ####\"" > $(ROOTFS_DIR)/glibc/lua_testcode.sh ;; \
-		esac; \
-	done
-	@for g in lmbench iozone; do \
-		echo "#!/bin/sh\necho \"#### OS COMP TEST GROUP START $$g-musl ####\"\necho \"testcase $$g skipped (not available)\"\necho \"#### OS COMP TEST GROUP END $$g-musl ####\"" > $(ROOTFS_DIR)/musl/$${g}_testcode.sh; \
-		echo "#!/bin/sh\necho \"#### OS COMP TEST GROUP START $$g-glibc ####\"\necho \"testcase $$g skipped (not available)\"\necho \"#### OS COMP TEST GROUP END $$g-glibc ####\"" > $(ROOTFS_DIR)/glibc/$${g}_testcode.sh; \
-	done
 ifdef IOZONE_ONLY
 	@touch $(ROOTFS_DIR)/iozone_only
 endif
