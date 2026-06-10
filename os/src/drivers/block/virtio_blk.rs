@@ -78,13 +78,12 @@ impl VirtIOBlock {
         }
         #[cfg(not(target_arch = "loongarch64"))]
         unsafe {
-            Self(UPSafeCell::new(
-                VirtIOBlk::<VirtioHal, MmioTransport>::new(
-                    MmioTransport::new(NonNull::new_unchecked(addr.get_mut_ptr()))
-                        .expect("this is not a valid virtio device"),
-                )
-                .unwrap(),
-            ))
+            let transport = MmioTransport::new(NonNull::new_unchecked(addr.get_mut_ptr()))
+                .expect("this is not a valid virtio device");
+            let blk = VirtIOBlk::<VirtioHal, MmioTransport>::new(transport).unwrap();
+            let capacity = blk.capacity();
+            crate::println!("[virtio-blk] online at {:#x}, capacity={} sectors", addr.raw(), capacity);
+            Self(UPSafeCell::new(blk))
         }
     }
 
