@@ -45,6 +45,14 @@ fn kernel_callback(context: &mut TrapFrame) -> TrapType {
             }
             TrapType::LoadPageFault(stval)
         }
+        Trap::Exception(Exception::LoadMisaligned) => {
+            log::error!("kernel LoadMisaligned at {:#x} sepc {:#x}", stval, context.sepc);
+            TrapType::LoadPageFault(stval)
+        }
+        Trap::Exception(Exception::StoreMisaligned) => {
+            log::error!("kernel StoreMisaligned at {:#x} sepc {:#x}", stval, context.sepc);
+            TrapType::StorePageFault(stval)
+        }
         Trap::Exception(Exception::UserEnvCall) => TrapType::SysCall,
         // 时钟中断
         Trap::Interrupt(Interrupt::SupervisorTimer) => {

@@ -139,21 +139,32 @@ impl MemorySet {
             let mut new_area = MapArea::from_another(area);
             for (&vpn, frame) in area.data_frames.iter() {
                 if !shared {
-                    let new_frame = frame_alloc()?;
-                    memory_set.page_table.map_page(
-                        vpn,
-                        new_frame.paddr,
-                        area.map_perm.into(),
-                        MappingSize::Page4KB,
-                    );
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            frame.paddr.get_ptr::<u8>(),
-                            new_frame.paddr.get_mut_ptr(),
-                            PAGE_SIZE,
+                    if area.is_shared {
+                        let shared_frame = frame.shared_clone();
+                        memory_set.page_table.map_page(
+                            vpn,
+                            shared_frame.paddr,
+                            area.map_perm.into(),
+                            MappingSize::Page4KB,
                         );
+                        new_area.data_frames.insert(vpn, shared_frame);
+                    } else {
+                        let new_frame = frame_alloc()?;
+                        memory_set.page_table.map_page(
+                            vpn,
+                            new_frame.paddr,
+                            area.map_perm.into(),
+                            MappingSize::Page4KB,
+                        );
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                frame.paddr.get_ptr::<u8>(),
+                                new_frame.paddr.get_mut_ptr(),
+                                PAGE_SIZE,
+                            );
+                        }
+                        new_area.data_frames.insert(vpn, new_frame);
                     }
-                    new_area.data_frames.insert(vpn, new_frame);
                 } else {
                     new_area.data_frames.insert(vpn, frame.shared_clone());
                 }
@@ -200,11 +211,16 @@ impl MemorySet {
         let (paddr, _) = translated.unwrap();
         let old = area.data_frames.get(&vpn).unwrap();
         if old.is_shared() {
-            let f = match frame_alloc() { Some(f) => f, None => return false };
-            unsafe { core::ptr::copy_nonoverlapping(paddr.get_ptr::<u8>(), f.paddr.get_mut_ptr(), PAGE_SIZE); }
-            self.page_table.unmap_page(vpn);
-            self.page_table.map_page(vpn, f.paddr, area.map_perm.into(), MappingSize::Page4KB);
-            area.data_frames.insert(vpn, f);
+            if area.is_shared {
+                self.page_table.unmap_page(vpn);
+                self.page_table.map_page(vpn, paddr, area.map_perm.into(), MappingSize::Page4KB);
+            } else {
+                let f = match frame_alloc() { Some(f) => f, None => return false };
+                unsafe { core::ptr::copy_nonoverlapping(paddr.get_ptr::<u8>(), f.paddr.get_mut_ptr(), PAGE_SIZE); }
+                self.page_table.unmap_page(vpn);
+                self.page_table.map_page(vpn, f.paddr, area.map_perm.into(), MappingSize::Page4KB);
+                area.data_frames.insert(vpn, f);
+            }
         } else {
             self.page_table.unmap_page(vpn);
             self.page_table.map_page(vpn, paddr, area.map_perm.into(), MappingSize::Page4KB);
@@ -352,10 +368,12 @@ impl MemorySet {
         permission: MapPermission,
         file: alloc::sync::Arc<dyn crate::fs::File>,
         offset: usize,
+        is_shared: bool,
     ) -> bool {
         let mut map_area = MapArea::new(start_addr, end_addr, MapType::Framed, permission);
         map_area.file = Some(file);
         map_area.file_offset = offset;
+        map_area.is_shared = is_shared;
         self.areas.push(map_area);
         true
     }
@@ -458,10 +476,11 @@ pub struct MapArea {
     pub vaddr_range: VAddrRange,
     data_frames: BTreeMap<VirtAddr, FrameTracker>,
     map_type: MapType,
-    map_perm: MapPermission,
+    pub map_perm: MapPermission,
     file: Option<alloc::sync::Arc<dyn crate::fs::File>>,
     file_offset: usize,
     dirty: alloc::collections::BTreeSet<VirtAddr>,
+    pub is_shared: bool,
 }
 
 impl MapArea {
@@ -484,6 +503,7 @@ impl MapArea {
             file: None,
             file_offset: 0,
             dirty: alloc::collections::BTreeSet::new(),
+            is_shared: false,
         }
     }
     pub fn from_another(another: &MapArea) -> Self {
@@ -498,6 +518,7 @@ impl MapArea {
             file: another.file.clone(),
             file_offset: another.file_offset,
             dirty: alloc::collections::BTreeSet::new(),
+            is_shared: another.is_shared,
         }
     }
     pub fn map(&mut self, page_table: &Arc<PageTableWrapper>) -> Result<(), ()> {

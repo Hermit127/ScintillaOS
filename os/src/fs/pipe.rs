@@ -17,21 +17,24 @@ pub struct Pipe {
     readable: bool,
     writable: bool,
     buffer: Arc<UPSafeCell<PipeRingBuffer>>,
+    is_nonblock: bool,
 }
 
 impl Pipe {
-    pub fn read_end_with_buffer(buffer: Arc<UPSafeCell<PipeRingBuffer>>) -> Self {
+    pub fn read_end_with_buffer(buffer: Arc<UPSafeCell<PipeRingBuffer>>, is_nonblock: bool) -> Self {
         Self {
             readable: true,
             writable: false,
             buffer,
+            is_nonblock,
         }
     }
-    pub fn write_end_with_buffer(buffer: Arc<UPSafeCell<PipeRingBuffer>>) -> Self {
+    pub fn write_end_with_buffer(buffer: Arc<UPSafeCell<PipeRingBuffer>>, is_nonblock: bool) -> Self {
         Self {
             readable: false,
             writable: true,
             buffer,
+            is_nonblock,
         }
     }
 }
@@ -109,7 +112,7 @@ impl PipeRingBuffer {
         }
     }
     pub fn all_write_ends_closed(&self) -> bool {
-        self.write_end.as_ref().unwrap().upgrade().is_none() && self.write_open == 0
+        self.write_end.as_ref().map_or(true, |w| w.upgrade().is_none()) && self.write_open == 0
     }
     pub fn all_read_ends_closed(&self) -> bool {
         self.read_end.as_ref().map_or(true, |r| r.upgrade().is_none()) && self.read_open == 0
@@ -133,10 +136,13 @@ impl PipeRingBuffer {
 }
 
 /// Return (read_end, write_end)
-pub fn make_pipe() -> (Arc<Pipe>, Arc<Pipe>) {
+pub fn make_pipe(flags: usize) -> (Arc<Pipe>, Arc<Pipe>) {
+    const O_NONBLOCK: usize = 0x800;
+    let is_nonblock = (flags & O_NONBLOCK) != 0;
     let buffer = Arc::new(unsafe { UPSafeCell::new_named(PipeRingBuffer::new(), "PipeRingBuffer") });
-    let read_end = Arc::new(Pipe::read_end_with_buffer(buffer.clone()));
-    let write_end = Arc::new(Pipe::write_end_with_buffer(buffer.clone()));
+    let read_end = Arc::new(Pipe::read_end_with_buffer(buffer.clone(), is_nonblock));
+    let write_end = Arc::new(Pipe::write_end_with_buffer(buffer.clone(), is_nonblock));
+    buffer.exclusive_access().set_write_end(&write_end);
     buffer.exclusive_access().set_read_end(&read_end);
     (read_end, write_end)
 }
@@ -172,6 +178,9 @@ impl File for Pipe {
                 }
                 if already_read > 0 {
                     return already_read as isize;
+                }
+                if self.is_nonblock {
+                    return -11;
                 }
                 if has_pending_signals() {
                     return already_read as isize;
@@ -230,7 +239,18 @@ impl File for Pipe {
                 return -32;
             }
             if loop_write == 0 {
-                return already_write as isize;
+                if self.is_nonblock && already_write == 0 {
+                    return -11;
+                }
+                if already_write > 0 {
+                    return already_write as isize;
+                }
+                if has_pending_signals() {
+                    return -4;
+                }
+                stdout_release_if_owner();
+                suspend_current_and_run_next();
+                continue;
             }
             let mut ring_buffer = self.buffer.exclusive_access();
             let mut made_progress = false;

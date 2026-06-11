@@ -886,7 +886,7 @@ pub fn sys_pipe2(pipe: *mut usize, flags: usize) -> isize {
     let token = current_user_token();
     let (read_fd, write_fd) = {
         let mut inner = task.inner_exclusive_access();
-        let (pipe_read, pipe_write) = make_pipe();
+        let (pipe_read, pipe_write) = make_pipe(flags);
         let read_fd = inner.alloc_fd();
         if read_fd >= inner.fd_table.len() { return -24; }
         inner.fd_table[read_fd] = Some(pipe_read);

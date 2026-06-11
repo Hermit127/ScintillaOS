@@ -551,6 +551,11 @@ pub fn sys_mmap(
     if start % crate::config::PAGE_SIZE != 0 || len == 0 {
         return -1;
     }
+    let end = start.checked_add(len);
+    if end.is_none() {
+        return -22;
+    }
+    let end = end.unwrap();
 
     let task = crate::task::current_task().unwrap();
     let mut inner = task.inner_exclusive_access();
@@ -567,7 +572,11 @@ pub fn sys_mmap(
 
     if (flags & MAP_ANONYMOUS) != 0 {
         let start_addr = polyhal::VirtAddr::from(real_start);
-        let end_addr = polyhal::VirtAddr::from(real_start + len);
+        let real_end = real_start.checked_add(len).unwrap_or(usize::MAX);
+        let end_addr = polyhal::VirtAddr::from(real_end);
+        if end_addr <= start_addr {
+            return -22;
+        }
         if (flags & MAP_FIXED) != 0 && inner.memory_set.is_overlap(start_addr, end_addr) {
             inner.memory_set.munmap(start_addr, end_addr);
         }
@@ -577,7 +586,11 @@ pub fn sys_mmap(
         return real_start as isize;
     } else {
         let start_addr = polyhal::VirtAddr::from(real_start);
-        let end_addr = polyhal::VirtAddr::from(real_start + len);
+        let real_end = real_start.checked_add(len).unwrap_or(usize::MAX);
+        let end_addr = polyhal::VirtAddr::from(real_end);
+        if end_addr <= start_addr {
+            return -22;
+        }
         if (flags & MAP_FIXED) != 0 && inner.memory_set.is_overlap(start_addr, end_addr) {
             inner.memory_set.munmap(start_addr, end_addr);
         }
@@ -587,9 +600,10 @@ pub fn sys_mmap(
         }
 
         if let Some(file) = inner.fd_table[fd as usize].clone() {
+            let is_shared = (flags & MAP_SHARED) != 0;
             let ok = inner
                 .memory_set
-                .insert_file_area(start_addr, end_addr, permission, file, offset);
+                .insert_file_area(start_addr, end_addr, permission, file, offset, is_shared);
             if ok {
                 return real_start as isize;
             } else {
@@ -965,6 +979,14 @@ pub fn sys_ppoll(
 
         if ready > 0 {
             return ready as isize;
+        }
+
+        let task = current_task().unwrap();
+        let inner = task.inner_exclusive_access();
+        let has_signal = !inner.signals.is_empty();
+        drop(inner);
+        if has_signal {
+            return -4;
         }
 
         if !tmo_p.is_null() {
@@ -1908,7 +1930,15 @@ pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset_ptr: *mut usize, count: 
         return -9;
     }
 
+    drop(inner);
+
     let saved_in_off = if !offset_ptr.is_null() {
+        let task2 = current_task().unwrap();
+        let inner2 = task2.inner_exclusive_access();
+        if !inner2.memory_set.valid_user_buf(offset_ptr as *const u8, core::mem::size_of::<usize>(), false) {
+            return -14;
+        }
+        drop(inner2);
         let off = in_file.get_offset();
         let user_off = *translated_ref(token, offset_ptr);
         in_file.seek(user_off);
@@ -1916,8 +1946,6 @@ pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset_ptr: *mut usize, count: 
     } else {
         None
     };
-
-    drop(inner);
 
     let mut total: isize = 0;
     let mut buf = [0u8; 4096];
@@ -1997,7 +2025,7 @@ pub fn sys_rt_sigtimedwait(set: *const u8, info: *mut u8, timeout: *const u8, si
     let saved_mask = {
         let mut inner = task.inner_exclusive_access();
         let old = inner.signal_mask;
-        inner.signal_mask = !mask;
+        inner.signal_mask &= !mask;
         old
     };
 
@@ -2031,6 +2059,10 @@ pub fn sys_rt_sigtimedwait(set: *const u8, info: *mut u8, timeout: *const u8, si
                 }
             }
             if inner.killed {
+                inner.signal_mask = saved_mask;
+                return -4; // EINTR
+            }
+            if !(inner.signals & !inner.signal_mask).is_empty() {
                 inner.signal_mask = saved_mask;
                 return -4; // EINTR
             }

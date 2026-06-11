@@ -1,7 +1,10 @@
 # LTP 子集测试状态报告
 
-> 统计截止：2026-06-04
+> 统计截止：2026-06-10
 > 架构：riscv64
+> 累计批次：23 批 | 累计覆盖：761 个不同测试（已移除 cgroup_core01-03、cgroup_fj_proc、cgroup_regression_fork_processes、cgroup_regression_getdelays、cgroup_xattr）
+
+## 全域回归列表（SUBSET_LIST）
 
 ---
 
@@ -326,6 +329,162 @@ wait01/02, waitpid01/03/04,
 write01-05, writev02/05/06,
 statvfs01/02, rmdir01-03, dup01-07,
 fcntl01-05/07-13/15-27/29/30
+```
+
+---
+
+## 第十七批子集（当前）
+
+共 **78** 个测试，覆盖 clone 全量（01-09）、creat/fallocate/madvise/mincore、rename/unlink 扩展、getrlimit/setrlimit/getrusage/gettimeofday、ioctl/newuname/swap/splice、hostname/domainname/eventfd/epoll、timerfd/timer/prctl、close/UID/GID 基础。
+
+```
+clone01-09, creat01/03/04, fallocate01-04,
+madvise01-03, mincore01-04,
+rename08-11, unlink09,
+getrlimit01/02, setrlimit01/02, getrusage03/04, gettimeofday01/02,
+ioctl01-03, newuname01, swapoff01, swapon01, splice01-04,
+sethostname02, setdomainname03,
+eventfd01/02, eventfd2_02,
+epoll_create1_01, epoll_ctl01, epoll_wait01, epoll_pwait01,
+timerfd_create01, timerfd_settime01, timerfd_gettime01,
+timer_settime01, timer_gettime01, timer_delete01,
+prctl01-05, close01/02,
+getegid01, geteuid01, getgid01, getuid01,
+setresuid01, setresgid01, setreuid01, setregid01,
+getresuid01, getresgid01
+```
+
+---
+
+## 第十八批子集（当前）
+
+共 **88** 个测试，覆盖 UID/GID/setfsgid/setfsuid、cacheflush/modify_ldt、migrate_pages/move_pages、bpf 全量、add_key/request_key/keyctl、capget/capset/getrandom/adjtimex、clock_settime/settimeofday/reboot/vfork、mount/sync_file_range/readahead/copy_file_range/memfd、vhangup/profil/gettid/tgkill/readdir/realpath、xattr 全量（含 l*/f* 系列）、priority/prctl/sysctl、preadv/pwritev、sendmmsg/recvmmsg、fsync/fdatasync。
+
+```
+setfsgid01, setfsuid01, cacheflush01,
+modify_ldt01/02, migrate_pages01, move_pages02,
+bpf_map01, bpf_prog01-07,
+add_key01-05, request_key01-04, keyctl01-04,
+capget01/02, capset01/02, getrandom01-04, adjtimex01-03,
+clock_settime01-03, settimeofday01/02, reboot01/02, vfork01/02,
+mount07, sync_file_range01/02, readahead02, copy_file_range03,
+memfd_create03/04, vhangup01, profil01, gettid01/02, tgkill01,
+readdir01, realpath01,
+fgetxattr02/03, setxattr02/03, flistxattr02/03, lgetxattr01,
+llistxattr01, removexattr01, lremovexattr01, fremovexattr01,
+getpriority02, setpriority02, prctl06-08, sysctl01,
+preadv03, pwritev03,
+sendmmsg01, recvmmsg01, fsync04, fdatasync02/03,
+setfsgid02, setfsuid02
+```
+
+---
+
+---
+
+## 第十九批子集（当前）
+
+共 **56** 个测试，**全部为新测试用例**，与之前 18 批无重复。覆盖 abs/access/acct、add_key/adjtimex、af_alg 全量（加密）、aio、arch_prctl/asapi/aslr/atof、bind/bpf 深层、cap_bounds/capget/capset/cfs_bandwidth、cgroup、chmod/chown、chroot/clock_adjtime、can。
+
+```
+abs01, access03/04, acct02,
+add_key02-05, adjtimex02/03,
+af_alg01-07, aio01/02,
+arch_prctl01, asapi_01-03, aslr01, atof01,
+bind04-06, bpf_prog02-07,
+cap_bounds_r, cap_bounds_rw, cap_bset_inh_bounds,
+capget02, capset02/04, cfs_bandwidth01,
+cgroup_core01-03, cgroup_xattr,
+chmod05-07, chown05, chroot03/04,
+clock_adjtime01/02,
+can_bcm01, can_filter, can_rcv_own_msgs
+```
+
+---
+
+## 第二十批子集（当前）
+
+共 **55** 个测试，覆盖 aio/autogroup、bind/bpf/block_dev、cap_bounds/capset、cgroup 深层、check_*、chmod/chown_16、chroot/clock_nanosleep、clone/creat、epoll/eventfd/exec、fallocate/fchdir/fcntl、fgetxattr/flistxattr/fremovexattr、flock/fork/fsync。
+
+```
+aio02, autogroup01, bind05/06, bpf_prog03/04, block_dev,
+cap_bounds_r, cap_bounds_rw, cap_bset_inh_bounds, capset03/04,
+cgroup_core02/03, cgroup_fj_proc, cgroup_regression_fork_processes,
+cgroup_regression_getdelays, cgroup_xattr,
+check_keepcaps, check_simple_capset,
+chmod06/07, chown01-05_16,
+chroot04, clock_adjtime02, clock_nanosleep03/04,
+clone07/08, creat03/04,
+epoll_ctl03, epoll_pwait03, eventfd03/04, execve03/04,
+fallocate05, fchdir02/03, fcntl33-36,
+fgetxattr03, flistxattr03,
+flock04/06, fork07, fsync03
+```
+
+---
+
+## 第二十一批子集（当前）
+
+共 **53** 个测试，覆盖 aio/bpf、cgroup/check_*、chown_16、clock_settime/clone/clone3、confstr/cpuacct/cpuctl/cpufreq/cpuhotplug、creat/epoll/eventfd/exec、fchdir/fcntl/fstat/fstatfs。
+
+```
+aiodio_append, aiodio_sparse, block_dev,
+bpf_prog04-07, capset04,
+cgroup_core03, cgroup_regression_getdelays, cgroup_xattr,
+check_envval, check_keepcaps, check_simple_capset,
+chmod07, chown01-05_16,
+clock_settime02/03,
+clone02-06/08/09, clone301-303,
+confstr01, cpuacct_task,
+cpuctl_def_task01-03, cpuctl_test01-04,
+cpufreq_boost,
+cpuhotplug_do_disk_write_loop, cpuhotplug_do_kcompile_loop,
+creat04, epoll_wait03, eventfd04, execve05,
+fchdir03, fcntl35/36, fstat03, fstatfs01
+```
+
+---
+
+## 第二十二批子集
+
+共 **49** 个测试，覆盖 aiocp/aio、bpf、cgroup/check_*、chown_16、clock/clone/clone3、cpuacct/cpuctl/cpufreq/cpuhotplug/cpuset、crash/creat、eventfd、exec/fallocate/fcntl/flock/fork/getdents。
+
+```
+aiocp, aiodio_append, aiodio_sparse, block_dev,
+bpf_prog05-07, cgroup_regression_getdelays, cgroup_xattr,
+check_envval, check_keepcaps, check_simple_capset,
+chown01-05_16, clock_settime03,
+clone03-06/08/09, clone302/303,
+cpuacct_task, cpuctl_def_task02-04, cpuctl_test02-04,
+cpufreq_boost, cpuhotplug_do_disk_write_loop,
+cpuhotplug_do_kcompile_loop, cpuhotplug_do_spin_loop, cpuset01,
+crash01, creat06/07, eventfd05,
+execve02, fallocate03, fcntl34, flock06, fork08/09, getdents02
+```
+
+---
+
+## 第二十三批子集（当前）
+
+共 **53** 个测试，覆盖 acl/add_key/adjtimex/delete_module、af_alg/aio、asapi/bind、can、cap_bounds、get_*/check_netem、clock/clone、cpuctl/cpuhotplug、creat/create_*、crypto/cve。（cgroup_fj_proc、cgroup_regression_fork_processes 未实现，替换为 get_mempolicy01、get_robust_list01；access04 已测过，替换为 delete_module03）
+
+```
+access04, acl1, add_key03/04/05, adjtimex03, delete_module03,
+af_alg02-07, aio-stress, aiocp,
+asapi_02/03, bind06,
+can_filter, can_rcv_own_msgs,
+cap_bounds_r, cap_bounds_rw, cap_bset_inh_bounds,
+get_mempolicy01, get_robust_list01,
+check_netem, check_pe, check_setkey,
+clock_nanosleep04,
+clone04-06/08/09, clone303,
+cpuctl_fj_cpu-hog, cpuctl_fj_simple_echo,
+cpuctl_latency_check_task, cpuctl_latency_test,
+cpuhotplug_report_proc_interrupts,
+creat08/09, create_datafile, create_file,
+crypto_user01/02,
+cve-2014-0196, cve-2015-3290, cve-2016-10044,
+cve-2016-7042, cve-2016-7117, cve-2017-16939
 ```
 
 ---
