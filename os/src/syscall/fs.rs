@@ -5,6 +5,7 @@ use crate::fs::{
 };
 use crate::mm::{translated_byte_buffer, translated_refmut, translated_str};
 use crate::task::{current_task, current_user_token};
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 
@@ -151,7 +152,8 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> isize
     if path.is_empty() {
         return -2;
     }
-    if let Some(existing) = vfs_resolve_with_fallback(&base, path.as_str()) {
+    let existing = vfs_resolve_with_fallback(&base, path.as_str());
+    if let Some(existing) = existing {
         if open_flags.directory_requested() && !existing.is_dir {
             return -20;
         }
@@ -1347,12 +1349,20 @@ pub fn sys_mount(
         "vdd" => Arc::new(VirtIOBlock::new_at(polyhal::PhysAddr::new(0x10004000))),
         _ => BLOCK_DEVICE.clone(),
     };
-    let sb = match VfsSuperBlock::new_ext4(blk_dev, "ext4") {
+    let mut lwext4_mount_path =
+        String::from(target_path.trim_end_matches('\0').trim_end_matches('/'));
+    if lwext4_mount_path.is_empty() {
+        lwext4_mount_path.push('/');
+    } else if lwext4_mount_path != "/" {
+        lwext4_mount_path.push('/');
+    }
+
+    let sb = match VfsSuperBlock::new_ext4_at(blk_dev, "ext4", lwext4_mount_path.as_str()) {
         Some(sb) => sb,
         None => return -17,
     };
 
-    if vfs_mount(mnt_point, sb) {
+    if vfs_mount(mnt_point, sb, lwext4_mount_path.as_str()) {
         0
     } else {
         -16

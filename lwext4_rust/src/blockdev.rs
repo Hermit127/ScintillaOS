@@ -106,7 +106,7 @@ impl<K: KernelDevOp> Ext4BlockWrapper<K> {
         let c_mountpoint = if dev_name_str == "ext4_root" {
             CString::new("/").unwrap()
         } else {
-            CString::new("/mp/").unwrap()
+            CString::new(mount_point).unwrap()
         };
         let c_mountpoint = c_mountpoint.as_bytes_with_nul();
 

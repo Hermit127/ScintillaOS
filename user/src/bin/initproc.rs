@@ -36,12 +36,9 @@ fn bind_loaders() {
 
 fn install_busybox() {
     sys_mkdir(b"/bin\0".as_ptr(), 0o777);
-    let r1 = symlinkat("/busybox\0", "/bin/sh\0");
-    println!("[initproc] symlink 1: {}", r1);
-    let r2 = symlinkat("/busybox\0", "/bin/cat\0");
-    println!("[initproc] symlink 2: {}", r2);
-    let r3 = symlinkat("/busybox\0", "/bin/ls\0");
-    println!("[initproc] symlink 3: {}", r3);
+    let ret = symlinkat("/busybox\0", "/bin/sh\0");
+    if ret == 0 { println!("[initproc] /bin/sh created"); }
+
     let args: [*const u8; 5] = [
         b"/busybox\0".as_ptr(),
         b"--install\0".as_ptr(),

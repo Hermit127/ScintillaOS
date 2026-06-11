@@ -62,13 +62,25 @@ impl VfsSuperBlock {
         blk_device: Arc<dyn crate::drivers::BlockDevice>,
         fs_type: &'static str,
     ) -> Option<Arc<Self>> {
+        Self::new_ext4_at(blk_device, fs_type, "/mp/")
+    }
+
+    pub fn new_ext4_at(
+        blk_device: Arc<dyn crate::drivers::BlockDevice>,
+        fs_type: &'static str,
+        mount_point: &str,
+    ) -> Option<Arc<Self>> {
         const DISK_SIZE_512M: u64 = 512 * 1024 * 1024;
         let stream = BlockDeviceStream {
             inner: blk_device,
             pos: 0,
             total_size: DISK_SIZE_512M,
         };
-        let ext4 = Ext4BlockWrapper::<BlockDeviceStreamOp>::new(stream).ok()?;
+        let ext4 = Ext4BlockWrapper::<BlockDeviceStreamOp>::new_with_name(
+            stream,
+            "ext4_fs",
+            mount_point,
+        ).ok()?;
         Some(Arc::new(VfsSuperBlock {
             fs_type,
             fs_data: unsafe { UPSafeCell::new_named(FsInner::Ext4(Ext4Wrapper(ext4)), "VfsFsData") },
@@ -559,7 +571,7 @@ lazy_static! {
 fn lookup_mount(dentry: &Arc<Dentry>) -> Option<Arc<Dentry>> {
     let table = MOUNT_TABLE.exclusive_access();
     for m in table.iter() {
-        if Arc::ptr_eq(&m.mnt_point, dentry) {
+        if Arc::ptr_eq(&m.mnt_point, dentry) || m.mnt_point.path == dentry.path {
             return Some(m.mnt_root.clone());
         }
     }
@@ -569,7 +581,7 @@ fn lookup_mount(dentry: &Arc<Dentry>) -> Option<Arc<Dentry>> {
 fn is_mount_root(dentry: &Arc<Dentry>) -> Option<Arc<Dentry>> {
     let table = MOUNT_TABLE.exclusive_access();
     for m in table.iter() {
-        if Arc::ptr_eq(&m.mnt_root, dentry) {
+        if Arc::ptr_eq(&m.mnt_root, dentry) || m.mnt_root.path == dentry.path {
             return Some(m.mnt_point.clone());
         }
     }
@@ -664,7 +676,7 @@ pub fn vfs_resolve_path(start: &Arc<Dentry>, path: &str) -> Option<Arc<Dentry>> 
         }
     }
 
-    Some(current)
+    lookup_mount(&current).or(Some(current))
 }
 
 pub fn vfs_resolve_with_fallback(start: &Arc<Dentry>, path: &str) -> Option<Arc<Dentry>> {
@@ -746,7 +758,7 @@ pub fn vfs_create(parent: &Arc<Dentry>, name: &str, is_dir: bool, mode: u32) -> 
 
 // ==================== Mount Operations ====================
 
-pub fn vfs_mount(mnt_point: Arc<Dentry>, sb: Arc<VfsSuperBlock>) -> bool {
+pub fn vfs_mount(mnt_point: Arc<Dentry>, sb: Arc<VfsSuperBlock>, fs_path: &str) -> bool {
     let path = mnt_point.path.clone();
     {
         let table = MOUNT_TABLE.exclusive_access();
@@ -758,7 +770,7 @@ pub fn vfs_mount(mnt_point: Arc<Dentry>, sb: Arc<VfsSuperBlock>) -> bool {
         }
     }
 
-    let mnt_root = Dentry::new_mount_root(sb, mnt_point.path.clone(), "/mp/");
+    let mnt_root = Dentry::new_mount_root(sb, mnt_point.path.clone(), fs_path);
 
     MOUNT_TABLE.exclusive_access().push(Mount {
         mnt_point: mnt_point.clone(),
@@ -805,7 +817,7 @@ pub fn mount_test_disk_at(mnt_point: Arc<Dentry>) -> bool {
         Some(sb) => sb,
         None => return false,
     };
-    vfs_mount(mnt_point, test_sb)
+    vfs_mount(mnt_point, test_sb, "/mp/")
 }
 
 pub fn list_apps() {

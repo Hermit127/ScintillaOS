@@ -307,6 +307,9 @@ fn follow_symlink(start: &Arc<Dentry>, dentry: Arc<Dentry>, depth: usize) -> Opt
     if depth >= 8 {
         return None;
     }
+    if dentry.is_dir {
+        return Some(dentry);
+    }
     let info = dentry.super_block.get_inode_info(&dentry.fs_path)?;
     if !info.is_link {
         return Some(dentry);
@@ -314,7 +317,7 @@ fn follow_symlink(start: &Arc<Dentry>, dentry: Arc<Dentry>, depth: usize) -> Opt
 
     let mut target = alloc::vec![0u8; 512];
     let n = dentry.super_block.read_at(&dentry.fs_path, 0, &mut target);
-    target.truncate(n);
+    target.truncate(n as usize);
     let target = core::str::from_utf8(&target).ok()?.trim_matches('\0');
     if target.is_empty() {
         return None;
@@ -678,8 +681,6 @@ pub fn symlink_at(base: Option<Arc<Dentry>>, target: &str, linkpath: &str) -> bo
             link_cpath.as_ptr() as *const core::ffi::c_char,
         )
     };
-    if rc != EOK as i32 {
-        crate::println!("[symlink_at] ext4_fsymlink({} -> {}) = {}", target, link_fs_path, rc);
-    }
+
     rc == EOK as i32
 }
