@@ -141,26 +141,6 @@ impl VfsSuperBlock {
 
     pub fn get_inode_info(&self, fs_path: &str) -> Option<InodeInfo> {
         self.with_fs(|_fs| {
-            let c_path = CString::new(fs_path).ok()?;
-            let c_path = c_path.into_raw();
-
-            let mut file: ext4_file = unsafe { core::mem::zeroed() };
-            let flags = CString::new("rb").ok()?;
-            let flags_ptr = flags.into_raw();
-
-            let rc = unsafe { ext4_fopen(&mut file, c_path, flags_ptr) };
-            unsafe {
-                drop(CString::from_raw(c_path));
-                drop(CString::from_raw(flags_ptr));
-            }
-
-            if rc != EOK as i32 {
-                return None;
-            }
-
-            let inode_num = file.inode;
-            let size = unsafe { ext4_fsize(&mut file) };
-
             let mut mode: u32 = 0;
             let c_path2 = CString::new(fs_path).ok()?;
             let _mode_rc = unsafe { ext4_mode_get(c_path2.as_ptr() as *const c_char, &mut mode) };
@@ -172,8 +152,6 @@ impl VfsSuperBlock {
                 ext4_owner_get(c_path_owner.as_ptr() as *const c_char, &mut uid, &mut gid);
             }
 
-            let is_link = mode & 0xA000 == 0xA000;
-
             let mut atime: u32 = 0;
             let mut mtime: u32 = 0;
             let mut ctime: u32 = 0;
@@ -184,23 +162,41 @@ impl VfsSuperBlock {
                 ext4_ctime_get(c_path3.as_ptr() as *const c_char, &mut ctime);
             }
 
-            unsafe {
-                ext4_fclose(&mut file);
-            }
+            let is_link = mode & 0xA000 == 0xA000;
+            let mut file: ext4_file = unsafe { core::mem::zeroed() };
+            let c_path_file = CString::new(fs_path).ok()?;
+            let flags = CString::new("rb").ok()?;
+            let file_rc = unsafe {
+                ext4_fopen(
+                    &mut file,
+                    c_path_file.as_ptr() as *const c_char,
+                    flags.as_ptr() as *const c_char,
+                )
+            };
 
-            let mut is_dir = (mode & 0x4000) != 0;
-            if !is_dir {
+            let (inode_num, size, is_dir) = if file_rc == EOK as i32 {
+                let inode_num = file.inode;
+                let size = unsafe { ext4_fsize(&mut file) };
+                unsafe {
+                    ext4_fclose(&mut file);
+                }
+                (inode_num, size, (mode & 0x4000) != 0)
+            } else {
                 let mut dir: ext4_dir = unsafe { core::mem::zeroed() };
                 let c_path_dir = CString::new(fs_path).ok()?;
-                let rc = unsafe { ext4_dir_open(&mut dir, c_path_dir.as_ptr() as *const c_char) };
-                if rc == EOK as i32 {
-                    is_dir = true;
-                    mode = (mode & 0o7777) | 0o040000;
-                    unsafe {
-                        ext4_dir_close(&mut dir);
-                    }
+                let dir_rc = unsafe { ext4_dir_open(&mut dir, c_path_dir.as_ptr() as *const c_char) };
+                if dir_rc != EOK as i32 {
+                    return None;
                 }
-            }
+                let inode_num = dir.f.inode;
+                let size = dir.f.fsize;
+                unsafe {
+                    ext4_dir_close(&mut dir);
+                }
+                mode = (mode & 0o7777) | 0o040000;
+                (inode_num, size, true)
+            };
+
             Some(InodeInfo {
                 inode_num,
                 is_dir,
@@ -618,6 +614,8 @@ pub fn vfs_lookup(parent: &Arc<Dentry>, name: &str) -> Option<Arc<Dentry>> {
 
     let child_fs_path = if parent.fs_path == "/" {
         format!("/{}", name)
+    } else if parent.fs_path.ends_with('/') {
+        format!("{}{}", parent.fs_path, name)
     } else {
         format!("{}/{}", parent.fs_path, name)
     };

@@ -62,12 +62,17 @@ fn list_dir(path: &str) -> Vec<String> {
     if fd < 0 { return Vec::new(); }
     let mut buf = [0u8; 4096];
     let mut names = Vec::new();
+    let mut rounds = 0;
     loop {
+        rounds += 1;
+        if rounds > 64 { break; }
         let n = getdents64(fd as usize, &mut buf);
         if n <= 0 { break; }
         let mut pos = 0;
         while pos < n as usize {
+            if pos + 19 > n as usize { break; }
             let d_reclen = u16::from_le_bytes([buf[pos+16], buf[pos+17]]) as usize;
+            if d_reclen < 19 || pos + d_reclen > n as usize { break; }
             let name_start = pos + 19;
             let mut name_len = 0;
             while name_start + name_len < pos + d_reclen && buf[name_start + name_len] != 0 { name_len += 1; }
@@ -81,6 +86,15 @@ fn list_dir(path: &str) -> Vec<String> {
     names
 }
 
+fn join_path(dir: &str, name: &str) -> String {
+    let mut base = String::from(dir.trim_end_matches('\0'));
+    if !base.ends_with('/') {
+        base.push('/');
+    }
+    base.push_str(name);
+    base
+}
+
 fn run_script(dir: &str, script: &str) {
     let script_arg = String::from("./") + script + "\0";
     let args: [*const u8; 3] = [b"sh\0".as_ptr(), script_arg.as_ptr(), core::ptr::null()];
@@ -90,6 +104,40 @@ fn run_script(dir: &str, script: &str) {
         exec("/busybox\0", &args);
         exit(127);
     } else if pid > 0 { let mut ec = 0; waitpid(pid as usize, &mut ec); }
+}
+
+fn scan_and_run(dir: &str, depth: usize) -> bool {
+    let entries = list_dir(dir);
+    println!(
+        "[initproc] {} has {} entries",
+        dir.trim_end_matches('\0'),
+        entries.len()
+    );
+
+    let mut found = false;
+    for entry in &entries {
+        if entry.ends_with("_testcode.sh") {
+            println!("[initproc] [RUN] {}{}", dir.trim_end_matches('\0'), entry);
+            run_script(dir, entry);
+            found = true;
+        }
+    }
+
+    if depth == 0 {
+        return found;
+    }
+
+    for entry in &entries {
+        if entry == "lost+found" || entry.ends_with(".sh") || entry.ends_with(".txt") {
+            continue;
+        }
+        let mut next = join_path(dir, entry);
+        next.push_str("/\0");
+        if scan_and_run(&next, depth - 1) {
+            found = true;
+        }
+    }
+    found
 }
 
 #[no_mangle]
@@ -106,30 +154,38 @@ fn main() -> i32 {
         bind_loaders();
     }
 
-    // Scan /mnt for subdirectories containing *_testcode.sh (A20-style)
-    let entries = list_dir("/mnt/\0");
-    println!("[initproc] /mnt/ has {} entries", entries.len());
+    #[cfg(target_arch = "riscv64")]
+    let candidate_dirs: [&str; 6] = [
+        "/mnt/riscv/musl/\0",
+        "/mnt/riscv/glibc/\0",
+        "/mnt/musl/\0",
+        "/mnt/glibc/\0",
+        "/mnt/basic/\0",
+        "/mnt/\0",
+    ];
+    #[cfg(target_arch = "loongarch64")]
+    let candidate_dirs: [&str; 6] = [
+        "/mnt/loongarch/musl/\0",
+        "/mnt/loongarch/glibc/\0",
+        "/mnt/musl/\0",
+        "/mnt/glibc/\0",
+        "/mnt/basic/\0",
+        "/mnt/\0",
+    ];
+    #[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
+    let candidate_dirs: [&str; 4] = ["/mnt/musl/\0", "/mnt/glibc/\0", "/mnt/basic/\0", "/mnt/\0"];
+
     let mut found = false;
-    for sub in &entries {
-        if sub == "lost+found" { continue; }
-        let subpath = String::from("/mnt/") + sub + "/\0";
-        let scripts = list_dir(&subpath);
-        println!("[initproc] /mnt/{}/ has {} entries", sub, scripts.len());
-        for s in &scripts {
-            if !s.ends_with("_testcode.sh") { continue; }
+    for dir in &candidate_dirs {
+        if scan_and_run(dir, 0) {
             found = true;
-            println!("[initproc] [RUN] {}/{}", sub, s);
-            run_script(&subpath, s);
         }
     }
-
-    // Fallback: scripts at /mnt root
     if !found {
-        for s in &entries {
-            if !s.ends_with("_testcode.sh") { continue; }
-            println!("[initproc] [RUN] /mnt/{}", s);
-            run_script("/mnt/\0", s);
-        }
+        found = scan_and_run("/mnt/\0", 4);
+    }
+    if !found {
+        println!("[initproc] no test scripts found");
     }
 
     println!("[initproc] === DONE ===");
