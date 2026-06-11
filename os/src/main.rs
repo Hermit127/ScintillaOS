@@ -46,6 +46,11 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
     if let Some(task) = crate::task::current_task() {
         task.record_time_user_to_kernel();
     }
+    static mut TRAP_COUNT: usize = 0;
+    unsafe { TRAP_COUNT += 1; }
+    if unsafe { TRAP_COUNT } <= 5 {
+        println!("[kernel] trap #{}, type={:?}", unsafe { TRAP_COUNT }, trap_type);
+    }
     // trace!("trap_type @ {:x?} {:#x?}", trap_type, ctx);
     match trap_type {
         Breakpoint => return,
@@ -53,9 +58,19 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             // jump to next instruction anyway
             ctx.syscall_ok();
             let args = ctx.args();
-            // get system call return value
-            // info!("syscall: {}", ctx[TrapFrameArgs::SYSCALL]);
-
+            let syscall_id = ctx[TrapFrameArgs::SYSCALL];
+            if syscall_id == 64 { // SYS_WRITE
+                let fd = args[0];
+                let buf_ptr = args[1] as *const u8;
+                let len = args[2];
+                // Read first few bytes of what the user is trying to write
+                if len > 0 && len <= 256 {
+                    let token = crate::task::current_user_token();
+                    let bytes = crate::mm::translated_byte_buffer(token, buf_ptr as *mut u8, len.min(64));
+                    let s = core::str::from_utf8(&bytes).unwrap_or("<non-utf8>");
+                    println!("[kernel] WRITE(fd={}, len={}): {}", fd, len, s);
+                }
+            }
             let result = syscall(
                 ctx[TrapFrameArgs::SYSCALL],
                 [args[0], args[1], args[2], args[3], args[4], args[5]],
@@ -67,15 +82,19 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             let vaddr = polyhal::VirtAddr::from(bad_addr);
             let task = crate::task::current_task().unwrap();
             let mut inner = task.inner_exclusive_access();
-            if !inner.memory_set.handle_page_fault(vaddr) {
+            let handled = inner.memory_set.handle_page_fault(vaddr);
+            println!("[kernel] PageFault at {:#x}, handled={}", bad_addr, handled);
+            if !handled {
                 drop(inner);
                 current_add_signal(SignalFlags::SIGSEGV);
             }
         }
         InstructionPageFault(_paddr) => {
+            println!("[kernel] InstructionPageFault at {:#x}", _paddr);
             current_add_signal(SignalFlags::SIGSEGV);
         }
-        IllegalInstruction(_) => {
+        IllegalInstruction(addr) => {
+            println!("[kernel] IllegalInstruction at {:#x}", addr);
             current_add_signal(SignalFlags::SIGILL);
         }
         Timer => {
@@ -146,6 +165,7 @@ fn main(hartid: usize) {
     fs::list_apps();
     task::init_kernel_page();
     task::add_initproc();
+    println!("[kernel] initproc added, starting run_tasks...");
     task::run_tasks();
     panic!("Unreachable in main function of rCore Tutorial kernel!");
 }

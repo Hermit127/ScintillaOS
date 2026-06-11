@@ -37,7 +37,7 @@ pub fn main(argc: usize, argv: &[&str]) -> i32 {
         }
         if !child_exited {
             println!("child has run for {}ms, kill it!", timeout_ms);
-            kill(pid, SignalFlags::SIGINT.bits());
+            kill(pid, SignalFlags::SIGINT.bits() as i32);
             assert_eq!(waitpid(pid, &mut exit_code) as usize, pid);
             println!("exit code of the child is {}", exit_code);
         }

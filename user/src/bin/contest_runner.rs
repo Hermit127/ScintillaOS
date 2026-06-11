@@ -138,6 +138,7 @@ fn run_iozone() {
 
 #[no_mangle]
 pub fn main() -> i32 {
+    println!("[contest_runner] started!");
     mount("", "/mnt\0", "ext4\0", 0, &[]);
 
     println!("#### OS COMP TEST GROUP START basic-musl ####");

@@ -178,10 +178,12 @@ pub fn sleep(period_ms: usize) {
 }
 
 /// Action for a signal
-#[repr(C, align(16))]
+#[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct SignalAction {
     pub handler: usize,
+    pub flags: usize,
+    pub restorer: usize,
     pub mask: SignalFlags,
 }
 
@@ -189,7 +191,9 @@ impl Default for SignalAction {
     fn default() -> Self {
         Self {
             handler: 0,
-            mask: SignalFlags::from_bits(40).unwrap(),
+            flags: 0,
+            restorer: 0,
+            mask: SignalFlags::empty(),
         }
     }
 }
@@ -228,8 +232,8 @@ pub const SIGPWR: i32 = 30;
 pub const SIGSYS: i32 = 31;
 
 bitflags! {
-    pub struct SignalFlags: i32 {
-        const SIGDEF = 1; // Default signal handling
+    pub struct SignalFlags: i64 {
+        const SIGDEF = 1;
         const SIGHUP = 1 << 1;
         const SIGINT = 1 << 2;
         const SIGQUIT = 1 << 3;
@@ -261,6 +265,8 @@ bitflags! {
         const SIGIO = 1 << 29;
         const SIGPWR = 1 << 30;
         const SIGSYS = 1 << 31;
+        const SIGCANCEL = 1 << 32;
+        const SIGSETXID = 1 << 33;
     }
 }
 
