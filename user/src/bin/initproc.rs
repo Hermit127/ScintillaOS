@@ -7,7 +7,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use user_lib::{close, exec, exit, fork, getdents64, open, shutdown, symlinkat, sys_mkdir, sys_mount, waitpid, OpenFlags};
+use user_lib::{close, exec, execve, exit, fork, getdents64, open, shutdown, symlinkat, sys_mkdir, sys_mount, waitpid, OpenFlags};
 
 fn bind_loaders() {
     sys_mkdir(b"/lib\0".as_ptr(), 0o777);
@@ -24,7 +24,16 @@ fn bind_loaders() {
         ("/mnt/musl/lib/libc.so", "/lib/ld-musl-riscv64.so.1"),
         ("/mnt/musl/lib/libc.so", "/lib/libc.so"),
     ];
-    #[cfg(not(target_arch = "riscv64"))]
+    #[cfg(target_arch = "loongarch64")]
+    let mappings: [(&str, &str); 6] = [
+        ("/mnt/glibc/lib/ld-linux-loongarch-lp64d.so.1", "/lib/ld-linux-loongarch-lp64d.so.1"),
+        ("/mnt/glibc/lib/libc.so.6", "/lib/libc.so.6"),
+        ("/mnt/glibc/lib/libm.so.6", "/lib/libm.so.6"),
+        ("/mnt/musl/lib/libc.so", "/lib/ld-musl-loongarch64.so.1"),
+        ("/mnt/musl/lib/libc.so", "/lib/ld-musl-loongarch-lp64d.so.1"),
+        ("/mnt/musl/lib/libc.so", "/lib/libc.so"),
+    ];
+    #[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
     let mappings: [(&str, &str); 0] = [];
 
     for (src, dst) in &mappings {
@@ -95,15 +104,85 @@ fn join_path(dir: &str, name: &str) -> String {
     base
 }
 
+fn script_priority(script: &str) -> u8 {
+    if script.starts_with("basic_") { 0 }
+    else if script.starts_with("lua_") { 1 }
+    else if script.starts_with("busybox_") { 2 }
+    else if script.starts_with("ltp_") { 3 }
+    else if script.starts_with("libctest_") { 4 }
+    else if script.starts_with("iperf_") { 5 }
+    else if script.starts_with("netperf_") { 6 }
+    else if script.starts_with("libcbench_") { 7 }
+    else if script.starts_with("iozone_") { 8 }
+    else if script.starts_with("cyclictest_") { 9 }
+    else if script.starts_with("lmbench_") { 10 }
+    else if script.starts_with("unixbench_") { 11 }
+    else { 50 }
+}
+
+fn script_budget(script: &str) -> &'static str {
+    if script.starts_with("basic_") { "30" }
+    else if script.starts_with("lua_") { "10" }
+    else if script.starts_with("busybox_") { "45" }
+    else if script.starts_with("ltp_") { "2000" }
+    else if script.starts_with("libctest_") { "150" }
+    else if script.starts_with("iperf_") { "40" }
+    else if script.starts_with("netperf_") { "60" }
+    else if script.starts_with("libcbench_") { "30" }
+    else if script.starts_with("iozone_") { "40" }
+    else if script.starts_with("cyclictest_") { "20" }
+    else if script.starts_with("lmbench_") { "60" }
+    else if script.starts_with("unixbench_") { "90" }
+    else { "10" }
+}
+
+fn sort_scripts(scripts: &mut Vec<String>) {
+    scripts.sort_by(|a, b| {
+        let pa = script_priority(a);
+        let pb = script_priority(b);
+        if pa == pb {
+            a.as_str().cmp(b.as_str())
+        } else {
+            pa.cmp(&pb)
+        }
+    });
+}
+
 fn run_script(dir: &str, script: &str) {
     let script_arg = String::from("./") + script + "\0";
-    let args: [*const u8; 3] = [b"sh\0".as_ptr(), script_arg.as_ptr(), core::ptr::null()];
+    let budget = script_budget(script);
+    let budget_arg = String::from(budget) + "\0";
+    let ld_path = String::from("LD_LIBRARY_PATH=") + dir.trim_end_matches('\0').trim_end_matches('/') + "/lib:/lib:/lib64\0";
+    let path = String::from("PATH=") + dir.trim_end_matches('\0').trim_end_matches('/') + "/ltp/testcases/bin:/bin:/\0";
+    let ltp_root = String::from("LTPROOT=") + dir.trim_end_matches('\0').trim_end_matches('/') + "/ltp\0";
+    let args: [*const u8; 9] = [
+        b"busybox\0".as_ptr(),
+        b"timeout\0".as_ptr(),
+        b"-s\0".as_ptr(),
+        b"KILL\0".as_ptr(),
+        budget_arg.as_ptr(),
+        b"./busybox\0".as_ptr(),
+        b"sh\0".as_ptr(),
+        script_arg.as_ptr(),
+        core::ptr::null(),
+    ];
+    let envs: [*const u8; 5] = [
+        ld_path.as_ptr(),
+        path.as_ptr(),
+        ltp_root.as_ptr(),
+        b"LTP_TIMEOUT_MUL=2\0".as_ptr(),
+        core::ptr::null(),
+    ];
     let pid = fork();
     if pid == 0 {
         user_lib::chdir(dir);
-        exec("/busybox\0", &args);
+        execve("./busybox\0", &args, &envs);
         exit(127);
-    } else if pid > 0 { let mut ec = 0; waitpid(pid as usize, &mut ec); }
+    } else if pid > 0 {
+        let mut ec = 0;
+        waitpid(pid as usize, &mut ec);
+        println!("[initproc] [DONE] {}{} exit {}", dir.trim_end_matches('\0'), script, ec);
+    }
 }
 
 fn scan_and_run(dir: &str, depth: usize) -> bool {
@@ -115,7 +194,13 @@ fn scan_and_run(dir: &str, depth: usize) -> bool {
     );
 
     let mut found = false;
-    for entry in &entries {
+    let mut scripts: Vec<String> = entries
+        .iter()
+        .filter(|entry| entry.ends_with("_testcode.sh"))
+        .cloned()
+        .collect();
+    sort_scripts(&mut scripts);
+    for entry in &scripts {
         if entry.ends_with("_testcode.sh") {
             println!("[initproc] [RUN] {}{}", dir.trim_end_matches('\0'), entry);
             run_script(dir, entry);
@@ -154,31 +239,23 @@ fn main() -> i32 {
         bind_loaders();
     }
 
-    #[cfg(target_arch = "riscv64")]
-    let candidate_dirs: [&str; 6] = [
-        "/mnt/riscv/musl/\0",
-        "/mnt/riscv/glibc/\0",
-        "/mnt/musl/\0",
-        "/mnt/glibc/\0",
-        "/mnt/basic/\0",
-        "/mnt/\0",
-    ];
-    #[cfg(target_arch = "loongarch64")]
-    let candidate_dirs: [&str; 6] = [
-        "/mnt/loongarch/musl/\0",
-        "/mnt/loongarch/glibc/\0",
-        "/mnt/musl/\0",
-        "/mnt/glibc/\0",
-        "/mnt/basic/\0",
-        "/mnt/\0",
-    ];
-    #[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
-    let candidate_dirs: [&str; 4] = ["/mnt/musl/\0", "/mnt/glibc/\0", "/mnt/basic/\0", "/mnt/\0"];
-
     let mut found = false;
-    for dir in &candidate_dirs {
+    for dir in ["/mnt/musl/\0", "/mnt/glibc/\0"] {
         if scan_and_run(dir, 0) {
             found = true;
+        }
+    }
+    #[cfg(target_arch = "riscv64")]
+    let arch_dirs: [&str; 2] = ["/mnt/riscv/musl/\0", "/mnt/riscv/glibc/\0"];
+    #[cfg(target_arch = "loongarch64")]
+    let arch_dirs: [&str; 2] = ["/mnt/loongarch/musl/\0", "/mnt/loongarch/glibc/\0"];
+    #[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
+    let arch_dirs: [&str; 0] = [];
+    if !found {
+        for dir in arch_dirs {
+            if scan_and_run(dir, 0) {
+                found = true;
+            }
         }
     }
     if !found {
