@@ -94,7 +94,6 @@ impl VfsSuperBlock {
     // ---------- path-based ext4 operations ----------
 
     pub fn dir_get_entries(&self, fs_path: &str) -> Vec<DirEntry> {
-        crate::println!("[dir_get_entries] fs_path={}, fs_type={}", fs_path, self.fs_type);
         self.with_fs(|_fs| {
             let c_path = match CString::new(fs_path) {
                 Ok(s) => s,
@@ -105,7 +104,6 @@ impl VfsSuperBlock {
 
             unsafe {
                 let rc = ext4_dir_open(&mut d, c_path.as_ptr() as *const c_char);
-                crate::println!("[dir_get_entries] ext4_dir_open({}) = {}", fs_path, rc);
                 if rc != EOK as i32 {
                     return entries;
                 }
@@ -124,7 +122,6 @@ impl VfsSuperBlock {
                     });
                 }
                 ext4_dir_close(&mut d);
-                crate::println!("[dir_get_entries] {} -> {} entries", fs_path, entries.len());
             }
             entries
         })
@@ -561,14 +558,11 @@ lazy_static! {
 
 fn lookup_mount(dentry: &Arc<Dentry>) -> Option<Arc<Dentry>> {
     let table = MOUNT_TABLE.exclusive_access();
-    crate::println!("[lookup_mount] checking path={} (table has {} entries)", dentry.path, table.len());
     for m in table.iter() {
         if Arc::ptr_eq(&m.mnt_point, dentry) {
-            crate::println!("[lookup_mount] FOUND: path={} mnt_root.fs_path={}", dentry.path, m.mnt_root.fs_path);
             return Some(m.mnt_root.clone());
         }
     }
-    crate::println!("[lookup_mount] NOT FOUND for path={}", dentry.path);
     None
 }
 
@@ -753,7 +747,6 @@ pub fn vfs_create(parent: &Arc<Dentry>, name: &str, is_dir: bool, mode: u32) -> 
 // ==================== Mount Operations ====================
 
 pub fn vfs_mount(mnt_point: Arc<Dentry>, sb: Arc<VfsSuperBlock>) -> bool {
-    crate::println!("[vfs_mount] ENTER: path={}", mnt_point.path);
     let path = mnt_point.path.clone();
     {
         let table = MOUNT_TABLE.exclusive_access();
@@ -771,7 +764,6 @@ pub fn vfs_mount(mnt_point: Arc<Dentry>, sb: Arc<VfsSuperBlock>) -> bool {
         mnt_point: mnt_point.clone(),
         mnt_root: mnt_root.clone(),
     });
-    crate::println!("[vfs_mount] mounted: mnt_point.path={} mnt_root.fs_path={}", mnt_point.path, mnt_root.fs_path);
 
     true
 }
