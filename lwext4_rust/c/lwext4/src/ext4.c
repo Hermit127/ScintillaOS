@@ -3252,3 +3252,5 @@ void ext4_dir_entry_rewind(ext4_dir *dir)
 }
 
 /**
+ * @}
+ */
