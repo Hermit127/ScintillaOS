@@ -315,10 +315,21 @@ fn follow_symlink(start: &Arc<Dentry>, dentry: Arc<Dentry>, depth: usize) -> Opt
         return Some(dentry);
     }
 
-    let mut target = alloc::vec![0u8; 512];
-    let n = dentry.super_block.read_at(&dentry.fs_path, 0, &mut target);
-    target.truncate(n as usize);
-    let target = core::str::from_utf8(&target).ok()?.trim_matches('\0');
+    let mut target_buf = [0u8; 512];
+    let mut rcnt: usize = 0;
+    let c_path = alloc::ffi::CString::new(dentry.fs_path.as_bytes()).ok()?;
+    let rc = unsafe {
+        lwext4_rust::bindings::ext4_readlink(
+            c_path.as_ptr() as *const core::ffi::c_char,
+            target_buf.as_mut_ptr() as *mut core::ffi::c_char,
+            target_buf.len(),
+            &mut rcnt,
+        )
+    };
+    if rc != 0 || rcnt == 0 {
+        return None;
+    }
+    let target = core::str::from_utf8(&target_buf[..rcnt]).ok()?.trim_matches('\0');
     if target.is_empty() {
         return None;
     }

@@ -185,16 +185,20 @@ impl VfsSuperBlock {
                 let mut dir: ext4_dir = unsafe { core::mem::zeroed() };
                 let c_path_dir = CString::new(fs_path).ok()?;
                 let dir_rc = unsafe { ext4_dir_open(&mut dir, c_path_dir.as_ptr() as *const c_char) };
-                if dir_rc != EOK as i32 {
+                if dir_rc == EOK as i32 {
+                    let inode_num = dir.f.inode;
+                    let size = dir.f.fsize;
+                    unsafe {
+                        ext4_dir_close(&mut dir);
+                    }
+                    mode = (mode & 0o7777) | 0o040000;
+                    (inode_num, size, true)
+                } else if is_link {
+                    // Symlink: both fopen and dir_open fail, but mode indicates a link
+                    (0, 0, false)
+                } else {
                     return None;
                 }
-                let inode_num = dir.f.inode;
-                let size = dir.f.fsize;
-                unsafe {
-                    ext4_dir_close(&mut dir);
-                }
-                mode = (mode & 0o7777) | 0o040000;
-                (inode_num, size, true)
             };
 
             Some(InodeInfo {

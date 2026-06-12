@@ -83,7 +83,7 @@ fn bind_loaders() {
 }
 
 fn rebind_busybox_applets() {
-    let busybox = if file_exists("/mnt/musl/busybox\0") {
+    let bb_path = if file_exists("/mnt/musl/busybox\0") {
         "/mnt/musl/busybox"
     } else if file_exists("/mnt/glibc/busybox\0") {
         "/mnt/glibc/busybox"
@@ -91,16 +91,14 @@ fn rebind_busybox_applets() {
         return;
     };
     sys_mkdir(b"/bin\0".as_ptr(), 0o777);
-    let ret = force_symlink(busybox, "/busybox");
-    println!("[initproc] bind /busybox -> {}: {}", busybox, ret);
-    for applet in BUSYBOX_APPLETS {
-        let path = String::from("/bin/") + applet;
-        force_symlink(busybox, &path);
-    }
+    force_symlink(bb_path, "/bin/sh\0");
+    force_symlink(bb_path, "/bin/busybox\0");
+    println!("[initproc] /bin/sh and /bin/busybox -> {}", bb_path);
 }
 
 fn install_busybox() {
     sys_mkdir(b"/bin\0".as_ptr(), 0o777);
+    force_symlink("/busybox", "/bin/sh\0");
 }
 
 fn list_dir(path: &str) -> Vec<String> {

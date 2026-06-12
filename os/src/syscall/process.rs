@@ -221,10 +221,6 @@ pub fn sys_exec(path: *const u8, mut args: *const usize, mut envp: *const usize)
     };
     if let Some(app_inode) = app_inode {
         let all_data = app_inode.read_all();
-        // Debug on first few execs
-        if !path.starts_with("/busybox") && !path.starts_with("/bin/busybox") {
-            crate::println!("[sys_exec] {} len={}", path, all_data.len());
-        }
         if all_data.len() >= 2 && &all_data[..2] == b"#!" {
             let end = all_data.iter().position(|&b| b == b'\n').unwrap_or(all_data.len());
             let line = core::str::from_utf8(&all_data[2..end]).unwrap_or("");
@@ -248,24 +244,19 @@ pub fn sys_exec(path: *const u8, mut args: *const usize, mut envp: *const usize)
         }
         let task = current_task().unwrap();
         if all_data.len() < 4 || &all_data[..4] != b"\x7fELF" {
-            crate::println!("[sys_exec] {} not ELF", path);
             return -1;
         }
         // Check for dynamically linked ELF (has PT_INTERP)
         if let Some(interp_path) = crate::mm::get_elf_interp(&all_data) {
-            crate::println!("[sys_exec] {} PT_INTERP={}", path, interp_path);
             if let Some(interp_inode) = open_file(&interp_path, OpenFlags::RDONLY)
                 .or_else(|| open_file(&alloc::format!("/usr{}", interp_path), OpenFlags::RDONLY))
             {
-                crate::println!("[sys_exec] {} interp found, loading", path);
                 let interp_data = interp_inode.read_all();
                 task.exec_with_interp(all_data.as_slice(), Some(&interp_data), args_vec, env_vec);
                 return 0;
             }
-            crate::println!("[sys_exec] {} interp NOT FOUND: {}", path, interp_path);
             return -1;
         }
-        crate::println!("[sys_exec] {} static", path);
         task.exec(all_data.as_slice(), args_vec, env_vec);
         0
     } else {
