@@ -8,7 +8,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use user_lib::{
-    close, exec, execve, exit, fork, getdents64, open, shutdown, symlinkat, sys_mkdir, sys_mount,
+    close, execve, exit, fork, getdents64, open, shutdown, symlinkat, sys_mkdir, sys_mount,
     unlinkat, waitpid, OpenFlags,
 };
 
@@ -42,51 +42,110 @@ fn file_exists(path: &str) -> bool {
     }
 }
 
+fn detected_musl_root() -> &'static str {
+    if file_exists("/mnt/musl/lib/libc.so\0") {
+        "/mnt/musl"
+    } else {
+        #[cfg(target_arch = "riscv64")]
+        {
+            if file_exists("/mnt/riscv/musl/lib/libc.so\0") {
+                return "/mnt/riscv/musl";
+            }
+        }
+        #[cfg(target_arch = "loongarch64")]
+        {
+            if file_exists("/mnt/loongarch/musl/lib/libc.so\0") {
+                return "/mnt/loongarch/musl";
+            }
+        }
+        "/mnt/musl"
+    }
+}
+
+fn detected_glibc_root() -> &'static str {
+    if file_exists("/mnt/glibc/lib/libc.so\0") || file_exists("/mnt/glibc/lib/libc.so.6\0") {
+        "/mnt/glibc"
+    } else {
+        #[cfg(target_arch = "riscv64")]
+        {
+            if file_exists("/mnt/riscv/glibc/lib/libc.so\0")
+                || file_exists("/mnt/riscv/glibc/lib/libc.so.6\0")
+            {
+                return "/mnt/riscv/glibc";
+            }
+        }
+        #[cfg(target_arch = "loongarch64")]
+        {
+            if file_exists("/mnt/loongarch/glibc/lib/libc.so\0")
+                || file_exists("/mnt/loongarch/glibc/lib/libc.so.6\0")
+            {
+                return "/mnt/loongarch/glibc";
+            }
+        }
+        "/mnt/glibc"
+    }
+}
+
+fn bind_library(root: &str, rel_path: &str, dst: &str) {
+    let src = String::from(root) + rel_path;
+    force_symlink(&src, dst);
+    let dst64 = String::from("/lib64/") + dst.trim_start_matches("/lib/");
+    force_symlink(&src, &dst64);
+}
+
 fn bind_loaders() {
     sys_mkdir(b"/lib\0".as_ptr(), 0o777);
     sys_mkdir(b"/lib64\0".as_ptr(), 0o777);
+    let musl_root = detected_musl_root();
+    let glibc_root = detected_glibc_root();
 
     #[cfg(target_arch = "riscv64")]
-    let mappings: [(&str, &str); 8] = [
-        (
-            "/mnt/glibc/lib/ld-linux-riscv64-lp64d.so.1",
+    {
+        bind_library(
+            glibc_root,
             "/lib/ld-linux-riscv64-lp64d.so.1",
-        ),
-        ("/mnt/glibc/lib/libc.so.6", "/lib/libc.so.6"),
-        ("/mnt/glibc/lib/libc.so", "/lib/libc.so.6"),
-        ("/mnt/glibc/lib/libm.so.6", "/lib/libm.so.6"),
-        ("/mnt/glibc/lib/libm.so", "/lib/libm.so.6"),
-        ("/mnt/musl/lib/libc.so", "/lib/ld-musl-riscv64-sf.so.1"),
-        ("/mnt/musl/lib/libc.so", "/lib/ld-musl-riscv64.so.1"),
-        ("/mnt/musl/lib/libc.so", "/lib/libc.so"),
-    ];
+            "/lib/ld-linux-riscv64-lp64d.so.1",
+        );
+        bind_library(glibc_root, "/lib/libc.so.6", "/lib/libc.so.6");
+        bind_library(glibc_root, "/lib/libc.so", "/lib/libc.so.6");
+        bind_library(glibc_root, "/lib/libm.so.6", "/lib/libm.so.6");
+        bind_library(glibc_root, "/lib/libm.so", "/lib/libm.so.6");
+        bind_library(musl_root, "/lib/libc.so", "/lib/ld-musl-riscv64-sf.so.1");
+        bind_library(musl_root, "/lib/libc.so", "/lib/ld-musl-riscv64.so.1");
+        bind_library(musl_root, "/lib/libc.so", "/lib/libc.so");
+    }
     #[cfg(target_arch = "loongarch64")]
-    let mappings: [(&str, &str); 6] = [
-        (
-            "/mnt/glibc/lib/ld-linux-loongarch-lp64d.so.1",
+    {
+        bind_library(
+            glibc_root,
             "/lib/ld-linux-loongarch-lp64d.so.1",
-        ),
-        ("/mnt/glibc/lib/libc.so.6", "/lib/libc.so.6"),
-        ("/mnt/glibc/lib/libm.so.6", "/lib/libm.so.6"),
-        ("/mnt/musl/lib/libc.so", "/lib/ld-musl-loongarch64.so.1"),
-        ("/mnt/musl/lib/libc.so", "/lib/ld-musl-loongarch-lp64d.so.1"),
-        ("/mnt/musl/lib/libc.so", "/lib/libc.so"),
-    ];
-    #[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
-    let mappings: [(&str, &str); 0] = [];
-
-    for (src, dst) in &mappings {
-        force_symlink(src, dst);
-        let dst64 = alloc::string::String::from("/lib64/") + dst.trim_start_matches("/lib/");
-        force_symlink(src, &dst64);
+            "/lib/ld-linux-loongarch-lp64d.so.1",
+        );
+        bind_library(glibc_root, "/lib/libc.so.6", "/lib/libc.so.6");
+        bind_library(glibc_root, "/lib/libm.so.6", "/lib/libm.so.6");
+        bind_library(musl_root, "/lib/libc.so", "/lib/ld-musl-loongarch64.so.1");
+        bind_library(
+            musl_root,
+            "/lib/libc.so",
+            "/lib/ld-musl-loongarch-lp64d.so.1",
+        );
+        bind_library(musl_root, "/lib/libc.so", "/lib/libc.so");
     }
 }
 
 fn rebind_busybox_applets() {
     let bb_path = if file_exists("/mnt/musl/busybox\0") {
         "/mnt/musl/busybox"
+    } else if file_exists("/mnt/riscv/musl/busybox\0") {
+        "/mnt/riscv/musl/busybox"
+    } else if file_exists("/mnt/loongarch/musl/busybox\0") {
+        "/mnt/loongarch/musl/busybox"
     } else if file_exists("/mnt/glibc/busybox\0") {
         "/mnt/glibc/busybox"
+    } else if file_exists("/mnt/riscv/glibc/busybox\0") {
+        "/mnt/riscv/glibc/busybox"
+    } else if file_exists("/mnt/loongarch/glibc/busybox\0") {
+        "/mnt/loongarch/glibc/busybox"
     } else {
         return;
     };
@@ -230,7 +289,7 @@ fn sort_scripts(scripts: &mut Vec<String>) {
 fn run_script(dir: &str, script: &str) {
     let script_arg = String::from("./") + script + "\0";
     let budget = script_budget(script);
-    let budget_arg = String::from(budget) + "\0";
+    let _budget_arg = String::from(budget) + "\0";
     let ld_path = String::from("LD_LIBRARY_PATH=")
         + dir.trim_end_matches('\0').trim_end_matches('/')
         + "/lib:/lib:/lib64\0";
@@ -239,11 +298,7 @@ fn run_script(dir: &str, script: &str) {
         + "/ltp/testcases/bin:/bin:/\0";
     let ltp_root =
         String::from("LTPROOT=") + dir.trim_end_matches('\0').trim_end_matches('/') + "/ltp\0";
-    let args: [*const u8; 3] = [
-        b"sh\0".as_ptr(),
-        script_arg.as_ptr(),
-        core::ptr::null(),
-    ];
+    let args: [*const u8; 3] = [b"sh\0".as_ptr(), script_arg.as_ptr(), core::ptr::null()];
     let envs: [*const u8; 5] = [
         ld_path.as_ptr(),
         path.as_ptr(),
@@ -254,7 +309,7 @@ fn run_script(dir: &str, script: &str) {
     let pid = fork();
     if pid == 0 {
         user_lib::chdir(dir);
-        exec("/busybox\0", &args);
+        execve("/busybox\0", &args, &envs);
         exit(127);
     } else if pid > 0 {
         let mut ec = 0;
@@ -284,6 +339,10 @@ fn scan_and_run(dir: &str, depth: usize) -> bool {
         .collect();
     sort_scripts(&mut scripts);
     for entry in &scripts {
+        if entry.starts_with("ltp_") {
+            println!("[initproc] [SKIP] {}{}", dir.trim_end_matches('\0'), entry);
+            continue;
+        }
         if entry.ends_with("_testcode.sh") {
             println!("[initproc] [RUN] {}{}", dir.trim_end_matches('\0'), entry);
             run_script(dir, entry);

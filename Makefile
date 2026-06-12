@@ -360,9 +360,9 @@ TEST_DISK ?= fs-img.img
 
 # Dual-disk mode (test disk bus 0, disk.img bus 1, for contest)
 QEMU_ARGS_DUAL := -drive file=$(TEST_DISK),if=none,format=raw,id=x0 \
-			-device $(VIRTIO_BLK_DEVICE),drive=x0$(if $(filter loongarch64,$(ARCH)),,bus=$(VIRTIO_BLK_BUS)) \
+			-device $(VIRTIO_BLK_DEVICE),drive=x0$(if $(filter loongarch64,$(ARCH)),,,bus=$(VIRTIO_BLK_BUS)) \
 			-drive file=disk.img,if=none,format=raw,id=x1 \
-			-device $(VIRTIO_BLK_DEVICE),drive=x1$(if $(filter loongarch64,$(ARCH)),,bus=$(VIRTIO_BLK_BUS2))
+			-device $(VIRTIO_BLK_DEVICE),drive=x1$(if $(filter loongarch64,$(ARCH)),,,bus=$(VIRTIO_BLK_BUS2))
 
 # virtio-net network configuration (SLIRP user-mode, riscv64/aarch64)
 ifeq ($(ARCH), riscv64)

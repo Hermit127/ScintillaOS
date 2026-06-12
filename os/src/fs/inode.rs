@@ -225,6 +225,24 @@ impl OpenFlags {
 
 // ==================== File Operations ====================
 
+fn current_euid_is_root() -> bool {
+    crate::task::current_task()
+        .map(|task| task.inner_exclusive_access().euid == 0)
+        .unwrap_or(false)
+}
+
+fn root_make_accessible(dentry: &Arc<Dentry>, bits: u32) {
+    if !current_euid_is_root() {
+        return;
+    }
+    if let Some(info) = dentry.super_block.get_inode_info(&dentry.fs_path) {
+        let new_mode = info.mode | (bits & 0o777);
+        if new_mode != info.mode {
+            dentry.super_block.set_mode(&dentry.fs_path, new_mode);
+        }
+    }
+}
+
 pub fn open_file(path: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
     open_file_new(None, path, flags, 0o666)
 }
@@ -259,6 +277,9 @@ fn open_file_new(
                 if flags.excl_requested() {
                     return None;
                 }
+                if flags.trunc_requested() || flags.contains(OpenFlags::WRONLY) || flags.contains(OpenFlags::RDWR) {
+                    root_make_accessible(&dentry, 0o666);
+                }
                 if flags.trunc_requested() {
                     let truncated = dentry.super_block.truncate_file(&dentry.fs_path, 0);
                     if !truncated {
@@ -272,6 +293,7 @@ fn open_file_new(
         }
 
         let (parent, name) = vfs_resolve_parent_and_name(&start, path)?;
+        root_make_accessible(&parent, 0o777);
         let dentry = vfs_create(&parent, &name, false, mode)?;
         let (readable, writable) = flags.read_write();
         return Some(Arc::new(OSInode::new(
@@ -285,6 +307,10 @@ fn open_file_new(
     let dentry = follow_symlink(&start, vfs_resolve_with_fallback(&start, path)?, 0)?;
     if want_dir && !dentry.is_dir {
         return None;
+    }
+
+    if !dentry.is_dir && (flags.trunc_requested() || flags.contains(OpenFlags::WRONLY) || flags.contains(OpenFlags::RDWR)) {
+        root_make_accessible(&dentry, 0o666);
     }
 
     if flags.trunc_requested() && !dentry.is_dir {
@@ -355,6 +381,7 @@ pub fn mkdir_at(base: Option<Arc<Dentry>>, path: &str) -> bool {
         None => return false,
     };
 
+    root_make_accessible(&parent, 0o777);
     vfs_create(&parent, &name, true, 0o777).is_some()
 }
 
@@ -373,6 +400,9 @@ pub fn unlink_at(base: Option<Arc<Dentry>>, path: &str, is_dir: bool) -> bool {
         Some(p) => p,
         None => return false,
     };
+
+    root_make_accessible(&parent, 0o777);
+    root_make_accessible(&dentry, 0o777);
 
     let ok = if is_dir {
         dentry.super_block.unlink_dir(&dentry.fs_path)
