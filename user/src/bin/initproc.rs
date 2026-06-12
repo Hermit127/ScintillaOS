@@ -91,8 +91,8 @@ fn rebind_busybox_applets() {
         return;
     };
     sys_mkdir(b"/bin\0".as_ptr(), 0o777);
-    force_symlink(bb_path, "/bin/sh\0");
     force_symlink(bb_path, "/bin/busybox\0");
+    force_symlink(bb_path, "/bin/sh\0");
     println!("[initproc] /bin/sh and /bin/busybox -> {}", bb_path);
 }
 
