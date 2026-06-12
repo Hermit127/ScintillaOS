@@ -12,7 +12,7 @@ use user_lib::{
     unlinkat, waitpid, OpenFlags,
 };
 
-const BUSYBOX_APPLETS: [&str; 70] = [
+const BUSYBOX_APPLETS: [&str; 68] = [
     "busybox", "sh", "ash", "ls", "cat", "echo", "mkdir", "rm", "rmdir", "mv", "cp",
     "true", "false", "env", "pwd", "wc", "grep", "head", "tail", "sort", "uniq", "tr", "find", "touch",
     "test", "[", "[[", "stat", "sleep", "kill", "basename", "dirname", "cut", "expr", "seq", "id",
@@ -297,11 +297,14 @@ fn run_script(dir: &str, script: &str) {
     let ltp_root =
         String::from("LTPROOT=") + dir.trim_end_matches('\0').trim_end_matches('/') + "/ltp\0";
     let args: [*const u8; 3] = [b"sh\0".as_ptr(), script_arg.as_ptr(), core::ptr::null()];
-    let envs: [*const u8; 5] = [
+    let envs: [*const u8; 8] = [
         ld_path.as_ptr(),
         path.as_ptr(),
         ltp_root.as_ptr(),
         b"LTP_TIMEOUT_MUL=2\0".as_ptr(),
+        b"ENOUGH=1000\0".as_ptr(),
+        b"TIMING_O=0\0".as_ptr(),
+        b"LOOP_O=0\0".as_ptr(),
         core::ptr::null(),
     ];
     let pid = fork();
