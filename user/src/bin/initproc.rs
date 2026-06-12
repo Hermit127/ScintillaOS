@@ -12,9 +12,9 @@ use user_lib::{
     unlinkat, waitpid, OpenFlags,
 };
 
-const BUSYBOX_APPLETS: [&str; 68] = [
-    "busybox", "sh", "ash", "ls", "cat", "echo", "mkdir", "rm", "rmdir", "mv", "cp", "true",
-    "false", "env", "pwd", "wc", "grep", "head", "tail", "sort", "uniq", "tr", "find", "touch",
+const BUSYBOX_APPLETS: [&str; 70] = [
+    "busybox", "sh", "ash", "ls", "cat", "echo", "mkdir", "rm", "rmdir", "mv", "cp",
+    "true", "false", "env", "pwd", "wc", "grep", "head", "tail", "sort", "uniq", "tr", "find", "touch",
     "test", "[", "[[", "stat", "sleep", "kill", "basename", "dirname", "cut", "expr", "seq", "id",
     "printf", "date", "chmod", "chown", "ln", "dd", "sync", "cmp", "od", "awk", "sed", "xargs",
     "readlink", "mkfifo", "du", "df", "mount", "umount", "chattr", "getconf", "tee", "yes",
@@ -152,6 +152,10 @@ fn rebind_busybox_applets() {
     sys_mkdir(b"/bin\0".as_ptr(), 0o777);
     force_symlink(bb_path, "/bin/busybox\0");
     force_symlink(bb_path, "/bin/sh\0");
+    for applet in BUSYBOX_APPLETS {
+        let path = String::from("/bin/") + applet + "\0";
+        force_symlink(bb_path, &path);
+    }
     println!("[initproc] /bin/sh and /bin/busybox -> {}", bb_path);
 }
 
@@ -219,29 +223,23 @@ fn script_priority(script: &str) -> u8 {
         0
     } else if script.starts_with("lua_") {
         1
-    } else if script.starts_with("busybox_") {
-        2
-    } else if script.starts_with("ltp_") {
-        3
-    } else if script.starts_with("libctest_") {
-        4
-    } else if script.starts_with("iperf_") {
-        5
-    } else if script.starts_with("netperf_") {
-        6
-    } else if script.starts_with("libcbench_") {
-        7
     } else if script.starts_with("iozone_") {
-        8
-    } else if script.starts_with("cyclictest_") {
-        9
+        2
     } else if script.starts_with("lmbench_") {
-        10
-    } else if script.starts_with("unixbench_") {
-        11
+        3
+    } else if script.starts_with("busybox_") {
+        4
     } else {
         50
     }
+}
+
+fn should_run_script(script: &str) -> bool {
+    script.starts_with("basic_")
+        || script.starts_with("busybox_")
+        || script.starts_with("lua_")
+        || script.starts_with("iozone_")
+        || script.starts_with("lmbench_")
 }
 
 fn script_budget(script: &str) -> &'static str {
@@ -339,7 +337,7 @@ fn scan_and_run(dir: &str, depth: usize) -> bool {
         .collect();
     sort_scripts(&mut scripts);
     for entry in &scripts {
-        if entry.starts_with("ltp_") {
+        if !should_run_script(entry) {
             println!("[initproc] [SKIP] {}{}", dir.trim_end_matches('\0'), entry);
             continue;
         }
