@@ -265,10 +265,16 @@ pub fn sys_chdir(path: &str) -> isize {
 }
 
 pub fn sys_getcwd(buf: &mut [u8]) -> isize {
-    syscall(SYSCALL_GETCWD, [buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0, 0])
+    syscall(
+        SYSCALL_GETCWD,
+        [buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0, 0],
+    )
 }
 pub fn sys_getdents64(fd: usize, buf: &mut [u8]) -> isize {
-    syscall(SYSCALL_GETDENTS64, [fd, buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0])
+    syscall(
+        SYSCALL_GETDENTS64,
+        [fd, buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0],
+    )
 }
 
 #[repr(C)]
@@ -318,7 +324,21 @@ pub fn sys_mkdir(path: *const u8, mode: u32) -> isize {
 pub fn sys_symlinkat(target: *const u8, linkpath: *const u8) -> isize {
     syscall(
         SYSCALL_SYMLINKAT,
-        [target as usize, AT_FDCWD as usize, linkpath as usize, 0, 0, 0],
+        [
+            target as usize,
+            AT_FDCWD as usize,
+            linkpath as usize,
+            0,
+            0,
+            0,
+        ],
+    )
+}
+
+pub fn sys_unlinkat_path(path: *const u8, flags: u32) -> isize {
+    syscall(
+        SYSCALL_UNLINKAT,
+        [AT_FDCWD as usize, path as usize, flags as usize, 0, 0, 0],
     )
 }
 

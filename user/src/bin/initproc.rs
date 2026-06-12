@@ -7,7 +7,34 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use user_lib::{close, exec, execve, exit, fork, getdents64, open, shutdown, symlinkat, sys_mkdir, sys_mount, waitpid, OpenFlags};
+use user_lib::{
+    close, exec, execve, exit, fork, getdents64, open, shutdown, symlinkat, sys_mkdir, sys_mount,
+    unlinkat, waitpid, OpenFlags,
+};
+
+const BUSYBOX_APPLETS: [&str; 68] = [
+    "busybox", "sh", "ash", "ls", "cat", "echo", "mkdir", "rm", "rmdir", "mv", "cp", "true",
+    "false", "env", "pwd", "wc", "grep", "head", "tail", "sort", "uniq", "tr", "find", "touch",
+    "test", "[", "[[", "stat", "sleep", "kill", "basename", "dirname", "cut", "expr", "seq", "id",
+    "printf", "date", "chmod", "chown", "ln", "dd", "sync", "cmp", "od", "awk", "sed", "xargs",
+    "readlink", "mkfifo", "du", "df", "mount", "umount", "chattr", "getconf", "tee", "yes",
+    "mknod", "mktemp", "chgrp", "dmesg", "ps", "free", "hostname", "md5sum", "diff", "unlink",
+];
+
+fn force_symlink(target: &str, linkpath: &str) -> isize {
+    unlinkat(linkpath);
+    symlinkat(target, linkpath)
+}
+
+fn file_exists(path: &str) -> bool {
+    let fd = open(path, OpenFlags::RDONLY);
+    if fd < 0 {
+        false
+    } else {
+        close(fd as usize);
+        true
+    }
+}
 
 fn bind_loaders() {
     sys_mkdir(b"/lib\0".as_ptr(), 0o777);
@@ -15,7 +42,10 @@ fn bind_loaders() {
 
     #[cfg(target_arch = "riscv64")]
     let mappings: [(&str, &str); 8] = [
-        ("/mnt/glibc/lib/ld-linux-riscv64-lp64d.so.1", "/lib/ld-linux-riscv64-lp64d.so.1"),
+        (
+            "/mnt/glibc/lib/ld-linux-riscv64-lp64d.so.1",
+            "/lib/ld-linux-riscv64-lp64d.so.1",
+        ),
         ("/mnt/glibc/lib/libc.so.6", "/lib/libc.so.6"),
         ("/mnt/glibc/lib/libc.so", "/lib/libc.so.6"),
         ("/mnt/glibc/lib/libm.so.6", "/lib/libm.so.6"),
@@ -26,7 +56,10 @@ fn bind_loaders() {
     ];
     #[cfg(target_arch = "loongarch64")]
     let mappings: [(&str, &str); 6] = [
-        ("/mnt/glibc/lib/ld-linux-loongarch-lp64d.so.1", "/lib/ld-linux-loongarch-lp64d.so.1"),
+        (
+            "/mnt/glibc/lib/ld-linux-loongarch-lp64d.so.1",
+            "/lib/ld-linux-loongarch-lp64d.so.1",
+        ),
         ("/mnt/glibc/lib/libc.so.6", "/lib/libc.so.6"),
         ("/mnt/glibc/lib/libm.so.6", "/lib/libm.so.6"),
         ("/mnt/musl/lib/libc.so", "/lib/ld-musl-loongarch64.so.1"),
@@ -37,16 +70,35 @@ fn bind_loaders() {
     let mappings: [(&str, &str); 0] = [];
 
     for (src, dst) in &mappings {
-        symlinkat(src, dst);
+        force_symlink(src, dst);
         let dst64 = alloc::string::String::from("/lib64/") + dst.trim_start_matches("/lib/");
-        symlinkat(src, &dst64);
+        force_symlink(src, &dst64);
+    }
+}
+
+fn rebind_busybox_applets() {
+    let busybox = if file_exists("/mnt/musl/busybox\0") {
+        "/mnt/musl/busybox"
+    } else if file_exists("/mnt/glibc/busybox\0") {
+        "/mnt/glibc/busybox"
+    } else {
+        return;
+    };
+    sys_mkdir(b"/bin\0".as_ptr(), 0o777);
+    let ret = force_symlink(busybox, "/busybox");
+    println!("[initproc] bind /busybox -> {}: {}", busybox, ret);
+    for applet in BUSYBOX_APPLETS {
+        let path = String::from("/bin/") + applet;
+        force_symlink(busybox, &path);
     }
 }
 
 fn install_busybox() {
     sys_mkdir(b"/bin\0".as_ptr(), 0o777);
-    let ret = symlinkat("/busybox\0", "/bin/sh\0");
-    if ret == 0 { println!("[initproc] /bin/sh created"); }
+    let ret = force_symlink("/busybox", "/bin/sh");
+    if ret == 0 {
+        println!("[initproc] /bin/sh created");
+    }
 
     let args: [*const u8; 5] = [
         b"/busybox\0".as_ptr(),
@@ -68,26 +120,42 @@ fn install_busybox() {
 
 fn list_dir(path: &str) -> Vec<String> {
     let fd = open(path, OpenFlags::RDONLY);
-    if fd < 0 { return Vec::new(); }
+    if fd < 0 {
+        return Vec::new();
+    }
     let mut buf = [0u8; 4096];
     let mut names = Vec::new();
     let mut rounds = 0;
     loop {
         rounds += 1;
-        if rounds > 64 { break; }
+        if rounds > 64 {
+            break;
+        }
         let n = getdents64(fd as usize, &mut buf);
-        if n <= 0 { break; }
+        if n <= 0 {
+            break;
+        }
         let mut pos = 0;
         while pos < n as usize {
-            if pos + 19 > n as usize { break; }
-            let d_reclen = u16::from_le_bytes([buf[pos+16], buf[pos+17]]) as usize;
-            if d_reclen < 19 || pos + d_reclen > n as usize { break; }
+            if pos + 19 > n as usize {
+                break;
+            }
+            let d_reclen = u16::from_le_bytes([buf[pos + 16], buf[pos + 17]]) as usize;
+            if d_reclen < 19 || pos + d_reclen > n as usize {
+                break;
+            }
             let name_start = pos + 19;
             let mut name_len = 0;
-            while name_start + name_len < pos + d_reclen && buf[name_start + name_len] != 0 { name_len += 1; }
-            let name = core::str::from_utf8(&buf[name_start..name_start+name_len]).unwrap_or("");
-            if name != "." && name != ".." { names.push(String::from(name)); }
-            if d_reclen == 0 { break; }
+            while name_start + name_len < pos + d_reclen && buf[name_start + name_len] != 0 {
+                name_len += 1;
+            }
+            let name = core::str::from_utf8(&buf[name_start..name_start + name_len]).unwrap_or("");
+            if name != "." && name != ".." {
+                names.push(String::from(name));
+            }
+            if d_reclen == 0 {
+                break;
+            }
             pos += d_reclen;
         }
     }
@@ -105,35 +173,63 @@ fn join_path(dir: &str, name: &str) -> String {
 }
 
 fn script_priority(script: &str) -> u8 {
-    if script.starts_with("basic_") { 0 }
-    else if script.starts_with("lua_") { 1 }
-    else if script.starts_with("busybox_") { 2 }
-    else if script.starts_with("ltp_") { 3 }
-    else if script.starts_with("libctest_") { 4 }
-    else if script.starts_with("iperf_") { 5 }
-    else if script.starts_with("netperf_") { 6 }
-    else if script.starts_with("libcbench_") { 7 }
-    else if script.starts_with("iozone_") { 8 }
-    else if script.starts_with("cyclictest_") { 9 }
-    else if script.starts_with("lmbench_") { 10 }
-    else if script.starts_with("unixbench_") { 11 }
-    else { 50 }
+    if script.starts_with("basic_") {
+        0
+    } else if script.starts_with("lua_") {
+        1
+    } else if script.starts_with("busybox_") {
+        2
+    } else if script.starts_with("ltp_") {
+        3
+    } else if script.starts_with("libctest_") {
+        4
+    } else if script.starts_with("iperf_") {
+        5
+    } else if script.starts_with("netperf_") {
+        6
+    } else if script.starts_with("libcbench_") {
+        7
+    } else if script.starts_with("iozone_") {
+        8
+    } else if script.starts_with("cyclictest_") {
+        9
+    } else if script.starts_with("lmbench_") {
+        10
+    } else if script.starts_with("unixbench_") {
+        11
+    } else {
+        50
+    }
 }
 
 fn script_budget(script: &str) -> &'static str {
-    if script.starts_with("basic_") { "30" }
-    else if script.starts_with("lua_") { "10" }
-    else if script.starts_with("busybox_") { "45" }
-    else if script.starts_with("ltp_") { "2000" }
-    else if script.starts_with("libctest_") { "150" }
-    else if script.starts_with("iperf_") { "40" }
-    else if script.starts_with("netperf_") { "60" }
-    else if script.starts_with("libcbench_") { "30" }
-    else if script.starts_with("iozone_") { "40" }
-    else if script.starts_with("cyclictest_") { "20" }
-    else if script.starts_with("lmbench_") { "60" }
-    else if script.starts_with("unixbench_") { "90" }
-    else { "10" }
+    if script.starts_with("basic_") {
+        "30"
+    } else if script.starts_with("lua_") {
+        "10"
+    } else if script.starts_with("busybox_") {
+        "45"
+    } else if script.starts_with("ltp_") {
+        "2000"
+    } else if script.starts_with("libctest_") {
+        "150"
+    } else if script.starts_with("iperf_") {
+        "40"
+    } else if script.starts_with("netperf_") {
+        "60"
+    } else if script.starts_with("libcbench_") {
+        "30"
+    } else if script.starts_with("iozone_") {
+        "40"
+    } else if script.starts_with("cyclictest_") {
+        "20"
+    } else if script.starts_with("lmbench_") {
+        "60"
+    } else if script.starts_with("unixbench_") {
+        "90"
+    } else {
+        "10"
+    }
 }
 
 fn sort_scripts(scripts: &mut Vec<String>) {
@@ -152,9 +248,14 @@ fn run_script(dir: &str, script: &str) {
     let script_arg = String::from("./") + script + "\0";
     let budget = script_budget(script);
     let budget_arg = String::from(budget) + "\0";
-    let ld_path = String::from("LD_LIBRARY_PATH=") + dir.trim_end_matches('\0').trim_end_matches('/') + "/lib:/lib:/lib64\0";
-    let path = String::from("PATH=") + dir.trim_end_matches('\0').trim_end_matches('/') + "/ltp/testcases/bin:/bin:/\0";
-    let ltp_root = String::from("LTPROOT=") + dir.trim_end_matches('\0').trim_end_matches('/') + "/ltp\0";
+    let ld_path = String::from("LD_LIBRARY_PATH=")
+        + dir.trim_end_matches('\0').trim_end_matches('/')
+        + "/lib:/lib:/lib64\0";
+    let path = String::from("PATH=")
+        + dir.trim_end_matches('\0').trim_end_matches('/')
+        + "/ltp/testcases/bin:/bin:/\0";
+    let ltp_root =
+        String::from("LTPROOT=") + dir.trim_end_matches('\0').trim_end_matches('/') + "/ltp\0";
     let args: [*const u8; 9] = [
         b"busybox\0".as_ptr(),
         b"timeout\0".as_ptr(),
@@ -181,7 +282,12 @@ fn run_script(dir: &str, script: &str) {
     } else if pid > 0 {
         let mut ec = 0;
         waitpid(pid as usize, &mut ec);
-        println!("[initproc] [DONE] {}{} exit {}", dir.trim_end_matches('\0'), script, ec);
+        println!(
+            "[initproc] [DONE] {}{} exit {}",
+            dir.trim_end_matches('\0'),
+            script,
+            ec
+        );
     }
 }
 
@@ -237,6 +343,7 @@ fn main() -> i32 {
 
     if r == 0 {
         bind_loaders();
+        rebind_busybox_applets();
     }
 
     let mut found = false;
