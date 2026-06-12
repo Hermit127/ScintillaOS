@@ -23,7 +23,13 @@ const BUSYBOX_APPLETS: [&str; 68] = [
 
 fn force_symlink(target: &str, linkpath: &str) -> isize {
     unlinkat(linkpath);
-    symlinkat(target, linkpath)
+    let r1 = symlinkat(target, linkpath);
+    if r1 != 0 {
+        unlinkat(linkpath);
+        symlinkat(target, linkpath)
+    } else {
+        0
+    }
 }
 
 fn file_exists(path: &str) -> bool {
@@ -235,13 +241,7 @@ fn run_script(dir: &str, script: &str) {
         + "/ltp/testcases/bin:/bin:/\0";
     let ltp_root =
         String::from("LTPROOT=") + dir.trim_end_matches('\0').trim_end_matches('/') + "/ltp\0";
-    let args: [*const u8; 9] = [
-        b"busybox\0".as_ptr(),
-        b"timeout\0".as_ptr(),
-        b"-s\0".as_ptr(),
-        b"KILL\0".as_ptr(),
-        budget_arg.as_ptr(),
-        b"./busybox\0".as_ptr(),
+    let args: [*const u8; 3] = [
         b"sh\0".as_ptr(),
         script_arg.as_ptr(),
         core::ptr::null(),
@@ -256,7 +256,7 @@ fn run_script(dir: &str, script: &str) {
     let pid = fork();
     if pid == 0 {
         user_lib::chdir(dir);
-        execve("./busybox\0", &args, &envs);
+        exec("/busybox\0", &args);
         exit(127);
     } else if pid > 0 {
         let mut ec = 0;
