@@ -303,6 +303,7 @@ impl TaskControlBlock {
         let mut loaded = MemorySet::from_elf(elf_data);
         let mut entry_point = loaded.entry_point;
         let program_entry = loaded.program_entry;
+        let program_break = loaded.program_break;
 
         // Load dynamic linker/interpreter at a fixed high address
         if let Some(id) = interp_data {
@@ -312,7 +313,7 @@ impl TaskControlBlock {
             loaded.interp_base = interp_base;
         }
         let stack_top = loaded.user_sp;
-        let heap_bottom = stack_top;
+        let heap_bottom = program_break;
         let ph_addr = loaded.ph_addr;
         let ph_entsize = loaded.ph_entsize;
         let ph_num = loaded.ph_num;

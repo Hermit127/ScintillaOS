@@ -18,6 +18,7 @@ pub struct LoadedElf {
     pub memory_set: MemorySet,
     pub user_sp: usize,
     pub entry_point: usize,
+    pub program_break: usize,
     pub ph_addr: usize,
     pub ph_entsize: usize,
     pub ph_num: usize,
@@ -146,10 +147,10 @@ impl MemorySet {
                 }
             }
         }
-        // map user stack with U flags
-        let mut user_stack_bottom: usize = max_end_va.into();
-        // guard page
-        user_stack_bottom += PAGE_SIZE;
+        let program_break =
+            (max_end_va.raw() + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE;
+        let user_stack_top: usize = 0x8_0000_0000;
+        let user_stack_bottom = user_stack_top - USER_STACK_SIZE;
         let user_stack_top = user_stack_bottom + USER_STACK_SIZE;
         memory_set.push(
             MapArea::new(
@@ -165,6 +166,7 @@ impl MemorySet {
             memory_set,
             user_sp: user_stack_top,
             entry_point: program_entry,
+            program_break,
             ph_addr,
             ph_entsize: e_phentsize,
             ph_num: ph_count as usize,
