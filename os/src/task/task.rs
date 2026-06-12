@@ -434,6 +434,8 @@ impl TaskControlBlock {
         auxv_write!(AT_HWCAP, 0u64);
         auxv_write!(AT_PLATFORM, platform_addr as u64);
         auxv_write!(AT_RANDOM, random_addr as u64);
+        // AT_EXECFN
+        auxv_write!(31, string_addrs[0] as u64);
         auxv_write!(AT_NULL, 0u64);
 
         // Step 5: envp NULL and pointers
