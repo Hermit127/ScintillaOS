@@ -243,6 +243,9 @@ pub fn sys_exec(path: *const u8, mut args: *const usize, mut envp: *const usize)
             return -1;
         }
         let task = current_task().unwrap();
+        if all_data.len() < 4 || &all_data[..4] != b"\x7fELF" {
+            return -1;
+        }
         // Check for dynamically linked ELF (has PT_INTERP)
         if let Some(interp_path) = crate::mm::get_elf_interp(&all_data) {
             if let Some(interp_inode) = open_file(&interp_path, OpenFlags::RDONLY)
