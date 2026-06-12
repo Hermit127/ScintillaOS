@@ -95,27 +95,6 @@ fn rebind_busybox_applets() {
 
 fn install_busybox() {
     sys_mkdir(b"/bin\0".as_ptr(), 0o777);
-    let ret = force_symlink("/busybox", "/bin/sh");
-    if ret == 0 {
-        println!("[initproc] /bin/sh created");
-    }
-
-    let args: [*const u8; 5] = [
-        b"/busybox\0".as_ptr(),
-        b"--install\0".as_ptr(),
-        b"-s\0".as_ptr(),
-        b"/bin\0".as_ptr(),
-        core::ptr::null(),
-    ];
-    let pid = fork();
-    if pid == 0 {
-        exec("/busybox\0", &args);
-        exit(0);
-    } else if pid > 0 {
-        let mut ec = 0;
-        waitpid(pid as usize, &mut ec);
-        println!("[initproc] busybox --install exit: {}", ec);
-    }
 }
 
 fn list_dir(path: &str) -> Vec<String> {
