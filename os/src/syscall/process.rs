@@ -1,4 +1,4 @@
-use crate::fs::{open_file, OpenFlags, File};
+use crate::fs::{open_file, open_file_at, OpenFlags, File};
 use crate::fs::stdio::stdout_release_if_owner;
 use crate::mm::{
     translated_byte_buffer, translated_ref, translated_refmut, translated_str, MapPermission,
@@ -208,13 +208,17 @@ pub fn sys_exec(path: *const u8, mut args: *const usize, mut envp: *const usize)
             }
         }
     }
-    let app_inode = open_file(path.as_str(), OpenFlags::RDONLY).or_else(|| {
-        if path.starts_with('/') {
-            None
-        } else {
-            open_file(format!("/bin/{}", path).as_str(), OpenFlags::RDONLY)
-        }
-    });
+    let cwd = {
+        let task = current_task().unwrap();
+        let inner = task.inner_exclusive_access();
+        inner.cwd.clone()
+    };
+    let app_inode = if path.starts_with('/') {
+        open_file(path.as_str(), OpenFlags::RDONLY)
+    } else {
+        open_file_at(Some(cwd), path.as_str(), OpenFlags::RDONLY, 0)
+            .or_else(|| open_file(format!("/bin/{}", path).as_str(), OpenFlags::RDONLY))
+    };
     if let Some(app_inode) = app_inode {
         let all_data = app_inode.read_all();
         if all_data.len() >= 2 && &all_data[..2] == b"#!" {
@@ -248,6 +252,7 @@ pub fn sys_exec(path: *const u8, mut args: *const usize, mut envp: *const usize)
                 task.exec_with_interp(all_data.as_slice(), Some(&interp_data), args_vec, env_vec);
                 return 0;
             }
+            return -1;
         }
         task.exec(all_data.as_slice(), args_vec, env_vec);
         0
