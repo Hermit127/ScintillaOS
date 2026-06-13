@@ -506,11 +506,11 @@ impl Dentry {
         })
     }
 
-    fn new_mount_root(sb: Arc<VfsSuperBlock>, mnt_path: String) -> Arc<Self> {
+    fn new_mount_root(sb: Arc<VfsSuperBlock>, mnt_path: String, lwext4_mount: &str) -> Arc<Self> {
         Arc::new(Dentry {
             name: String::from("/"),
             path: mnt_path,
-            fs_path: String::from("/"),
+            fs_path: String::from(lwext4_mount),
             inode_num: 2,
             is_dir: true,
             parent: None,
@@ -527,6 +527,8 @@ impl Dentry {
         };
         let fs_path = if parent.fs_path == "/" {
             format!("/{}", name)
+        } else if parent.fs_path.ends_with('/') {
+            format!("{}{}", parent.fs_path, name)
         } else {
             format!("{}/{}", parent.fs_path, name)
         };
@@ -756,7 +758,7 @@ pub fn vfs_mount(mnt_point: Arc<Dentry>, sb: Arc<VfsSuperBlock>) -> bool {
         }
     }
 
-    let mnt_root = Dentry::new_mount_root(sb, mnt_point.path.clone());
+    let mnt_root = Dentry::new_mount_root(sb, mnt_point.path.clone(), "/mp/");
 
     MOUNT_TABLE.exclusive_access().push(Mount {
         mnt_point: mnt_point.clone(),

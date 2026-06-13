@@ -252,7 +252,9 @@ fn open_file_new(
             return None;
         }
 
-        if let Some(dentry) = vfs_resolve_with_fallback(&start, path) {
+        if let Some(dentry) = vfs_resolve_with_fallback(&start, path)
+            .and_then(|d| follow_symlink(&start, d, 0))
+        {
             if !dentry.is_dir {
                 if flags.excl_requested() {
                     return None;
@@ -280,7 +282,7 @@ fn open_file_new(
         )));
     }
 
-    let dentry = vfs_resolve_with_fallback(&start, path)?;
+    let dentry = follow_symlink(&start, vfs_resolve_with_fallback(&start, path)?, 0)?;
     if want_dir && !dentry.is_dir {
         return None;
     }
@@ -299,6 +301,32 @@ fn open_file_new(
     };
     let append = !dentry.is_dir && flags.contains(OpenFlags::APPEND);
     Some(Arc::new(OSInode::new(readable, writable, append, dentry)))
+}
+
+fn follow_symlink(start: &Arc<Dentry>, dentry: Arc<Dentry>, depth: usize) -> Option<Arc<Dentry>> {
+    if depth >= 8 {
+        return None;
+    }
+    let info = dentry.super_block.get_inode_info(&dentry.fs_path)?;
+    if !info.is_link {
+        return Some(dentry);
+    }
+
+    let mut target = alloc::vec![0u8; 512];
+    let n = dentry.super_block.read_at(&dentry.fs_path, 0, &mut target);
+    target.truncate(n);
+    let target = core::str::from_utf8(&target).ok()?.trim_matches('\0');
+    if target.is_empty() {
+        return None;
+    }
+
+    let base = if target.starts_with('/') {
+        crate::fs::vfs::ROOT_DENTRY.clone()
+    } else {
+        dentry.parent.clone().unwrap_or_else(|| start.clone())
+    };
+    let next = vfs_resolve_with_fallback(&base, target)?;
+    follow_symlink(&base, next, depth + 1)
 }
 
 pub fn mkdir_at(base: Option<Arc<Dentry>>, path: &str) -> bool {

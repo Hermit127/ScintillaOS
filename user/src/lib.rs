@@ -317,5 +317,7 @@ pub fn umount2(target: &str, flags: usize) -> isize {
 }
 
 pub fn symlinkat(target: &str, linkpath: &str) -> isize {
+    let target = alloc::format!("{}\0", target.trim_end_matches('\0'));
+    let linkpath = alloc::format!("{}\0", linkpath.trim_end_matches('\0'));
     sys_symlinkat(target.as_ptr(), linkpath.as_ptr())
 }

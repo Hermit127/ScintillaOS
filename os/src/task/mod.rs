@@ -331,11 +331,20 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
 
 lazy_static! {
     pub static ref INITPROC: Arc<TaskControlBlock> = Arc::new({
-        let inode = open_file("/bin/initproc", OpenFlags::RDONLY).unwrap();
-        let v = inode.read_all();
+        let v = open_file("/bin/initproc", OpenFlags::RDONLY)
+            .map(|inode| inode.read_all())
+            .unwrap_or_else(|| EMBEDDED_INITPROC.to_vec());
         TaskControlBlock::new(v.as_slice())
     });
 }
+
+#[cfg(target_arch = "riscv64")]
+static EMBEDDED_INITPROC: &[u8] =
+    include_bytes!("../../../target/riscv64gc-unknown-none-elf/release/initproc");
+
+#[cfg(target_arch = "loongarch64")]
+static EMBEDDED_INITPROC: &[u8] =
+    include_bytes!("../../../target/loongarch64-unknown-none/release/initproc");
 
 pub fn add_initproc() {
     trace!("os::task::add_initproc");

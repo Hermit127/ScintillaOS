@@ -331,6 +331,7 @@ kernel:
 	@echo Platform: $(BOARD)
 	@mkdir -p .cargo 2>/dev/null || true
 	@cp -f cargo_config/config.toml .cargo/config.toml 2>/dev/null || true
+	@cd user && make build TARGET=$(TARGET)
 	@cargo build --release --target $(TARGET)
 
 clean:
