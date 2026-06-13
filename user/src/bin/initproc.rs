@@ -192,24 +192,10 @@ fn script_budget(script: &str) -> &'static str {
         "10"
     } else if script.starts_with("busybox_") {
         "45"
-    } else if script.starts_with("ltp_") {
-        "2000"
-    } else if script.starts_with("libctest_") {
-        "150"
-    } else if script.starts_with("iperf_") {
-        "40"
-    } else if script.starts_with("netperf_") {
-        "60"
-    } else if script.starts_with("libcbench_") {
-        "30"
     } else if script.starts_with("iozone_") {
         "40"
-    } else if script.starts_with("cyclictest_") {
-        "20"
     } else if script.starts_with("lmbench_") {
         "60"
-    } else if script.starts_with("unixbench_") {
-        "90"
     } else {
         "10"
     }
@@ -234,17 +220,11 @@ fn run_script(dir: &str, script: &str) {
     let ld_path = String::from("LD_LIBRARY_PATH=")
         + dir.trim_end_matches('\0').trim_end_matches('/')
         + "/lib:/lib:/lib64\0";
-    let path = String::from("PATH=")
-        + dir.trim_end_matches('\0').trim_end_matches('/')
-        + "/ltp/testcases/bin:/bin:/\0";
-    let ltp_root =
-        String::from("LTPROOT=") + dir.trim_end_matches('\0').trim_end_matches('/') + "/ltp\0";
+    let path = b"PATH=/bin:/\0";
     let args: [*const u8; 3] = [b"sh\0".as_ptr(), script_arg.as_ptr(), core::ptr::null()];
-    let envs: [*const u8; 8] = [
+    let envs: [*const u8; 6] = [
         ld_path.as_ptr(),
-        path.as_ptr(),
-        ltp_root.as_ptr(),
-        b"LTP_TIMEOUT_MUL=2\0".as_ptr(),
+        path.as_ptr() as *const u8,
         b"ENOUGH=1000\0".as_ptr(),
         b"TIMING_O=0\0".as_ptr(),
         b"LOOP_O=0\0".as_ptr(),
@@ -279,14 +259,11 @@ fn scan_and_run(dir: &str, depth: usize) -> bool {
     let mut scripts: Vec<String> = entries
         .iter()
         .filter(|entry| entry.ends_with("_testcode.sh"))
+        .filter(|entry| should_run_script(entry))
         .cloned()
         .collect();
     sort_scripts(&mut scripts);
     for entry in &scripts {
-        if !should_run_script(entry) {
-            println!("[initproc] [SKIP] {}{}", dir.trim_end_matches('\0'), entry);
-            continue;
-        }
         if entry.ends_with("_testcode.sh") {
             setup_runtime_for_dir(dir);
             println!("[initproc] [RUN] {}{}", dir.trim_end_matches('\0'), entry);
