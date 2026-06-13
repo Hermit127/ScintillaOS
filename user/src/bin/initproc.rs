@@ -32,60 +32,6 @@ fn force_symlink(target: &str, linkpath: &str) -> isize {
     }
 }
 
-fn file_exists(path: &str) -> bool {
-    let fd = open(path, OpenFlags::RDONLY);
-    if fd < 0 {
-        false
-    } else {
-        close(fd as usize);
-        true
-    }
-}
-
-fn detected_musl_root() -> &'static str {
-    if file_exists("/mnt/musl/lib/libc.so\0") {
-        "/mnt/musl"
-    } else {
-        #[cfg(target_arch = "riscv64")]
-        {
-            if file_exists("/mnt/riscv/musl/lib/libc.so\0") {
-                return "/mnt/riscv/musl";
-            }
-        }
-        #[cfg(target_arch = "loongarch64")]
-        {
-            if file_exists("/mnt/loongarch/musl/lib/libc.so\0") {
-                return "/mnt/loongarch/musl";
-            }
-        }
-        "/mnt/musl"
-    }
-}
-
-fn detected_glibc_root() -> &'static str {
-    if file_exists("/mnt/glibc/lib/libc.so\0") || file_exists("/mnt/glibc/lib/libc.so.6\0") {
-        "/mnt/glibc"
-    } else {
-        #[cfg(target_arch = "riscv64")]
-        {
-            if file_exists("/mnt/riscv/glibc/lib/libc.so\0")
-                || file_exists("/mnt/riscv/glibc/lib/libc.so.6\0")
-            {
-                return "/mnt/riscv/glibc";
-            }
-        }
-        #[cfg(target_arch = "loongarch64")]
-        {
-            if file_exists("/mnt/loongarch/glibc/lib/libc.so\0")
-                || file_exists("/mnt/loongarch/glibc/lib/libc.so.6\0")
-            {
-                return "/mnt/loongarch/glibc";
-            }
-        }
-        "/mnt/glibc"
-    }
-}
-
 fn bind_library(root: &str, rel_path: &str, dst: &str) {
     let src = String::from(root) + rel_path;
     force_symlink(&src, dst);
@@ -93,75 +39,72 @@ fn bind_library(root: &str, rel_path: &str, dst: &str) {
     force_symlink(&src, &dst64);
 }
 
-fn bind_loaders() {
+fn setup_busybox_applets() {
+    sys_mkdir(b"/bin\0".as_ptr(), 0o777);
+    force_symlink("/busybox", "/bin/busybox\0");
+    force_symlink("/busybox", "/bin/sh\0");
+    for applet in BUSYBOX_APPLETS {
+        let path = String::from("/bin/") + applet + "\0";
+        force_symlink("/busybox", &path);
+    }
+}
+
+fn runtime_roots(root: &str) -> (String, String) {
+    if let Some(prefix) = root.strip_suffix("/musl") {
+        (String::from(root), String::from(prefix) + "/glibc")
+    } else if let Some(prefix) = root.strip_suffix("/glibc") {
+        (String::from(prefix) + "/musl", String::from(root))
+    } else {
+        (String::from(root), String::from(root))
+    }
+}
+
+fn setup_runtime_for_dir(dir: &str) {
+    setup_busybox_applets();
     sys_mkdir(b"/lib\0".as_ptr(), 0o777);
     sys_mkdir(b"/lib64\0".as_ptr(), 0o777);
-    let musl_root = detected_musl_root();
-    let glibc_root = detected_glibc_root();
+
+    let root = dir.trim_end_matches('\0').trim_end_matches('/');
+    let (musl_root, glibc_root) = runtime_roots(root);
+    println!(
+        "[initproc] runtime root {} musl {} glibc {}",
+        root, musl_root, glibc_root
+    );
 
     #[cfg(target_arch = "riscv64")]
     {
         bind_library(
-            glibc_root,
+            &glibc_root,
             "/lib/ld-linux-riscv64-lp64d.so.1",
             "/lib/ld-linux-riscv64-lp64d.so.1",
         );
-        bind_library(glibc_root, "/lib/libc.so.6", "/lib/libc.so.6");
-        bind_library(glibc_root, "/lib/libc.so", "/lib/libc.so.6");
-        bind_library(glibc_root, "/lib/libm.so.6", "/lib/libm.so.6");
-        bind_library(glibc_root, "/lib/libm.so", "/lib/libm.so.6");
-        bind_library(musl_root, "/lib/libc.so", "/lib/ld-musl-riscv64-sf.so.1");
-        bind_library(musl_root, "/lib/libc.so", "/lib/ld-musl-riscv64.so.1");
-        bind_library(musl_root, "/lib/libc.so", "/lib/libc.so");
+        bind_library(&glibc_root, "/lib/libc.so.6", "/lib/libc.so.6");
+        bind_library(&glibc_root, "/lib/libm.so.6", "/lib/libm.so.6");
+        bind_library(&musl_root, "/lib/libc.so", "/lib/ld-musl-riscv64-sf.so.1");
+        bind_library(&musl_root, "/lib/libc.so", "/lib/ld-musl-riscv64.so.1");
+        bind_library(&musl_root, "/lib/libc.so", "/lib/libc.so");
     }
     #[cfg(target_arch = "loongarch64")]
     {
         bind_library(
-            glibc_root,
+            &glibc_root,
             "/lib/ld-linux-loongarch-lp64d.so.1",
             "/lib/ld-linux-loongarch-lp64d.so.1",
         );
-        bind_library(glibc_root, "/lib/libc.so.6", "/lib/libc.so.6");
-        bind_library(glibc_root, "/lib/libm.so.6", "/lib/libm.so.6");
-        bind_library(musl_root, "/lib/libc.so", "/lib/ld-musl-loongarch64.so.1");
+        bind_library(&glibc_root, "/lib/libc.so.6", "/lib/libc.so.6");
+        bind_library(&glibc_root, "/lib/libm.so.6", "/lib/libm.so.6");
+        bind_library(&musl_root, "/lib/libc.so", "/lib/ld-musl-loongarch64.so.1");
         bind_library(
-            musl_root,
+            &musl_root,
             "/lib/libc.so",
             "/lib/ld-musl-loongarch-lp64d.so.1",
         );
-        bind_library(musl_root, "/lib/libc.so", "/lib/libc.so");
+        bind_library(&musl_root, "/lib/libc.so", "/lib/libc.so");
     }
-}
-
-fn rebind_busybox_applets() {
-    let bb_path = if file_exists("/mnt/musl/busybox\0") {
-        "/mnt/musl/busybox"
-    } else if file_exists("/mnt/riscv/musl/busybox\0") {
-        "/mnt/riscv/musl/busybox"
-    } else if file_exists("/mnt/loongarch/musl/busybox\0") {
-        "/mnt/loongarch/musl/busybox"
-    } else if file_exists("/mnt/glibc/busybox\0") {
-        "/mnt/glibc/busybox"
-    } else if file_exists("/mnt/riscv/glibc/busybox\0") {
-        "/mnt/riscv/glibc/busybox"
-    } else if file_exists("/mnt/loongarch/glibc/busybox\0") {
-        "/mnt/loongarch/glibc/busybox"
-    } else {
-        return;
-    };
-    sys_mkdir(b"/bin\0".as_ptr(), 0o777);
-    force_symlink(bb_path, "/bin/busybox\0");
-    force_symlink(bb_path, "/bin/sh\0");
-    for applet in BUSYBOX_APPLETS {
-        let path = String::from("/bin/") + applet + "\0";
-        force_symlink(bb_path, &path);
-    }
-    println!("[initproc] /bin/sh and /bin/busybox -> {}", bb_path);
 }
 
 fn install_busybox() {
-    sys_mkdir(b"/bin\0".as_ptr(), 0o777);
-    force_symlink("/busybox", "/bin/sh\0");
+    setup_busybox_applets();
 }
 
 fn list_dir(path: &str) -> Vec<String> {
@@ -345,6 +288,7 @@ fn scan_and_run(dir: &str, depth: usize) -> bool {
             continue;
         }
         if entry.ends_with("_testcode.sh") {
+            setup_runtime_for_dir(dir);
             println!("[initproc] [RUN] {}{}", dir.trim_end_matches('\0'), entry);
             run_script(dir, entry);
             found = true;
@@ -377,11 +321,7 @@ fn main() -> i32 {
     sys_mkdir(b"/mnt\0".as_ptr(), 0o777);
     let r = sys_mount("vda\0", "/mnt\0", "ext4\0", 0, &[]);
     println!("[initproc] mount vda -> /mnt: {}", r);
-
-    if r == 0 {
-        bind_loaders();
-        rebind_busybox_applets();
-    }
+    println!("[initproc] scan begin");
 
     let mut found = false;
     for dir in ["/mnt/musl/\0", "/mnt/glibc/\0"] {
