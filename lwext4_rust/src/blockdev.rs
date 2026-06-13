@@ -127,7 +127,17 @@ impl<K: KernelDevOp> Ext4BlockWrapper<K> {
         ext4bd.ext4_set_debug();
 
         unsafe {
-            ext4bd.lwext4_mount(false)?;
+            if let Err(err) = ext4bd.lwext4_mount(false) {
+                if is_root {
+                    return Err(err);
+                }
+                error!(
+                    "lwext4 read-write mount failed rc = {:?}, retry read-only\n",
+                    err
+                );
+                ext4bd.lwext4_force_unmount();
+                ext4bd.lwext4_mount(true)?;
+            }
         }
 
         ext4bd.lwext4_dir_ls();
@@ -276,6 +286,14 @@ impl<K: KernelDevOp> Ext4BlockWrapper<K> {
 
         info!("lwext4 mount Okay");
         Ok(0)
+    }
+
+    unsafe fn lwext4_force_unmount(&mut self) {
+        let c_name = &self.name as *const _ as *const c_char;
+        let c_mountpoint = &self.mount_point as *const _ as *const c_char;
+        let _ = ext4_umount(c_mountpoint);
+        let _ = ext4_device_unregister(c_name);
+        self.has_journal = false;
     }
 
     /// Call this when block device is being uninstalled
