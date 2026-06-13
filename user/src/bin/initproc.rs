@@ -216,25 +216,13 @@ fn sort_scripts(scripts: &mut Vec<String>) {
 
 fn run_script(dir: &str, script: &str) {
     let script_arg = String::from("./") + script + "\0";
-    let budget = script_budget(script);
-    let _budget_arg = String::from(budget) + "\0";
-    let ld_path = String::from("LD_LIBRARY_PATH=")
-        + dir.trim_end_matches('\0').trim_end_matches('/')
-        + "/lib:/lib:/lib64\0";
-    let path = b"PATH=/bin:/\0";
     let args: [*const u8; 3] = [b"sh\0".as_ptr(), script_arg.as_ptr(), core::ptr::null()];
-    let envs: [*const u8; 6] = [
-        ld_path.as_ptr(),
-        path.as_ptr() as *const u8,
-        b"ENOUGH=1000\0".as_ptr(),
-        b"TIMING_O=0\0".as_ptr(),
-        b"LOOP_O=0\0".as_ptr(),
-        core::ptr::null(),
-    ];
     let pid = fork();
     if pid == 0 {
-        user_lib::chdir(dir);
-        execve("/busybox\0", &args, &envs);
+        if user_lib::chdir(dir) != 0 {
+            exit(126);
+        }
+        exec("/busybox\0", &args);
         exit(127);
     } else if pid > 0 {
         let mut ec = 0;
