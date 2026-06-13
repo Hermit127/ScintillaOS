@@ -23,13 +23,14 @@ const BUSYBOX_APPLETS: [&str; 68] = [
 
 fn force_symlink(target: &str, linkpath: &str) -> isize {
     unlinkat(linkpath);
-    let r1 = symlinkat(target, linkpath);
-    if r1 != 0 {
+    let mut r = symlinkat(target, linkpath);
+    let mut tries = 0;
+    while r != 0 && tries < 4 {
         unlinkat(linkpath);
-        symlinkat(target, linkpath)
-    } else {
-        0
+        r = symlinkat(target, linkpath);
+        tries += 1;
     }
+    r
 }
 
 fn bind_library(root: &str, rel_path: &str, dst: &str) {
