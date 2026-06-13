@@ -127,17 +127,7 @@ impl<K: KernelDevOp> Ext4BlockWrapper<K> {
         ext4bd.ext4_set_debug();
 
         unsafe {
-            if let Err(err) = ext4bd.lwext4_mount(false) {
-                if is_root {
-                    return Err(err);
-                }
-                error!(
-                    "lwext4 read-write mount failed rc = {:?}, retry read-only\n",
-                    err
-                );
-                ext4bd.lwext4_force_unmount();
-                ext4bd.lwext4_mount(true)?;
-            }
+            ext4bd.lwext4_mount(false)?;
         }
 
         ext4bd.lwext4_dir_ls();
@@ -276,24 +266,21 @@ impl<K: KernelDevOp> Ext4BlockWrapper<K> {
             }
             let r = ext4_journal_start(c_mountpoint);
             if r != EOK as i32 {
-                error!("ext4_journal_start: rc = {:?}\n", r);
-                return Err(r);
+                if (r == ENOTSUP as i32) || (r == EINVAL as i32) {
+                    info!("ext4_journal_start unsupported rc = {:?}, continue without journal\n", r);
+                } else {
+                    error!("ext4_journal_start: rc = {:?}\n", r);
+                    return Err(r);
+                }
+            } else {
+                ext4_cache_write_back(c_mountpoint, true);
+                self.has_journal = true;
             }
-            ext4_cache_write_back(c_mountpoint, true);
-            self.has_journal = true;
         }
         // ext4_bcache
 
         info!("lwext4 mount Okay");
         Ok(0)
-    }
-
-    unsafe fn lwext4_force_unmount(&mut self) {
-        let c_name = &self.name as *const _ as *const c_char;
-        let c_mountpoint = &self.mount_point as *const _ as *const c_char;
-        let _ = ext4_umount(c_mountpoint);
-        let _ = ext4_device_unregister(c_name);
-        self.has_journal = false;
     }
 
     /// Call this when block device is being uninstalled
