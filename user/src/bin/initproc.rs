@@ -287,12 +287,21 @@ fn main() -> i32 {
     sys_mkdir(b"/mnt\0".as_ptr(), 0o777);
     let r = sys_mount("vda\0", "/mnt\0", "ext4\0", 0, &[]);
     println!("[initproc] mount vda -> /mnt: {}", r);
-    println!("[initproc] scan begin");
 
+    // Run musl and glibc in parallel via fork
+    let mut children: [isize; 2] = [-1, -1];
+    for (i, dir) in ["/mnt/musl/\0", "/mnt/glibc/\0"].iter().enumerate() {
+        let pid = fork();
+        if pid == 0 {
+            if scan_and_run(dir, 0) { exit(0); } else { exit(1); }
+        } else if pid > 0 { children[i] = pid; }
+    }
     let mut found = false;
-    for dir in ["/mnt/musl/\0", "/mnt/glibc/\0"] {
-        if scan_and_run(dir, 0) {
-            found = true;
+    for &pid in &children {
+        if pid > 0 {
+            let mut ec = 0;
+            waitpid(pid as usize, &mut ec);
+            if ec == 0 { found = true; }
         }
     }
     #[cfg(target_arch = "riscv64")]
