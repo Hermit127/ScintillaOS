@@ -220,6 +220,7 @@ fn loongarch64_trap_handler(tf: &mut TrapFrame) -> TrapType {
         | Trap::Exception(Exception::FetchPageFault) => {
             TrapType::InstructionPageFault(badv::read().vaddr())
         }
+        Trap::Exception(Exception::PagePrivilegeIllegal) => TrapType::LoadPageFault(badv::read().vaddr()),
         // Load Fault
         Trap::Exception(Exception::LoadPageFault)
         | Trap::Exception(Exception::PageNonReadableFault) => {

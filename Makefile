@@ -93,6 +93,7 @@ all: kernel-rv disk.img disk-rv.img kernel-la disk-la.img
 kernel-rv:
 	@echo "===== Building kernel-rv (riscv64) ====="
 	@$(MAKE) kernel ARCH=riscv64
+	@$(OBJCOPY) target/riscv64gc-unknown-none-elf/release/os --strip-all -O binary target/riscv64gc-unknown-none-elf/release/os.bin
 	@$(OBJCOPY) target/riscv64gc-unknown-none-elf/release/os --strip-all -O binary kernel-rv
 	@echo "kernel-rv ready"
 
@@ -371,11 +372,13 @@ QEMU_ARGS_DUAL := -drive file=$(TEST_DISK),if=none,format=raw,id=x0 \
 			-device $(VIRTIO_BLK_DEVICE),drive=x1$(if $(filter loongarch64,$(ARCH)),,$(COMMA)bus=$(VIRTIO_BLK_BUS2))
 
 # virtio-net network configuration (SLIRP user-mode, riscv64/aarch64)
+QEMU_NET_HOSTFWD ?= hostfwd=tcp::5555-:5001$(COMMA)hostfwd=tcp::5556-:5201
+QEMU_NETDEV_USER := user$(COMMA)id=net0$(if $(QEMU_NET_HOSTFWD),$(COMMA)$(QEMU_NET_HOSTFWD))
 ifeq ($(ARCH), riscv64)
-  QEMU_NET_ARGS := -netdev user,id=net0,hostfwd=tcp::5555-:5001,hostfwd=tcp::5556-:5201 \
+  QEMU_NET_ARGS := -netdev $(QEMU_NETDEV_USER) \
 			-device virtio-net-device,netdev=net0,bus=virtio-mmio-bus.2
 else ifeq ($(ARCH), aarch64)
-  QEMU_NET_ARGS := -netdev user,id=net0,hostfwd=tcp::5555-:5001,hostfwd=tcp::5556-:5201 \
+  QEMU_NET_ARGS := -netdev $(QEMU_NETDEV_USER) \
 			-device virtio-net-device,netdev=net0,bus=virtio-mmio-bus.2
 else
   QEMU_NET_ARGS :=

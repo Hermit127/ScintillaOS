@@ -225,6 +225,24 @@ impl OpenFlags {
 
 // ==================== File Operations ====================
 
+fn current_euid_is_root() -> bool {
+    crate::task::current_task()
+        .map(|task| task.inner_exclusive_access().euid == 0)
+        .unwrap_or(false)
+}
+
+fn root_make_accessible(dentry: &Arc<Dentry>, bits: u32) {
+    if !current_euid_is_root() {
+        return;
+    }
+    if let Some(info) = dentry.super_block.get_inode_info(&dentry.fs_path) {
+        let new_mode = info.mode | (bits & 0o777);
+        if new_mode != info.mode {
+            dentry.super_block.set_mode(&dentry.fs_path, new_mode);
+        }
+    }
+}
+
 pub fn open_file(path: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
     open_file_new(None, path, flags, 0o666)
 }
@@ -259,6 +277,9 @@ fn open_file_new(
                 if flags.excl_requested() {
                     return None;
                 }
+                if flags.trunc_requested() || flags.contains(OpenFlags::WRONLY) || flags.contains(OpenFlags::RDWR) {
+                    root_make_accessible(&dentry, 0o666);
+                }
                 if flags.trunc_requested() {
                     let truncated = dentry.super_block.truncate_file(&dentry.fs_path, 0);
                     if !truncated {
@@ -272,6 +293,7 @@ fn open_file_new(
         }
 
         let (parent, name) = vfs_resolve_parent_and_name(&start, path)?;
+        root_make_accessible(&parent, 0o777);
         let dentry = vfs_create(&parent, &name, false, mode)?;
         let (readable, writable) = flags.read_write();
         return Some(Arc::new(OSInode::new(
@@ -285,6 +307,10 @@ fn open_file_new(
     let dentry = follow_symlink(&start, vfs_resolve_with_fallback(&start, path)?, 0)?;
     if want_dir && !dentry.is_dir {
         return None;
+    }
+
+    if !dentry.is_dir && (flags.trunc_requested() || flags.contains(OpenFlags::WRONLY) || flags.contains(OpenFlags::RDWR)) {
+        root_make_accessible(&dentry, 0o666);
     }
 
     if flags.trunc_requested() && !dentry.is_dir {
@@ -307,15 +333,29 @@ fn follow_symlink(start: &Arc<Dentry>, dentry: Arc<Dentry>, depth: usize) -> Opt
     if depth >= 8 {
         return None;
     }
+    if dentry.is_dir {
+        return Some(dentry);
+    }
     let info = dentry.super_block.get_inode_info(&dentry.fs_path)?;
     if !info.is_link {
         return Some(dentry);
     }
 
-    let mut target = alloc::vec![0u8; 512];
-    let n = dentry.super_block.read_at(&dentry.fs_path, 0, &mut target);
-    target.truncate(n);
-    let target = core::str::from_utf8(&target).ok()?.trim_matches('\0');
+    let mut target_buf = [0u8; 512];
+    let mut rcnt: usize = 0;
+    let c_path = alloc::ffi::CString::new(dentry.fs_path.as_bytes()).ok()?;
+    let rc = unsafe {
+        lwext4_rust::bindings::ext4_readlink(
+            c_path.as_ptr() as *const core::ffi::c_char,
+            target_buf.as_mut_ptr() as *mut core::ffi::c_char,
+            target_buf.len(),
+            &mut rcnt,
+        )
+    };
+    if rc != 0 || rcnt == 0 {
+        return None;
+    }
+    let target = core::str::from_utf8(&target_buf[..rcnt]).ok()?.trim_matches('\0');
     if target.is_empty() {
         return None;
     }
@@ -341,6 +381,7 @@ pub fn mkdir_at(base: Option<Arc<Dentry>>, path: &str) -> bool {
         None => return false,
     };
 
+    root_make_accessible(&parent, 0o777);
     vfs_create(&parent, &name, true, 0o777).is_some()
 }
 
@@ -359,6 +400,9 @@ pub fn unlink_at(base: Option<Arc<Dentry>>, path: &str, is_dir: bool) -> bool {
         Some(p) => p,
         None => return false,
     };
+
+    root_make_accessible(&parent, 0o777);
+    root_make_accessible(&dentry, 0o777);
 
     let ok = if is_dir {
         dentry.super_block.unlink_dir(&dentry.fs_path)
@@ -431,42 +475,12 @@ impl File for OSInode {
     }
 
     fn write_at(&self, offset: usize, buf: &mut [u8]) -> isize {
-        let need_open = {
-            let inner = self.inner.exclusive_access();
-            inner.file_handle.is_none()
-        };
-        if need_open {
-            self.open_handle();
-        }
-        let mut inner = self.inner.exclusive_access();
-        if let Some(ref mut file) = inner.file_handle {
-            unsafe {
-                ext4_fseek(file, offset as i64, SEEK_SET as u32);
-            }
-            let mut rw_count: usize = 0;
-            let rc = unsafe {
-                ext4_fwrite(
-                    file,
-                    buf.as_ptr() as *const core::ffi::c_void,
-                    buf.len(),
-                    &mut rw_count,
-                )
-            };
-            if rc == EOK as i32 {
-                return rw_count as isize;
-            }
-        }
-        -1
+        self.dentry
+            .super_block
+            .write_at(&self.dentry.fs_path, offset, buf) as isize
     }
 
     fn write(&self, buf: &mut [u8]) -> isize {
-        let need_open = {
-            let inner = self.inner.exclusive_access();
-            inner.file_handle.is_none()
-        };
-        if need_open {
-            self.open_handle();
-        }
         let mut inner = self.inner.exclusive_access();
         if self.append {
             inner.offset = self
@@ -477,25 +491,14 @@ impl File for OSInode {
                 .unwrap_or(inner.offset);
         }
         let off = inner.offset;
-        if let Some(ref mut file) = inner.file_handle {
-            unsafe {
-                ext4_fseek(file, off as i64, SEEK_SET as u32);
-            }
-            let mut rw_count: usize = 0;
-            let rc = unsafe {
-                ext4_fwrite(
-                    file,
-                    buf.as_ptr() as *const core::ffi::c_void,
-                    buf.len(),
-                    &mut rw_count,
-                )
-            };
-            if rc == EOK as i32 {
-                inner.offset = off + rw_count;
-                return rw_count as isize;
-            }
-        }
-        -1
+        drop(inner);
+        let rw_count = self
+            .dentry
+            .super_block
+            .write_at(&self.dentry.fs_path, off, buf);
+        let mut inner = self.inner.exclusive_access();
+        inner.offset = off + rw_count;
+        rw_count as isize
     }
 
     fn stat(&self) -> Kstat {
@@ -678,8 +681,6 @@ pub fn symlink_at(base: Option<Arc<Dentry>>, target: &str, linkpath: &str) -> bo
             link_cpath.as_ptr() as *const core::ffi::c_char,
         )
     };
-    if rc != EOK as i32 {
-        crate::println!("[symlink_at] ext4_fsymlink({} -> {}) = {}", target, link_fs_path, rc);
-    }
+
     rc == EOK as i32
 }

@@ -321,3 +321,8 @@ pub fn symlinkat(target: &str, linkpath: &str) -> isize {
     let linkpath = alloc::format!("{}\0", linkpath.trim_end_matches('\0'));
     sys_symlinkat(target.as_ptr(), linkpath.as_ptr())
 }
+
+pub fn unlinkat(path: &str) -> isize {
+    let path = alloc::format!("{}\0", path.trim_end_matches('\0'));
+    sys_unlinkat_path(path.as_ptr(), 0)
+}

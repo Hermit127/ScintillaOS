@@ -5,10 +5,65 @@ use crate::fs::{
 };
 use crate::mm::{translated_byte_buffer, translated_refmut, translated_str};
 use crate::task::{current_task, current_user_token};
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
+use alloc::vec::Vec;
 
 const AT_FDCWD: isize = -100;
+
+pub fn copy_from_user_pages(ptr: *const u8, len: usize) -> Option<Vec<u8>> {
+    if len == 0 {
+        return Some(Vec::new());
+    }
+    let task = current_task()?;
+    let inner = task.inner_exclusive_access();
+    let start = ptr as usize;
+    let end = start.checked_add(len)?;
+    let mut out = Vec::with_capacity(len);
+    let mut cur = start;
+    while cur < end {
+        let page_base = cur & !(crate::config::PAGE_SIZE - 1);
+        let page_off = cur - page_base;
+        let chunk = core::cmp::min(crate::config::PAGE_SIZE - page_off, end - cur);
+        let (paddr, _) = inner.memory_set.translate(polyhal::VirtAddr::from(page_base))?;
+        let src = unsafe { core::slice::from_raw_parts(paddr.get_ptr::<u8>().add(page_off), chunk) };
+        out.extend_from_slice(src);
+        cur += chunk;
+    }
+    Some(out)
+}
+
+pub fn copy_to_user_pages(ptr: *mut u8, data: &[u8]) -> bool {
+    if data.is_empty() {
+        return true;
+    }
+    let task = match current_task() {
+        Some(task) => task,
+        None => return false,
+    };
+    let inner = task.inner_exclusive_access();
+    let start = ptr as usize;
+    let end = match start.checked_add(data.len()) {
+        Some(end) => end,
+        None => return false,
+    };
+    let mut cur = start;
+    let mut copied = 0usize;
+    while cur < end {
+        let page_base = cur & !(crate::config::PAGE_SIZE - 1);
+        let page_off = cur - page_base;
+        let chunk = core::cmp::min(crate::config::PAGE_SIZE - page_off, end - cur);
+        let Some((paddr, _)) = inner.memory_set.translate(polyhal::VirtAddr::from(page_base)) else {
+            return false;
+        };
+        let dst = unsafe { core::slice::from_raw_parts_mut(paddr.get_mut_ptr::<u8>().add(page_off), chunk) };
+        dst.copy_from_slice(&data[copied..copied + chunk]);
+        copied += chunk;
+        cur += chunk;
+    }
+    true
+}
 
 fn resolve_base_dir(dirfd: isize) -> Option<Arc<Dentry>> {
     let task = current_task()?;
@@ -51,11 +106,12 @@ pub fn sys_write(fd: usize, buf: *mut u8, len: usize) -> isize {
             return -9;
         }
         let file = file.clone();
-        if !inner.memory_set.valid_user_buf(buf, len, false) {
-            return -14;
-        }
         drop(inner);
-        file.write(translated_byte_buffer(token, buf, len))
+        let mut kbuf = match copy_from_user_pages(buf as *const u8, len) {
+            Some(buf) => buf,
+            None => return -14,
+        };
+        file.write(kbuf.as_mut_slice())
     } else {
         -1
     }
@@ -76,12 +132,13 @@ pub fn sys_read(fd: usize, buf: *mut u8, len: usize) -> isize {
         if !file.readable() {
             return -9;
         }
-        if !inner.memory_set.valid_user_buf(buf, len, true) {
+        drop(inner);
+        let mut kbuf = vec![0u8; len];
+        let n = file.read(kbuf.as_mut_slice());
+        if n > 0 && !copy_to_user_pages(buf, &kbuf[..n as usize]) {
             return -14;
         }
-        drop(inner);
-
-        file.read(translated_byte_buffer(token, buf, len))
+        n
     } else {
         -9
     }
@@ -151,7 +208,8 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> isize
     if path.is_empty() {
         return -2;
     }
-    if let Some(existing) = vfs_resolve_with_fallback(&base, path.as_str()) {
+    let existing = vfs_resolve_with_fallback(&base, path.as_str());
+    if let Some(existing) = existing {
         if open_flags.directory_requested() && !existing.is_dir {
             return -20;
         }
@@ -1347,12 +1405,20 @@ pub fn sys_mount(
         "vdd" => Arc::new(VirtIOBlock::new_at(polyhal::PhysAddr::new(0x10004000))),
         _ => BLOCK_DEVICE.clone(),
     };
-    let sb = match VfsSuperBlock::new_ext4(blk_dev, "ext4") {
+    let lwext4_mount_path = match source_str.as_str() {
+        "vda" => "/__mount_vda/",
+        "vdb" => "/__mount_vdb/",
+        "vdc" => "/__mount_vdc/",
+        "vdd" => "/__mount_vdd/",
+        _ => "/__mount_blk/",
+    };
+
+    let sb = match VfsSuperBlock::new_ext4_at(blk_dev, "ext4", lwext4_mount_path) {
         Some(sb) => sb,
         None => return -17,
     };
 
-    if vfs_mount(mnt_point, sb) {
+    if vfs_mount(mnt_point, sb, lwext4_mount_path) {
         0
     } else {
         -16
@@ -1463,8 +1529,11 @@ pub fn sys_pread64(fd: usize, buf: *mut u8, len: usize, offset: usize) -> isize 
         None => return -1,
     };
     drop(inner);
-    let user_buf = translated_byte_buffer(token, buf, len);
-    let n = dentry.super_block.read_at(&dentry.fs_path, offset, user_buf);
+    let mut kbuf = vec![0u8; len];
+    let n = dentry.super_block.read_at(&dentry.fs_path, offset, kbuf.as_mut_slice());
+    if n > 0 && !copy_to_user_pages(buf, &kbuf[..n]) {
+        return -14;
+    }
     n as isize
 }
 
@@ -1484,8 +1553,11 @@ pub fn sys_pwrite64(fd: usize, buf: *mut u8, len: usize, offset: usize) -> isize
         None => return -1,
     };
     drop(inner);
-    let user_buf = translated_byte_buffer(token, buf, len);
-    let n = dentry.super_block.write_at(&dentry.fs_path, offset, user_buf);
+    let user_buf = match copy_from_user_pages(buf as *const u8, len) {
+        Some(buf) => buf,
+        None => return -14,
+    };
+    let n = dentry.super_block.write_at(&dentry.fs_path, offset, user_buf.as_slice());
     n as isize
 }
 
@@ -1536,8 +1608,11 @@ pub fn sys_preadv(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> is
         if !ok {
             return -14;
         }
-        let user_buf = crate::mm::translated_byte_buffer(token, iov.iov_base as *mut u8, iov.iov_len);
-        let n = dentry.super_block.read_at(&dentry.fs_path, off, user_buf);
+        let mut kbuf = vec![0u8; iov.iov_len];
+        let n = dentry.super_block.read_at(&dentry.fs_path, off, kbuf.as_mut_slice());
+        if n > 0 && !copy_to_user_pages(iov.iov_base as *mut u8, &kbuf[..n]) {
+            return -14;
+        }
         total += n as isize;
         off += n;
         if n < iov.iov_len {
@@ -1595,8 +1670,11 @@ pub fn sys_pwritev(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> i
         if !ok {
             return -14;
         }
-        let user_buf = crate::mm::translated_byte_buffer(token, iov.iov_base as *mut u8, iov.iov_len);
-        let n = dentry.super_block.write_at(&dentry.fs_path, off, user_buf);
+        let user_buf = match copy_from_user_pages(iov.iov_base as *const u8, iov.iov_len) {
+            Some(buf) => buf,
+            None => return -14,
+        };
+        let n = dentry.super_block.write_at(&dentry.fs_path, off, user_buf.as_slice());
         total += n as isize;
         off += n;
         if n < iov.iov_len {

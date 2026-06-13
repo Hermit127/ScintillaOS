@@ -238,3 +238,49 @@ pub fn probe_all() -> Vec<Arc<dyn BlockDevice>> {
     crate::println!("[virtio-blk] probe_all: found {} devices", out.len());
     out
 }
+
+/// Probe all virtio PCI block devices on LoongArch. Returns devices in PCI order.
+#[cfg(target_arch = "loongarch64")]
+pub fn probe_all() -> Vec<Arc<dyn BlockDevice>> {
+    let mut root = unsafe {
+        PciRoot::new(
+            (PCI_ECAM_BASE.raw() | VIRT_ADDR_START) as *mut u8,
+            Cam::Ecam,
+        )
+    };
+    let mut out = Vec::new();
+    for (device_function, info) in root.enumerate_bus(0) {
+        if virtio_device_type(&info) != Some(DeviceType::Block) {
+            continue;
+        }
+        let (_, command) = root.get_status_command(device_function);
+        VirtIOBlock::alloc_pci_bars(&mut root, device_function, out.len());
+        root.set_command(
+            device_function,
+            command | Command::MEMORY_SPACE | Command::BUS_MASTER,
+        );
+        let transport = match PciTransport::new::<VirtioHal>(&mut root, device_function) {
+            Ok(transport) => transport,
+            Err(e) => {
+                crate::println!("[virtio-blk] pci {:?}: transport err {:?}", device_function, e);
+                continue;
+            }
+        };
+        let blk = match VirtIOBlk::<VirtioHal, PciTransport>::new(transport) {
+            Ok(blk) => blk,
+            Err(e) => {
+                crate::println!("[virtio-blk] pci {:?}: blk err {:?}", device_function, e);
+                continue;
+            }
+        };
+        let capacity = blk.capacity();
+        crate::println!(
+            "[virtio-blk] pci {:?}: OK, capacity={} sectors",
+            device_function,
+            capacity
+        );
+        out.push(Arc::new(VirtIOBlock(unsafe { UPSafeCell::new(blk) })) as Arc<dyn BlockDevice>);
+    }
+    crate::println!("[virtio-blk] probe_all: found {} devices", out.len());
+    out
+}

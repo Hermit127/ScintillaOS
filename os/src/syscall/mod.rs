@@ -101,6 +101,10 @@ const SYSCALL_UTIMENSAT: usize = 88;
 const SYSCALL_RENAMEAT2: usize = 276;
 
 const SYSCALL_SOCKET: usize = 198;
+const SYSCALL_SHMGET: usize = 194;
+const SYSCALL_SHMCTL: usize = 195;
+const SYSCALL_SHMAT: usize = 196;
+const SYSCALL_SHMDT: usize = 197;
 const SYSCALL_BIND: usize = 200;
 const SYSCALL_LISTEN: usize = 201;
 const SYSCALL_ACCEPT: usize = 202;
@@ -269,6 +273,10 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4] as i32, args[5]),
         SYSCALL_MUNMAP => sys_munmap(args[0], args[1]),
         SYSCALL_MSYNC => sys_msync(args[0], args[1], args[2]),
+        SYSCALL_SHMGET => sys_shmget(args[0], args[1], args[2]),
+        SYSCALL_SHMCTL => sys_shmctl(args[0], args[1], args[2]),
+        SYSCALL_SHMAT => sys_shmat(args[0], args[1], args[2]),
+        SYSCALL_SHMDT => sys_shmdt(args[0]),
         SYSCALL_SOCKET => sys_socket(args[0], args[1], args[2]),
         SYSCALL_BIND => sys_bind(args[0], args[1] as *const u8, args[2]),
         SYSCALL_LISTEN => sys_listen(args[0], args[1]),

@@ -62,13 +62,25 @@ impl VfsSuperBlock {
         blk_device: Arc<dyn crate::drivers::BlockDevice>,
         fs_type: &'static str,
     ) -> Option<Arc<Self>> {
+        Self::new_ext4_at(blk_device, fs_type, "/mp/")
+    }
+
+    pub fn new_ext4_at(
+        blk_device: Arc<dyn crate::drivers::BlockDevice>,
+        fs_type: &'static str,
+        mount_point: &str,
+    ) -> Option<Arc<Self>> {
         const DISK_SIZE_512M: u64 = 512 * 1024 * 1024;
         let stream = BlockDeviceStream {
             inner: blk_device,
             pos: 0,
             total_size: DISK_SIZE_512M,
         };
-        let ext4 = Ext4BlockWrapper::<BlockDeviceStreamOp>::new(stream).ok()?;
+        let ext4 = Ext4BlockWrapper::<BlockDeviceStreamOp>::new_with_name(
+            stream,
+            "ext4_fs",
+            mount_point,
+        ).ok()?;
         Some(Arc::new(VfsSuperBlock {
             fs_type,
             fs_data: unsafe { UPSafeCell::new_named(FsInner::Ext4(Ext4Wrapper(ext4)), "VfsFsData") },
@@ -129,26 +141,6 @@ impl VfsSuperBlock {
 
     pub fn get_inode_info(&self, fs_path: &str) -> Option<InodeInfo> {
         self.with_fs(|_fs| {
-            let c_path = CString::new(fs_path).ok()?;
-            let c_path = c_path.into_raw();
-
-            let mut file: ext4_file = unsafe { core::mem::zeroed() };
-            let flags = CString::new("rb").ok()?;
-            let flags_ptr = flags.into_raw();
-
-            let rc = unsafe { ext4_fopen(&mut file, c_path, flags_ptr) };
-            unsafe {
-                drop(CString::from_raw(c_path));
-                drop(CString::from_raw(flags_ptr));
-            }
-
-            if rc != EOK as i32 {
-                return None;
-            }
-
-            let inode_num = file.inode;
-            let size = unsafe { ext4_fsize(&mut file) };
-
             let mut mode: u32 = 0;
             let c_path2 = CString::new(fs_path).ok()?;
             let _mode_rc = unsafe { ext4_mode_get(c_path2.as_ptr() as *const c_char, &mut mode) };
@@ -160,8 +152,6 @@ impl VfsSuperBlock {
                 ext4_owner_get(c_path_owner.as_ptr() as *const c_char, &mut uid, &mut gid);
             }
 
-            let is_link = mode & 0xA000 == 0xA000;
-
             let mut atime: u32 = 0;
             let mut mtime: u32 = 0;
             let mut ctime: u32 = 0;
@@ -172,23 +162,45 @@ impl VfsSuperBlock {
                 ext4_ctime_get(c_path3.as_ptr() as *const c_char, &mut ctime);
             }
 
-            unsafe {
-                ext4_fclose(&mut file);
-            }
+            let is_link = mode & 0xA000 == 0xA000;
+            let mut file: ext4_file = unsafe { core::mem::zeroed() };
+            let c_path_file = CString::new(fs_path).ok()?;
+            let flags = CString::new("rb").ok()?;
+            let file_rc = unsafe {
+                ext4_fopen(
+                    &mut file,
+                    c_path_file.as_ptr() as *const c_char,
+                    flags.as_ptr() as *const c_char,
+                )
+            };
 
-            let mut is_dir = (mode & 0x4000) != 0;
-            if !is_dir {
+            let (inode_num, size, is_dir) = if file_rc == EOK as i32 {
+                let inode_num = file.inode;
+                let size = unsafe { ext4_fsize(&mut file) };
+                unsafe {
+                    ext4_fclose(&mut file);
+                }
+                (inode_num, size, (mode & 0x4000) != 0)
+            } else {
                 let mut dir: ext4_dir = unsafe { core::mem::zeroed() };
                 let c_path_dir = CString::new(fs_path).ok()?;
-                let rc = unsafe { ext4_dir_open(&mut dir, c_path_dir.as_ptr() as *const c_char) };
-                if rc == EOK as i32 {
-                    is_dir = true;
-                    mode = (mode & 0o7777) | 0o040000;
+                let dir_rc = unsafe { ext4_dir_open(&mut dir, c_path_dir.as_ptr() as *const c_char) };
+                if dir_rc == EOK as i32 {
+                    let inode_num = dir.f.inode;
+                    let size = dir.f.fsize;
                     unsafe {
                         ext4_dir_close(&mut dir);
                     }
+                    mode = (mode & 0o7777) | 0o040000;
+                    (inode_num, size, true)
+                } else if is_link {
+                    // Symlink: both fopen and dir_open fail, but mode indicates a link
+                    (0, 0, false)
+                } else {
+                    return None;
                 }
-            }
+            };
+
             Some(InodeInfo {
                 inode_num,
                 is_dir,
@@ -270,6 +282,41 @@ impl VfsSuperBlock {
     }
 
     pub fn write_at(&self, fs_path: &str, offset: usize, buf: &[u8]) -> usize {
+        const EXT4_RW_BLOCK: usize = 4096;
+        if buf.is_empty() {
+            return 0;
+        }
+        let Some(end) = offset.checked_add(buf.len()) else {
+            return 0;
+        };
+        if offset % EXT4_RW_BLOCK != 0 || buf.len() % EXT4_RW_BLOCK != 0 {
+            let aligned_start = offset & !(EXT4_RW_BLOCK - 1);
+            let aligned_end = (end + EXT4_RW_BLOCK - 1) & !(EXT4_RW_BLOCK - 1);
+            let Some(info) = self.get_inode_info(fs_path) else {
+                return 0;
+            };
+            let old_size = info.size as usize;
+            let final_size = old_size.max(end);
+            let mut block_buf = vec![0u8; aligned_end - aligned_start];
+            let read_len = self.read_at(fs_path, aligned_start, block_buf.as_mut_slice());
+            if read_len < block_buf.len() {
+                block_buf[read_len..].fill(0);
+            }
+            let begin = offset - aligned_start;
+            block_buf[begin..begin + buf.len()].copy_from_slice(buf);
+            let written = self.write_at_raw(fs_path, aligned_start, block_buf.as_slice());
+            if written != block_buf.len() {
+                return 0;
+            }
+            if final_size < aligned_end {
+                self.truncate_file(fs_path, final_size as u64);
+            }
+            return buf.len();
+        }
+        self.write_at_raw(fs_path, offset, buf)
+    }
+
+    fn write_at_raw(&self, fs_path: &str, offset: usize, buf: &[u8]) -> usize {
         self.with_fs(|_fs| {
             let c_path = match CString::new(fs_path) {
                 Ok(s) => s,
@@ -559,7 +606,7 @@ lazy_static! {
 fn lookup_mount(dentry: &Arc<Dentry>) -> Option<Arc<Dentry>> {
     let table = MOUNT_TABLE.exclusive_access();
     for m in table.iter() {
-        if Arc::ptr_eq(&m.mnt_point, dentry) {
+        if Arc::ptr_eq(&m.mnt_point, dentry) || m.mnt_point.path == dentry.path {
             return Some(m.mnt_root.clone());
         }
     }
@@ -569,7 +616,7 @@ fn lookup_mount(dentry: &Arc<Dentry>) -> Option<Arc<Dentry>> {
 fn is_mount_root(dentry: &Arc<Dentry>) -> Option<Arc<Dentry>> {
     let table = MOUNT_TABLE.exclusive_access();
     for m in table.iter() {
-        if Arc::ptr_eq(&m.mnt_root, dentry) {
+        if Arc::ptr_eq(&m.mnt_root, dentry) || m.mnt_root.path == dentry.path {
             return Some(m.mnt_point.clone());
         }
     }
@@ -606,6 +653,8 @@ pub fn vfs_lookup(parent: &Arc<Dentry>, name: &str) -> Option<Arc<Dentry>> {
 
     let child_fs_path = if parent.fs_path == "/" {
         format!("/{}", name)
+    } else if parent.fs_path.ends_with('/') {
+        format!("{}{}", parent.fs_path, name)
     } else {
         format!("{}/{}", parent.fs_path, name)
     };
@@ -664,7 +713,7 @@ pub fn vfs_resolve_path(start: &Arc<Dentry>, path: &str) -> Option<Arc<Dentry>> 
         }
     }
 
-    Some(current)
+    lookup_mount(&current).or(Some(current))
 }
 
 pub fn vfs_resolve_with_fallback(start: &Arc<Dentry>, path: &str) -> Option<Arc<Dentry>> {
@@ -746,7 +795,7 @@ pub fn vfs_create(parent: &Arc<Dentry>, name: &str, is_dir: bool, mode: u32) -> 
 
 // ==================== Mount Operations ====================
 
-pub fn vfs_mount(mnt_point: Arc<Dentry>, sb: Arc<VfsSuperBlock>) -> bool {
+pub fn vfs_mount(mnt_point: Arc<Dentry>, sb: Arc<VfsSuperBlock>, fs_path: &str) -> bool {
     let path = mnt_point.path.clone();
     {
         let table = MOUNT_TABLE.exclusive_access();
@@ -758,7 +807,7 @@ pub fn vfs_mount(mnt_point: Arc<Dentry>, sb: Arc<VfsSuperBlock>) -> bool {
         }
     }
 
-    let mnt_root = Dentry::new_mount_root(sb, mnt_point.path.clone(), "/mp/");
+    let mnt_root = Dentry::new_mount_root(sb, mnt_point.path.clone(), fs_path);
 
     MOUNT_TABLE.exclusive_access().push(Mount {
         mnt_point: mnt_point.clone(),
@@ -805,7 +854,7 @@ pub fn mount_test_disk_at(mnt_point: Arc<Dentry>) -> bool {
         Some(sb) => sb,
         None => return false,
     };
-    vfs_mount(mnt_point, test_sb)
+    vfs_mount(mnt_point, test_sb, "/__mount_vda/")
 }
 
 pub fn list_apps() {

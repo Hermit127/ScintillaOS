@@ -88,8 +88,8 @@ impl<K: KernelDevOp> Ext4BlockWrapper<K> {
         };
 
         let is_root = FIRST_MOUNT.swap(false, Ordering::Relaxed);
-        let (dev_name_str, is_readonly) = if is_root {
-            ("ext4_root", false)
+        let dev_name_str = if is_root {
+            "ext4_root"
         } else {
             let id = DEV_COUNTER.fetch_add(1, Ordering::Relaxed) % MAX_DEVICES;
             let name = alloc::format!("ext4_mnt{}", id);
@@ -99,14 +99,14 @@ impl<K: KernelDevOp> Ext4BlockWrapper<K> {
                 ext4_device_unregister(c.as_ptr() as *const c_char);
             }
             let leaked: &'static str = Box::leak(name.into_boxed_str());
-            (leaked, true)
+            leaked
         };
         let c_name = CString::new(dev_name_str).expect("CString::new ext4_fs failed");
         let c_name = c_name.as_bytes_with_nul();
         let c_mountpoint = if dev_name_str == "ext4_root" {
             CString::new("/").unwrap()
         } else {
-            CString::new("/mp/").unwrap()
+            CString::new(mount_point).unwrap()
         };
         let c_mountpoint = c_mountpoint.as_bytes_with_nul();
 
@@ -126,16 +126,13 @@ impl<K: KernelDevOp> Ext4BlockWrapper<K> {
         info!("New an Ext4 Block Device");
         ext4bd.ext4_set_debug();
 
-        let skip_recovery = is_readonly;
         unsafe {
-            ext4bd.lwext4_mount(skip_recovery)?;
+            ext4bd.lwext4_mount(false)?;
         }
 
-        if !skip_recovery {
-            ext4bd.lwext4_dir_ls();
-            ext4bd.print_lwext4_mp_stats();
-            ext4bd.print_lwext4_block_stats();
-        }
+        ext4bd.lwext4_dir_ls();
+        ext4bd.print_lwext4_mp_stats();
+        ext4bd.print_lwext4_block_stats();
 
         Ok(ext4bd)
     }
@@ -269,11 +266,16 @@ impl<K: KernelDevOp> Ext4BlockWrapper<K> {
             }
             let r = ext4_journal_start(c_mountpoint);
             if r != EOK as i32 {
-                error!("ext4_journal_start: rc = {:?}\n", r);
-                return Err(r);
+                if (r == ENOTSUP as i32) || (r == EINVAL as i32) {
+                    info!("ext4_journal_start unsupported rc = {:?}, continue without journal\n", r);
+                } else {
+                    error!("ext4_journal_start: rc = {:?}\n", r);
+                    return Err(r);
+                }
+            } else {
+                ext4_cache_write_back(c_mountpoint, true);
+                self.has_journal = true;
             }
-            ext4_cache_write_back(c_mountpoint, true);
-            self.has_journal = true;
         }
         // ext4_bcache
 

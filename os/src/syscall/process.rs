@@ -1,9 +1,10 @@
-use crate::fs::{open_file, OpenFlags, File};
+use crate::fs::{open_file, open_file_at, OpenFlags, File};
 use crate::fs::stdio::stdout_release_if_owner;
 use crate::mm::{
-    translated_byte_buffer, translated_ref, translated_refmut, translated_str, MapPermission,
+    frames_alloc, translated_byte_buffer, translated_ref, translated_refmut, translated_str, FrameTracker, MapPermission,
     get_elf_interp,
 };
+use crate::sync::UPSafeCell;
 use crate::task::{
     add_task, block_current_and_run_next, current_task, current_user_token,
     exit_current_and_run_next, pid2task, pid_alloc, sleep_current_and_run_next, suspend_current_and_run_next,
@@ -14,6 +15,8 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
+use lazy_static::*;
 use log::info;
 use polyhal::kcontext::KContextArgs;
 use polyhal::time::Time;
@@ -28,6 +31,21 @@ const MAP_SHARED: usize = 0x01;
 const MAP_PRIVATE: usize = 0x02;
 const MAP_FIXED: usize = 0x10;
 const MAP_ANONYMOUS: usize = 0x20;
+
+struct ShmSegment {
+    id: usize,
+    key: usize,
+    size: usize,
+    frames: Vec<FrameTracker>,
+    removed: bool,
+}
+
+lazy_static! {
+    static ref SHM_SEGMENTS: UPSafeCell<Vec<ShmSegment>> =
+        unsafe { UPSafeCell::new_named(Vec::new(), "ShmSegments") };
+}
+
+static NEXT_SHMID: AtomicUsize = AtomicUsize::new(1);
 
 const UTSNAME_LEN: usize = 65;
 
@@ -208,13 +226,17 @@ pub fn sys_exec(path: *const u8, mut args: *const usize, mut envp: *const usize)
             }
         }
     }
-    let app_inode = open_file(path.as_str(), OpenFlags::RDONLY).or_else(|| {
-        if path.starts_with('/') {
-            None
-        } else {
-            open_file(format!("/bin/{}", path).as_str(), OpenFlags::RDONLY)
-        }
-    });
+    let cwd = {
+        let task = current_task().unwrap();
+        let inner = task.inner_exclusive_access();
+        inner.cwd.clone()
+    };
+    let app_inode = if path.starts_with('/') {
+        open_file(path.as_str(), OpenFlags::RDONLY)
+    } else {
+        open_file_at(Some(cwd), path.as_str(), OpenFlags::RDONLY, 0)
+            .or_else(|| open_file(format!("/bin/{}", path).as_str(), OpenFlags::RDONLY))
+    };
     if let Some(app_inode) = app_inode {
         let all_data = app_inode.read_all();
         if all_data.len() >= 2 && &all_data[..2] == b"#!" {
@@ -239,6 +261,9 @@ pub fn sys_exec(path: *const u8, mut args: *const usize, mut envp: *const usize)
             return -1;
         }
         let task = current_task().unwrap();
+        if all_data.len() < 4 || &all_data[..4] != b"\x7fELF" {
+            return -1;
+        }
         // Check for dynamically linked ELF (has PT_INTERP)
         if let Some(interp_path) = crate::mm::get_elf_interp(&all_data) {
             if let Some(interp_inode) = open_file(&interp_path, OpenFlags::RDONLY)
@@ -248,6 +273,7 @@ pub fn sys_exec(path: *const u8, mut args: *const usize, mut envp: *const usize)
                 task.exec_with_interp(all_data.as_slice(), Some(&interp_data), args_vec, env_vec);
                 return 0;
             }
+            return -1;
         }
         task.exec(all_data.as_slice(), args_vec, env_vec);
         0
@@ -609,6 +635,74 @@ pub fn sys_munmap(start: usize, len: usize) -> isize {
     }
 }
 
+pub fn sys_shmget(key: usize, size: usize, _flags: usize) -> isize {
+    const IPC_PRIVATE: usize = 0;
+    if key != IPC_PRIVATE {
+        let segments = SHM_SEGMENTS.exclusive_access();
+        if let Some(seg) = segments.iter().find(|seg| seg.key == key && !seg.removed) {
+            return seg.id as isize;
+        }
+        drop(segments);
+    }
+    if size == 0 {
+        return -22;
+    }
+    let page_count = (size + crate::config::PAGE_SIZE - 1) / crate::config::PAGE_SIZE;
+    let Some(frames) = frames_alloc(page_count) else {
+        return -12;
+    };
+    let id = NEXT_SHMID.fetch_add(1, Ordering::Relaxed);
+    let mut segments = SHM_SEGMENTS.exclusive_access();
+    segments.push(ShmSegment {
+        id,
+        key,
+        size: page_count * crate::config::PAGE_SIZE,
+        frames,
+        removed: false,
+    });
+    id as isize
+}
+
+pub fn sys_shmat(shmid: usize, shmaddr: usize, _shmflg: usize) -> isize {
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    let segments = SHM_SEGMENTS.exclusive_access();
+    let Some(seg) = segments.iter().find(|seg| seg.id == shmid && !seg.removed) else {
+        return -22;
+    };
+    let start = if shmaddr == 0 {
+        let max_end: usize = inner.memory_set.max_end_vaddr().into();
+        (max_end + crate::config::PAGE_SIZE - 1) / crate::config::PAGE_SIZE
+            * crate::config::PAGE_SIZE
+    } else {
+        shmaddr & !(crate::config::PAGE_SIZE - 1)
+    };
+    let ok = inner.memory_set.insert_shared_frames(
+        polyhal::VirtAddr::from(start),
+        polyhal::VirtAddr::from(start + seg.size),
+        MapPermission::R | MapPermission::W | MapPermission::U,
+        seg.frames.as_slice(),
+    );
+    if ok { start as isize } else { -12 }
+}
+
+pub fn sys_shmdt(_shmaddr: usize) -> isize {
+    0
+}
+
+pub fn sys_shmctl(shmid: usize, cmd: usize, _buf: usize) -> isize {
+    const IPC_RMID: usize = 0;
+    if cmd == IPC_RMID {
+        let mut segments = SHM_SEGMENTS.exclusive_access();
+        if let Some(seg) = segments.iter_mut().find(|seg| seg.id == shmid) {
+            seg.removed = true;
+            return 0;
+        }
+        return -22;
+    }
+    0
+}
+
 pub fn sys_msync(start: usize, len: usize, flags: usize) -> isize {
     if (len > 0 && start as u64 + len as u64 > usize::MAX as u64)
         || start % crate::config::PAGE_SIZE != 0
@@ -768,12 +862,17 @@ pub fn sys_set_tid_address(tidptr: *mut i32) -> isize {
 }
 
 pub fn sys_exit_group(status: i32) -> ! {
-    let tid = {
+    let (tid, can_clear_tid) = {
         let task = current_task().unwrap();
         let inner = task.inner_exclusive_access();
-        inner.tid_ptr
+        let tid = inner.tid_ptr;
+        let can_clear = tid != 0
+            && inner
+                .memory_set
+                .valid_user_buf(tid as *const u8, core::mem::size_of::<i32>(), true);
+        (tid, can_clear)
     };
-    if tid != 0 {
+    if can_clear_tid {
         *translated_refmut(current_user_token(), tid as *mut i32) = 0;
     }
 
@@ -1746,7 +1845,6 @@ pub fn sys_readv(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
         if iov.iov_len == 0 {
             continue;
         }
-        let buf = crate::mm::translated_byte_buffer(token, iov.iov_base as *mut u8, iov.iov_len);
         let task = current_task().unwrap();
         let inner = task.inner_exclusive_access();
         if fd >= inner.fd_table.len() || inner.fd_table[fd].is_none() {
@@ -1754,7 +1852,16 @@ pub fn sys_readv(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
         }
         let file = inner.fd_table[fd].as_ref().unwrap().clone();
         drop(inner);
-        let n = file.read(buf);
+        let mut kbuf = alloc::vec![0u8; iov.iov_len];
+        let n = file.read(kbuf.as_mut_slice());
+        if n > 0
+            && !crate::syscall::fs::copy_to_user_pages(
+                iov.iov_base as *mut u8,
+                &kbuf[..n as usize],
+            )
+        {
+            return -14;
+        }
         total += n as isize;
         if (n as usize) < iov.iov_len {
             break;
@@ -1778,7 +1885,13 @@ pub fn sys_writev(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
         if iov.iov_len == 0 {
             continue;
         }
-        let buf = crate::mm::translated_byte_buffer(token, iov.iov_base as *mut u8, iov.iov_len);
+        let mut buf = match crate::syscall::fs::copy_from_user_pages(
+            iov.iov_base as *const u8,
+            iov.iov_len,
+        ) {
+            Some(buf) => buf,
+            None => return -14,
+        };
         let task = current_task().unwrap();
         let inner = task.inner_exclusive_access();
         if fd >= inner.fd_table.len() || inner.fd_table[fd].is_none() {
@@ -1786,7 +1899,7 @@ pub fn sys_writev(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
         }
         let file = inner.fd_table[fd].as_ref().unwrap().clone();
         drop(inner);
-        let n = file.write(buf);
+        let n = file.write(buf.as_mut_slice());
         total += n as isize;
         if (n as usize) < iov.iov_len {
             break;

@@ -6,8 +6,6 @@ mod signal;
 #[allow(clippy::module_inception)]
 mod task;
 
-use crate::fs::{open_file, OpenFlags};
-use crate::mm::translated_refmut;
 use crate::sync::UPSafeCell;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -331,10 +329,7 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
 
 lazy_static! {
     pub static ref INITPROC: Arc<TaskControlBlock> = Arc::new({
-        let v = open_file("/bin/initproc", OpenFlags::RDONLY)
-            .map(|inode| inode.read_all())
-            .unwrap_or_else(|| EMBEDDED_INITPROC.to_vec());
-        TaskControlBlock::new(v.as_slice())
+        TaskControlBlock::new(EMBEDDED_INITPROC)
     });
 }
 

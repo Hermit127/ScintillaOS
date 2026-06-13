@@ -18,6 +18,7 @@ pub struct LoadedElf {
     pub memory_set: MemorySet,
     pub user_sp: usize,
     pub entry_point: usize,
+    pub program_break: usize,
     pub ph_addr: usize,
     pub ph_entsize: usize,
     pub ph_num: usize,
@@ -146,10 +147,10 @@ impl MemorySet {
                 }
             }
         }
-        // map user stack with U flags
-        let mut user_stack_bottom: usize = max_end_va.into();
-        // guard page
-        user_stack_bottom += PAGE_SIZE;
+        let program_break =
+            (max_end_va.raw() + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE;
+        let user_stack_top: usize = 0x8_0000_0000;
+        let user_stack_bottom = user_stack_top - USER_STACK_SIZE;
         let user_stack_top = user_stack_bottom + USER_STACK_SIZE;
         memory_set.push(
             MapArea::new(
@@ -165,6 +166,7 @@ impl MemorySet {
             memory_set,
             user_sp: user_stack_top,
             entry_point: program_entry,
+            program_break,
             ph_addr,
             ph_entsize: e_phentsize,
             ph_num: ph_count as usize,
@@ -225,7 +227,7 @@ impl MemorySet {
             for (&vpn, frame) in area.data_frames.iter() {
                 let new_frame = frame.shared_clone();
                 let mut child_perm = area.map_perm;
-                if child_perm.contains(MapPermission::W) {
+                if child_perm.contains(MapPermission::W) && !area.shared {
                     child_perm.remove(MapPermission::W);
                     user_space.page_table.unmap_page(vpn);
                     user_space.page_table.map_page(
@@ -272,6 +274,12 @@ impl MemorySet {
         if write_fault && !area.map_perm.contains(MapPermission::W) { return false; }
         // Read fault on already-mapped read-only page — re-establish PTE
         if !write_fault && !area.map_perm.contains(MapPermission::W) {
+            let paddr = match area.data_frames.get(&vpn) { Some(f) => f.paddr, None => return false };
+            self.page_table.unmap_page(vpn);
+            self.page_table.map_page(vpn, paddr, area.map_perm.into(), MappingSize::Page4KB);
+            return true;
+        }
+        if area.shared {
             let paddr = match area.data_frames.get(&vpn) { Some(f) => f.paddr, None => return false };
             self.page_table.unmap_page(vpn);
             self.page_table.map_page(vpn, paddr, area.map_perm.into(), MappingSize::Page4KB);
@@ -452,6 +460,33 @@ impl MemorySet {
         true
     }
 
+    pub fn insert_shared_frames(
+        &mut self,
+        start_addr: polyhal::VirtAddr,
+        end_addr: polyhal::VirtAddr,
+        permission: MapPermission,
+        frames: &[FrameTracker],
+    ) -> bool {
+        let mut map_area = MapArea::new(start_addr, end_addr, MapType::Framed, permission);
+        let needed = map_area.vaddr_range.clone().into_iter().count();
+        if frames.len() < needed {
+            return false;
+        }
+        for (vaddr, frame) in map_area.vaddr_range.clone().into_iter().zip(frames.iter()) {
+            let shared = frame.shared_clone();
+            self.page_table.map_page(
+                vaddr,
+                shared.paddr,
+                permission.into(),
+                MappingSize::Page4KB,
+            );
+            map_area.data_frames.insert(vaddr, shared);
+        }
+        map_area.shared = true;
+        self.areas.push(map_area);
+        true
+    }
+
     pub fn msync(&mut self, start_addr: polyhal::VirtAddr, len: usize, flags: usize) -> isize {
         const MS_INVALIDATE: usize = 2;
         if start_addr.raw() % crate::config::PAGE_SIZE != 0 { return -22; }
@@ -554,6 +589,7 @@ pub struct MapArea {
     file: Option<alloc::sync::Arc<dyn crate::fs::File>>,
     file_offset: usize,
     dirty: alloc::collections::BTreeSet<VirtAddr>,
+    shared: bool,
 }
 
 impl MapArea {
@@ -576,6 +612,7 @@ impl MapArea {
             file: None,
             file_offset: 0,
             dirty: alloc::collections::BTreeSet::new(),
+            shared: false,
         }
     }
     pub fn from_another(another: &MapArea) -> Self {
@@ -590,6 +627,7 @@ impl MapArea {
             file: another.file.clone(),
             file_offset: another.file_offset,
             dirty: alloc::collections::BTreeSet::new(),
+            shared: another.shared,
         }
     }
     pub fn map(&mut self, page_table: &Arc<PageTableWrapper>) -> Result<(), ()> {
