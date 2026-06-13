@@ -213,12 +213,17 @@ fn loongarch64_trap_handler(tf: &mut TrapFrame) -> TrapType {
         }
         Trap::Exception(Exception::Syscall) => TrapType::SysCall,
         Trap::Exception(Exception::StorePageFault)
-        | Trap::Exception(Exception::PageModifyFault) => {
+        | Trap::Exception(Exception::PageModifyFault)
+        | Trap::Exception(Exception::PageNonWritableFault) => {
             TrapType::StorePageFault(badv::read().vaddr())
         }
         Trap::Exception(Exception::PageNonExecutableFault)
         | Trap::Exception(Exception::FetchPageFault) => {
             TrapType::InstructionPageFault(badv::read().vaddr())
+        }
+        Trap::Exception(Exception::PageInvalidTLB)
+        | Trap::Exception(Exception::PagePrivilegeIllegal) => {
+            TrapType::LoadPageFault(badv::read().vaddr())
         }
         // Load Fault
         Trap::Exception(Exception::LoadPageFault)
