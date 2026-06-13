@@ -8,7 +8,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use user_lib::{
-    close, execve, exit, fork, getdents64, open, shutdown, symlinkat, sys_mkdir, sys_mount,
+    close, exec, execve, exit, fork, getdents64, open, shutdown, symlinkat, sys_mkdir, sys_mount,
     unlinkat, waitpid, OpenFlags,
 };
 
