@@ -164,13 +164,13 @@ fn join_path(dir: &str, name: &str) -> String {
 fn script_priority(script: &str) -> u8 {
     if script.starts_with("basic_") {
         0
-    } else if script.starts_with("lua_") {
+    } else if script.starts_with("busybox_") {
         1
     } else if script.starts_with("iozone_") {
         2
-    } else if script.starts_with("lmbench_") {
+    } else if script.starts_with("lua_") {
         3
-    } else if script.starts_with("busybox_") {
+    } else if script.starts_with("lmbench_") {
         4
     } else {
         50
