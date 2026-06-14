@@ -141,6 +141,9 @@ pub fn exec(path: &str, args: &[*const u8]) -> isize {
 pub fn execve(path: &str, args: &[*const u8], envs: &[*const u8]) -> isize {
     sys_exec(path, args, envs)
 }
+pub fn chroot(path: &str) -> isize {
+    sys_chroot(path)
+}
 pub fn wait(exit_code: &mut i32) -> isize {
     loop {
         match sys_waitpid(-1, exit_code as *mut _) {
@@ -166,7 +169,8 @@ pub fn waitpid(pid: usize, exit_code: &mut i32) -> isize {
 }
 
 pub fn waitpid_nb(pid: usize, exit_code: &mut i32) -> isize {
-    sys_waitpid(pid as isize, exit_code as *mut _)
+    const WNOHANG: usize = 1;
+    sys_waitpid_options(pid as isize, exit_code as *mut _, WNOHANG)
 }
 
 pub fn sleep(period_ms: usize) {

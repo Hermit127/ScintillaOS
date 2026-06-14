@@ -8,7 +8,10 @@ use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
 
 use crate::mm::{translated_ref, translated_refmut};
 use crate::net::socket::{SocketFile, SocketType};
-use crate::task::{block_current_and_run_next, current_task, current_user_token, suspend_current_and_run_next, BlockReason};
+use crate::task::{
+    block_current_and_run_next, current_task, current_user_token, suspend_current_and_run_next,
+    BlockReason,
+};
 use alloc::sync::Arc;
 
 const SOCKET_BUFFER_SIZE: usize = 65536;
@@ -227,16 +230,26 @@ pub fn sys_bind(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
             sock.listen(if ip == 0 {
                 IpListenEndpoint { addr: None, port }
             } else {
-                IpListenEndpoint { addr: Some(endpoint.addr), port }
-            }).map(|_| 0).unwrap_or(-22)
+                IpListenEndpoint {
+                    addr: Some(endpoint.addr),
+                    port,
+                }
+            })
+            .map(|_| 0)
+            .unwrap_or(-22)
         }
         SocketType::Udp => {
             let sock: &mut UdpSocket = iface.sockets.get_mut(handle);
             sock.bind(if ip == 0 {
                 IpListenEndpoint { addr: None, port }
             } else {
-                IpListenEndpoint { addr: Some(endpoint.addr), port }
-            }).map(|_| 0).unwrap_or(-22)
+                IpListenEndpoint {
+                    addr: Some(endpoint.addr),
+                    port,
+                }
+            })
+            .map(|_| 0)
+            .unwrap_or(-22)
         }
     })
     .unwrap_or(-1)
@@ -802,7 +815,9 @@ pub fn sys_getsockopt(
         }
         (IPPROTO_TCP, 2) => {
             // TCP_MAXSEG - return typical Ethernet MSS
-            if st != SocketType::Tcp { return -95; }
+            if st != SocketType::Tcp {
+                return -95;
+            }
             *translated_refmut(token, optlen as *mut u32) = 4;
             *translated_refmut(token, optval as *mut i32) = 1460;
             0

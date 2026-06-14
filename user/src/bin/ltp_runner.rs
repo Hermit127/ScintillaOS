@@ -6,39 +6,78 @@ extern crate user_lib;
 extern crate alloc;
 
 use alloc::format;
-use user_lib::{exec, fork, waitpid, open, close, read, getdents64, OpenFlags};
+use user_lib::{close, exec, fork, getdents64, open, read, waitpid, OpenFlags};
 
 const LTP_DIR: &str = "/ltp/testcases/bin/";
 
 const SUBSET_LIST: &[&str] = &[
     // Socket more variants
-    "accept03", "accept4_01",
-    "bind02", "bind03",
-    "sendto03", "sendmsg03", "recvmsg03",
-    "getsockopt02", "setsockopt02",
-    "socketpair01", "socketpair02",
+    "accept03",
+    "accept4_01",
+    "bind02",
+    "bind03",
+    "sendto03",
+    "sendmsg03",
+    "recvmsg03",
+    "getsockopt02",
+    "setsockopt02",
+    "socketpair01",
+    "socketpair02",
     // fcntl more
-    "fcntl27", "fcntl29", "fcntl30", "fcntl31", "fcntl32",
-    "fcntl33", "fcntl34", "fcntl35", "fcntl36",
+    "fcntl27",
+    "fcntl29",
+    "fcntl30",
+    "fcntl31",
+    "fcntl32",
+    "fcntl33",
+    "fcntl34",
+    "fcntl35",
+    "fcntl36",
     // Kill more (skip kill10 — needs full multi-process signal sync)
-    "kill07", "kill08", "kill09", "kill11", "kill12",
+    "kill07",
+    "kill08",
+    "kill09",
+    "kill11",
+    "kill12",
     // prctl / ioctl
-    "prctl01", "prctl02", "prctl03", "prctl04", "prctl05",
-    "ioctl01", "ioctl02", "ioctl03",
+    "prctl01",
+    "prctl02",
+    "prctl03",
+    "prctl04",
+    "prctl05",
+    "ioctl01",
+    "ioctl02",
+    "ioctl03",
     // Memory
-    "mprotect04", "mprotect05",
-    "madvise01", "madvise02", "madvise03",
+    "mprotect04",
+    "mprotect05",
+    "madvise01",
+    "madvise02",
+    "madvise03",
     // getrandom / getrusage
-    "getrandom01", "getrandom02", "getrandom03", "getrandom04",
-    "getrusage01", "getrusage02",
+    "getrandom01",
+    "getrandom02",
+    "getrandom03",
+    "getrandom04",
+    "getrusage01",
+    "getrusage02",
     // UID/GID more
-    "setfsgid01", "setfsuid01", "getegid01", "geteuid01",
+    "setfsgid01",
+    "setfsuid01",
+    "getegid01",
+    "geteuid01",
     // nice
-    "nice01", "nice02", "nice03",
+    "nice01",
+    "nice02",
+    "nice03",
     // mount / chroot
-    "mount01", "mount02", "mount03",
-    "chroot01", "chroot03",
-    "umount01", "umount02",
+    "mount01",
+    "mount02",
+    "mount03",
+    "chroot01",
+    "chroot03",
+    "umount01",
+    "umount02",
 ];
 
 fn is_elf(name: &str) -> bool {
@@ -120,7 +159,9 @@ pub fn main() -> i32 {
         let mut total: usize = 0;
         loop {
             let n = getdents64(fd as usize, &mut buf);
-            if n <= 0 { break; }
+            if n <= 0 {
+                break;
+            }
             for_each_dirent(&buf, n, |name| {
                 if is_elf(name) {
                     run_test(name);

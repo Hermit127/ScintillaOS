@@ -8,18 +8,17 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use user_lib::{
-    close, exec, exit, fork, getdents64, open, shutdown, symlinkat, sys_mkdir, sys_mount, unlinkat,
-    waitpid, OpenFlags,
+    chroot, close, execve, exit, fork, get_time, getdents64, kill, open, shutdown, sleep,
+    symlinkat, sys_mkdir, sys_mount, unlinkat, waitpid, waitpid_nb, OpenFlags,
 };
 
-const BUSYBOX_APPLETS: &[&str] = &[
+const BUSYBOX_APPLETS: [&str; 68] = [
     "busybox", "sh", "ash", "ls", "cat", "echo", "mkdir", "rm", "rmdir", "mv", "cp", "true",
-    "false", "env", "pwd", "wc", "grep", "head", "tail", "sort", "uniq", "tr", "find",
-    "touch", "test", "[", "[[", "stat", "sleep", "kill", "basename", "dirname", "cut",
-    "expr", "seq", "id", "printf", "date", "chmod", "chown", "ln", "dd", "sync", "cmp",
-    "od", "awk", "sed", "xargs", "readlink", "mkfifo", "du", "df", "mount", "umount",
-    "chattr", "getconf", "tee", "yes", "mknod", "mktemp", "chgrp", "dmesg", "ps", "free",
-    "hostname", "md5sum", "diff", "unlink", "timeout",
+    "false", "env", "pwd", "wc", "grep", "head", "tail", "sort", "uniq", "tr", "find", "touch",
+    "test", "[", "[[", "stat", "sleep", "kill", "basename", "dirname", "cut", "expr", "seq", "id",
+    "printf", "date", "chmod", "chown", "ln", "dd", "sync", "cmp", "od", "awk", "sed", "xargs",
+    "readlink", "mkfifo", "du", "df", "mount", "umount", "chattr", "getconf", "tee", "yes",
+    "mknod", "mktemp", "chgrp", "dmesg", "ps", "free", "hostname", "md5sum", "diff", "unlink",
 ];
 
 fn force_symlink(target: &str, linkpath: &str) -> isize {
@@ -34,49 +33,79 @@ fn force_symlink(target: &str, linkpath: &str) -> isize {
     r
 }
 
-fn path_exists(path: &str) -> bool {
-    let fd = open(path, OpenFlags::RDONLY);
-    if fd < 0 {
-        return false;
-    }
-    close(fd as usize);
-    true
+fn mkdir_path(path: &str) {
+    let p = String::from(path.trim_end_matches('\0')) + "\0";
+    sys_mkdir(p.as_ptr(), 0o777);
 }
 
-fn symlink_if_missing(target: &str, linkpath: &str) {
-    if !path_exists(linkpath) {
-        force_symlink(target, linkpath);
-    }
-}
-
-fn bind_library(root: &str, rel_path: &str, dst: &str) {
-    let src = String::from(root) + rel_path;
+fn bind_library(chroot_root: &str, src_root: &str, rel_path: &str, dst: &str) {
+    let chroot_root = chroot_root.trim_end_matches('\0').trim_end_matches('/');
+    let src_root = src_root.trim_end_matches('\0').trim_end_matches('/');
+    let src = String::from(src_root) + rel_path;
     force_symlink(&src, dst);
     let dst64 = String::from("/lib64/") + dst.trim_start_matches("/lib/");
     force_symlink(&src, &dst64);
+    let inside_src = if let Some(suffix) = src_root.strip_prefix(chroot_root) {
+        String::from(suffix) + rel_path
+    } else {
+        src.clone()
+    };
+    let local_dst = String::from(chroot_root) + dst;
+    force_symlink(&inside_src, &local_dst);
+    let local_dst64 = String::from(chroot_root) + "/lib64/" + dst.trim_start_matches("/lib/");
+    force_symlink(&inside_src, &local_dst64);
+}
+
+fn setup_runtime_dirs(root: &str) {
+    let root = root.trim_end_matches('\0').trim_end_matches('/');
+    mkdir_path(&(String::from(root) + "/bin"));
+    mkdir_path(&(String::from(root) + "/usr"));
+    mkdir_path(&(String::from(root) + "/usr/bin"));
+    mkdir_path(&(String::from(root) + "/tmp"));
+    mkdir_path(&(String::from(root) + "/mnt"));
+    mkdir_path(&(String::from(root) + "/lib"));
+    mkdir_path(&(String::from(root) + "/lib64"));
+}
+
+fn setup_busybox_applets_at(root: &str) {
+    let root = root.trim_end_matches('\0').trim_end_matches('/');
+    setup_runtime_dirs(root);
+    force_symlink("/busybox", &(String::from(root) + "/bin/busybox\0"));
+    force_symlink("/busybox", &(String::from(root) + "/bin/sh\0"));
+    for applet in BUSYBOX_APPLETS {
+        let path = String::from(root) + "/bin/" + applet + "\0";
+        force_symlink("/busybox", &path);
+    }
 }
 
 fn setup_busybox_applets() {
     sys_mkdir(b"/bin\0".as_ptr(), 0o777);
-    symlink_if_missing("/bin/busybox", "/busybox");
-    symlink_if_missing("/bin/busybox", "/bin/sh");
+    force_symlink("/busybox", "/bin/busybox\0");
+    force_symlink("/busybox", "/bin/sh\0");
     for applet in BUSYBOX_APPLETS {
-        if *applet == "busybox" {
-            continue;
-        }
-        let path = String::from("/bin/") + *applet;
-        symlink_if_missing("/bin/busybox", &path);
+        let path = String::from("/bin/") + applet + "\0";
+        force_symlink("/busybox", &path);
     }
 }
 
-fn runtime_roots(dir: &str) -> (String, String) {
-    let root = dir.trim_end_matches('\0').trim_end_matches('/');
+fn runtime_roots(root: &str) -> (String, String) {
     if let Some(prefix) = root.strip_suffix("/musl") {
         (String::from(root), String::from(prefix) + "/glibc")
     } else if let Some(prefix) = root.strip_suffix("/glibc") {
         (String::from(prefix) + "/musl", String::from(root))
     } else {
-        (String::from(root) + "/musl", String::from(root) + "/glibc")
+        (String::from(root), String::from(root))
+    }
+}
+
+fn chroot_root_and_cwd(dir: &str) -> (String, String) {
+    let root = dir.trim_end_matches('\0').trim_end_matches('/');
+    if let Some(prefix) = root.strip_suffix("/musl") {
+        (String::from(prefix), String::from("/musl"))
+    } else if let Some(prefix) = root.strip_suffix("/glibc") {
+        (String::from(prefix), String::from("/glibc"))
+    } else {
+        (String::from(root), String::from("/"))
     }
 }
 
@@ -85,52 +114,77 @@ fn setup_runtime_for_dir(dir: &str) {
     sys_mkdir(b"/lib\0".as_ptr(), 0o777);
     sys_mkdir(b"/lib64\0".as_ptr(), 0o777);
 
-    let test_root = dir.trim_end_matches('\0').trim_end_matches('/');
-    if test_root.starts_with("/mnt") {
-        let local_busybox = String::from(test_root) + "/busybox";
-        let local_sh = String::from(test_root) + "/sh";
-        symlink_if_missing("/bin/busybox", &local_busybox);
-        symlink_if_missing("/bin/busybox", &local_sh);
-    }
-
-    let (musl_root, glibc_root) = runtime_roots(dir);
+    let root = dir.trim_end_matches('\0').trim_end_matches('/');
+    let (musl_root, glibc_root) = runtime_roots(root);
+    let (chroot_root, chroot_cwd) = chroot_root_and_cwd(root);
+    setup_runtime_dirs(&musl_root);
+    setup_runtime_dirs(&glibc_root);
+    setup_runtime_dirs(&chroot_root);
+    let busybox = chroot_cwd.clone() + "/busybox";
+    force_symlink(&busybox, &(chroot_root.clone() + "/busybox\0"));
+    setup_busybox_applets_at(&chroot_root);
     println!(
-        "[initproc] runtime for {} musl={} glibc={}",
-        dir.trim_end_matches('\0'),
-        musl_root,
-        glibc_root
+        "[initproc] runtime root {} chroot {} cwd {} musl {} glibc {}",
+        root, chroot_root, chroot_cwd, musl_root, glibc_root
     );
 
     #[cfg(target_arch = "riscv64")]
     {
         bind_library(
+            &chroot_root,
             &glibc_root,
             "/lib/ld-linux-riscv64-lp64d.so.1",
             "/lib/ld-linux-riscv64-lp64d.so.1",
         );
-        bind_library(&glibc_root, "/lib/libc.so.6", "/lib/libc.so.6");
-        bind_library(&glibc_root, "/lib/libm.so.6", "/lib/libm.so.6");
-        bind_library(&musl_root, "/lib/libc.so", "/lib/ld-musl-riscv64-sf.so.1");
-        bind_library(&musl_root, "/lib/libc.so", "/lib/ld-musl-riscv64.so.1");
-        bind_library(&musl_root, "/lib/libc.so", "/lib/libc.so");
+        bind_library(&chroot_root, &glibc_root, "/lib/libc.so", "/lib/libc.so.6");
+        bind_library(&chroot_root, &glibc_root, "/lib/libm.so", "/lib/libm.so.6");
+        bind_library(
+            &chroot_root,
+            &musl_root,
+            "/lib/libc.so",
+            "/lib/ld-musl-riscv64-sf.so.1",
+        );
+        bind_library(
+            &chroot_root,
+            &musl_root,
+            "/lib/libc.so",
+            "/lib/ld-musl-riscv64.so.1",
+        );
+        bind_library(&chroot_root, &musl_root, "/lib/libc.so", "/lib/libc.so");
     }
-
     #[cfg(target_arch = "loongarch64")]
     {
         bind_library(
+            &chroot_root,
             &glibc_root,
             "/lib/ld-linux-loongarch-lp64d.so.1",
             "/lib/ld-linux-loongarch-lp64d.so.1",
         );
-        bind_library(&glibc_root, "/lib/libc.so.6", "/lib/libc.so.6");
-        bind_library(&glibc_root, "/lib/libm.so.6", "/lib/libm.so.6");
-        bind_library(&musl_root, "/lib/libc.so", "/lib/ld-musl-loongarch64.so.1");
         bind_library(
+            &chroot_root,
+            &glibc_root,
+            "/lib/libc.so.6",
+            "/lib/libc.so.6",
+        );
+        bind_library(
+            &chroot_root,
+            &glibc_root,
+            "/lib/libm.so.6",
+            "/lib/libm.so.6",
+        );
+        bind_library(
+            &chroot_root,
+            &musl_root,
+            "/lib/libc.so",
+            "/lib/ld-musl-loongarch64.so.1",
+        );
+        bind_library(
+            &chroot_root,
             &musl_root,
             "/lib/libc.so",
             "/lib/ld-musl-loongarch-lp64d.so.1",
         );
-        bind_library(&musl_root, "/lib/libc.so", "/lib/libc.so");
+        bind_library(&chroot_root, &musl_root, "/lib/libc.so", "/lib/libc.so");
     }
 }
 
@@ -173,6 +227,9 @@ fn list_dir(path: &str) -> Vec<String> {
             if name != "." && name != ".." {
                 names.push(String::from(name));
             }
+            if d_reclen == 0 {
+                break;
+            }
             pos += d_reclen;
         }
     }
@@ -194,16 +251,12 @@ fn script_priority(script: &str) -> u8 {
         0
     } else if script.starts_with("busybox_") {
         1
-    } else if script.starts_with("iozone_") {
-        2
     } else if script.starts_with("lua_") {
+        2
+    } else if script.starts_with("iozone_") {
         3
-    } else if script.starts_with("libctest_") {
-        4
-    } else if script.starts_with("libcbench_") {
-        5
     } else if script.starts_with("lmbench_") {
-        6
+        4
     } else {
         50
     }
@@ -212,28 +265,24 @@ fn script_priority(script: &str) -> u8 {
 fn should_run_script(script: &str) -> bool {
     script.starts_with("basic_")
         || script.starts_with("busybox_")
-        || script.starts_with("iozone_")
         || script.starts_with("lua_")
-        || script.starts_with("libctest_")
-        || script.starts_with("libcbench_")
+        || script.starts_with("iozone_")
         || script.starts_with("lmbench_")
 }
 
 fn script_budget(script: &str) -> &'static str {
     if script.starts_with("basic_") {
-        "45"
-    } else if script.starts_with("lua_") {
-        "20"
-    } else if script.starts_with("busybox_") {
-        "60"
-    } else if script.starts_with("iozone_") {
-        "300"
-    } else if script.starts_with("libctest_") || script.starts_with("libcbench_") {
-        "60"
-    } else if script.starts_with("lmbench_") {
         "90"
+    } else if script.starts_with("lua_") {
+        "90"
+    } else if script.starts_with("busybox_") {
+        "180"
+    } else if script.starts_with("iozone_") {
+        "720"
+    } else if script.starts_with("lmbench_") {
+        "240"
     } else {
-        "20"
+        "90"
     }
 }
 
@@ -249,165 +298,75 @@ fn sort_scripts(scripts: &mut Vec<String>) {
     });
 }
 
-fn wait_child(pid: isize, name: &str) -> i32 {
-    if pid <= 0 {
-        println!("[initproc] fork failed for {}", name);
-        return 127;
+struct TestScript {
+    dir: String,
+    script: String,
+}
+
+fn script_path(dir: &str, script: &str) -> String {
+    let mut path = String::from(dir.trim_end_matches('\0'));
+    if !path.ends_with('/') {
+        path.push('/');
     }
-    let mut ec = 0;
-    let wp = waitpid(pid as usize, &mut ec);
-    println!("[initproc] {} waitpid={} exit={}", name, wp, ec);
-    ec
+    path.push_str(script);
+    path
 }
 
-fn run_command_in_dir(dir: &str, name: &str, path: &str, args: &[*const u8]) -> i32 {
-    let pid = fork();
-    if pid == 0 {
-        if user_lib::chdir(dir) != 0 {
-            println!("[initproc] chdir({}) failed", dir);
-            exit(126);
-        }
-        let er = exec(path, args);
-        println!("[initproc] exec {} failed: {}", name, er);
-        exit(127);
-    }
-    wait_child(pid, name)
-}
-
-fn run_iozone_command(dir: &str, label: &str, first_test_id: &str, second_test_id: &str) -> i32 {
-    let args: [*const u8; 12] = [
-        b"./iozone\0".as_ptr(),
-        b"-t\0".as_ptr(),
-        b"4\0".as_ptr(),
-        b"-i\0".as_ptr(),
-        first_test_id.as_ptr(),
-        b"-i\0".as_ptr(),
-        second_test_id.as_ptr(),
-        b"-r\0".as_ptr(),
-        b"1k\0".as_ptr(),
-        b"-s\0".as_ptr(),
-        b"1m\0".as_ptr(),
-        core::ptr::null(),
-    ];
-    println!("{}", label);
-    run_command_in_dir(dir, label, "./iozone\0", &args)
-}
-
-fn run_iozone_script(dir: &str, script: &str) -> i32 {
-    setup_runtime_for_dir(dir);
-    println!("[initproc] [RUN] {}{} direct", dir.trim_end_matches('\0'), script);
-    println!("#### OS COMP TEST GROUP START iozone ####");
-    println!("iozone automatic measurements");
-    let auto_args: [*const u8; 7] = [
-        b"./iozone\0".as_ptr(),
-        b"-a\0".as_ptr(),
-        b"-r\0".as_ptr(),
-        b"1k\0".as_ptr(),
-        b"-s\0".as_ptr(),
-        b"4m\0".as_ptr(),
-        core::ptr::null(),
-    ];
-    let mut last = run_command_in_dir(dir, "iozone automatic", "./iozone\0", &auto_args);
-    last = run_iozone_command(dir, "iozone throughput write/read measurements", "0\0", "1\0") | last;
-    last = run_iozone_command(dir, "iozone throughput random-read measurements", "0\0", "2\0") | last;
-    last = run_iozone_command(dir, "iozone throughput read-backwards measurements", "0\0", "3\0") | last;
-    last = run_iozone_command(dir, "iozone throughput stride-read measurements", "0\0", "5\0") | last;
-    last = run_iozone_command(dir, "iozone throughput fwrite/fread measurements", "6\0", "7\0") | last;
-    last = run_iozone_command(dir, "iozone throughput pwrite/pread measurements", "9\0", "10\0") | last;
-    last = run_iozone_command(dir, "iozone throughtput pwritev/preadv measurements", "11\0", "12\0") | last;
-    println!("#### OS COMP TEST GROUP END iozone ####");
-    last
-}
-
-fn run_script(dir: &str, script: &str) -> i32 {
-    if script.starts_with("iozone_") {
-        return run_iozone_script(dir, script);
-    }
-    setup_runtime_for_dir(dir);
+fn run_script(dir: &str, script: &str) {
+    let (chroot_root, chroot_cwd) = chroot_root_and_cwd(dir);
     let script_arg = String::from("./") + script + "\0";
-    let budget = String::from(script_budget(script)) + "\0";
-    let args: [*const u8; 7] = [
-        b"busybox\0".as_ptr(),
-        b"timeout\0".as_ptr(),
-        budget.as_ptr(),
-        b"/busybox\0".as_ptr(),
-        b"sh\0".as_ptr(),
-        script_arg.as_ptr(),
+    let args: [*const u8; 3] = [b"sh\0".as_ptr(), script_arg.as_ptr(), core::ptr::null()];
+    let envs: [*const u8; 5] = [
+        b"PATH=/bin:/usr/bin:.\0".as_ptr(),
+        b"LD_LIBRARY_PATH=/lib:/lib64:.\0".as_ptr(),
+        b"HOME=/\0".as_ptr(),
+        b"TMPDIR=/tmp\0".as_ptr(),
         core::ptr::null(),
     ];
-    println!(
-        "[initproc] [RUN] {}{} budget={}s",
-        dir.trim_end_matches('\0'),
-        script,
-        script_budget(script)
-    );
     let pid = fork();
     if pid == 0 {
-        if user_lib::chdir(dir) != 0 {
-            println!("[initproc] chdir({}) failed", dir);
+        let chroot_arg = chroot_root.clone() + "\0";
+        let chdir_arg = chroot_cwd.clone() + "\0";
+        if chroot(&chroot_arg) != 0 {
             exit(126);
         }
-        let er = exec("/busybox\0", &args);
-        println!("[initproc] exec busybox timeout failed: {}", er);
-        exit(127);
-    }
-    wait_child(pid, script)
-}
-
-fn run_program(path: &str, name: &str) -> i32 {
-    println!("[initproc] fallback run {}", name);
-    let args: [*const u8; 2] = [path.as_ptr(), core::ptr::null()];
-    let pid = fork();
-    if pid == 0 {
-        let er = exec(path, &args);
-        println!("[initproc] exec({}) failed: {}", path, er);
-        exit(127);
-    }
-    wait_child(pid, name)
-}
-
-fn run_basic_fallback() {
-    run_program("/bin/contest_runner_musl\0", "basic-musl");
-    run_program("/bin/contest_runner_glibc\0", "basic-glibc");
-}
-
-fn run_busybox_fallback(glibc: bool) -> i32 {
-    setup_runtime_for_dir("/\0");
-    let (script, name) = if glibc {
-        ("/busybox_glibc_testcode.sh\0", "busybox-glibc")
-    } else {
-        ("/busybox_testcode.sh\0", "busybox-musl")
-    };
-    let args: [*const u8; 7] = [
-        b"busybox\0".as_ptr(),
-        b"timeout\0".as_ptr(),
-        b"60\0".as_ptr(),
-        b"/busybox\0".as_ptr(),
-        b"sh\0".as_ptr(),
-        script.as_ptr(),
-        core::ptr::null(),
-    ];
-    println!("[initproc] fallback run {} from rootfs", name);
-    let pid = fork();
-    if pid == 0 {
-        if user_lib::chdir("/\0") != 0 {
+        if user_lib::chdir(&chdir_arg) != 0 {
             exit(126);
         }
-        let er = exec("/busybox\0", &args);
-        println!("[initproc] fallback exec busybox failed: {}", er);
+        execve("/busybox\0", &args, &envs);
         exit(127);
+    } else if pid > 0 {
+        let mut ec = 0;
+        let budget_ms = script_budget(script).parse::<isize>().unwrap_or(10) * 1000;
+        let start = get_time();
+        loop {
+            let r = waitpid_nb(pid as usize, &mut ec);
+            if r == pid {
+                println!(
+                    "[initproc] [DONE] {}{} exit {}",
+                    dir.trim_end_matches('\0'),
+                    script,
+                    ec
+                );
+                break;
+            }
+            if get_time() - start > budget_ms {
+                println!(
+                    "[initproc] [TIMEOUT] {}{} after {}ms",
+                    dir.trim_end_matches('\0'),
+                    script,
+                    budget_ms
+                );
+                kill(pid as usize, 9);
+                waitpid(pid as usize, &mut ec);
+                break;
+            }
+            sleep(20);
+        }
     }
-    wait_child(pid, name)
 }
 
-fn remount_test_disk(reason: &str) -> isize {
-    sys_mkdir(b"/mnt\0".as_ptr(), 0o777);
-    let r = sys_mount("vda\0", "/mnt\0", "ext4\0", 0, &[]);
-    println!("[initproc] remount vda -> /mnt after {}: {}", reason, r);
-    r
-}
-
-fn scan_and_run(dir: &str, depth: usize) -> bool {
+fn collect_scripts(dir: &str, depth: usize, out: &mut Vec<TestScript>) {
     let entries = list_dir(dir);
     println!(
         "[initproc] {} has {} entries",
@@ -415,7 +374,6 @@ fn scan_and_run(dir: &str, depth: usize) -> bool {
         entries.len()
     );
 
-    let mut found = false;
     let mut scripts: Vec<String> = entries
         .iter()
         .filter(|entry| entry.ends_with("_testcode.sh"))
@@ -423,55 +381,61 @@ fn scan_and_run(dir: &str, depth: usize) -> bool {
         .cloned()
         .collect();
     sort_scripts(&mut scripts);
-
-    for script in &scripts {
-        if dir == "/mnt/\0" && script == "basic_testcode.sh" {
-            println!(
-                "[initproc] root basic_testcode.sh may use arch-suffixed groups; using rootfs basic runners"
-            );
-            run_basic_fallback();
-            remount_test_disk("basic fallback");
-        } else {
-            let code = run_script(dir, script);
-            if script == "busybox_testcode.sh" && code != 0 {
-                println!(
-                    "[initproc] external busybox script exited {}; trying rootfs fallback",
-                    code
-                );
-                run_busybox_fallback(dir.contains("glibc"));
-            }
-        }
-        found = true;
-    }
-
-    if depth == 0 {
-        return found;
-    }
-
-    for entry in &entries {
-        if entry == "lost+found"
-            || entry == "bin"
-            || entry == "lib"
-            || entry == "lib64"
-            || entry == "sbin"
-            || entry == "tmp"
-            || entry.ends_with(".sh")
-            || entry.ends_with(".txt")
+    for entry in &scripts {
+        let path = script_path(dir, entry);
+        if out
+            .iter()
+            .any(|old| script_path(&old.dir, &old.script) == path)
         {
             continue;
         }
-        if dir == "/mnt/\0"
-            && (entry == "musl" || entry == "glibc" || entry == "riscv" || entry == "loongarch")
-        {
+        out.push(TestScript {
+            dir: String::from(dir),
+            script: entry.clone(),
+        });
+    }
+
+    if depth == 0 {
+        return;
+    }
+
+    for entry in &entries {
+        if entry == "lost+found" || entry.ends_with(".sh") || entry.ends_with(".txt") {
             continue;
         }
         let mut next = join_path(dir, entry);
         next.push_str("/\0");
-        if scan_and_run(&next, depth - 1) {
-            found = true;
-        }
+        collect_scripts(&next, depth - 1, out);
     }
-    found
+}
+
+fn sort_collected_scripts(scripts: &mut Vec<TestScript>) {
+    scripts.sort_by(|a, b| {
+        let pa = script_priority(&a.script);
+        let pb = script_priority(&b.script);
+        if pa != pb {
+            return pa.cmp(&pb);
+        }
+        let sa = a.script.as_str();
+        let sb = b.script.as_str();
+        if sa != sb {
+            return sa.cmp(sb);
+        }
+        a.dir.as_str().cmp(b.dir.as_str())
+    });
+}
+
+fn run_collected_scripts(mut scripts: Vec<TestScript>) -> bool {
+    if scripts.is_empty() {
+        return false;
+    }
+    sort_collected_scripts(&mut scripts);
+    for item in scripts {
+        setup_runtime_for_dir(&item.dir);
+        println!("[initproc] [RUN] {}", script_path(&item.dir, &item.script));
+        run_script(&item.dir, &item.script);
+    }
+    true
 }
 
 #[no_mangle]
@@ -483,40 +447,28 @@ fn main() -> i32 {
     sys_mkdir(b"/mnt\0".as_ptr(), 0o777);
     let r = sys_mount("vda\0", "/mnt\0", "ext4\0", 0, &[]);
     println!("[initproc] mount vda -> /mnt: {}", r);
-    if r == 0 {
-        setup_runtime_for_dir("/mnt/\0");
+
+    let mut scripts = Vec::new();
+    for dir in ["/mnt/musl/\0", "/mnt/glibc/\0"] {
+        collect_scripts(dir, 0, &mut scripts);
     }
-
-    let mut found = false;
-
     #[cfg(target_arch = "riscv64")]
     let arch_dirs: [&str; 2] = ["/mnt/riscv/musl/\0", "/mnt/riscv/glibc/\0"];
     #[cfg(target_arch = "loongarch64")]
     let arch_dirs: [&str; 2] = ["/mnt/loongarch/musl/\0", "/mnt/loongarch/glibc/\0"];
     #[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
     let arch_dirs: [&str; 0] = [];
-
-    for dir in arch_dirs {
-        if scan_and_run(dir, 1) {
-            found = true;
+    if scripts.is_empty() {
+        for dir in arch_dirs {
+            collect_scripts(dir, 0, &mut scripts);
         }
     }
-
-    for dir in ["/mnt/musl/\0", "/mnt/glibc/\0"] {
-        if scan_and_run(dir, 1) {
-            found = true;
-        }
+    if scripts.is_empty() {
+        collect_scripts("/mnt/\0", 4, &mut scripts);
     }
-
-    if scan_and_run("/mnt/\0", 4) {
-        found = true;
-    }
-
+    let found = run_collected_scripts(scripts);
     if !found {
-        println!("[initproc] no test scripts found on /mnt; using rootfs fallbacks");
-        run_basic_fallback();
-        run_busybox_fallback(false);
-        run_busybox_fallback(true);
+        println!("[initproc] no test scripts found");
     }
 
     println!("[initproc] === DONE ===");

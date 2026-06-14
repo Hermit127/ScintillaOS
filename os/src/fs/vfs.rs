@@ -76,14 +76,14 @@ impl VfsSuperBlock {
             pos: 0,
             total_size: DISK_SIZE_512M,
         };
-        let ext4 = Ext4BlockWrapper::<BlockDeviceStreamOp>::new_with_name(
-            stream,
-            "ext4_fs",
-            mount_point,
-        ).ok()?;
+        let ext4 =
+            Ext4BlockWrapper::<BlockDeviceStreamOp>::new_with_name(stream, "ext4_fs", mount_point)
+                .ok()?;
         Some(Arc::new(VfsSuperBlock {
             fs_type,
-            fs_data: unsafe { UPSafeCell::new_named(FsInner::Ext4(Ext4Wrapper(ext4)), "VfsFsData") },
+            fs_data: unsafe {
+                UPSafeCell::new_named(FsInner::Ext4(Ext4Wrapper(ext4)), "VfsFsData")
+            },
         }))
     }
 
@@ -184,7 +184,8 @@ impl VfsSuperBlock {
             } else {
                 let mut dir: ext4_dir = unsafe { core::mem::zeroed() };
                 let c_path_dir = CString::new(fs_path).ok()?;
-                let dir_rc = unsafe { ext4_dir_open(&mut dir, c_path_dir.as_ptr() as *const c_char) };
+                let dir_rc =
+                    unsafe { ext4_dir_open(&mut dir, c_path_dir.as_ptr() as *const c_char) };
                 if dir_rc == EOK as i32 {
                     let inode_num = dir.f.inode;
                     let size = dir.f.fsize;
@@ -635,7 +636,15 @@ fn vfs_parent(dentry: &Arc<Dentry>) -> Option<Arc<Dentry>> {
 pub fn vfs_lookup(parent: &Arc<Dentry>, name: &str) -> Option<Arc<Dentry>> {
     match name {
         "." => return Some(parent.clone()),
-        ".." => return vfs_parent(parent).or_else(|| Some(parent.clone())),
+        ".." => {
+            if let Some(task) = crate::task::current_task() {
+                let root = task.inner_exclusive_access().root.clone();
+                if Arc::ptr_eq(parent, &root) || parent.path == root.path {
+                    return Some(parent.clone());
+                }
+            }
+            return vfs_parent(parent).or_else(|| Some(parent.clone()));
+        }
         _ => {}
     }
 
@@ -766,7 +775,12 @@ pub fn vfs_resolve_parent_and_name(
 
 // ==================== File Creation ====================
 
-pub fn vfs_create(parent: &Arc<Dentry>, name: &str, is_dir: bool, mode: u32) -> Option<Arc<Dentry>> {
+pub fn vfs_create(
+    parent: &Arc<Dentry>,
+    name: &str,
+    is_dir: bool,
+    mode: u32,
+) -> Option<Arc<Dentry>> {
     let inode_num = parent
         .super_block
         .create_file(&parent.fs_path, name, is_dir)?;

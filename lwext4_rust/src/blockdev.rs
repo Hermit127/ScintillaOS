@@ -267,7 +267,10 @@ impl<K: KernelDevOp> Ext4BlockWrapper<K> {
             let r = ext4_journal_start(c_mountpoint);
             if r != EOK as i32 {
                 if (r == ENOTSUP as i32) || (r == EINVAL as i32) {
-                    info!("ext4_journal_start unsupported rc = {:?}, continue without journal\n", r);
+                    info!(
+                        "ext4_journal_start unsupported rc = {:?}, continue without journal\n",
+                        r
+                    );
                 } else {
                     error!("ext4_journal_start: rc = {:?}\n", r);
                     return Err(r);

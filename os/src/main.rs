@@ -5,9 +5,8 @@
 use crate::{
     syscall::syscall,
     task::{
-        check_and_wake_up_tasks, check_signals_error_of_current, current_add_signal,
-        current_task, exit_current_and_run_next, handle_signals, ready_queue_len, SignalFlags,
-        suspend_current_and_run_next,
+        check_and_wake_up_tasks, check_signals_error_of_current, current_add_signal, current_task,
+        exit_current_and_run_next, handle_signals, suspend_current_and_run_next, SignalFlags,
     },
 };
 // use polyhal::api::ArchInterface;
@@ -89,14 +88,14 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
         }
         Timer => {
             static mut TICK: usize = 0;
-            unsafe { TICK += 1; }
+            unsafe {
+                TICK += 1;
+            }
             net::net_poll();
             net::wake_net_blocked_tasks();
             check_and_wake_up_tasks();
             check_itimer();
-            if ready_queue_len() > 0 {
-                suspend_current_and_run_next();
-            }
+            suspend_current_and_run_next();
         }
         _ => {
             warn!("unsuspended trap type: {:?}", trap_type);
@@ -120,7 +119,9 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
 
 fn check_itimer() {
     let Some(task) = current_task() else { return };
-    let Some(mut inner) = task.try_inner_exclusive_access() else { return };
+    let Some(mut inner) = task.try_inner_exclusive_access() else {
+        return;
+    };
     if inner.itimer_expire == 0 {
         return;
     }

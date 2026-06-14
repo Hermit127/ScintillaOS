@@ -144,6 +144,15 @@ impl TaskControlBlockInner {
         self.fd_table.clear();
         self.fd_cloexec.clear();
     }
+
+    pub fn close_cloexec_fds(&mut self) {
+        let len = self.fd_table.len().min(self.fd_cloexec.len());
+        for fd in 0..len {
+            if self.fd_cloexec[fd] {
+                self.close_fd(fd);
+            }
+        }
+    }
 }
 
 fn task_entry() {
@@ -208,60 +217,63 @@ impl TaskControlBlock {
         let task_control_block = Self {
             pid: pid_handle,
             inner: unsafe {
-                UPSafeCell::new_named(TaskControlBlockInner {
-                    trap_cx: TrapFrame::new(),
-                    base_size: user_sp,
-                    task_cx: blank_kcontext(kstack.get_position().1), // Set task_cx's Kernel Stack Top
-                    task_status: TaskStatus::Ready,
-                    memory_set,
-                    parent: None,
-                    children: Vec::new(),
-                    exit_code: 0,
-                    fd_table: vec![
-                        // 0 -> stdin
-                        Some(Arc::new(Stdin)),
-                        // 1 -> stdout
-                        Some(Arc::new(Stdout)),
-                        // 2 -> stderr
-                        Some(Arc::new(Stdout)),
-                    ],
-                    fd_cloexec: vec![false, false, false],
-                    cwd: ROOT_DENTRY.clone(),
-                    root: ROOT_DENTRY.clone(),
-                    tid_ptr: 0,
-                    uid: 0,
-                    euid: 0,
-                    gid: 0,
-                    egid: 0,
-                    umask: 0o022,
-                    signals: SignalFlags::empty(),
-                    signal_mask: SignalFlags::empty(),
-                    signal_mask_backup: None,
-                    handling_sig: -1,
-                    signal_actions: SignalActions::default(),
-                    killed: false,
-                    frozen: false,
-                    trap_ctx_backup: None,
-                    kernel_stack: kstack,
-                    // added
-                    heap_bottom,
-                    program_brk: heap_bottom,
-                    sleeping: None,
-                    utime: 0,
-                    stime: 0,
-                    cutime: 0,
-                    cstime: 0,
-                    last_time: polyhal::time::Time::now().to_nsec() as usize,
-                    block_reason: None,
-                    itimer_expire: 0,
-                    itimer_interval_us: 0,
-                    child_tid: 0,
-                    alt_stack: 0,
-                    alt_stack_size: 0,
-                    alt_stack_flags: 0,
-                    in_syscall: false,
-                    exit_signal: 0,
-                }, "TaskInner")
+                UPSafeCell::new_named(
+                    TaskControlBlockInner {
+                        trap_cx: TrapFrame::new(),
+                        base_size: user_sp,
+                        task_cx: blank_kcontext(kstack.get_position().1), // Set task_cx's Kernel Stack Top
+                        task_status: TaskStatus::Ready,
+                        memory_set,
+                        parent: None,
+                        children: Vec::new(),
+                        exit_code: 0,
+                        fd_table: vec![
+                            // 0 -> stdin
+                            Some(Arc::new(Stdin)),
+                            // 1 -> stdout
+                            Some(Arc::new(Stdout)),
+                            // 2 -> stderr
+                            Some(Arc::new(Stdout)),
+                        ],
+                        fd_cloexec: vec![false, false, false],
+                        cwd: ROOT_DENTRY.clone(),
+                        root: ROOT_DENTRY.clone(),
+                        tid_ptr: 0,
+                        uid: 0,
+                        euid: 0,
+                        gid: 0,
+                        egid: 0,
+                        umask: 0o022,
+                        signals: SignalFlags::empty(),
+                        signal_mask: SignalFlags::empty(),
+                        signal_mask_backup: None,
+                        handling_sig: -1,
+                        signal_actions: SignalActions::default(),
+                        killed: false,
+                        frozen: false,
+                        trap_ctx_backup: None,
+                        kernel_stack: kstack,
+                        // added
+                        heap_bottom,
+                        program_brk: heap_bottom,
+                        sleeping: None,
+                        utime: 0,
+                        stime: 0,
+                        cutime: 0,
+                        cstime: 0,
+                        last_time: polyhal::time::Time::now().to_nsec() as usize,
+                        block_reason: None,
+                        itimer_expire: 0,
+                        itimer_interval_us: 0,
+                        child_tid: 0,
+                        alt_stack: 0,
+                        alt_stack_size: 0,
+                        alt_stack_flags: 0,
+                        in_syscall: false,
+                        exit_signal: 0,
+                    },
+                    "TaskInner",
+                )
             },
         };
         // prepare TrapContext in user space
@@ -273,13 +285,20 @@ impl TaskControlBlock {
                 tls_base + tls_size
             } else {
                 let max_va: usize = inner.memory_set.max_end_vaddr().into();
-                let tls_va = (max_va + crate::config::PAGE_SIZE - 1) / crate::config::PAGE_SIZE * crate::config::PAGE_SIZE;
+                let tls_va = (max_va + crate::config::PAGE_SIZE - 1) / crate::config::PAGE_SIZE
+                    * crate::config::PAGE_SIZE;
                 let ok = inner.memory_set.insert_framed_area(
                     tls_va.into(),
                     (tls_va + crate::config::PAGE_SIZE).into(),
-                    crate::mm::MapPermission::R | crate::mm::MapPermission::W | crate::mm::MapPermission::U,
+                    crate::mm::MapPermission::R
+                        | crate::mm::MapPermission::W
+                        | crate::mm::MapPermission::U,
                 );
-                if ok { tls_va + crate::config::PAGE_SIZE } else { 0 }
+                if ok {
+                    tls_va + crate::config::PAGE_SIZE
+                } else {
+                    0
+                }
             }
         };
         let trap_cx = task_control_block.inner_exclusive_access().get_trap_cx();
@@ -465,6 +484,7 @@ impl TaskControlBlock {
         let crt_sp = sp;
 
         let mut inner = self.inner_exclusive_access();
+        inner.close_cloexec_fds();
         inner.memory_set = memory_set;
         inner.heap_bottom = heap_bottom;
         inner.program_brk = heap_bottom;
@@ -479,13 +499,18 @@ impl TaskControlBlock {
             trap_cx[TrapFrameArgs::TLS] = tls_base + tls_size;
         } else {
             let max_va: usize = inner.memory_set.max_end_vaddr().into();
-            let tls_va = (max_va + crate::config::PAGE_SIZE - 1) / crate::config::PAGE_SIZE * crate::config::PAGE_SIZE;
+            let tls_va = (max_va + crate::config::PAGE_SIZE - 1) / crate::config::PAGE_SIZE
+                * crate::config::PAGE_SIZE;
             let ok = inner.memory_set.insert_framed_area(
                 tls_va.into(),
                 (tls_va + crate::config::PAGE_SIZE).into(),
-                crate::mm::MapPermission::R | crate::mm::MapPermission::W | crate::mm::MapPermission::U,
+                crate::mm::MapPermission::R
+                    | crate::mm::MapPermission::W
+                    | crate::mm::MapPermission::U,
             );
-            if ok { trap_cx[TrapFrameArgs::TLS] = tls_va + crate::config::PAGE_SIZE; }
+            if ok {
+                trap_cx[TrapFrameArgs::TLS] = tls_va + crate::config::PAGE_SIZE;
+            }
         }
         *inner.get_trap_cx() = trap_cx;
     }
@@ -550,52 +575,55 @@ impl TaskControlBlock {
         let task_control_block = Arc::new(TaskControlBlock {
             pid: pid_handle,
             inner: unsafe {
-                UPSafeCell::new_named(TaskControlBlockInner {
-                    trap_cx: trap_cx_clone,
-                    base_size,
-                    task_cx: blank_kcontext(kstack.get_position().1), // Set task_cx's Kernel Stack Top
-                    task_status: TaskStatus::Ready,
-                    memory_set,
-                    parent: Some(Arc::downgrade(self)),
-                    children: Vec::new(),
-                    exit_code: 0,
-                    fd_table,
-                    fd_cloexec,
-                    cwd,
-                    root,
-                    tid_ptr,
-                    uid,
-                    euid,
-                    gid,
-                    egid,
-                    umask,
-                    signals: SignalFlags::empty(),
-                    signal_mask,
-                    signal_mask_backup: None,
-                    handling_sig: -1,
-                    signal_actions,
-                    killed: false,
-                    frozen: false,
-                    trap_ctx_backup: None,
-                    kernel_stack: kstack,
-                    heap_bottom,
-                    program_brk,
-                    sleeping: None,
-                    utime: 0,
-                    stime: 0,
-                    cutime: 0,
-                    cstime: 0,
-                    last_time: polyhal::time::Time::now().to_nsec() as usize,
-                    block_reason: None,
-                    itimer_expire: 0,
-                    itimer_interval_us: 0,
-                    child_tid: 0,
-                    alt_stack: 0,
-                    alt_stack_size: 0,
-                    alt_stack_flags: 0,
-                    in_syscall: false,
-                    exit_signal: 0,
-                }, "TaskInner")
+                UPSafeCell::new_named(
+                    TaskControlBlockInner {
+                        trap_cx: trap_cx_clone,
+                        base_size,
+                        task_cx: blank_kcontext(kstack.get_position().1), // Set task_cx's Kernel Stack Top
+                        task_status: TaskStatus::Ready,
+                        memory_set,
+                        parent: Some(Arc::downgrade(self)),
+                        children: Vec::new(),
+                        exit_code: 0,
+                        fd_table,
+                        fd_cloexec,
+                        cwd,
+                        root,
+                        tid_ptr,
+                        uid,
+                        euid,
+                        gid,
+                        egid,
+                        umask,
+                        signals: SignalFlags::empty(),
+                        signal_mask,
+                        signal_mask_backup: None,
+                        handling_sig: -1,
+                        signal_actions,
+                        killed: false,
+                        frozen: false,
+                        trap_ctx_backup: None,
+                        kernel_stack: kstack,
+                        heap_bottom,
+                        program_brk,
+                        sleeping: None,
+                        utime: 0,
+                        stime: 0,
+                        cutime: 0,
+                        cstime: 0,
+                        last_time: polyhal::time::Time::now().to_nsec() as usize,
+                        block_reason: None,
+                        itimer_expire: 0,
+                        itimer_interval_us: 0,
+                        child_tid: 0,
+                        alt_stack: 0,
+                        alt_stack_size: 0,
+                        alt_stack_flags: 0,
+                        in_syscall: false,
+                        exit_signal: 0,
+                    },
+                    "TaskInner",
+                )
             },
         });
         // add child to parent's children list

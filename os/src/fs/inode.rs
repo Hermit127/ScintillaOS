@@ -36,7 +36,9 @@ impl Drop for OSInode {
     fn drop(&mut self) {
         let mut inner = self.inner.exclusive_access();
         if let Some(ref mut f) = inner.file_handle {
-            unsafe { ext4_fclose(f); }
+            unsafe {
+                ext4_fclose(f);
+            }
         }
     }
 }
@@ -69,7 +71,16 @@ impl OSInode {
             writable,
             append,
             dentry,
-            inner: unsafe { UPSafeCell::new_named(OSInodeInner { offset, file_handle: None, lock_type: 2 }, "OSInodeInner") },
+            inner: unsafe {
+                UPSafeCell::new_named(
+                    OSInodeInner {
+                        offset,
+                        file_handle: None,
+                        lock_type: 2,
+                    },
+                    "OSInodeInner",
+                )
+            },
         }
     }
     pub fn dentry(&self) -> &Arc<Dentry> {
@@ -102,7 +113,9 @@ impl OSInode {
             let mut inner = self.inner.exclusive_access();
             // seek to current offset
             let offset = inner.offset;
-            unsafe { ext4_fseek(&mut file, offset as i64, SEEK_SET as u32); }
+            unsafe {
+                ext4_fseek(&mut file, offset as i64, SEEK_SET as u32);
+            }
             inner.file_handle = Some(file);
         }
     }
@@ -270,14 +283,17 @@ fn open_file_new(
             return None;
         }
 
-        if let Some(dentry) = vfs_resolve_with_fallback(&start, path)
-            .and_then(|d| follow_symlink(&start, d, 0))
+        if let Some(dentry) =
+            vfs_resolve_with_fallback(&start, path).and_then(|d| follow_symlink(&start, d, 0))
         {
             if !dentry.is_dir {
                 if flags.excl_requested() {
                     return None;
                 }
-                if flags.trunc_requested() || flags.contains(OpenFlags::WRONLY) || flags.contains(OpenFlags::RDWR) {
+                if flags.trunc_requested()
+                    || flags.contains(OpenFlags::WRONLY)
+                    || flags.contains(OpenFlags::RDWR)
+                {
                     root_make_accessible(&dentry, 0o666);
                 }
                 if flags.trunc_requested() {
@@ -309,7 +325,11 @@ fn open_file_new(
         return None;
     }
 
-    if !dentry.is_dir && (flags.trunc_requested() || flags.contains(OpenFlags::WRONLY) || flags.contains(OpenFlags::RDWR)) {
+    if !dentry.is_dir
+        && (flags.trunc_requested()
+            || flags.contains(OpenFlags::WRONLY)
+            || flags.contains(OpenFlags::RDWR))
+    {
         root_make_accessible(&dentry, 0o666);
     }
 
@@ -329,7 +349,11 @@ fn open_file_new(
     Some(Arc::new(OSInode::new(readable, writable, append, dentry)))
 }
 
-fn follow_symlink(start: &Arc<Dentry>, dentry: Arc<Dentry>, depth: usize) -> Option<Arc<Dentry>> {
+pub fn follow_symlink(
+    start: &Arc<Dentry>,
+    dentry: Arc<Dentry>,
+    depth: usize,
+) -> Option<Arc<Dentry>> {
     if depth >= 8 {
         return None;
     }
@@ -355,13 +379,17 @@ fn follow_symlink(start: &Arc<Dentry>, dentry: Arc<Dentry>, depth: usize) -> Opt
     if rc != 0 || rcnt == 0 {
         return None;
     }
-    let target = core::str::from_utf8(&target_buf[..rcnt]).ok()?.trim_matches('\0');
+    let target = core::str::from_utf8(&target_buf[..rcnt])
+        .ok()?
+        .trim_matches('\0');
     if target.is_empty() {
         return None;
     }
 
     let base = if target.starts_with('/') {
-        crate::fs::vfs::ROOT_DENTRY.clone()
+        crate::task::current_task()
+            .map(|task| task.inner_exclusive_access().root.clone())
+            .unwrap_or_else(|| crate::fs::vfs::ROOT_DENTRY.clone())
     } else {
         dentry.parent.clone().unwrap_or_else(|| start.clone())
     };
@@ -431,16 +459,62 @@ impl File for OSInode {
     }
 
     fn read(&self, buf: &mut [u8]) -> isize {
+        if !self.writable {
+            let mut inner = self.inner.exclusive_access();
+            let rw_count = self
+                .dentry
+                .super_block
+                .read_at(&self.dentry.fs_path, inner.offset, buf);
+            inner.offset += rw_count;
+            return rw_count as isize;
+        }
+        let need_open = {
+            let inner = self.inner.exclusive_access();
+            inner.file_handle.is_none()
+        };
+        if need_open {
+            self.open_handle();
+        }
         let mut inner = self.inner.exclusive_access();
-        let rw_count = self
-            .dentry
-            .super_block
-            .read_at(&self.dentry.fs_path, inner.offset, buf);
-        inner.offset += rw_count;
-        rw_count as isize
+        let off = inner.offset;
+        if let Some(ref mut file) = inner.file_handle {
+            let size = unsafe { ext4_fsize(file) as usize };
+            if off >= size {
+                return 0;
+            }
+            let max_read = buf.len().min(size - off);
+            unsafe {
+                ext4_fseek(file, off as i64, SEEK_SET as u32);
+            }
+            let mut total = 0usize;
+            while total < max_read {
+                let mut rw_count: usize = 0;
+                let rc = unsafe {
+                    ext4_fread(
+                        file,
+                        buf[total..max_read].as_mut_ptr() as *mut core::ffi::c_void,
+                        max_read - total,
+                        &mut rw_count,
+                    )
+                };
+                if rc != EOK as i32 || rw_count == 0 {
+                    break;
+                }
+                total += rw_count;
+            }
+            inner.offset = off + total;
+            return total as isize;
+        }
+        -1
     }
 
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> isize {
+        if !self.writable {
+            return self
+                .dentry
+                .super_block
+                .read_at(&self.dentry.fs_path, offset, buf) as isize;
+        }
         let need_open = {
             let inner = self.inner.exclusive_access();
             inner.file_handle.is_none()
@@ -450,17 +524,22 @@ impl File for OSInode {
         }
         let mut inner = self.inner.exclusive_access();
         if let Some(ref mut file) = inner.file_handle {
+            let size = unsafe { ext4_fsize(file) as usize };
+            if offset >= size {
+                return 0;
+            }
+            let max_read = buf.len().min(size - offset);
             unsafe {
                 ext4_fseek(file, offset as i64, SEEK_SET as u32);
             }
             let mut total = 0usize;
-            while total < buf.len() {
+            while total < max_read {
                 let mut rw_count: usize = 0;
                 let rc = unsafe {
                     ext4_fread(
                         file,
-                        buf[total..].as_mut_ptr() as *mut core::ffi::c_void,
-                        buf.len() - total,
+                        buf[total..max_read].as_mut_ptr() as *mut core::ffi::c_void,
+                        max_read - total,
                         &mut rw_count,
                     )
                 };

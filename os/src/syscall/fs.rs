@@ -8,62 +8,8 @@ use crate::task::{current_task, current_user_token};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
-use alloc::vec::Vec;
 
 const AT_FDCWD: isize = -100;
-
-pub fn copy_from_user_pages(ptr: *const u8, len: usize) -> Option<Vec<u8>> {
-    if len == 0 {
-        return Some(Vec::new());
-    }
-    let task = current_task()?;
-    let inner = task.inner_exclusive_access();
-    let start = ptr as usize;
-    let end = start.checked_add(len)?;
-    let mut out = Vec::with_capacity(len);
-    let mut cur = start;
-    while cur < end {
-        let page_base = cur & !(crate::config::PAGE_SIZE - 1);
-        let page_off = cur - page_base;
-        let chunk = core::cmp::min(crate::config::PAGE_SIZE - page_off, end - cur);
-        let (paddr, _) = inner.memory_set.translate(polyhal::VirtAddr::from(page_base))?;
-        let src = unsafe { core::slice::from_raw_parts(paddr.get_ptr::<u8>().add(page_off), chunk) };
-        out.extend_from_slice(src);
-        cur += chunk;
-    }
-    Some(out)
-}
-
-pub fn copy_to_user_pages(ptr: *mut u8, data: &[u8]) -> bool {
-    if data.is_empty() {
-        return true;
-    }
-    let task = match current_task() {
-        Some(task) => task,
-        None => return false,
-    };
-    let inner = task.inner_exclusive_access();
-    let start = ptr as usize;
-    let end = match start.checked_add(data.len()) {
-        Some(end) => end,
-        None => return false,
-    };
-    let mut cur = start;
-    let mut copied = 0usize;
-    while cur < end {
-        let page_base = cur & !(crate::config::PAGE_SIZE - 1);
-        let page_off = cur - page_base;
-        let chunk = core::cmp::min(crate::config::PAGE_SIZE - page_off, end - cur);
-        let Some((paddr, _)) = inner.memory_set.translate(polyhal::VirtAddr::from(page_base)) else {
-            return false;
-        };
-        let dst = unsafe { core::slice::from_raw_parts_mut(paddr.get_mut_ptr::<u8>().add(page_off), chunk) };
-        dst.copy_from_slice(&data[copied..copied + chunk]);
-        copied += chunk;
-        cur += chunk;
-    }
-    true
-}
 
 fn resolve_base_dir(dirfd: isize) -> Option<Arc<Dentry>> {
     let task = current_task()?;
@@ -84,6 +30,9 @@ fn resolve_base_dir(dirfd: isize) -> Option<Arc<Dentry>> {
     };
     if !file.is_dir() {
         return None;
+    }
+    if let Some(inode) = file.as_any().downcast_ref::<crate::fs::inode::OSInode>() {
+        return Some(inode.get_dentry().clone());
     }
     let path = file.path()?;
     let cwd = inner.cwd.clone();
@@ -106,12 +55,11 @@ pub fn sys_write(fd: usize, buf: *mut u8, len: usize) -> isize {
             return -9;
         }
         let file = file.clone();
+        if !inner.memory_set.valid_user_buf(buf, len, false) {
+            return -14;
+        }
         drop(inner);
-        let mut kbuf = match copy_from_user_pages(buf as *const u8, len) {
-            Some(buf) => buf,
-            None => return -14,
-        };
-        file.write(kbuf.as_mut_slice())
+        file.write(translated_byte_buffer(token, buf, len))
     } else {
         -1
     }
@@ -132,13 +80,12 @@ pub fn sys_read(fd: usize, buf: *mut u8, len: usize) -> isize {
         if !file.readable() {
             return -9;
         }
-        drop(inner);
-        let mut kbuf = vec![0u8; len];
-        let n = file.read(kbuf.as_mut_slice());
-        if n > 0 && !copy_to_user_pages(buf, &kbuf[..n as usize]) {
+        if !inner.memory_set.valid_user_buf(buf, len, true) {
             return -14;
         }
-        n
+        drop(inner);
+
+        file.read(translated_byte_buffer(token, buf, len))
     } else {
         -9
     }
@@ -153,7 +100,8 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> isize
     // Validate path before reading
     {
         let inner = task.inner_exclusive_access();
-        let end_of_page = ((path as usize) + crate::config::PAGE_SIZE) & !(crate::config::PAGE_SIZE - 1);
+        let end_of_page =
+            ((path as usize) + crate::config::PAGE_SIZE) & !(crate::config::PAGE_SIZE - 1);
         let first_page_len = 4096.min(end_of_page - (path as usize));
         if !inner.memory_set.valid_user_buf(path, first_page_len, false) {
             return -14;
@@ -321,7 +269,8 @@ pub fn sys_chdir(path: *const u8) -> isize {
     let task = current_task().unwrap();
     let inner = task.inner_exclusive_access();
     let max_len = 4096;
-    let end_of_page = ((path as usize) + crate::config::PAGE_SIZE) & !(crate::config::PAGE_SIZE - 1);
+    let end_of_page =
+        ((path as usize) + crate::config::PAGE_SIZE) & !(crate::config::PAGE_SIZE - 1);
     let first_page_len = max_len.min(end_of_page - (path as usize));
     if !inner.memory_set.valid_user_buf(path, first_page_len, false) {
         return -14;
@@ -343,11 +292,58 @@ pub fn sys_chdir(path: *const u8) -> isize {
     0
 }
 
+pub fn sys_chroot(path: *const u8) -> isize {
+    if path.is_null() {
+        return -14;
+    }
+    let token = current_user_token();
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+    let max_len = 4096;
+    let end_of_page =
+        ((path as usize) + crate::config::PAGE_SIZE) & !(crate::config::PAGE_SIZE - 1);
+    let first_page_len = max_len.min(end_of_page - (path as usize));
+    if !inner.memory_set.valid_user_buf(path, first_page_len, false) {
+        return -14;
+    }
+    let path_str = translated_str(token, path);
+    if path_str.len() >= max_len {
+        return -36;
+    }
+    let cwd = inner.cwd.clone();
+    drop(inner);
+    let Some(root_dentry) = vfs_resolve_path(&cwd, &path_str) else {
+        return -2;
+    };
+    if !root_dentry.is_dir {
+        return -20;
+    }
+    let mut inner = task.inner_exclusive_access();
+    inner.root = root_dentry.clone();
+    inner.cwd = root_dentry;
+    0
+}
+
 pub fn sys_getcwd(buf: *mut u8, size: usize) -> isize {
     let task = current_task().unwrap();
     let cwd_path = {
         let inner = task.inner_exclusive_access();
-        inner.cwd.path.clone()
+        let cwd_path = inner.cwd.path.clone();
+        let root_path = inner.root.path.clone();
+        if root_path != "/" && cwd_path.starts_with(&root_path) {
+            let suffix = &cwd_path[root_path.len()..];
+            if suffix.is_empty() {
+                String::from("/")
+            } else if suffix.starts_with('/') {
+                String::from(suffix)
+            } else {
+                let mut path = String::from("/");
+                path.push_str(suffix);
+                path
+            }
+        } else {
+            cwd_path
+        }
     };
     let need = cwd_path.len() + 1;
     if size > 0 && size < need {
@@ -470,7 +466,7 @@ pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const u8, _flags: us
 }
 
 pub fn sys_faccessat(dirfd: isize, path: *const u8, mode: usize, _flags: usize) -> isize {
-    sys_faccessat2(dirfd, path, mode, _flags)
+    sys_faccessat2(dirfd, path, mode, 0)
 }
 
 pub fn sys_faccessat2(dirfd: isize, path: *const u8, mode: usize, flags: usize) -> isize {
@@ -501,6 +497,14 @@ pub fn sys_faccessat2(dirfd: isize, path: *const u8, mode: usize, flags: usize) 
     let dentry = match vfs_resolve_with_fallback(&base, &path_str) {
         Some(d) => d,
         None => return -2,
+    };
+    let dentry = if flags & AT_SYMLINK_NOFOLLOW == 0 {
+        match crate::fs::follow_symlink(&base, dentry, 0) {
+            Some(d) => d,
+            None => return -2,
+        }
+    } else {
+        dentry
     };
 
     if mode == F_OK {
@@ -761,31 +765,46 @@ pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             }
         }
         // File locking stubs (both 32-bit: 5/6/7 and 64-bit: 12/13/14)
-        5 | 12 => { // F_GETLK
+        5 | 12 => {
+            // F_GETLK
             let token = inner.get_user_token();
-            let cur_type = inner.fd_table[fd].as_ref()
+            let cur_type = inner.fd_table[fd]
+                .as_ref()
                 .and_then(|f| f.as_any().downcast_ref::<crate::fs::inode::OSInode>())
                 .map(|ino| ino.get_lock_type())
                 .unwrap_or(2);
             let size = 32;
-            if !inner.memory_set.valid_user_buf(arg as *const u8, size, true) {
+            if !inner
+                .memory_set
+                .valid_user_buf(arg as *const u8, size, true)
+            {
                 return -14;
             }
             let token = inner.get_user_token();
             drop(inner);
             let buf = crate::mm::translated_byte_buffer(token, arg as *mut u8, size);
-            for b in buf.iter_mut() { *b = 0; }
+            for b in buf.iter_mut() {
+                *b = 0;
+            }
             buf[0] = cur_type as u8;
             return 0;
         }
-        6 | 7 | 13 | 14 => { // F_SETLK / F_SETLKW
-            if let Some(inode) = inner.fd_table[fd].as_ref().and_then(|f| f.as_any().downcast_ref::<crate::fs::inode::OSInode>()) {
+        6 | 7 | 13 | 14 => {
+            // F_SETLK / F_SETLKW
+            if let Some(inode) = inner.fd_table[fd]
+                .as_ref()
+                .and_then(|f| f.as_any().downcast_ref::<crate::fs::inode::OSInode>())
+            {
                 inode.set_lock_type(1); // F_WRLCK
             }
             0
         }
-        2 | 15 => { // F_UNLCK
-            if let Some(inode) = inner.fd_table[fd].as_ref().and_then(|f| f.as_any().downcast_ref::<crate::fs::inode::OSInode>()) {
+        2 | 15 => {
+            // F_UNLCK
+            if let Some(inode) = inner.fd_table[fd]
+                .as_ref()
+                .and_then(|f| f.as_any().downcast_ref::<crate::fs::inode::OSInode>())
+            {
                 inode.set_lock_type(2); // F_UNLCK
             }
             0
@@ -952,7 +971,9 @@ pub fn sys_pipe2(pipe: *mut usize, flags: usize) -> isize {
         let mut inner = task.inner_exclusive_access();
         let (pipe_read, pipe_write) = make_pipe();
         let read_fd = inner.alloc_fd();
-        if read_fd >= inner.fd_table.len() { return -24; }
+        if read_fd >= inner.fd_table.len() {
+            return -24;
+        }
         inner.fd_table[read_fd] = Some(pipe_read);
         let write_fd = inner.alloc_fd();
         if write_fd >= inner.fd_table.len() {
@@ -1158,6 +1179,7 @@ pub fn sys_readlinkat(dirfd: isize, path: *const u8, buf: *mut u8, bufsiz: usize
 
 pub fn sys_fstatat(dirfd: isize, path: *const u8, stat_buf: *mut u8, flags: usize) -> isize {
     const AT_EMPTY_PATH: usize = 0x1000;
+    const AT_SYMLINK_NOFOLLOW: usize = 0x100;
 
     if stat_buf.is_null() {
         return -22; // EINVAL
@@ -1181,6 +1203,14 @@ pub fn sys_fstatat(dirfd: isize, path: *const u8, stat_buf: *mut u8, flags: usiz
         Some(d) => d,
         None => return -2,
     };
+    let dentry = if flags & AT_SYMLINK_NOFOLLOW == 0 {
+        match crate::fs::follow_symlink(&base, dentry, 0) {
+            Some(d) => d,
+            None => return -2,
+        }
+    } else {
+        dentry
+    };
 
     let inode = crate::fs::inode::OSInode::new(false, false, false, dentry);
     let st = inode.stat();
@@ -1196,6 +1226,7 @@ pub fn sys_statx(
     statx_buf: *mut u8,
 ) -> isize {
     const AT_EMPTY_PATH: u32 = 0x1000;
+    const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
 
     if statx_buf.is_null() {
         return -22;
@@ -1229,6 +1260,14 @@ pub fn sys_statx(
     let dentry = match vfs_resolve_path(&base, &path_str) {
         Some(d) => d,
         None => return -2,
+    };
+    let dentry = if flags & AT_SYMLINK_NOFOLLOW == 0 {
+        match crate::fs::follow_symlink(&base, dentry, 0) {
+            Some(d) => d,
+            None => return -2,
+        }
+    } else {
+        dentry
     };
 
     let inode = crate::fs::inode::OSInode::new(false, false, false, dentry);
@@ -1347,8 +1386,8 @@ pub fn sys_getdents64(fd: usize, dirp: *mut u8, len: usize) -> isize {
 
 // ==================== mount / umount ====================
 
-use crate::drivers::{BLOCK_DEVICE, ROOT_BLOCK_DEVICE};
 use crate::drivers::block::VirtIOBlock;
+use crate::drivers::{BLOCK_DEVICE, ROOT_BLOCK_DEVICE};
 use crate::fs::vfs::{vfs_mount, vfs_umount};
 
 pub fn sys_mount(
@@ -1382,9 +1421,7 @@ pub fn sys_mount(
         return -20;
     }
 
-    if fstype_str.as_str() == "vfat"
-        && matches!(source_str.as_str(), "/dev/vda2" | "vda2")
-    {
+    if fstype_str.as_str() == "vfat" && matches!(source_str.as_str(), "/dev/vda2" | "vda2") {
         return 0;
     }
 
@@ -1405,20 +1442,20 @@ pub fn sys_mount(
         "vdd" => Arc::new(VirtIOBlock::new_at(polyhal::PhysAddr::new(0x10004000))),
         _ => BLOCK_DEVICE.clone(),
     };
-    let lwext4_mount_path = match source_str.as_str() {
-        "vda" => "/__mount_vda/",
-        "vdb" => "/__mount_vdb/",
-        "vdc" => "/__mount_vdc/",
-        "vdd" => "/__mount_vdd/",
-        _ => "/__mount_blk/",
-    };
+    let mut lwext4_mount_path =
+        String::from(target_path.trim_end_matches('\0').trim_end_matches('/'));
+    if lwext4_mount_path.is_empty() {
+        lwext4_mount_path.push('/');
+    } else if lwext4_mount_path != "/" {
+        lwext4_mount_path.push('/');
+    }
 
-    let sb = match VfsSuperBlock::new_ext4_at(blk_dev, "ext4", lwext4_mount_path) {
+    let sb = match VfsSuperBlock::new_ext4_at(blk_dev, "ext4", lwext4_mount_path.as_str()) {
         Some(sb) => sb,
         None => return -17,
     };
 
-    if vfs_mount(mnt_point, sb, lwext4_mount_path) {
+    if vfs_mount(mnt_point, sb, lwext4_mount_path.as_str()) {
         0
     } else {
         -16
@@ -1529,11 +1566,10 @@ pub fn sys_pread64(fd: usize, buf: *mut u8, len: usize, offset: usize) -> isize 
         None => return -1,
     };
     drop(inner);
-    let mut kbuf = vec![0u8; len];
-    let n = dentry.super_block.read_at(&dentry.fs_path, offset, kbuf.as_mut_slice());
-    if n > 0 && !copy_to_user_pages(buf, &kbuf[..n]) {
-        return -14;
-    }
+    let user_buf = translated_byte_buffer(token, buf, len);
+    let n = dentry
+        .super_block
+        .read_at(&dentry.fs_path, offset, user_buf);
     n as isize
 }
 
@@ -1553,11 +1589,10 @@ pub fn sys_pwrite64(fd: usize, buf: *mut u8, len: usize, offset: usize) -> isize
         None => return -1,
     };
     drop(inner);
-    let user_buf = match copy_from_user_pages(buf as *const u8, len) {
-        Some(buf) => buf,
-        None => return -14,
-    };
-    let n = dentry.super_block.write_at(&dentry.fs_path, offset, user_buf.as_slice());
+    let user_buf = translated_byte_buffer(token, buf, len);
+    let n = dentry
+        .super_block
+        .write_at(&dentry.fs_path, offset, user_buf);
     n as isize
 }
 
@@ -1570,7 +1605,10 @@ pub fn sys_preadv(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> is
     let token = current_user_token();
     let task = current_task().unwrap();
     let inner = task.inner_exclusive_access();
-    if !inner.memory_set.valid_user_buf(iov, iovcnt * core::mem::size_of::<IoVec>(), false) {
+    if !inner
+        .memory_set
+        .valid_user_buf(iov, iovcnt * core::mem::size_of::<IoVec>(), false)
+    {
         return -14;
     }
     if fd >= inner.fd_table.len() || inner.fd_table[fd].is_none() {
@@ -1603,16 +1641,16 @@ pub fn sys_preadv(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> is
         }
         let task = current_task().unwrap();
         let inner = task.inner_exclusive_access();
-        let ok = inner.memory_set.valid_user_buf(iov.iov_base as *const u8, iov.iov_len, true);
+        let ok = inner
+            .memory_set
+            .valid_user_buf(iov.iov_base as *const u8, iov.iov_len, true);
         drop(inner);
         if !ok {
             return -14;
         }
-        let mut kbuf = vec![0u8; iov.iov_len];
-        let n = dentry.super_block.read_at(&dentry.fs_path, off, kbuf.as_mut_slice());
-        if n > 0 && !copy_to_user_pages(iov.iov_base as *mut u8, &kbuf[..n]) {
-            return -14;
-        }
+        let user_buf =
+            crate::mm::translated_byte_buffer(token, iov.iov_base as *mut u8, iov.iov_len);
+        let n = dentry.super_block.read_at(&dentry.fs_path, off, user_buf);
         total += n as isize;
         off += n;
         if n < iov.iov_len {
@@ -1632,7 +1670,10 @@ pub fn sys_pwritev(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> i
     let task = current_task().unwrap();
     let inner = task.inner_exclusive_access();
     // Validate iov array
-    if !inner.memory_set.valid_user_buf(iov, iovcnt * core::mem::size_of::<IoVec>(), false) {
+    if !inner
+        .memory_set
+        .valid_user_buf(iov, iovcnt * core::mem::size_of::<IoVec>(), false)
+    {
         return -14;
     }
     if fd >= inner.fd_table.len() || inner.fd_table[fd].is_none() {
@@ -1665,16 +1706,16 @@ pub fn sys_pwritev(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> i
         }
         let task = current_task().unwrap();
         let inner = task.inner_exclusive_access();
-        let ok = inner.memory_set.valid_user_buf(iov.iov_base as *const u8, iov.iov_len, false);
+        let ok = inner
+            .memory_set
+            .valid_user_buf(iov.iov_base as *const u8, iov.iov_len, false);
         drop(inner);
         if !ok {
             return -14;
         }
-        let user_buf = match copy_from_user_pages(iov.iov_base as *const u8, iov.iov_len) {
-            Some(buf) => buf,
-            None => return -14,
-        };
-        let n = dentry.super_block.write_at(&dentry.fs_path, off, user_buf.as_slice());
+        let user_buf =
+            crate::mm::translated_byte_buffer(token, iov.iov_base as *mut u8, iov.iov_len);
+        let n = dentry.super_block.write_at(&dentry.fs_path, off, user_buf);
         total += n as isize;
         off += n;
         if n < iov.iov_len {
@@ -1684,11 +1725,23 @@ pub fn sys_pwritev(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> i
     total
 }
 
-pub fn sys_preadv2(fd: usize, iov: *const u8, iovcnt: usize, offset: usize, _flags: usize) -> isize {
+pub fn sys_preadv2(
+    fd: usize,
+    iov: *const u8,
+    iovcnt: usize,
+    offset: usize,
+    _flags: usize,
+) -> isize {
     sys_preadv(fd, iov, iovcnt, offset)
 }
 
-pub fn sys_pwritev2(fd: usize, iov: *const u8, iovcnt: usize, offset: usize, _flags: usize) -> isize {
+pub fn sys_pwritev2(
+    fd: usize,
+    iov: *const u8,
+    iovcnt: usize,
+    offset: usize,
+    _flags: usize,
+) -> isize {
     sys_pwritev(fd, iov, iovcnt, offset)
 }
 
@@ -1705,7 +1758,11 @@ fn sync_fd(fd: usize) -> isize {
     };
     drop(inner);
     let rc = dentry.super_block.fsync(&dentry.fs_path);
-    if rc == 0 { 0 } else { -5 }
+    if rc == 0 {
+        0
+    } else {
+        -5
+    }
 }
 
 pub fn sys_fsync(fd: usize) -> isize {
@@ -1718,7 +1775,11 @@ pub fn sys_fdatasync(fd: usize) -> isize {
 
 pub fn sys_sync() -> isize {
     let rc = crate::fs::vfs::ROOT_SB.sync_all();
-    if rc == 0 { 0 } else { -5 }
+    if rc == 0 {
+        0
+    } else {
+        -5
+    }
 }
 
 pub fn sys_syncfs(fd: usize) -> isize {
@@ -1787,7 +1848,9 @@ pub fn sys_ftruncate(fd: usize, length: u64) -> isize {
         Some(f) => f.clone(),
         None => return -1,
     };
-    let dentry = file.as_any().downcast_ref::<crate::fs::inode::OSInode>()
+    let dentry = file
+        .as_any()
+        .downcast_ref::<crate::fs::inode::OSInode>()
         .map(|inode| inode.dentry());
     match dentry {
         Some(d) => {
@@ -1832,7 +1895,14 @@ pub fn sys_readahead(_fd: usize, _offset: usize, _count: usize) -> isize {
 
 // ---- copy_file_range (285) ----
 
-pub fn sys_copy_file_range(fd_in: usize, off_in: *mut usize, fd_out: usize, off_out: *mut usize, len: usize, _flags: usize) -> isize {
+pub fn sys_copy_file_range(
+    fd_in: usize,
+    off_in: *mut usize,
+    fd_out: usize,
+    off_out: *mut usize,
+    len: usize,
+    _flags: usize,
+) -> isize {
     let task = current_task().unwrap();
     let inner = task.inner_exclusive_access();
     if fd_in >= inner.fd_table.len() || inner.fd_table[fd_in].is_none() {
@@ -1857,9 +1927,13 @@ pub fn sys_copy_file_range(fd_in: usize, off_in: *mut usize, fd_out: usize, off_
     while (total as usize) < len {
         let chunk = (len - total as usize).min(buf.len());
         let n = f_in.read(&mut buf[..chunk]);
-        if n <= 0 { break; }
+        if n <= 0 {
+            break;
+        }
         let w = f_out.write(&mut buf[..n as usize]);
-        if w <= 0 { break; }
+        if w <= 0 {
+            break;
+        }
         total += w;
     }
     total

@@ -83,7 +83,11 @@ impl VirtIOBlock {
                 .expect("this is not a valid virtio device");
             let blk = VirtIOBlk::<VirtioHal, MmioTransport>::new(transport).unwrap();
             let capacity = blk.capacity();
-            crate::println!("[virtio-blk] online at {:#x}, capacity={} sectors", addr.raw(), capacity);
+            crate::println!(
+                "[virtio-blk] online at {:#x}, capacity={} sectors",
+                addr.raw(),
+                capacity
+            );
             Self(UPSafeCell::new(blk))
         }
     }
@@ -206,30 +210,51 @@ unsafe impl Hal for VirtioHal {
 #[cfg(not(target_arch = "loongarch64"))]
 pub fn probe_all() -> Vec<Arc<dyn BlockDevice>> {
     const BASES: &[usize] = &[
-        0x1000_1000, 0x1000_2000, 0x1000_3000, 0x1000_4000,
-        0x1000_5000, 0x1000_6000, 0x1000_7000, 0x1000_8000,
+        0x1000_1000,
+        0x1000_2000,
+        0x1000_3000,
+        0x1000_4000,
+        0x1000_5000,
+        0x1000_6000,
+        0x1000_7000,
+        0x1000_8000,
     ];
     let mut out = Vec::new();
     for &base in BASES {
         // Use virtual address (physical | VIRT_ADDR_START) for MMIO access
         let va = base | VIRT_ADDR_START;
         let magic = unsafe { core::ptr::read_volatile(va as *const u32) };
-        crate::println!("[virtio-blk] probe {:#x} (va={:#x}): magic={:#x}", base, va, magic);
-        if magic != 0x7472_6976 { continue; }
+        crate::println!(
+            "[virtio-blk] probe {:#x} (va={:#x}): magic={:#x}",
+            base,
+            va,
+            magic
+        );
+        if magic != 0x7472_6976 {
+            continue;
+        }
         let device_id = unsafe { core::ptr::read_volatile((va + 0x08) as *const u32) };
         crate::println!("[virtio-blk] probe {:#x}: device_id={}", base, device_id);
-        if device_id != 2 { continue; }
+        if device_id != 2 {
+            continue;
+        }
         let header = match unsafe { NonNull::new(va as *mut u8) } {
             Some(h) => h,
             None => continue,
         };
         let transport = match unsafe { MmioTransport::new(header.cast()) } {
             Ok(t) => t,
-            Err(e) => { crate::println!("[virtio-blk] probe {:#x}: transport err {:?}", base, e); continue; }
+            Err(e) => {
+                crate::println!("[virtio-blk] probe {:#x}: transport err {:?}", base, e);
+                continue;
+            }
         };
         let blk = match VirtIOBlk::<VirtioHal, MmioTransport>::new(transport) {
             Ok(b) => b,
-            Err(e) => { crate::println!("[virtio-blk] probe {:#x}: blk err {:?}", base, e); continue; }
+            Err(e) => {
+                crate::println!("[virtio-blk] probe {:#x}: blk err {:?}", base, e);
+                continue;
+            }
         };
         let dev: Arc<dyn BlockDevice> = Arc::new(VirtIOBlock(unsafe { UPSafeCell::new(blk) }));
         crate::println!("[virtio-blk] probe {:#x}: OK (device #{})", base, out.len());
@@ -262,7 +287,11 @@ pub fn probe_all() -> Vec<Arc<dyn BlockDevice>> {
         let transport = match PciTransport::new::<VirtioHal>(&mut root, device_function) {
             Ok(transport) => transport,
             Err(e) => {
-                crate::println!("[virtio-blk] pci {:?}: transport err {:?}", device_function, e);
+                crate::println!(
+                    "[virtio-blk] pci {:?}: transport err {:?}",
+                    device_function,
+                    e
+                );
                 continue;
             }
         };

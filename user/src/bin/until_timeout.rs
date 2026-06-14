@@ -4,7 +4,7 @@
 #[macro_use]
 extern crate user_lib;
 
-use user_lib::{exec, fork, get_time, kill, waitpid, waitpid_nb, SignalFlags};
+use user_lib::{exec, fork, get_time, kill, waitpid, waitpid_nb, SIGINT};
 
 #[no_mangle]
 pub fn main(argc: usize, argv: &[&str]) -> i32 {
@@ -37,7 +37,7 @@ pub fn main(argc: usize, argv: &[&str]) -> i32 {
         }
         if !child_exited {
             println!("child has run for {}ms, kill it!", timeout_ms);
-            kill(pid, SignalFlags::SIGINT.bits());
+            kill(pid, SIGINT);
             assert_eq!(waitpid(pid, &mut exit_code) as usize, pid);
             println!("exit code of the child is {}", exit_code);
         }

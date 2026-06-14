@@ -74,35 +74,49 @@ fn sockaddr(addr: u32, port: u16) -> [u8; 16] {
 fn run_server() {
     let fd = sys_call(SYS_SOCKET, [AF_INET, SOCK_STREAM, 0, 0, 0, 0]);
     println!("server socket={}", fd);
-    if fd < 0 { exit(1); }
+    if fd < 0 {
+        exit(1);
+    }
     let fd = fd as usize;
 
     let opt: i32 = 1;
     let opt_ptr = &opt as *const i32 as usize;
-    sys_call(SYS_SETSOCKOPT, [fd, SOL_SOCKET, SO_REUSEADDR, opt_ptr, 4, 0]);
+    sys_call(
+        SYS_SETSOCKOPT,
+        [fd, SOL_SOCKET, SO_REUSEADDR, opt_ptr, 4, 0],
+    );
 
     let sa = sockaddr(0, 9999);
     let sa_ptr = sa.as_ptr() as usize;
     let ret = sys_call(SYS_BIND, [fd, sa_ptr, 16, 0, 0, 0]);
     println!("server bind={}", ret);
-    if ret < 0 { exit(1); }
+    if ret < 0 {
+        exit(1);
+    }
 
     let ret = sys_call(SYS_LISTEN, [fd, 5, 0, 0, 0, 0]);
     println!("server listen={}", ret);
-    if ret < 0 { exit(1); }
+    if ret < 0 {
+        exit(1);
+    }
 
     println!("server listening on port 9999");
 
     let cfd = sys_call(SYS_ACCEPT, [fd, 0, 0, 0, 0, 0]);
     println!("server accepted fd={}", cfd);
-    if cfd < 0 { exit(1); }
+    if cfd < 0 {
+        exit(1);
+    }
     let cfd = cfd as usize;
 
     let mut buf = [0u8; 64];
     let n = sys_call(SYS_READ, [cfd, buf.as_mut_ptr() as usize, 64, 0, 0, 0]);
     println!("server read n={} data={:?}", n, &buf[..n as usize]);
 
-    let n2 = sys_call(SYS_WRITE, [cfd, buf.as_mut_ptr() as usize, n as usize, 0, 0, 0]);
+    let n2 = sys_call(
+        SYS_WRITE,
+        [cfd, buf.as_mut_ptr() as usize, n as usize, 0, 0, 0],
+    );
     println!("server wrote n2={}", n2);
 
     sys_call(SYS_CLOSE, [cfd, 0, 0, 0, 0, 0]);
@@ -114,14 +128,18 @@ fn run_server() {
 fn run_client() {
     let fd = sys_call(SYS_SOCKET, [AF_INET, SOCK_STREAM, 0, 0, 0, 0]);
     println!("client socket={}", fd);
-    if fd < 0 { exit(1); }
+    if fd < 0 {
+        exit(1);
+    }
     let fd = fd as usize;
 
     let sa = sockaddr(0x7f000001u32, 9999); // 127.0.0.1
     let sa_ptr = sa.as_ptr() as usize;
     let ret = sys_call(SYS_CONNECT, [fd, sa_ptr, 16, 0, 0, 0]);
     println!("client connect={}", ret);
-    if ret < 0 { exit(1); }
+    if ret < 0 {
+        exit(1);
+    }
 
     let msg = b"HELLO_TCP\0";
     let n = sys_call(SYS_WRITE, [fd, msg.as_ptr() as usize, 10, 0, 0, 0]);

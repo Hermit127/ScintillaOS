@@ -1,8 +1,8 @@
 use super::{File, Kstat, S_IFIFO};
 use crate::sync::UPSafeCell;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use alloc::sync::Arc;
 
 use crate::task::{
     block_current_and_run_next, current_task, wake_pipe_read_tasks, wake_pipe_write_tasks,
@@ -156,7 +156,8 @@ impl PipeRingBuffer {
 
 /// Return (read_end, write_end)
 pub fn make_pipe() -> (Arc<Pipe>, Arc<Pipe>) {
-    let buffer = Arc::new(unsafe { UPSafeCell::new_named(PipeRingBuffer::new(), "PipeRingBuffer") });
+    let buffer =
+        Arc::new(unsafe { UPSafeCell::new_named(PipeRingBuffer::new(), "PipeRingBuffer") });
     let read_end = Arc::new(Pipe::read_end_with_buffer(buffer.clone()));
     let write_end = Arc::new(Pipe::write_end_with_buffer(buffer.clone()));
     (read_end, write_end)
@@ -223,7 +224,10 @@ impl File for Pipe {
             }
             let (loop_write, read_end_closed) = {
                 let ring_buffer = self.buffer.exclusive_access();
-                (ring_buffer.available_write(), ring_buffer.all_read_ends_closed())
+                (
+                    ring_buffer.available_write(),
+                    ring_buffer.all_read_ends_closed(),
+                )
             };
             if read_end_closed {
                 return -32;

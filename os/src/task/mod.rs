@@ -24,7 +24,9 @@ pub use processor::{
     current_task, current_user_token, init_kernel_page, run_tasks, schedule, take_current_task,
 };
 pub use signal::{SignalFlags, MAX_SIG};
-pub use task::{BlockReason, KernelStack, TaskControlBlock, TaskControlBlockInner, TaskStatus, blank_kcontext};
+pub use task::{
+    blank_kcontext, BlockReason, KernelStack, TaskControlBlock, TaskControlBlockInner, TaskStatus,
+};
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -58,8 +60,6 @@ pub fn suspend_current_and_run_next() {
 
     //added for kernel time accounting
     task.record_time_suspend();
-    crate::fs::stdio::stdout_release_if_owner();
-
     // ---- access current TCB exclusively
     let mut task_inner = task.inner_exclusive_access();
     let task_cx_ptr = &mut task_inner.task_cx as *mut KContext;
@@ -181,10 +181,10 @@ pub fn wake_blocked_task(task: &Arc<TaskControlBlock>) {
     let mut inner = task.inner_exclusive_access();
     let should_wake = inner.task_status == TaskStatus::Blocked || removed;
     if should_wake && inner.task_status != TaskStatus::Zombie {
-            inner.task_status = TaskStatus::Ready;
-            inner.block_reason = None;
-            drop(inner);
-            add_priority_task(task.clone());
+        inner.task_status = TaskStatus::Ready;
+        inner.block_reason = None;
+        drop(inner);
+        add_priority_task(task.clone());
     }
 }
 
@@ -328,9 +328,8 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
 }
 
 lazy_static! {
-    pub static ref INITPROC: Arc<TaskControlBlock> = Arc::new({
-        TaskControlBlock::new(EMBEDDED_INITPROC)
-    });
+    pub static ref INITPROC: Arc<TaskControlBlock> =
+        Arc::new({ TaskControlBlock::new(EMBEDDED_INITPROC) });
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -536,7 +535,11 @@ pub fn handle_signals() {
                 let task = current_task().unwrap();
                 let inner = task.inner_exclusive_access();
                 let sig = inner.exit_signal;
-                if sig != 0 { sig } else { -9 }
+                if sig != 0 {
+                    sig
+                } else {
+                    -9
+                }
             };
             exit_current_and_run_next(exit_code);
         }

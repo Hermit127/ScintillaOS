@@ -6,6 +6,7 @@ const SYSCALL_DUP: usize = 23;
 const SYSCALL_DUP3: usize = 24;
 const SYSCALL_GETCWD: usize = 17;
 const SYSCALL_CHDIR: usize = 49;
+const SYSCALL_CHROOT: usize = 51;
 const SYSCALL_OPENAT: usize = 56;
 const SYSCALL_CLOSE: usize = 57;
 const SYSCALL_PIPE2: usize = 59;
@@ -219,10 +220,21 @@ pub fn sys_exec(path: &str, args: &[*const u8], envs: &[*const u8]) -> isize {
     )
 }
 
+pub fn sys_chroot(path: &str) -> isize {
+    syscall(SYSCALL_CHROOT, [path.as_ptr() as usize, 0, 0, 0, 0, 0])
+}
+
 pub fn sys_waitpid(pid: isize, exit_code: *mut i32) -> isize {
     syscall(
         SYSCALL_WAITPID,
         [pid as usize, exit_code as usize, 0, 0, 0, 0],
+    )
+}
+
+pub fn sys_waitpid_options(pid: isize, exit_code: *mut i32, options: usize) -> isize {
+    syscall(
+        SYSCALL_WAITPID,
+        [pid as usize, exit_code as usize, options, 0, 0, 0],
     )
 }
 

@@ -8,14 +8,39 @@ extern crate alloc;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use user_lib::{exec, fork, waitpid, shutdown, mount, exit};
+use user_lib::{exec, exit, fork, mount, shutdown, waitpid};
 
 const TEST_LIST: &[&str] = &[
-    "brk", "chdir", "close", "dup", "dup2", "execve", "exit",
-    "fstat", "getcwd", "getdents", "getpid", "getppid", "gettimeofday",
-    "mkdir_", "mmap", "mount", "munmap", "openat", "open", "pipe", "read",
-    "sleep", "times", "umount", "uname", "unlink", "wait", "waitpid",
-    "write", "yield",
+    "brk",
+    "chdir",
+    "close",
+    "dup",
+    "dup2",
+    "execve",
+    "exit",
+    "fstat",
+    "getcwd",
+    "getdents",
+    "getpid",
+    "getppid",
+    "gettimeofday",
+    "mkdir_",
+    "mmap",
+    "mount",
+    "munmap",
+    "openat",
+    "open",
+    "pipe",
+    "read",
+    "sleep",
+    "times",
+    "umount",
+    "uname",
+    "unlink",
+    "wait",
+    "waitpid",
+    "write",
+    "yield",
 ];
 
 fn run_test(name: &str) -> i32 {
@@ -52,32 +77,64 @@ fn run_iozone() {
     let bin = "/bin/iozone\0";
 
     println!("iozone throughput write/read measurements");
-    run_cmd(bin, &["-i\0", "0\0", "-i\0", "1\0", "-r\0", "1k\0", "-s\0", "1m\0"]);
+    run_cmd(
+        bin,
+        &["-i\0", "0\0", "-i\0", "1\0", "-r\0", "1k\0", "-s\0", "1m\0"],
+    );
 
     println!("iozone throughput random-read measurements");
-    run_cmd(bin, &["-i\0", "0\0", "-i\0", "2\0", "-r\0", "1k\0", "-s\0", "1m\0"]);
+    run_cmd(
+        bin,
+        &["-i\0", "0\0", "-i\0", "2\0", "-r\0", "1k\0", "-s\0", "1m\0"],
+    );
 
     println!("iozone throughput read-backwards measurements");
-    run_cmd(bin, &["-i\0", "0\0", "-i\0", "3\0", "-r\0", "1k\0", "-s\0", "1m\0"]);
+    run_cmd(
+        bin,
+        &["-i\0", "0\0", "-i\0", "3\0", "-r\0", "1k\0", "-s\0", "1m\0"],
+    );
 
     println!("iozone throughput stride-read measurements");
-    run_cmd(bin, &["-i\0", "0\0", "-i\0", "5\0", "-r\0", "1k\0", "-s\0", "1m\0"]);
+    run_cmd(
+        bin,
+        &["-i\0", "0\0", "-i\0", "5\0", "-r\0", "1k\0", "-s\0", "1m\0"],
+    );
 
     println!("iozone throughput fwrite/fread measurements");
-    run_cmd(bin, &["-i\0", "6\0", "-i\0", "7\0", "-r\0", "1k\0", "-s\0", "1m\0"]);
+    run_cmd(
+        bin,
+        &["-i\0", "6\0", "-i\0", "7\0", "-r\0", "1k\0", "-s\0", "1m\0"],
+    );
 
     println!("iozone throughput pwrite/pread measurements");
-    run_cmd(bin, &["-i\0", "9\0", "-i\0", "10\0", "-r\0", "1k\0", "-s\0", "1m\0"]);
+    run_cmd(
+        bin,
+        &[
+            "-i\0", "9\0", "-i\0", "10\0", "-r\0", "1k\0", "-s\0", "1m\0",
+        ],
+    );
 
     println!("iozone throughtput pwritev/preadv measurements");
-    run_cmd(bin, &["-i\0", "11\0", "-i\0", "12\0", "-r\0", "1k\0", "-s\0", "1m\0"]);
+    run_cmd(
+        bin,
+        &[
+            "-i\0", "11\0", "-i\0", "12\0", "-r\0", "1k\0", "-s\0", "1m\0",
+        ],
+    );
 
     println!("#### OS COMP TEST GROUP END iozone ####");
 }
 
 const LUA_TESTS: &[&str] = &[
-    "strings", "sort", "sin30", "round_num", "max_min",
-    "file_io", "remove", "date", "random",
+    "strings",
+    "sort",
+    "sin30",
+    "round_num",
+    "max_min",
+    "file_io",
+    "remove",
+    "date",
+    "random",
 ];
 
 fn run_lua(bin: &str, group_name: &str) {

@@ -14,6 +14,7 @@ const SYSCALL_UNLINKAT: usize = 35;
 const SYSCALL_SYMLINKAT: usize = 36;
 const SYSCALL_FTRUNCATE: usize = 46;
 const SYSCALL_CHDIR: usize = 49;
+const SYSCALL_CHROOT: usize = 51;
 const SYSCALL_OPENAT: usize = 56;
 const SYSCALL_CLOSE: usize = 57;
 const SYSCALL_PIPE2: usize = 59;
@@ -122,6 +123,7 @@ const SYSCALL_RECVMSG: usize = 212;
 
 const SYSCALL_SET_TID_ADDRESS: usize = 96;
 const SYSCALL_EXIT_GROUP: usize = 94;
+const SYSCALL_WAITID: usize = 95;
 
 mod fs;
 mod process;
@@ -166,13 +168,21 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_DUP => sys_dup(args[0]),
         SYSCALL_DUP3 => sys_dup3(args[0], args[1], args[2]),
         SYSCALL_FCNTL => sys_fcntl(args[0], args[1], args[2]),
-        SYSCALL_FACCESSAT => sys_faccessat(args[0] as isize, args[1] as *const u8, args[2], args[3]),
+        SYSCALL_FACCESSAT => {
+            sys_faccessat(args[0] as isize, args[1] as *const u8, args[2], args[3])
+        }
         SYSCALL_FACCESSAT2 => {
             sys_faccessat2(args[0] as isize, args[1] as *const u8, args[2], args[3])
         }
         SYSCALL_FCHMOD => sys_fchmod(args[0], args[1] as u32),
         SYSCALL_FCHMODAT => sys_fchmodat(args[0] as isize, args[1] as *const u8, args[2] as u32),
-        SYSCALL_FCHOWNAT => sys_fchownat(args[0] as isize, args[1] as *const u8, args[2] as u32, args[3] as u32, args[4] as u32),
+        SYSCALL_FCHOWNAT => sys_fchownat(
+            args[0] as isize,
+            args[1] as *const u8,
+            args[2] as u32,
+            args[3] as u32,
+            args[4] as u32,
+        ),
         SYSCALL_FCHOWN => sys_fchown(args[0], args[1] as u32, args[2] as u32),
         SYSCALL_IOCTL => sys_ioctl(args[0], args[1], args[2]),
         SYSCALL_GETCWD => sys_getcwd(args[0] as *mut u8, args[1]),
@@ -182,6 +192,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             sys_symlinkat(args[0] as *const u8, args[1] as isize, args[2] as *const u8)
         }
         SYSCALL_CHDIR => sys_chdir(args[0] as *const u8),
+        SYSCALL_CHROOT => sys_chroot(args[0] as *const u8),
         SYSCALL_OPENAT => sys_openat(
             args[0] as isize,
             args[1] as *const u8,
@@ -249,6 +260,13 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[2] as *const usize,
         ),
         SYSCALL_WAITPID => sys_waitpid(args[0] as isize, args[1] as *mut i32, args[2]),
+        SYSCALL_WAITID => sys_waitid(
+            args[0],
+            args[1],
+            args[2] as *mut u8,
+            args[3],
+            args[4] as *mut u8,
+        ),
         //added
         SYSCALL_FSTAT => sys_fstat(args[0], args[1] as *mut u8),
         SYSCALL_SYNC => sys_sync(),
@@ -274,7 +292,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_MUNMAP => sys_munmap(args[0], args[1]),
         SYSCALL_MSYNC => sys_msync(args[0], args[1], args[2]),
         SYSCALL_SHMGET => sys_shmget(args[0], args[1], args[2]),
-        SYSCALL_SHMCTL => sys_shmctl(args[0], args[1], args[2]),
+        SYSCALL_SHMCTL => sys_shmctl(args[0], args[1], args[2] as *mut u8),
         SYSCALL_SHMAT => sys_shmat(args[0], args[1], args[2]),
         SYSCALL_SHMDT => sys_shmdt(args[0]),
         SYSCALL_SOCKET => sys_socket(args[0], args[1], args[2]),
