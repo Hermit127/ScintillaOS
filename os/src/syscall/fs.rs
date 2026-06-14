@@ -1855,6 +1855,9 @@ pub fn sys_ftruncate(fd: usize, length: u64) -> isize {
     match dentry {
         Some(d) => {
             if d.super_block.truncate_file(&d.fs_path, length) {
+                if let Some(inode) = file.as_any().downcast_ref::<crate::fs::inode::OSInode>() {
+                    inode.update_cached_size(length as i64);
+                }
                 0
             } else {
                 -1

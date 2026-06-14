@@ -34,7 +34,7 @@ lazy_static! {
 }
 
 static LAST_USER_TIME_US: AtomicU64 = AtomicU64::new(0);
-const USER_TIME_MIN_STEP_US: u64 = 50;
+const USER_TIME_MIN_STEP_US: u64 = 1;
 
 fn monotonic_user_time_us() -> u64 {
     let hw_us = (Time::now().to_nsec() / 1000) as u64;

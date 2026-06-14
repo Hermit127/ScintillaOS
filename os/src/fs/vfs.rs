@@ -283,37 +283,6 @@ impl VfsSuperBlock {
     }
 
     pub fn write_at(&self, fs_path: &str, offset: usize, buf: &[u8]) -> usize {
-        const EXT4_RW_BLOCK: usize = 4096;
-        if buf.is_empty() {
-            return 0;
-        }
-        let Some(end) = offset.checked_add(buf.len()) else {
-            return 0;
-        };
-        if offset % EXT4_RW_BLOCK != 0 || buf.len() % EXT4_RW_BLOCK != 0 {
-            let aligned_start = offset & !(EXT4_RW_BLOCK - 1);
-            let aligned_end = (end + EXT4_RW_BLOCK - 1) & !(EXT4_RW_BLOCK - 1);
-            let Some(info) = self.get_inode_info(fs_path) else {
-                return 0;
-            };
-            let old_size = info.size as usize;
-            let final_size = old_size.max(end);
-            let mut block_buf = vec![0u8; aligned_end - aligned_start];
-            let read_len = self.read_at(fs_path, aligned_start, block_buf.as_mut_slice());
-            if read_len < block_buf.len() {
-                block_buf[read_len..].fill(0);
-            }
-            let begin = offset - aligned_start;
-            block_buf[begin..begin + buf.len()].copy_from_slice(buf);
-            let written = self.write_at_raw(fs_path, aligned_start, block_buf.as_slice());
-            if written != block_buf.len() {
-                return 0;
-            }
-            if final_size < aligned_end {
-                self.truncate_file(fs_path, final_size as u64);
-            }
-            return buf.len();
-        }
         self.write_at_raw(fs_path, offset, buf)
     }
 
@@ -366,6 +335,8 @@ impl VfsSuperBlock {
     pub fn create_file(&self, parent_path: &str, name: &str, is_dir: bool) -> Option<u32> {
         let full_path = if parent_path == "/" {
             format!("/{}", name)
+        } else if parent_path.ends_with('/') {
+            format!("{}{}", parent_path, name)
         } else {
             format!("{}/{}", parent_path, name)
         };
@@ -535,6 +506,7 @@ pub struct Dentry {
     pub fs_path: String,
     pub inode_num: u32,
     pub is_dir: bool,
+    pub is_link: bool,
     pub parent: Option<Arc<Dentry>>,
     pub super_block: Arc<VfsSuperBlock>,
     pub children: UPSafeCell<Option<Vec<Arc<Dentry>>>>,
@@ -548,6 +520,7 @@ impl Dentry {
             fs_path: String::from("/"),
             inode_num: 2,
             is_dir: true,
+            is_link: false,
             parent: None,
             super_block: sb,
             children: unsafe { UPSafeCell::new(None) },
@@ -561,13 +534,20 @@ impl Dentry {
             fs_path: String::from(lwext4_mount),
             inode_num: 2,
             is_dir: true,
+            is_link: false,
             parent: None,
             super_block: sb,
             children: unsafe { UPSafeCell::new(None) },
         })
     }
 
-    fn new_child(parent: &Arc<Dentry>, name: &str, inode_num: u32, is_dir: bool) -> Arc<Self> {
+    fn new_child(
+        parent: &Arc<Dentry>,
+        name: &str,
+        inode_num: u32,
+        is_dir: bool,
+        is_link: bool,
+    ) -> Arc<Self> {
         let path = if parent.path == "/" {
             format!("/{}", name)
         } else {
@@ -586,6 +566,7 @@ impl Dentry {
             fs_path,
             inode_num,
             is_dir,
+            is_link,
             parent: Some(parent.clone()),
             super_block: parent.super_block.clone(),
             children: unsafe { UPSafeCell::new(None) },
@@ -668,7 +649,7 @@ pub fn vfs_lookup(parent: &Arc<Dentry>, name: &str) -> Option<Arc<Dentry>> {
         format!("{}/{}", parent.fs_path, name)
     };
 
-    let (child_inode, is_dir) = {
+    let (child_inode, is_dir, is_link) = {
         let entries = parent.super_block.dir_get_entries(&parent.fs_path);
         let found = entries.iter().find(|e| e.get_name() == name)?;
         let inode_num = found.inode;
@@ -677,10 +658,11 @@ pub fn vfs_lookup(parent: &Arc<Dentry>, name: &str) -> Option<Arc<Dentry>> {
             Some(info) => info.is_dir,
             None => found.de_type == 2,
         };
-        (inode_num, is_dir)
+        let is_link = info.map(|info| info.is_link).unwrap_or(false);
+        (inode_num, is_dir, is_link)
     };
 
-    let child = Dentry::new_child(parent, name, child_inode, is_dir);
+    let child = Dentry::new_child(parent, name, child_inode, is_dir, is_link);
 
     {
         let mut children = parent.children.exclusive_access();
@@ -785,7 +767,7 @@ pub fn vfs_create(
         .super_block
         .create_file(&parent.fs_path, name, is_dir)?;
 
-    let child = Dentry::new_child(parent, name, inode_num, is_dir);
+    let child = Dentry::new_child(parent, name, inode_num, is_dir, false);
 
     let umask = crate::task::current_task()
         .map(|t| t.inner_exclusive_access().umask)

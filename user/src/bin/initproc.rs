@@ -136,6 +136,12 @@ fn setup_runtime_for_dir(dir: &str) {
             "/lib/ld-linux-riscv64-lp64d.so.1",
             "/lib/ld-linux-riscv64-lp64d.so.1",
         );
+        bind_library(
+            &chroot_root,
+            &glibc_root,
+            "/lib/ld-linux-riscv64-lp64d.so.1",
+            "/lib/ld-linux-riscv64-lp64.so.1",
+        );
         bind_library(&chroot_root, &glibc_root, "/lib/libc.so", "/lib/libc.so.6");
         bind_library(&chroot_root, &glibc_root, "/lib/libm.so", "/lib/libm.so.6");
         bind_library(
@@ -177,6 +183,12 @@ fn setup_runtime_for_dir(dir: &str) {
             &musl_root,
             "/lib/libc.so",
             "/lib/ld-musl-loongarch64.so.1",
+        );
+        bind_library(
+            &chroot_root,
+            &musl_root,
+            "/lib/libc.so",
+            "/lib/ld-musl-loongarch64-lp64d.so.1",
         );
         bind_library(
             &chroot_root,
@@ -280,7 +292,7 @@ fn script_budget(script: &str) -> &'static str {
     } else if script.starts_with("iozone_") {
         "720"
     } else if script.starts_with("lmbench_") {
-        "240"
+        "1800"
     } else {
         "90"
     }
