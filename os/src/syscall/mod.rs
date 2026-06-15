@@ -61,6 +61,7 @@ const SYSCALL_READV: usize = 65;
 const SYSCALL_MPROTECT: usize = 226;
 const SYSCALL_SETPGID: usize = 154;
 const SYSCALL_GETPGID: usize = 155;
+const SYSCALL_SETSID: usize = 157;
 const SYSCALL_MADVISE: usize = 233;
 const SYSCALL_SET_ROBUST_LIST: usize = 99;
 const SYSCALL_GETRANDOM: usize = 278;
@@ -224,7 +225,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_EXIT_GROUP => sys_exit_group(args[0] as i32),
         SYSCALL_YIELD => sys_yield(),
         SYSCALL_SYSLOG => sys_syslog(args[0], args[1] as *mut u8, args[2]),
-        SYSCALL_KILL => sys_kill(args[0], args[1] as i32),
+        SYSCALL_KILL => sys_kill(args[0] as isize, args[1] as i32),
         SYSCALL_SIGACTION => sys_sigaction(
             args[0] as i32,
             args[1] as *const SignalAction,
@@ -350,8 +351,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3] as *const u8,
             args[4],
         ),
-        SYSCALL_SETPGID => 0, // no-op: single process group
-        SYSCALL_GETPGID => 0, // no-op: always pgid=0
+        SYSCALL_SETPGID => sys_setpgid(args[0], args[1]),
+        SYSCALL_GETPGID => sys_getpgid(args[0]),
+        SYSCALL_SETSID => sys_setsid(),
         SYSCALL_MADVISE => sys_madvise(args[0], args[1], args[2]),
         SYSCALL_STATFS => sys_statfs(args[0] as *const u8, args[1] as *mut u8),
         SYSCALL_FSTATFS => sys_fstatfs(args[0], args[1] as *mut u8),

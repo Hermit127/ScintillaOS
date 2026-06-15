@@ -8,8 +8,9 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use user_lib::{
-    chroot, close, execve, exit, fork, get_time, getdents64, kill, open, shutdown, sleep,
-    symlinkat, sys_mkdir, sys_mount, sys_waitpid_options, unlinkat, waitpid, waitpid_nb, OpenFlags,
+    chroot, close, execve, exit, fork, get_time, getdents64, kill, kill_pgrp, open, setsid,
+    shutdown, sleep, symlinkat, sys_mkdir, sys_mount, sys_waitpid_options, unlinkat, waitpid,
+    waitpid_nb, OpenFlags,
 };
 
 const BUSYBOX_APPLETS: [&str; 68] = [
@@ -515,6 +516,7 @@ fn run_script(dir: &str, script: &str) {
     ];
     let pid = fork();
     if pid == 0 {
+        setsid();
         let chroot_arg = chroot_root.clone() + "\0";
         let chdir_arg = chroot_cwd.clone() + "\0";
         if chroot(&chroot_arg) != 0 {
@@ -538,6 +540,7 @@ fn run_script(dir: &str, script: &str) {
                     script,
                     ec
                 );
+                kill_pgrp(pid as usize, 9);
                 reap_zombies();
                 break;
             }
@@ -548,6 +551,7 @@ fn run_script(dir: &str, script: &str) {
                     script,
                     budget_ms
                 );
+                kill_pgrp(pid as usize, 9);
                 kill(pid as usize, 9);
                 waitpid(pid as usize, &mut ec);
                 reap_zombies();
@@ -576,6 +580,7 @@ fn run_embedded_basic(script: &str) {
     let envs: [*const u8; 2] = [b"PATH=/bin:/usr/bin:.\0".as_ptr(), core::ptr::null()];
     let pid = fork();
     if pid == 0 {
+        setsid();
         execve(path, &args, &envs);
         exit(127);
     } else if pid > 0 {
@@ -586,6 +591,7 @@ fn run_embedded_basic(script: &str) {
             let r = waitpid_nb(pid as usize, &mut ec);
             if r == pid {
                 println!("[initproc] [DONE] embedded {} exit {}", label, ec);
+                kill_pgrp(pid as usize, 9);
                 reap_zombies();
                 break;
             }
@@ -594,6 +600,7 @@ fn run_embedded_basic(script: &str) {
                     "[initproc] [TIMEOUT] embedded {} after {}ms",
                     label, budget_ms
                 );
+                kill_pgrp(pid as usize, 9);
                 kill(pid as usize, 9);
                 waitpid(pid as usize, &mut ec);
                 reap_zombies();

@@ -9,7 +9,7 @@ use crate::task::{
     add_task, blank_kcontext, block_current_and_run_next, current_task, current_user_token,
     exit_current_and_run_next, force_exit_task, pid2task, pid_alloc, sleep_current_and_run_next,
     suspend_current_and_run_next, wake_blocked_task, BlockReason, KernelStack, SignalAction,
-    SignalFlags, TaskControlBlock, TaskControlBlockInner, TaskStatus, MAX_SIG,
+    SignalFlags, TaskControlBlock, TaskControlBlockInner, TaskStatus, PID2TCB, MAX_SIG,
 };
 use alloc::format;
 use alloc::string::String;
@@ -591,74 +591,157 @@ pub fn sys_waitid(
     }
 }
 
-pub fn sys_kill(pid: usize, signum: i32) -> isize {
+fn signal_task(task: &Arc<TaskControlBlock>, signum: i32) {
+    let target = task.getpid();
+    if signum == 9 && current_task().map(|t| t.getpid() != target).unwrap_or(true) {
+        force_exit_task(task, -9);
+        return;
+    }
+    let flag = SignalFlags::from_bits(1u32 << signum as usize).unwrap();
+    {
+        let mut task_ref = task.inner_exclusive_access();
+        if task_ref.signals.contains(flag) {
+            return;
+        }
+        task_ref.signals.insert(flag);
+        if flag == SignalFlags::SIGTERM || flag == SignalFlags::SIGKILL {
+            task_ref.killed = true;
+            task_ref.exit_signal = -(signum as i32);
+        } else if task_ref.signal_actions.table[signum as usize].handler == 0 {
+            let fatal = flag.intersects(
+                SignalFlags::SIGSEGV
+                    | SignalFlags::SIGABRT
+                    | SignalFlags::SIGILL
+                    | SignalFlags::SIGFPE
+                    | SignalFlags::SIGBUS
+                    | SignalFlags::SIGSYS
+                    | SignalFlags::SIGTRAP
+                    | SignalFlags::SIGALRM
+                    | SignalFlags::SIGVTALRM
+                    | SignalFlags::SIGPROF
+                    | SignalFlags::SIGTERM
+                    | SignalFlags::SIGINT
+                    | SignalFlags::SIGQUIT
+                    | SignalFlags::SIGHUP
+                    | SignalFlags::SIGPIPE
+                    | SignalFlags::SIGUSR1
+                    | SignalFlags::SIGUSR2
+                    | SignalFlags::SIGXCPU
+                    | SignalFlags::SIGXFSZ
+                    | SignalFlags::SIGIO
+                    | SignalFlags::SIGPWR,
+            );
+            if fatal {
+                task_ref.killed = true;
+                task_ref.exit_signal = -(signum as i32);
+            }
+        }
+    };
+    wake_blocked_task(task);
+}
+
+pub fn sys_kill(pid: isize, signum: i32) -> isize {
     if signum < 0 || signum as usize > MAX_SIG {
         return -22; // EINVAL
     }
-    let target = if pid == 0 || pid == usize::MAX {
-        current_task().map(|t| t.getpid()).unwrap_or(0)
+    let targets: Vec<Arc<TaskControlBlock>> = if pid > 0 {
+        pid2task(pid as usize).into_iter().collect()
+    } else {
+        let pgid = if pid == 0 {
+            current_task()
+                .map(|task| task.inner_exclusive_access().pgid)
+                .unwrap_or(0)
+        } else if pid == -1 {
+            0
+        } else {
+            (-pid) as usize
+        };
+        let map = PID2TCB.exclusive_access();
+        map.values()
+            .filter(|task| {
+                if task.getpid() == 0 {
+                    return false;
+                }
+                if pid == -1 {
+                    return true;
+                }
+                task.try_inner_borrow()
+                    .map(|inner| inner.pgid == pgid)
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect()
+    };
+    if targets.is_empty() {
+        return 0;
+    }
+    if signum == 0 {
+        return 0;
+    }
+    for task in targets {
+        signal_task(&task, signum);
+    }
+    0
+}
+
+pub fn sys_setpgid(pid: usize, pgid: usize) -> isize {
+    let target_pid = if pid == 0 {
+        current_task().map(|task| task.getpid()).unwrap_or(0)
     } else {
         pid
     };
-    if let Some(task) = pid2task(target) {
-        if signum == 0 {
-            return 0;
-        }
-        if signum == 9 && current_task().map(|t| t.getpid() != target).unwrap_or(true) {
-            force_exit_task(&task, -9);
-            return 0;
-        }
-        let flag = SignalFlags::from_bits(1u32 << signum as usize).unwrap();
-        let fatal_signal = {
-            let mut task_ref = task.inner_exclusive_access();
-            if task_ref.signals.contains(flag) {
-                return 0;
-            }
-            task_ref.signals.insert(flag);
-            if flag == SignalFlags::SIGTERM || flag == SignalFlags::SIGKILL {
-                task_ref.killed = true;
-                task_ref.exit_signal = -(signum as i32);
-                true
-            } else if task_ref.signal_actions.table[signum as usize].handler == 0 {
-                let fatal = flag.intersects(
-                    SignalFlags::SIGSEGV
-                        | SignalFlags::SIGABRT
-                        | SignalFlags::SIGILL
-                        | SignalFlags::SIGFPE
-                        | SignalFlags::SIGBUS
-                        | SignalFlags::SIGSYS
-                        | SignalFlags::SIGTRAP
-                        | SignalFlags::SIGALRM
-                        | SignalFlags::SIGVTALRM
-                        | SignalFlags::SIGPROF
-                        | SignalFlags::SIGTERM
-                        | SignalFlags::SIGINT
-                        | SignalFlags::SIGQUIT
-                        | SignalFlags::SIGHUP
-                        | SignalFlags::SIGPIPE
-                        | SignalFlags::SIGUSR1
-                        | SignalFlags::SIGUSR2
-                        | SignalFlags::SIGXCPU
-                        | SignalFlags::SIGXFSZ
-                        | SignalFlags::SIGIO
-                        | SignalFlags::SIGPWR,
-                );
-                if fatal {
-                    task_ref.killed = true;
-                    task_ref.exit_signal = -(signum as i32);
-                }
-                fatal
-            } else {
-                false
-            }
-        };
-        if fatal_signal {
-            wake_blocked_task(&task);
-        }
-        0
+    let new_pgid = if pgid == 0 { target_pid } else { pgid };
+    let Some(task) = pid2task(target_pid) else {
+        return -3;
+    };
+    task.inner_exclusive_access().pgid = new_pgid;
+    0
+}
+
+pub fn sys_getpgid(pid: usize) -> isize {
+    let target_pid = if pid == 0 {
+        current_task().map(|task| task.getpid()).unwrap_or(0)
     } else {
-        0 // kill to non-existent pid: silently succeed (POSIX)
+        pid
+    };
+    pid2task(target_pid)
+        .map(|task| task.inner_exclusive_access().pgid as isize)
+        .unwrap_or(-3)
+}
+
+pub fn sys_setsid() -> isize {
+    let Some(task) = current_task() else {
+        return -3;
+    };
+    let pid = task.getpid();
+    let mut inner = task.inner_exclusive_access();
+    inner.sid = pid;
+    inner.pgid = pid;
+    pid as isize
+}
+
+fn user_sigset_to_flags(raw: u64) -> SignalFlags {
+    let mut flags = SignalFlags::empty();
+    for sig in 1..=MAX_SIG {
+        if (raw & (1u64 << (sig - 1))) != 0 {
+            if let Some(flag) = SignalFlags::from_bits(1u32 << sig) {
+                flags.insert(flag);
+            }
+        }
     }
+    flags
+}
+
+fn flags_to_user_sigset(flags: SignalFlags) -> u64 {
+    let mut raw = 0u64;
+    for sig in 1..=MAX_SIG {
+        if let Some(flag) = SignalFlags::from_bits(1u32 << sig) {
+            if flags.contains(flag) {
+                raw |= 1u64 << (sig - 1);
+            }
+        }
+    }
+    raw
 }
 
 pub fn sys_sigprocmask(how: i32, set: *const u8, old_set: *mut u8, _sigsetsize: usize) -> isize {

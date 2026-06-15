@@ -269,7 +269,15 @@ bitflags! {
 }
 
 pub fn kill(pid: usize, signum: i32) -> isize {
-    sys_kill(pid, signum)
+    sys_kill(pid as isize, signum)
+}
+
+pub fn kill_pgrp(pgid: usize, signum: i32) -> isize {
+    sys_kill(-(pgid as isize), signum)
+}
+
+pub fn setsid() -> isize {
+    sys_setsid()
 }
 
 pub fn sigaction(

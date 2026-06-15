@@ -21,6 +21,9 @@ const SYSCALL_SIGACTION: usize = 134;
 const SYSCALL_SIGPROCMASK: usize = 135;
 const SYSCALL_SIGRETURN: usize = 139;
 const SYSCALL_TIMES: usize = 153;
+const SYSCALL_SETPGID: usize = 154;
+const SYSCALL_GETPGID: usize = 155;
+const SYSCALL_SETSID: usize = 157;
 const SYSCALL_GET_TIME: usize = 169;
 const SYSCALL_GETPID: usize = 172;
 const SYSCALL_GETUID: usize = 174;
@@ -190,8 +193,20 @@ pub fn sys_yield() -> isize {
     syscall(SYSCALL_YIELD, [0, 0, 0, 0, 0, 0])
 }
 
-pub fn sys_kill(pid: usize, signal: i32) -> isize {
-    syscall(SYSCALL_KILL, [pid, signal as usize, 0, 0, 0, 0])
+pub fn sys_kill(pid: isize, signal: i32) -> isize {
+    syscall(SYSCALL_KILL, [pid as usize, signal as usize, 0, 0, 0, 0])
+}
+
+pub fn sys_setpgid(pid: usize, pgid: usize) -> isize {
+    syscall(SYSCALL_SETPGID, [pid, pgid, 0, 0, 0, 0])
+}
+
+pub fn sys_getpgid(pid: usize) -> isize {
+    syscall(SYSCALL_GETPGID, [pid, 0, 0, 0, 0, 0])
+}
+
+pub fn sys_setsid() -> isize {
+    syscall(SYSCALL_SETSID, [0, 0, 0, 0, 0, 0])
 }
 
 pub fn sys_get_time() -> isize {

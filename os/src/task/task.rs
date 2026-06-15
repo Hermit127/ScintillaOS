@@ -62,6 +62,8 @@ pub struct TaskControlBlockInner {
     pub cwd: Arc<Dentry>,
     pub root: Arc<Dentry>,
     pub tid_ptr: usize,
+    pub pgid: usize,
+    pub sid: usize,
     pub uid: u32,
     pub euid: u32,
     pub gid: u32,
@@ -223,6 +225,7 @@ impl TaskControlBlock {
         let heap_bottom = user_sp;
         // alloc a pid and a kernel stack in kernel space
         let pid_handle = pid_alloc();
+        let pid_value = pid_handle.0;
         let kstack = KernelStack::new();
         let task_control_block = Self {
             pid: pid_handle,
@@ -250,6 +253,8 @@ impl TaskControlBlock {
                         cwd: ROOT_DENTRY.clone(),
                         root: ROOT_DENTRY.clone(),
                         tid_ptr: 0,
+                        pgid: pid_value,
+                        sid: pid_value,
                         uid: 0,
                         euid: 0,
                         gid: 0,
@@ -547,6 +552,8 @@ impl TaskControlBlock {
             cwd,
             root,
             tid_ptr,
+            pgid,
+            sid,
             uid,
             euid,
             gid,
@@ -576,6 +583,8 @@ impl TaskControlBlock {
                 parent_inner.cwd.clone(),
                 parent_inner.root.clone(),
                 parent_inner.tid_ptr,
+                parent_inner.pgid,
+                parent_inner.sid,
                 parent_inner.uid,
                 parent_inner.euid,
                 parent_inner.gid,
@@ -610,6 +619,8 @@ impl TaskControlBlock {
                         cwd,
                         root,
                         tid_ptr,
+                        pgid,
+                        sid,
                         uid,
                         euid,
                         gid,
