@@ -5,9 +5,8 @@
 use crate::{
     syscall::syscall,
     task::{
-        add_task, check_and_wake_up_tasks, check_signals_error_of_current, current_add_signal,
-        current_task, exit_current_and_run_next, handle_signals, pid2task, SignalFlags,
-        suspend_current_and_run_next, PID2TCB, TaskStatus,
+        check_and_wake_up_tasks, check_signals_error_of_current, current_add_signal, current_task,
+        exit_current_and_run_next, handle_signals, suspend_current_and_run_next, SignalFlags,
     },
 };
 // use polyhal::api::ArchInterface;
@@ -42,14 +41,12 @@ pub struct ArchInterfaceImpl;
 /// kernel interrupt
 #[polyhal::arch_interrupt]
 fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
+    if let Some(task) = crate::task::current_task() {
+        task.save_user_float_state();
+    }
     //user time accounting
     if let Some(task) = crate::task::current_task() {
         task.record_time_user_to_kernel();
-    }
-    static mut TRAP_COUNT: usize = 0;
-    unsafe { TRAP_COUNT += 1; }
-    if unsafe { TRAP_COUNT } <= 5 {
-        println!("[kernel] trap #{}, type={:?}", unsafe { TRAP_COUNT }, trap_type);
     }
     // trace!("trap_type @ {:x?} {:#x?}", trap_type, ctx);
     match trap_type {
@@ -58,19 +55,9 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             // jump to next instruction anyway
             ctx.syscall_ok();
             let args = ctx.args();
-            let syscall_id = ctx[TrapFrameArgs::SYSCALL];
-            if syscall_id == 64 { // SYS_WRITE
-                let fd = args[0];
-                let buf_ptr = args[1] as *const u8;
-                let len = args[2];
-                // Read first few bytes of what the user is trying to write
-                if len > 0 && len <= 256 {
-                    let token = crate::task::current_user_token();
-                    let bytes = crate::mm::translated_byte_buffer(token, buf_ptr as *mut u8, len.min(64));
-                    let s = core::str::from_utf8(&bytes).unwrap_or("<non-utf8>");
-                    println!("[kernel] WRITE(fd={}, len={}): {}", fd, len, s);
-                }
-            }
+            // get system call return value
+            // info!("syscall: {}", ctx[TrapFrameArgs::SYSCALL]);
+
             let result = syscall(
                 ctx[TrapFrameArgs::SYSCALL],
                 [args[0], args[1], args[2], args[3], args[4], args[5]],
@@ -78,33 +65,58 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             // cx is changed during sys_exec, so we have to call it again
             ctx[TrapFrameArgs::RET] = result as usize;
         }
-        StorePageFault(bad_addr) | LoadPageFault(bad_addr) => {
+        StorePageFault(bad_addr) => {
             let vaddr = polyhal::VirtAddr::from(bad_addr);
             let task = crate::task::current_task().unwrap();
             let mut inner = task.inner_exclusive_access();
-            let handled = inner.memory_set.handle_page_fault(vaddr);
-            println!("[kernel] PageFault at {:#x}, handled={}", bad_addr, handled);
-            if !handled {
+            if !inner.memory_set.handle_page_fault(vaddr, true) {
                 drop(inner);
                 current_add_signal(SignalFlags::SIGSEGV);
             }
         }
-        InstructionPageFault(_paddr) => {
-            println!("[kernel] InstructionPageFault at {:#x}", _paddr);
-            current_add_signal(SignalFlags::SIGSEGV);
+        InstructionPageFault(bad_addr)
+            if bad_addr == task::SIGNAL_RETURN_TRAMPOLINE
+                || ctx[TrapFrameArgs::SEPC] == task::SIGNAL_RETURN_TRAMPOLINE =>
+        {
+            if let Some(ret) = task::restore_current_signal_context() {
+                ctx[TrapFrameArgs::RET] = ret as usize;
+            } else {
+                current_add_signal(SignalFlags::SIGSEGV);
+            }
         }
-        IllegalInstruction(addr) => {
-            println!("[kernel] IllegalInstruction at {:#x}", addr);
+        LoadPageFault(bad_addr) => {
+            let vaddr = polyhal::VirtAddr::from(bad_addr);
+            let task = crate::task::current_task().unwrap();
+            let mut inner = task.inner_exclusive_access();
+            if !inner.memory_set.handle_page_fault(vaddr, false) {
+                drop(inner);
+                exit_current_and_run_next(-11);
+            }
+        }
+        InstructionPageFault(bad_addr) => {
+            let vaddr = polyhal::VirtAddr::from(bad_addr);
+            let task = crate::task::current_task().unwrap();
+            let mut inner = task.inner_exclusive_access();
+            if !inner.memory_set.handle_page_fault(vaddr, false) {
+                drop(inner);
+                current_add_signal(SignalFlags::SIGSEGV);
+            }
+        }
+        IllegalInstruction(_) => {
             current_add_signal(SignalFlags::SIGILL);
         }
         Timer => {
             static mut TICK: usize = 0;
-            unsafe { TICK += 1; }
+            unsafe {
+                TICK += 1;
+            }
             net::net_poll();
             net::wake_net_blocked_tasks();
             check_and_wake_up_tasks();
             check_itimer();
-            suspend_current_and_run_next();
+            if current_task().is_some() {
+                suspend_current_and_run_next();
+            }
         }
         _ => {
             warn!("unsuspended trap type: {:?}", trap_type);
@@ -127,18 +139,20 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
 }
 
 fn check_itimer() {
+    let Some(task) = current_task() else { return };
+    let Some(mut inner) = task.try_inner_exclusive_access() else {
+        return;
+    };
+    if inner.itimer_expire == 0 {
+        return;
+    }
     let now = polyhal::time::Time::now().to_usec() as u64;
-    let map = PID2TCB.exclusive_access();
-    for task in map.values() {
-        let Some(mut inner) = task.try_inner_exclusive_access() else { continue };
-        if inner.itimer_expire == 0 { continue; }
-        if now >= inner.itimer_expire {
-            inner.signals.insert(SignalFlags::SIGALRM);
-            if inner.itimer_interval_us > 0 {
-                inner.itimer_expire = now + inner.itimer_interval_us;
-            } else {
-                inner.itimer_expire = 0;
-            }
+    if now >= inner.itimer_expire {
+        inner.signals.insert(SignalFlags::SIGALRM);
+        if inner.itimer_interval_us > 0 {
+            inner.itimer_expire = now + inner.itimer_interval_us;
+        } else {
+            inner.itimer_expire = 0;
         }
     }
 }
@@ -165,7 +179,6 @@ fn main(hartid: usize) {
     fs::list_apps();
     task::init_kernel_page();
     task::add_initproc();
-    println!("[kernel] initproc added, starting run_tasks...");
     task::run_tasks();
     panic!("Unreachable in main function of rCore Tutorial kernel!");
 }

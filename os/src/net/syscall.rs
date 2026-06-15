@@ -8,8 +8,16 @@ use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
 
 use crate::mm::{translated_ref, translated_refmut};
 use crate::net::socket::{SocketFile, SocketType};
-use crate::task::{block_current_and_run_next, current_task, current_user_token, suspend_current_and_run_next, BlockReason};
+use crate::sync::UPSafeCell;
+use crate::task::{
+    add_task, block_current_and_run_next, current_task, current_user_token,
+    suspend_current_and_run_next, BlockReason, TaskStatus, NET_BLOCK_QUEUE,
+};
+use alloc::collections::VecDeque;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU16, Ordering};
+use lazy_static::*;
 
 const SOCKET_BUFFER_SIZE: usize = 65536;
 const UDP_META_COUNT: usize = 16;
@@ -17,6 +25,7 @@ const AF_INET: usize = 2;
 const SOCK_STREAM: usize = 1;
 const SOCK_DGRAM: usize = 2;
 const SOCK_NONBLOCK: usize = 0x800;
+const SOCK_CLOEXEC: usize = 0x80000;
 
 const MSG_DONTWAIT: usize = 0x40;
 const MSG_PEEK: usize = 0x02;
@@ -34,9 +43,32 @@ const TCP_NODELAY: usize = 1;
 const SHUT_RD: usize = 0;
 const SHUT_WR: usize = 1;
 const SHUT_RDWR: usize = 2;
+static NEXT_EPHEMERAL_PORT: AtomicU16 = AtomicU16::new(49152);
+
+#[derive(Clone)]
+struct LocalUdpPacket {
+    dst_port: u16,
+    src: IpEndpoint,
+    data: Vec<u8>,
+}
+
+lazy_static! {
+    static ref LOCAL_UDP_QUEUE: UPSafeCell<VecDeque<LocalUdpPacket>> =
+        unsafe { UPSafeCell::new(VecDeque::new()) };
+}
 
 fn net_ready() -> bool {
-    true
+    crate::net::net_available_fast()
+}
+
+fn next_ephemeral_port() -> u16 {
+    let old = NEXT_EPHEMERAL_PORT.fetch_add(1, Ordering::Relaxed);
+    if old < 49152 || old == u16::MAX {
+        NEXT_EPHEMERAL_PORT.store(49153, Ordering::Relaxed);
+        49152
+    } else {
+        old
+    }
 }
 
 #[repr(C)]
@@ -169,6 +201,176 @@ fn sock_lookup(sockfd: usize) -> Option<(SocketHandle, SocketType, bool)> {
     Some((handle, st, nonblock))
 }
 
+fn set_socket_local_endpoint(sockfd: usize, endpoint: IpEndpoint) {
+    let Some(task) = current_task() else {
+        return;
+    };
+    let inner = task.inner_exclusive_access();
+    if sockfd >= inner.fd_table.len() {
+        return;
+    }
+    if let Some(file) = &inner.fd_table[sockfd] {
+        if let Some(sock) = file.as_any().downcast_ref::<SocketFile>() {
+            sock.set_local_endpoint(endpoint);
+        }
+    }
+}
+
+fn get_socket_local_endpoint(sockfd: usize) -> Option<IpEndpoint> {
+    let task = current_task()?;
+    let inner = task.inner_exclusive_access();
+    if sockfd >= inner.fd_table.len() {
+        return None;
+    }
+    let file = inner.fd_table[sockfd].as_ref()?;
+    let sock = file.as_any().downcast_ref::<SocketFile>()?;
+    sock.get_local_endpoint()
+}
+
+fn is_local_ipv4(addr: IpAddress) -> bool {
+    let IpAddress::Ipv4(ipv4) = addr;
+    ipv4.0[0] == 127 || ipv4.0 == [0, 0, 0, 0] || ipv4.0 == [10, 0, 2, 15]
+}
+
+fn source_addr_for_dest(local: IpEndpoint, dest: IpEndpoint) -> IpEndpoint {
+    let IpAddress::Ipv4(local_ip) = local.addr;
+    if local_ip.0 != [0, 0, 0, 0] {
+        return local;
+    }
+    let IpAddress::Ipv4(dest_ip) = dest.addr;
+    let src_ip = if dest_ip.0[0] == 127 {
+        Ipv4Address::new(127, 0, 0, 1)
+    } else {
+        Ipv4Address::new(10, 0, 2, 15)
+    };
+    IpEndpoint::new(IpAddress::Ipv4(src_ip), local.port)
+}
+
+fn smoltcp_udp_endpoint(handle: SocketHandle) -> Option<IpEndpoint> {
+    crate::net::with_net_iface(|iface| {
+        let sock: &UdpSocket = iface.sockets.get(handle);
+        let ep = sock.endpoint();
+        if ep.port == 0 {
+            None
+        } else {
+            Some(IpEndpoint::new(
+                ep.addr
+                    .unwrap_or(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED)),
+                ep.port,
+            ))
+        }
+    })
+    .flatten()
+}
+
+fn ensure_udp_local_endpoint(sockfd: usize, handle: SocketHandle, dest: IpEndpoint) -> IpEndpoint {
+    if let Some(local) = get_socket_local_endpoint(sockfd) {
+        return source_addr_for_dest(local, dest);
+    }
+    if let Some(local) = smoltcp_udp_endpoint(handle) {
+        set_socket_local_endpoint(sockfd, local);
+        return source_addr_for_dest(local, dest);
+    }
+
+    let port = next_ephemeral_port();
+    let local = IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED), port);
+    crate::net::with_net_iface(|iface| {
+        let sock: &mut UdpSocket = iface.sockets.get_mut(handle);
+        let _ = sock.bind(IpListenEndpoint { addr: None, port });
+    });
+    set_socket_local_endpoint(sockfd, local);
+    source_addr_for_dest(local, dest)
+}
+
+fn wake_local_udp_receivers() {
+    let mut to_wake = Vec::new();
+    {
+        let mut queue = NET_BLOCK_QUEUE.exclusive_access();
+        let mut i = 0;
+        while i < queue.len() {
+            let should_wake = {
+                let inner = queue[i].inner_exclusive_access();
+                matches!(inner.block_reason, Some(BlockReason::UdpRecv(_)))
+            };
+            if should_wake {
+                to_wake.push(queue.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+    }
+    for task in to_wake {
+        let mut inner = task.inner_exclusive_access();
+        inner.task_status = TaskStatus::Ready;
+        inner.block_reason = None;
+        drop(inner);
+        add_task(task);
+    }
+}
+
+fn try_send_local_udp(
+    sockfd: usize,
+    handle: SocketHandle,
+    data: &[u8],
+    dest: IpEndpoint,
+) -> Option<isize> {
+    if !is_local_ipv4(dest.addr) {
+        return None;
+    }
+    let src = ensure_udp_local_endpoint(sockfd, handle, dest);
+    {
+        let mut queue = LOCAL_UDP_QUEUE.exclusive_access();
+        if queue.len() >= 256 {
+            return Some(-11);
+        }
+        queue.push_back(LocalUdpPacket {
+            dst_port: dest.port,
+            src,
+            data: data.to_vec(),
+        });
+    }
+    wake_local_udp_receivers();
+    Some(data.len() as isize)
+}
+
+fn local_recv_endpoint(sockfd: usize, handle: SocketHandle) -> Option<IpEndpoint> {
+    get_socket_local_endpoint(sockfd).or_else(|| {
+        let ep = smoltcp_udp_endpoint(handle)?;
+        set_socket_local_endpoint(sockfd, ep);
+        Some(ep)
+    })
+}
+
+fn try_recv_local_udp(
+    sockfd: usize,
+    handle: SocketHandle,
+    buf: &mut [u8],
+    src_addr: *mut u8,
+    addrlen: *mut usize,
+    peek: bool,
+) -> Option<isize> {
+    let local = local_recv_endpoint(sockfd, handle)?;
+    let mut queue = LOCAL_UDP_QUEUE.exclusive_access();
+    let pos = queue.iter().position(|packet| packet.dst_port == local.port)?;
+    let packet = if peek {
+        queue[pos].clone()
+    } else {
+        queue.remove(pos)?
+    };
+    let n = packet.data.len().min(buf.len());
+    buf[..n].copy_from_slice(&packet.data[..n]);
+    drop(queue);
+
+    if !src_addr.is_null() && !addrlen.is_null() {
+        let IpAddress::Ipv4(ipv4) = packet.src.addr;
+        let token = current_user_token();
+        *translated_refmut(token, addrlen as *mut u32) = core::mem::size_of::<SockAddrIn>() as u32;
+        write_sockaddr_in(src_addr, u32::from_be_bytes(ipv4.0), packet.src.port);
+    }
+
+    Some(n as isize)
+}
+
 pub fn sys_socket(domain: usize, type_: usize, _protocol: usize) -> isize {
     if domain != AF_INET {
         return -97;
@@ -184,6 +386,7 @@ pub fn sys_socket(domain: usize, type_: usize, _protocol: usize) -> isize {
     };
 
     let nonblock = (type_ & SOCK_NONBLOCK) != 0;
+    let cloexec = (type_ & SOCK_CLOEXEC) != 0;
 
     let task = current_task().unwrap();
     let mut inner = task.inner_exclusive_access();
@@ -194,7 +397,11 @@ pub fn sys_socket(domain: usize, type_: usize, _protocol: usize) -> isize {
     };
 
     let fd = inner.alloc_fd();
+    if fd >= inner.fd_table.len() {
+        return -24;
+    }
     inner.fd_table[fd] = Some(Arc::new(SocketFile::new(handle, st, nonblock)));
+    inner.fd_cloexec[fd] = cloexec;
     fd as isize
 }
 
@@ -206,10 +413,13 @@ pub fn sys_bind(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
         return -14;
     }
 
-    let (ip, port) = match parse_sockaddr_in(addr) {
+    let (ip, mut port) = match parse_sockaddr_in(addr) {
         Some(v) => v,
         None => return -22,
     };
+    if port == 0 {
+        port = next_ephemeral_port();
+    }
 
     let (handle, st, _nonblock) = match sock_lookup(sockfd) {
         Some(v) => v,
@@ -221,25 +431,44 @@ pub fn sys_bind(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
         port,
     );
 
-    crate::net::with_net_iface(|iface| match st {
+    let ret = crate::net::with_net_iface(|iface| match st {
         SocketType::Tcp => {
             let sock: &mut TcpSocket = iface.sockets.get_mut(handle);
             sock.listen(if ip == 0 {
                 IpListenEndpoint { addr: None, port }
             } else {
-                IpListenEndpoint { addr: Some(endpoint.addr), port }
-            }).map(|_| 0).unwrap_or(-22)
+                IpListenEndpoint {
+                    addr: Some(endpoint.addr),
+                    port,
+                }
+            })
+            .map(|_| 0)
+            .unwrap_or(-22)
         }
         SocketType::Udp => {
             let sock: &mut UdpSocket = iface.sockets.get_mut(handle);
             sock.bind(if ip == 0 {
                 IpListenEndpoint { addr: None, port }
             } else {
-                IpListenEndpoint { addr: Some(endpoint.addr), port }
-            }).map(|_| 0).unwrap_or(-22)
+                IpListenEndpoint {
+                    addr: Some(endpoint.addr),
+                    port,
+                }
+            })
+            .map(|_| 0)
+            .unwrap_or(-22)
         }
     })
-    .unwrap_or(-1)
+    .unwrap_or(-1);
+    if ret == 0 {
+        let local_addr = if ip == 0 {
+            IpAddress::Ipv4(Ipv4Address::UNSPECIFIED)
+        } else {
+            endpoint.addr
+        };
+        set_socket_local_endpoint(sockfd, IpEndpoint::new(local_addr, port));
+    }
+    ret
 }
 
 pub fn sys_connect(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
@@ -461,6 +690,9 @@ pub fn sys_accept(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
 
     // The new fd gets the old (now active) handle
     let new_fd = inner.alloc_fd();
+    if new_fd >= inner.fd_table.len() {
+        return -24;
+    }
     inner.fd_table[new_fd] = Some(Arc::new(SocketFile::new(handle, SocketType::Tcp, nonblock)));
 
     // Release inner lock before writing peer address (avoids holding lock during net_poll)
@@ -526,6 +758,9 @@ pub fn sys_sendto(
                 IpAddress::from(Ipv4Address::from_bytes(&ip.to_be_bytes())),
                 port,
             );
+            if let Some(ret) = try_send_local_udp(sockfd, handle, data, dest) {
+                return ret;
+            }
             udp_send(handle, data, dest)
         }
     }
@@ -554,7 +789,20 @@ pub fn sys_recvfrom(
 
     let result = match st {
         SocketType::Tcp => tcp_recv(handle, dontwait, recv_buf),
-        SocketType::Udp => udp_recv(handle, dontwait, recv_buf),
+        SocketType::Udp => loop {
+            if let Some(ret) =
+                try_recv_local_udp(sockfd, handle, recv_buf, src_addr, addrlen, peek)
+            {
+                return ret;
+            }
+            let ret = udp_recv(handle, true, recv_buf);
+            if ret != -11 || dontwait {
+                break ret;
+            }
+            block_current_and_run_next(BlockReason::UdpRecv(unsafe {
+                core::mem::transmute(handle)
+            }));
+        },
     };
 
     // Fill source address for UDP if requested
@@ -567,8 +815,8 @@ pub fn sys_recvfrom(
         if let Some(ep) = endpoint {
             if let Some(addr) = ep.addr {
                 if let IpAddress::Ipv4(ipv4) = addr {
-                    *translated_refmut(token, addrlen as *mut usize) =
-                        core::mem::size_of::<SockAddrIn>();
+                    *translated_refmut(token, addrlen as *mut u32) =
+                        core::mem::size_of::<SockAddrIn>() as u32;
                     write_sockaddr_in(src_addr, u32::from_be_bytes(ipv4.0), ep.port);
                 }
             }
@@ -581,9 +829,6 @@ pub fn sys_recvfrom(
 pub fn sys_sendmsg(sockfd: usize, msg: *const u8, flags: usize) -> isize {
     if !net_ready() {
         return -97;
-    }
-    if msg.is_null() {
-        return -14;
     }
     let token = current_user_token();
     let msghdr: &Msghdr = translated_ref(token, msg as *const Msghdr);
@@ -805,7 +1050,9 @@ pub fn sys_getsockopt(
         }
         (IPPROTO_TCP, 2) => {
             // TCP_MAXSEG - return typical Ethernet MSS
-            if st != SocketType::Tcp { return -95; }
+            if st != SocketType::Tcp {
+                return -95;
+            }
             *translated_refmut(token, optlen as *mut u32) = 4;
             *translated_refmut(token, optval as *mut i32) = 1460;
             0
@@ -873,7 +1120,7 @@ pub fn sys_getpeername(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isi
             let sock: &UdpSocket = iface.sockets.get(handle);
             sock.endpoint()
         })
-        .and_then(|ep| ep.addr.map(|a| IpEndpoint::new(a, ep.port))),
+            .map(|ep| IpEndpoint::new(ep.addr.unwrap_or(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED)), ep.port)),
     };
 
     match peer {
@@ -910,12 +1157,20 @@ pub fn sys_getsockname(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isi
             let sock: &TcpSocket = iface.sockets.get(handle);
             sock.local_endpoint()
         })
-        .flatten(),
+        .flatten()
+        .or_else(|| get_socket_local_endpoint(sockfd)),
         SocketType::Udp => crate::net::with_net_iface(|iface| {
             let sock: &UdpSocket = iface.sockets.get(handle);
             sock.endpoint()
         })
-        .and_then(|ep| ep.addr.map(|a| IpEndpoint::new(a, ep.port))),
+        .map(|ep| {
+            IpEndpoint::new(
+                ep.addr
+                    .unwrap_or(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED)),
+                ep.port,
+            )
+        })
+        .or_else(|| get_socket_local_endpoint(sockfd)),
     };
 
     match local {

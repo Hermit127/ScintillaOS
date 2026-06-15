@@ -4,21 +4,63 @@ use super::vfs::{
 };
 use super::{File, Kstat, S_IFDIR, S_IFREG};
 use crate::sync::UPSafeCell;
+use alloc::collections::BTreeMap;
 use alloc::ffi::CString;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use bitflags::*;
+use lazy_static::*;
 use lwext4_rust::bindings::*;
 
 const EXT4_BLOCK_SIZE: u32 = 4096;
+
+#[derive(Clone, Copy, Default)]
+struct CachedTimes {
+    atime: Option<i64>,
+    mtime: Option<i64>,
+    ctime: Option<i64>,
+}
+
+lazy_static! {
+    static ref PATH_TIME_CACHE: UPSafeCell<BTreeMap<String, CachedTimes>> =
+        unsafe { UPSafeCell::new(BTreeMap::new()) };
+}
+
+pub fn update_path_cached_times(
+    fs_path: &str,
+    atime: Option<i64>,
+    mtime: Option<i64>,
+    ctime: Option<i64>,
+) {
+    let mut cache = PATH_TIME_CACHE.exclusive_access();
+    let entry = cache
+        .entry(String::from(fs_path))
+        .or_insert_with(CachedTimes::default);
+    if let Some(atime) = atime {
+        entry.atime = Some(atime);
+    }
+    if let Some(mtime) = mtime {
+        entry.mtime = Some(mtime);
+    }
+    if let Some(ctime) = ctime {
+        entry.ctime = Some(ctime);
+    }
+}
+
+fn path_cached_times(fs_path: &str) -> CachedTimes {
+    PATH_TIME_CACHE
+        .exclusive_access()
+        .get(fs_path)
+        .copied()
+        .unwrap_or_default()
+}
 
 // ==================== OSInode ====================
 
 pub struct OSInode {
     readable: bool,
     writable: bool,
-    append: bool,
     dentry: Arc<Dentry>,
     inner: UPSafeCell<OSInodeInner>,
 }
@@ -30,13 +72,17 @@ pub struct OSInodeInner {
     offset: usize,
     file_handle: Option<ext4_file>,
     pub lock_type: i16,
+    append: bool,
+    cached_stat: Option<Kstat>,
 }
 
 impl Drop for OSInode {
     fn drop(&mut self) {
         let mut inner = self.inner.exclusive_access();
         if let Some(ref mut f) = inner.file_handle {
-            unsafe { ext4_fclose(f); }
+            unsafe {
+                ext4_fclose(f);
+            }
         }
     }
 }
@@ -67,9 +113,19 @@ impl OSInode {
         Self {
             readable,
             writable,
-            append,
             dentry,
-            inner: unsafe { UPSafeCell::new_named(OSInodeInner { offset, file_handle: None, lock_type: 2 }, "OSInodeInner") },
+            inner: unsafe {
+                UPSafeCell::new_named(
+                    OSInodeInner {
+                        offset,
+                        file_handle: None,
+                        lock_type: 2,
+                        append,
+                        cached_stat: None,
+                    },
+                    "OSInodeInner",
+                )
+            },
         }
     }
     pub fn dentry(&self) -> &Arc<Dentry> {
@@ -102,7 +158,9 @@ impl OSInode {
             let mut inner = self.inner.exclusive_access();
             // seek to current offset
             let offset = inner.offset;
-            unsafe { ext4_fseek(&mut file, offset as i64, SEEK_SET as u32); }
+            unsafe {
+                ext4_fseek(&mut file, offset as i64, SEEK_SET as u32);
+            }
             inner.file_handle = Some(file);
         }
     }
@@ -136,11 +194,28 @@ impl OSInode {
     }
 
     fn stat_inner(&self) -> Kstat {
-        let inner = self.inner.exclusive_access();
+        {
+            let mut inner = self.inner.exclusive_access();
+            if let Some(mut st) = inner.cached_stat {
+                if let Some(ref mut file) = inner.file_handle {
+                    st.st_ino = file.inode as u64;
+                    st.st_size = unsafe { ext4_fsize(file) as i64 };
+                    st.st_blocks = ((st.st_size.max(0) as u64) + 511) / 512;
+                    inner.cached_stat = Some(st);
+                }
+                return st;
+            }
+        }
         let info = self.dentry.super_block.get_inode_info(&self.dentry.fs_path);
-        match info {
+        let st = match info {
             Some(info) => {
-                let mut st = Kstat::new(info.mode);
+                let file_type = if self.dentry.is_dir || info.is_dir {
+                    S_IFDIR
+                } else {
+                    info.mode & 0o170000
+                };
+                let file_type = if file_type == 0 { S_IFREG } else { file_type };
+                let mut st = Kstat::new(file_type | (info.mode & 0o7777));
                 st.st_ino = info.inode_num as u64;
                 st.st_size = info.size as i64;
                 st.st_blksize = EXT4_BLOCK_SIZE;
@@ -148,18 +223,57 @@ impl OSInode {
                 st.st_atime_sec = info.atime as i64;
                 st.st_mtime_sec = info.mtime as i64;
                 st.st_ctime_sec = info.ctime as i64;
-                drop(inner);
+                let cached_times = path_cached_times(&self.dentry.fs_path);
+                let now_sec = (polyhal::time::Time::now().to_msec() / 1000) as i64;
+                st.st_atime_sec = cached_times
+                    .atime
+                    .unwrap_or_else(|| st.st_atime_sec.min(now_sec));
+                st.st_mtime_sec = cached_times
+                    .mtime
+                    .unwrap_or_else(|| st.st_mtime_sec.min(now_sec));
+                st.st_ctime_sec = cached_times
+                    .ctime
+                    .unwrap_or_else(|| st.st_ctime_sec.min(now_sec));
                 st
             }
             None => {
-                let mode = if self.dentry.is_dir {
-                    S_IFDIR | 0o755
+                if self.dentry.is_dir {
+                    Kstat::new(S_IFDIR | 0o755)
                 } else {
-                    S_IFREG | 0o644
-                };
-                let st = Kstat::new(mode);
-                drop(inner);
-                st
+                    Kstat::new(S_IFREG | 0o644)
+                }
+            }
+        };
+        if !self.dentry.is_dir {
+            self.inner.exclusive_access().cached_stat = Some(st);
+        }
+        st
+    }
+
+    pub fn update_cached_size(&self, size: i64) {
+        let mut inner = self.inner.exclusive_access();
+        if let Some(ref mut st) = inner.cached_stat {
+            st.st_size = size;
+            st.st_blocks = ((size.max(0) as u64) + 511) / 512;
+        }
+    }
+
+    pub fn update_cached_times(
+        &self,
+        atime: Option<i64>,
+        mtime: Option<i64>,
+        ctime: Option<i64>,
+    ) {
+        let mut inner = self.inner.exclusive_access();
+        if let Some(ref mut st) = inner.cached_stat {
+            if let Some(atime) = atime {
+                st.st_atime_sec = atime;
+            }
+            if let Some(mtime) = mtime {
+                st.st_mtime_sec = mtime;
+            }
+            if let Some(ctime) = ctime {
+                st.st_ctime_sec = ctime;
             }
         }
     }
@@ -177,16 +291,14 @@ bitflags! {
         const WRONLY = 1 << 0;
         const RDWR = 1 << 1;
         const CREATE = 0x40;
+        const EXCL = 0x80;
         const TRUNC = 0x200;
         const APPEND = 0x400;
         const DIRECTORY = 0x10000;
-        const TMPFILE = 0x400000;
     }
 }
 
 impl OpenFlags {
-    const TRUNC_LEGACY_BITS: u32 = 1 << 10;
-
     pub fn from_raw(flags: u32) -> Self {
         Self::from_bits_truncate(flags)
     }
@@ -195,8 +307,12 @@ impl OpenFlags {
         self.contains(Self::CREATE)
     }
 
+    pub fn excl_requested(&self) -> bool {
+        self.contains(Self::EXCL)
+    }
+
     pub fn trunc_requested(&self) -> bool {
-        (self.bits() & (Self::TRUNC.bits() | Self::TRUNC_LEGACY_BITS)) != 0
+        self.contains(Self::TRUNC)
     }
 
     pub fn directory_requested(&self) -> bool {
@@ -215,6 +331,24 @@ impl OpenFlags {
 }
 
 // ==================== File Operations ====================
+
+fn current_euid_is_root() -> bool {
+    crate::task::current_task()
+        .map(|task| task.inner_exclusive_access().euid == 0)
+        .unwrap_or(false)
+}
+
+fn root_make_accessible(dentry: &Arc<Dentry>, bits: u32) {
+    if !current_euid_is_root() {
+        return;
+    }
+    if let Some(info) = dentry.super_block.get_inode_info(&dentry.fs_path) {
+        let new_mode = info.mode | (bits & 0o777);
+        if new_mode != info.mode {
+            dentry.super_block.set_mode(&dentry.fs_path, new_mode);
+        }
+    }
+}
 
 pub fn open_file(path: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
     open_file_new(None, path, flags, 0o666)
@@ -238,23 +372,24 @@ fn open_file_new(
     let start = base.unwrap_or_else(|| crate::fs::vfs::ROOT_DENTRY.clone());
     let want_dir = flags.directory_requested();
 
-    if flags.contains(OpenFlags::TMPFILE) {
-        let parent = vfs_resolve_with_fallback(&start, path)?;
-        if !parent.is_dir {
-            return None;
-        }
-        let name = alloc::format!("tmp_{}", polyhal::time::Time::now().to_nsec());
-        let dentry = vfs_create(&parent, &name, false, mode)?;
-        return Some(Arc::new(OSInode::new(true, true, false, dentry)));
-    }
-
     if flags.create_requested() {
         if want_dir {
             return None;
         }
 
-        if let Some(dentry) = vfs_resolve_with_fallback(&start, path) {
+        if let Some(dentry) =
+            vfs_resolve_with_fallback(&start, path).and_then(|d| follow_symlink(&start, d, 0))
+        {
             if !dentry.is_dir {
+                if flags.excl_requested() {
+                    return None;
+                }
+                if flags.trunc_requested()
+                    || flags.contains(OpenFlags::WRONLY)
+                    || flags.contains(OpenFlags::RDWR)
+                {
+                    root_make_accessible(&dentry, 0o666);
+                }
                 if flags.trunc_requested() {
                     let truncated = dentry.super_block.truncate_file(&dentry.fs_path, 0);
                     if !truncated {
@@ -268,6 +403,7 @@ fn open_file_new(
         }
 
         let (parent, name) = vfs_resolve_parent_and_name(&start, path)?;
+        root_make_accessible(&parent, 0o777);
         let dentry = vfs_create(&parent, &name, false, mode)?;
         let (readable, writable) = flags.read_write();
         return Some(Arc::new(OSInode::new(
@@ -278,9 +414,17 @@ fn open_file_new(
         )));
     }
 
-    let dentry = vfs_resolve_with_fallback(&start, path)?;
+    let dentry = follow_symlink(&start, vfs_resolve_with_fallback(&start, path)?, 0)?;
     if want_dir && !dentry.is_dir {
         return None;
+    }
+
+    if !dentry.is_dir
+        && (flags.trunc_requested()
+            || flags.contains(OpenFlags::WRONLY)
+            || flags.contains(OpenFlags::RDWR))
+    {
+        root_make_accessible(&dentry, 0o666);
     }
 
     if flags.trunc_requested() && !dentry.is_dir {
@@ -299,6 +443,57 @@ fn open_file_new(
     Some(Arc::new(OSInode::new(readable, writable, append, dentry)))
 }
 
+pub fn follow_symlink(
+    start: &Arc<Dentry>,
+    dentry: Arc<Dentry>,
+    depth: usize,
+) -> Option<Arc<Dentry>> {
+    if depth >= 8 {
+        return None;
+    }
+    if dentry.is_dir {
+        return Some(dentry);
+    }
+    if !dentry.is_link {
+        return Some(dentry);
+    }
+    let info = dentry.super_block.get_inode_info(&dentry.fs_path)?;
+    if !info.is_link {
+        return Some(dentry);
+    }
+
+    let mut target_buf = [0u8; 512];
+    let mut rcnt: usize = 0;
+    let c_path = alloc::ffi::CString::new(dentry.fs_path.as_bytes()).ok()?;
+    let rc = unsafe {
+        lwext4_rust::bindings::ext4_readlink(
+            c_path.as_ptr() as *const core::ffi::c_char,
+            target_buf.as_mut_ptr() as *mut core::ffi::c_char,
+            target_buf.len(),
+            &mut rcnt,
+        )
+    };
+    if rc != 0 || rcnt == 0 {
+        return None;
+    }
+    let target = core::str::from_utf8(&target_buf[..rcnt])
+        .ok()?
+        .trim_matches('\0');
+    if target.is_empty() {
+        return None;
+    }
+
+    let base = if target.starts_with('/') {
+        crate::task::current_task()
+            .map(|task| task.inner_exclusive_access().root.clone())
+            .unwrap_or_else(|| crate::fs::vfs::ROOT_DENTRY.clone())
+    } else {
+        dentry.parent.clone().unwrap_or_else(|| start.clone())
+    };
+    let next = vfs_resolve_with_fallback(&base, target)?;
+    follow_symlink(&base, next, depth + 1)
+}
+
 pub fn mkdir_at(base: Option<Arc<Dentry>>, path: &str) -> bool {
     let start = base.unwrap_or_else(|| crate::fs::vfs::ROOT_DENTRY.clone());
 
@@ -311,6 +506,7 @@ pub fn mkdir_at(base: Option<Arc<Dentry>>, path: &str) -> bool {
         None => return false,
     };
 
+    root_make_accessible(&parent, 0o777);
     vfs_create(&parent, &name, true, 0o777).is_some()
 }
 
@@ -329,6 +525,9 @@ pub fn unlink_at(base: Option<Arc<Dentry>>, path: &str, is_dir: bool) -> bool {
         Some(p) => p,
         None => return false,
     };
+
+    root_make_accessible(&parent, 0o777);
+    root_make_accessible(&dentry, 0o777);
 
     let ok = if is_dir {
         dentry.super_block.unlink_dir(&dentry.fs_path)
@@ -357,16 +556,62 @@ impl File for OSInode {
     }
 
     fn read(&self, buf: &mut [u8]) -> isize {
+        if !self.writable {
+            let mut inner = self.inner.exclusive_access();
+            let rw_count = self
+                .dentry
+                .super_block
+                .read_at(&self.dentry.fs_path, inner.offset, buf);
+            inner.offset += rw_count;
+            return rw_count as isize;
+        }
+        let need_open = {
+            let inner = self.inner.exclusive_access();
+            inner.file_handle.is_none()
+        };
+        if need_open {
+            self.open_handle();
+        }
         let mut inner = self.inner.exclusive_access();
-        let rw_count = self
-            .dentry
-            .super_block
-            .read_at(&self.dentry.fs_path, inner.offset, buf);
-        inner.offset += rw_count;
-        rw_count as isize
+        let off = inner.offset;
+        if let Some(ref mut file) = inner.file_handle {
+            let size = unsafe { ext4_fsize(file) as usize };
+            if off >= size {
+                return 0;
+            }
+            let max_read = buf.len().min(size - off);
+            unsafe {
+                ext4_fseek(file, off as i64, SEEK_SET as u32);
+            }
+            let mut total = 0usize;
+            while total < max_read {
+                let mut rw_count: usize = 0;
+                let rc = unsafe {
+                    ext4_fread(
+                        file,
+                        buf[total..max_read].as_mut_ptr() as *mut core::ffi::c_void,
+                        max_read - total,
+                        &mut rw_count,
+                    )
+                };
+                if rc != EOK as i32 || rw_count == 0 {
+                    break;
+                }
+                total += rw_count;
+            }
+            inner.offset = off + total;
+            return total as isize;
+        }
+        -1
     }
 
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> isize {
+        if !self.writable {
+            return self
+                .dentry
+                .super_block
+                .read_at(&self.dentry.fs_path, offset, buf) as isize;
+        }
         let need_open = {
             let inner = self.inner.exclusive_access();
             inner.file_handle.is_none()
@@ -376,17 +621,22 @@ impl File for OSInode {
         }
         let mut inner = self.inner.exclusive_access();
         if let Some(ref mut file) = inner.file_handle {
+            let size = unsafe { ext4_fsize(file) as usize };
+            if offset >= size {
+                return 0;
+            }
+            let max_read = buf.len().min(size - offset);
             unsafe {
                 ext4_fseek(file, offset as i64, SEEK_SET as u32);
             }
             let mut total = 0usize;
-            while total < buf.len() {
+            while total < max_read {
                 let mut rw_count: usize = 0;
                 let rc = unsafe {
                     ext4_fread(
                         file,
-                        buf[total..].as_mut_ptr() as *mut core::ffi::c_void,
-                        buf.len() - total,
+                        buf[total..max_read].as_mut_ptr() as *mut core::ffi::c_void,
+                        max_read - total,
                         &mut rw_count,
                     )
                 };
@@ -401,6 +651,9 @@ impl File for OSInode {
     }
 
     fn write_at(&self, offset: usize, buf: &mut [u8]) -> isize {
+        if !self.writable {
+            return -1;
+        }
         let need_open = {
             let inner = self.inner.exclusive_access();
             inner.file_handle.is_none()
@@ -409,24 +662,47 @@ impl File for OSInode {
             self.open_handle();
         }
         let mut inner = self.inner.exclusive_access();
+        let saved_offset = inner.offset;
         if let Some(ref mut file) = inner.file_handle {
             unsafe {
                 ext4_fseek(file, offset as i64, SEEK_SET as u32);
             }
-            let mut rw_count: usize = 0;
-            let rc = unsafe {
-                ext4_fwrite(
-                    file,
-                    buf.as_ptr() as *const core::ffi::c_void,
-                    buf.len(),
-                    &mut rw_count,
-                )
-            };
-            if rc == EOK as i32 {
-                return rw_count as isize;
+            let mut total = 0usize;
+            while total < buf.len() {
+                let mut rw_count: usize = 0;
+                let rc = unsafe {
+                    ext4_fwrite(
+                        file,
+                        buf[total..].as_ptr() as *const core::ffi::c_void,
+                        buf.len() - total,
+                        &mut rw_count,
+                    )
+                };
+                if rc != EOK as i32 || rw_count == 0 {
+                    break;
+                }
+                total += rw_count;
             }
+            unsafe {
+                ext4_fseek(file, saved_offset as i64, SEEK_SET as u32);
+            }
+            let new_size = unsafe { ext4_fsize(file) as i64 };
+            if let Some(ref mut st) = inner.cached_stat {
+                st.st_size = new_size;
+                st.st_blocks = ((st.st_size.max(0) as u64) + 511) / 512;
+            }
+            return total as isize;
         }
-        -1
+        drop(inner);
+        let written = self
+            .dentry
+            .super_block
+            .write_at(&self.dentry.fs_path, offset, buf);
+        if written > 0 {
+            let new_size = (offset + written) as i64;
+            self.update_cached_size(new_size);
+        }
+        written as isize
     }
 
     fn write(&self, buf: &mut [u8]) -> isize {
@@ -438,34 +714,62 @@ impl File for OSInode {
             self.open_handle();
         }
         let mut inner = self.inner.exclusive_access();
-        if self.append {
-            inner.offset = self
-                .dentry
-                .super_block
-                .get_inode_info(&self.dentry.fs_path)
-                .map(|i| i.size as usize)
-                .unwrap_or(inner.offset);
-        }
-        let off = inner.offset;
+        let append = inner.append;
+        let cur_offset = inner.offset;
         if let Some(ref mut file) = inner.file_handle {
+            let off = if append {
+                unsafe { ext4_fsize(file) as usize }
+            } else {
+                cur_offset
+            };
             unsafe {
                 ext4_fseek(file, off as i64, SEEK_SET as u32);
             }
-            let mut rw_count: usize = 0;
-            let rc = unsafe {
-                ext4_fwrite(
-                    file,
-                    buf.as_ptr() as *const core::ffi::c_void,
-                    buf.len(),
-                    &mut rw_count,
-                )
-            };
-            if rc == EOK as i32 {
-                inner.offset = off + rw_count;
-                return rw_count as isize;
+            let mut total = 0usize;
+            while total < buf.len() {
+                let mut rw_count: usize = 0;
+                let rc = unsafe {
+                    ext4_fwrite(
+                        file,
+                        buf[total..].as_ptr() as *const core::ffi::c_void,
+                        buf.len() - total,
+                        &mut rw_count,
+                    )
+                };
+                if rc != EOK as i32 || rw_count == 0 {
+                    break;
+                }
+                total += rw_count;
             }
+            let new_size = unsafe { ext4_fsize(file) as i64 };
+            inner.offset = off + total;
+            if let Some(ref mut st) = inner.cached_stat {
+                st.st_size = new_size;
+                st.st_blocks = ((st.st_size.max(0) as u64) + 511) / 512;
+            }
+            return total as isize;
         }
-        -1
+        let off = if inner.append {
+            self.dentry
+                .super_block
+                .get_inode_info(&self.dentry.fs_path)
+                .map(|i| i.size as usize)
+                .unwrap_or(inner.offset)
+        } else {
+            inner.offset
+        };
+        drop(inner);
+        let rw_count = self
+            .dentry
+            .super_block
+            .write_at(&self.dentry.fs_path, off, buf);
+        let mut inner = self.inner.exclusive_access();
+        inner.offset = off + rw_count;
+        if let Some(ref mut st) = inner.cached_stat {
+            st.st_size = (off + rw_count) as i64;
+            st.st_blocks = ((st.st_size.max(0) as u64) + 511) / 512;
+        }
+        rw_count as isize
     }
 
     fn stat(&self) -> Kstat {
@@ -547,6 +851,26 @@ impl File for OSInode {
         self.inner.exclusive_access().offset
     }
 
+    fn get_flags(&self) -> usize {
+        let inner = self.inner.exclusive_access();
+        let mut flags = 0x8000usize;
+        if self.readable && self.writable {
+            flags |= OpenFlags::RDWR.bits() as usize;
+        } else if self.writable {
+            flags |= OpenFlags::WRONLY.bits() as usize;
+        }
+        if inner.append {
+            flags |= OpenFlags::APPEND.bits() as usize;
+        }
+        flags
+    }
+
+    fn set_flags(&self, flags: usize) -> bool {
+        let mut inner = self.inner.exclusive_access();
+        inner.append = (flags & OpenFlags::APPEND.bits() as usize) != 0;
+        true
+    }
+
     fn as_any(&self) -> &dyn core::any::Any {
         self
     }
@@ -582,6 +906,8 @@ pub fn rename_at(
 
     let new_fs_path = if new_parent.fs_path == "/" {
         alloc::format!("/{}", new_name)
+    } else if new_parent.fs_path.ends_with('/') {
+        alloc::format!("{}{}", new_parent.fs_path, new_name)
     } else {
         alloc::format!("{}/{}", new_parent.fs_path, new_name)
     };
@@ -629,6 +955,8 @@ pub fn symlink_at(base: Option<Arc<Dentry>>, target: &str, linkpath: &str) -> bo
 
     let link_fs_path = if parent.fs_path == "/" {
         alloc::format!("/{}", name)
+    } else if parent.fs_path.ends_with('/') {
+        alloc::format!("{}{}", parent.fs_path, name)
     } else {
         alloc::format!("{}/{}", parent.fs_path, name)
     };
@@ -644,8 +972,8 @@ pub fn symlink_at(base: Option<Arc<Dentry>>, target: &str, linkpath: &str) -> bo
 
     let rc = unsafe {
         ext4_fsymlink(
-            link_cpath.as_ptr() as *const core::ffi::c_char,
             target_cpath.as_ptr() as *const core::ffi::c_char,
+            link_cpath.as_ptr() as *const core::ffi::c_char,
         )
     };
 

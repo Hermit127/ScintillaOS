@@ -8,13 +8,7 @@ pub struct SignalAction {
     pub handler: usize,
     pub flags: usize,
     pub restorer: usize,
-    pub mask: u64,
-}
-
-impl SignalAction {
-    pub fn mask_flags(&self) -> SignalFlags {
-        SignalFlags::from_bits_truncate(self.mask)
-    }
+    pub mask: SignalFlags,
 }
 
 impl Default for SignalAction {
@@ -23,7 +17,7 @@ impl Default for SignalAction {
             handler: 0,
             flags: 0,
             restorer: 0,
-            mask: 0,
+            mask: SignalFlags::empty(),
         }
     }
 }

@@ -62,16 +62,29 @@ impl VfsSuperBlock {
         blk_device: Arc<dyn crate::drivers::BlockDevice>,
         fs_type: &'static str,
     ) -> Option<Arc<Self>> {
-        const DISK_SIZE_512M: u64 = 512 * 1024 * 1024;
+        Self::new_ext4_at(blk_device, fs_type, "/mp/")
+    }
+
+    pub fn new_ext4_at(
+        blk_device: Arc<dyn crate::drivers::BlockDevice>,
+        fs_type: &'static str,
+        mount_point: &str,
+    ) -> Option<Arc<Self>> {
+        const FALLBACK_DISK_SIZE: u64 = 512 * 1024 * 1024;
+        let total_size = blk_device.capacity_bytes().unwrap_or(FALLBACK_DISK_SIZE);
         let stream = BlockDeviceStream {
             inner: blk_device,
             pos: 0,
-            total_size: DISK_SIZE_512M,
+            total_size,
         };
-        let ext4 = Ext4BlockWrapper::<BlockDeviceStreamOp>::new(stream).ok()?;
+        let ext4 =
+            Ext4BlockWrapper::<BlockDeviceStreamOp>::new_with_name(stream, "ext4_fs", mount_point)
+                .ok()?;
         Some(Arc::new(VfsSuperBlock {
             fs_type,
-            fs_data: unsafe { UPSafeCell::new_named(FsInner::Ext4(Ext4Wrapper(ext4)), "VfsFsData") },
+            fs_data: unsafe {
+                UPSafeCell::new_named(FsInner::Ext4(Ext4Wrapper(ext4)), "VfsFsData")
+            },
         }))
     }
 
@@ -94,6 +107,7 @@ impl VfsSuperBlock {
     // ---------- path-based ext4 operations ----------
 
     pub fn dir_get_entries(&self, fs_path: &str) -> Vec<DirEntry> {
+        const MAX_DIR_ENTRIES: usize = 4096;
         self.with_fs(|_fs| {
             let c_path = match CString::new(fs_path) {
                 Ok(s) => s,
@@ -108,12 +122,15 @@ impl VfsSuperBlock {
                     return entries;
                 }
                 loop {
+                    if entries.len() >= MAX_DIR_ENTRIES {
+                        break;
+                    }
                     let de = ext4_dir_entry_next(&mut d);
                     if de.is_null() {
                         break;
                     }
                     let dentry = &*de;
-                    let name_len = dentry.name_length as usize;
+                    let name_len = (dentry.name_length as usize).min(dentry.name.len());
                     let name_bytes = dentry.name[..name_len].to_vec();
                     entries.push(DirEntry {
                         inode: dentry.inode,
@@ -129,26 +146,6 @@ impl VfsSuperBlock {
 
     pub fn get_inode_info(&self, fs_path: &str) -> Option<InodeInfo> {
         self.with_fs(|_fs| {
-            let c_path = CString::new(fs_path).ok()?;
-            let c_path = c_path.into_raw();
-
-            let mut file: ext4_file = unsafe { core::mem::zeroed() };
-            let flags = CString::new("rb").ok()?;
-            let flags_ptr = flags.into_raw();
-
-            let rc = unsafe { ext4_fopen(&mut file, c_path, flags_ptr) };
-            unsafe {
-                drop(CString::from_raw(c_path));
-                drop(CString::from_raw(flags_ptr));
-            }
-
-            if rc != EOK as i32 {
-                return None;
-            }
-
-            let inode_num = file.inode;
-            let size = unsafe { ext4_fsize(&mut file) };
-
             let mut mode: u32 = 0;
             let c_path2 = CString::new(fs_path).ok()?;
             let _mode_rc = unsafe { ext4_mode_get(c_path2.as_ptr() as *const c_char, &mut mode) };
@@ -160,8 +157,6 @@ impl VfsSuperBlock {
                 ext4_owner_get(c_path_owner.as_ptr() as *const c_char, &mut uid, &mut gid);
             }
 
-            let is_link = mode & 0xA000 == 0xA000;
-
             let mut atime: u32 = 0;
             let mut mtime: u32 = 0;
             let mut ctime: u32 = 0;
@@ -172,11 +167,66 @@ impl VfsSuperBlock {
                 ext4_ctime_get(c_path3.as_ptr() as *const c_char, &mut ctime);
             }
 
-            unsafe {
-                ext4_fclose(&mut file);
-            }
+            let file_type = mode & 0o170000;
+            let is_link = file_type == 0o120000;
+            let is_dir_mode = file_type == 0o040000;
 
-            let is_dir = (mode & 0x4000) != 0;
+            let (inode_num, size, is_dir) = if is_dir_mode {
+                let mut dir: ext4_dir = unsafe { core::mem::zeroed() };
+                let c_path_dir = CString::new(fs_path).ok()?;
+                let dir_rc =
+                    unsafe { ext4_dir_open(&mut dir, c_path_dir.as_ptr() as *const c_char) };
+                if dir_rc == EOK as i32 {
+                    let inode_num = dir.f.inode;
+                    let size = dir.f.fsize;
+                    unsafe {
+                        ext4_dir_close(&mut dir);
+                    }
+                    mode = (mode & 0o7777) | 0o040000;
+                    (inode_num, size, true)
+                } else {
+                    return None;
+                }
+            } else {
+                let mut file: ext4_file = unsafe { core::mem::zeroed() };
+                let c_path_file = CString::new(fs_path).ok()?;
+                let flags = CString::new("rb").ok()?;
+                let file_rc = unsafe {
+                    ext4_fopen(
+                        &mut file,
+                        c_path_file.as_ptr() as *const c_char,
+                        flags.as_ptr() as *const c_char,
+                    )
+                };
+
+                if file_rc == EOK as i32 {
+                    let inode_num = file.inode;
+                    let size = unsafe { ext4_fsize(&mut file) };
+                    unsafe {
+                        ext4_fclose(&mut file);
+                    }
+                    (inode_num, size, false)
+                } else if is_link {
+                    // Symlink lookup only needs the link flag and path.
+                    (0, 0, false)
+                } else {
+                    let mut dir: ext4_dir = unsafe { core::mem::zeroed() };
+                    let c_path_dir = CString::new(fs_path).ok()?;
+                    let dir_rc =
+                        unsafe { ext4_dir_open(&mut dir, c_path_dir.as_ptr() as *const c_char) };
+                    if dir_rc != EOK as i32 {
+                        return None;
+                    }
+                    let inode_num = dir.f.inode;
+                    let size = dir.f.fsize;
+                    unsafe {
+                        ext4_dir_close(&mut dir);
+                    }
+                    mode = (mode & 0o7777) | 0o040000;
+                    (inode_num, size, true)
+                }
+            };
+
             Some(InodeInfo {
                 inode_num,
                 is_dir,
@@ -258,6 +308,10 @@ impl VfsSuperBlock {
     }
 
     pub fn write_at(&self, fs_path: &str, offset: usize, buf: &[u8]) -> usize {
+        self.write_at_raw(fs_path, offset, buf)
+    }
+
+    fn write_at_raw(&self, fs_path: &str, offset: usize, buf: &[u8]) -> usize {
         self.with_fs(|_fs| {
             let c_path = match CString::new(fs_path) {
                 Ok(s) => s,
@@ -306,6 +360,8 @@ impl VfsSuperBlock {
     pub fn create_file(&self, parent_path: &str, name: &str, is_dir: bool) -> Option<u32> {
         let full_path = if parent_path == "/" {
             format!("/{}", name)
+        } else if parent_path.ends_with('/') {
+            format!("{}{}", parent_path, name)
         } else {
             format!("{}/{}", parent_path, name)
         };
@@ -475,6 +531,7 @@ pub struct Dentry {
     pub fs_path: String,
     pub inode_num: u32,
     pub is_dir: bool,
+    pub is_link: bool,
     pub parent: Option<Arc<Dentry>>,
     pub super_block: Arc<VfsSuperBlock>,
     pub children: UPSafeCell<Option<Vec<Arc<Dentry>>>>,
@@ -488,26 +545,34 @@ impl Dentry {
             fs_path: String::from("/"),
             inode_num: 2,
             is_dir: true,
+            is_link: false,
             parent: None,
             super_block: sb,
             children: unsafe { UPSafeCell::new(None) },
         })
     }
 
-    fn new_mount_root(sb: Arc<VfsSuperBlock>, mnt_path: String) -> Arc<Self> {
+    fn new_mount_root(sb: Arc<VfsSuperBlock>, mnt_path: String, lwext4_mount: &str) -> Arc<Self> {
         Arc::new(Dentry {
             name: String::from("/"),
             path: mnt_path,
-            fs_path: String::from("/"),
+            fs_path: String::from(lwext4_mount),
             inode_num: 2,
             is_dir: true,
+            is_link: false,
             parent: None,
             super_block: sb,
             children: unsafe { UPSafeCell::new(None) },
         })
     }
 
-    fn new_child(parent: &Arc<Dentry>, name: &str, inode_num: u32, is_dir: bool) -> Arc<Self> {
+    fn new_child(
+        parent: &Arc<Dentry>,
+        name: &str,
+        inode_num: u32,
+        is_dir: bool,
+        is_link: bool,
+    ) -> Arc<Self> {
         let path = if parent.path == "/" {
             format!("/{}", name)
         } else {
@@ -515,6 +580,8 @@ impl Dentry {
         };
         let fs_path = if parent.fs_path == "/" {
             format!("/{}", name)
+        } else if parent.fs_path.ends_with('/') {
+            format!("{}{}", parent.fs_path, name)
         } else {
             format!("{}/{}", parent.fs_path, name)
         };
@@ -524,6 +591,7 @@ impl Dentry {
             fs_path,
             inode_num,
             is_dir,
+            is_link,
             parent: Some(parent.clone()),
             super_block: parent.super_block.clone(),
             children: unsafe { UPSafeCell::new(None) },
@@ -545,7 +613,7 @@ lazy_static! {
 fn lookup_mount(dentry: &Arc<Dentry>) -> Option<Arc<Dentry>> {
     let table = MOUNT_TABLE.exclusive_access();
     for m in table.iter() {
-        if Arc::ptr_eq(&m.mnt_point, dentry) {
+        if Arc::ptr_eq(&m.mnt_point, dentry) || m.mnt_point.path == dentry.path {
             return Some(m.mnt_root.clone());
         }
     }
@@ -555,7 +623,7 @@ fn lookup_mount(dentry: &Arc<Dentry>) -> Option<Arc<Dentry>> {
 fn is_mount_root(dentry: &Arc<Dentry>) -> Option<Arc<Dentry>> {
     let table = MOUNT_TABLE.exclusive_access();
     for m in table.iter() {
-        if Arc::ptr_eq(&m.mnt_root, dentry) {
+        if Arc::ptr_eq(&m.mnt_root, dentry) || m.mnt_root.path == dentry.path {
             return Some(m.mnt_point.clone());
         }
     }
@@ -574,7 +642,15 @@ fn vfs_parent(dentry: &Arc<Dentry>) -> Option<Arc<Dentry>> {
 pub fn vfs_lookup(parent: &Arc<Dentry>, name: &str) -> Option<Arc<Dentry>> {
     match name {
         "." => return Some(parent.clone()),
-        ".." => return vfs_parent(parent).or_else(|| Some(parent.clone())),
+        ".." => {
+            if let Some(task) = crate::task::current_task() {
+                let root = task.inner_exclusive_access().root.clone();
+                if Arc::ptr_eq(parent, &root) || parent.path == root.path {
+                    return Some(parent.clone());
+                }
+            }
+            return vfs_parent(parent).or_else(|| Some(parent.clone()));
+        }
         _ => {}
     }
 
@@ -592,23 +668,16 @@ pub fn vfs_lookup(parent: &Arc<Dentry>, name: &str) -> Option<Arc<Dentry>> {
 
     let child_fs_path = if parent.fs_path == "/" {
         format!("/{}", name)
+    } else if parent.fs_path.ends_with('/') {
+        format!("{}{}", parent.fs_path, name)
     } else {
         format!("{}/{}", parent.fs_path, name)
     };
 
-    let (child_inode, is_dir) = {
-        let entries = parent.super_block.dir_get_entries(&parent.fs_path);
-        let found = entries.iter().find(|e| e.get_name() == name)?;
-        let inode_num = found.inode;
-        let info = parent.super_block.get_inode_info(&child_fs_path);
-        let is_dir = match &info {
-            Some(info) => info.is_dir,
-            None => found.de_type == 2,
-        };
-        (inode_num, is_dir)
-    };
+    let info = parent.super_block.get_inode_info(&child_fs_path)?;
+    let (child_inode, is_dir, is_link) = (info.inode_num, info.is_dir, info.is_link);
 
-    let child = Dentry::new_child(parent, name, child_inode, is_dir);
+    let child = Dentry::new_child(parent, name, child_inode, is_dir, is_link);
 
     {
         let mut children = parent.children.exclusive_access();
@@ -650,7 +719,7 @@ pub fn vfs_resolve_path(start: &Arc<Dentry>, path: &str) -> Option<Arc<Dentry>> 
         }
     }
 
-    Some(current)
+    lookup_mount(&current).or(Some(current))
 }
 
 pub fn vfs_resolve_with_fallback(start: &Arc<Dentry>, path: &str) -> Option<Arc<Dentry>> {
@@ -703,17 +772,23 @@ pub fn vfs_resolve_parent_and_name(
 
 // ==================== File Creation ====================
 
-pub fn vfs_create(parent: &Arc<Dentry>, name: &str, is_dir: bool, mode: u32) -> Option<Arc<Dentry>> {
+pub fn vfs_create(
+    parent: &Arc<Dentry>,
+    name: &str,
+    is_dir: bool,
+    mode: u32,
+) -> Option<Arc<Dentry>> {
     let inode_num = parent
         .super_block
         .create_file(&parent.fs_path, name, is_dir)?;
 
-    let child = Dentry::new_child(parent, name, inode_num, is_dir);
+    let child = Dentry::new_child(parent, name, inode_num, is_dir, false);
 
     let umask = crate::task::current_task()
         .map(|t| t.inner_exclusive_access().umask)
         .unwrap_or(0o22);
-    let effective_mode = mode & !umask;
+    let file_type = if is_dir { 0o040000 } else { 0o100000 };
+    let effective_mode = file_type | (mode & !umask & 0o7777);
     let fs_path = child.fs_path.clone();
     child.super_block.set_mode(&fs_path, effective_mode);
 
@@ -731,7 +806,7 @@ pub fn vfs_create(parent: &Arc<Dentry>, name: &str, is_dir: bool, mode: u32) -> 
 
 // ==================== Mount Operations ====================
 
-pub fn vfs_mount(mnt_point: Arc<Dentry>, sb: Arc<VfsSuperBlock>) -> bool {
+pub fn vfs_mount(mnt_point: Arc<Dentry>, sb: Arc<VfsSuperBlock>, fs_path: &str) -> bool {
     let path = mnt_point.path.clone();
     {
         let table = MOUNT_TABLE.exclusive_access();
@@ -743,7 +818,7 @@ pub fn vfs_mount(mnt_point: Arc<Dentry>, sb: Arc<VfsSuperBlock>) -> bool {
         }
     }
 
-    let mnt_root = Dentry::new_mount_root(sb, mnt_point.path.clone());
+    let mnt_root = Dentry::new_mount_root(sb, mnt_point.path.clone(), fs_path);
 
     MOUNT_TABLE.exclusive_access().push(Mount {
         mnt_point: mnt_point.clone(),
@@ -790,7 +865,7 @@ pub fn mount_test_disk_at(mnt_point: Arc<Dentry>) -> bool {
         Some(sb) => sb,
         None => return false,
     };
-    vfs_mount(mnt_point, test_sb)
+    vfs_mount(mnt_point, test_sb, "/__mount_vda/")
 }
 
 pub fn list_apps() {

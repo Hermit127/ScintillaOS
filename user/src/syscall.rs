@@ -6,6 +6,7 @@ const SYSCALL_DUP: usize = 23;
 const SYSCALL_DUP3: usize = 24;
 const SYSCALL_GETCWD: usize = 17;
 const SYSCALL_CHDIR: usize = 49;
+const SYSCALL_CHROOT: usize = 51;
 const SYSCALL_OPENAT: usize = 56;
 const SYSCALL_CLOSE: usize = 57;
 const SYSCALL_PIPE2: usize = 59;
@@ -20,6 +21,9 @@ const SYSCALL_SIGACTION: usize = 134;
 const SYSCALL_SIGPROCMASK: usize = 135;
 const SYSCALL_SIGRETURN: usize = 139;
 const SYSCALL_TIMES: usize = 153;
+const SYSCALL_SETPGID: usize = 154;
+const SYSCALL_GETPGID: usize = 155;
+const SYSCALL_SETSID: usize = 157;
 const SYSCALL_GET_TIME: usize = 169;
 const SYSCALL_GETPID: usize = 172;
 const SYSCALL_GETUID: usize = 174;
@@ -37,6 +41,7 @@ const SYSCALL_NANOSLEEP: usize = 101;
 
 const SYSCALL_MOUNT: usize = 40;
 const SYSCALL_UMOUNT2: usize = 39;
+const SYSCALL_SYMLINKAT: usize = 36;
 
 const SYSCALL_GETDENTS64: usize = 61;
 
@@ -188,8 +193,20 @@ pub fn sys_yield() -> isize {
     syscall(SYSCALL_YIELD, [0, 0, 0, 0, 0, 0])
 }
 
-pub fn sys_kill(pid: usize, signal: i32) -> isize {
-    syscall(SYSCALL_KILL, [pid, signal as usize, 0, 0, 0, 0])
+pub fn sys_kill(pid: isize, signal: i32) -> isize {
+    syscall(SYSCALL_KILL, [pid as usize, signal as usize, 0, 0, 0, 0])
+}
+
+pub fn sys_setpgid(pid: usize, pgid: usize) -> isize {
+    syscall(SYSCALL_SETPGID, [pid, pgid, 0, 0, 0, 0])
+}
+
+pub fn sys_getpgid(pid: usize) -> isize {
+    syscall(SYSCALL_GETPGID, [pid, 0, 0, 0, 0, 0])
+}
+
+pub fn sys_setsid() -> isize {
+    syscall(SYSCALL_SETSID, [0, 0, 0, 0, 0, 0])
 }
 
 pub fn sys_get_time() -> isize {
@@ -218,10 +235,21 @@ pub fn sys_exec(path: &str, args: &[*const u8], envs: &[*const u8]) -> isize {
     )
 }
 
+pub fn sys_chroot(path: &str) -> isize {
+    syscall(SYSCALL_CHROOT, [path.as_ptr() as usize, 0, 0, 0, 0, 0])
+}
+
 pub fn sys_waitpid(pid: isize, exit_code: *mut i32) -> isize {
     syscall(
         SYSCALL_WAITPID,
         [pid as usize, exit_code as usize, 0, 0, 0, 0],
+    )
+}
+
+pub fn sys_waitpid_options(pid: isize, exit_code: *mut i32, options: usize) -> isize {
+    syscall(
+        SYSCALL_WAITPID,
+        [pid as usize, exit_code as usize, options, 0, 0, 0],
     )
 }
 
@@ -264,10 +292,16 @@ pub fn sys_chdir(path: &str) -> isize {
 }
 
 pub fn sys_getcwd(buf: &mut [u8]) -> isize {
-    syscall(SYSCALL_GETCWD, [buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0, 0])
+    syscall(
+        SYSCALL_GETCWD,
+        [buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0, 0],
+    )
 }
 pub fn sys_getdents64(fd: usize, buf: &mut [u8]) -> isize {
-    syscall(SYSCALL_GETDENTS64, [fd, buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0])
+    syscall(
+        SYSCALL_GETDENTS64,
+        [fd, buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0],
+    )
 }
 
 #[repr(C)]
@@ -311,6 +345,27 @@ pub fn sys_mkdir(path: *const u8, mode: u32) -> isize {
     syscall(
         SYSCALL_MKDIRAT,
         [AT_FDCWD as usize, path as usize, mode as usize, 0, 0, 0],
+    )
+}
+
+pub fn sys_symlinkat(target: *const u8, linkpath: *const u8) -> isize {
+    syscall(
+        SYSCALL_SYMLINKAT,
+        [
+            target as usize,
+            AT_FDCWD as usize,
+            linkpath as usize,
+            0,
+            0,
+            0,
+        ],
+    )
+}
+
+pub fn sys_unlinkat_path(path: *const u8, flags: u32) -> isize {
+    syscall(
+        SYSCALL_UNLINKAT,
+        [AT_FDCWD as usize, path as usize, flags as usize, 0, 0, 0],
     )
 }
 

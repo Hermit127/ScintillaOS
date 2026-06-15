@@ -474,16 +474,25 @@ Finish:
 
 static struct ext4_mountpoint *ext4_get_mount(const char *path)
 {
+	struct ext4_mountpoint *best = NULL;
+	size_t best_len = 0;
+
 	for (size_t i = 0; i < CONFIG_EXT4_MOUNTPOINTS_COUNT; ++i) {
 
 		if (!s_mp[i].mounted)
 			continue;
 
-		if (!strncmp(s_mp[i].name, path, strlen(s_mp[i].name)))
-			return &s_mp[i];
+		size_t nlen = strlen(s_mp[i].name);
+		if (!strncmp(s_mp[i].name, path, nlen) && nlen > best_len) {
+			best = &s_mp[i];
+			best_len = nlen;
+		}
 	}
 
-	return NULL;
+	if (!best) {
+		ext4_dbg(DEBUG_FS, DBG_WARN "ext4_get_mount(%s) NULL\n", path);
+	}
+	return best;
 }
 
 __unused
@@ -1883,7 +1892,6 @@ int ext4_fwrite(ext4_file *file, const void *buf, size_t size, size_t *wcnt)
 
 	if (unalg) {
 		size_t len =  size;
-		uint64_t off;
 		if (size > (block_size - unalg))
 			len = block_size - unalg;
 
@@ -1891,10 +1899,21 @@ int ext4_fwrite(ext4_file *file, const void *buf, size_t size, size_t *wcnt)
 		if (r != EOK)
 			goto Finish;
 
-		off = fblk * block_size + unalg;
-		r = ext4_block_writebytes(file->mp->fs.bdev, off, u8_buf, len);
-		if (r != EOK)
-			goto Finish;
+		{
+			uint8_t pad_buf[4096];
+			if (block_size > sizeof(pad_buf)) {
+				r = EINVAL;
+				goto Finish;
+			}
+			r = ext4_blocks_get_direct(file->mp->fs.bdev, pad_buf, fblk, 1);
+			if (r != EOK)
+				goto Finish;
+			for (uint32_t i = 0; i < (uint32_t)len; i++)
+				pad_buf[unalg + i] = ((const uint8_t*)u8_buf)[i];
+			r = ext4_blocks_set_direct(file->mp->fs.bdev, pad_buf, fblk, 1);
+			if (r != EOK)
+				goto Finish;
+		}
 
 		u8_buf += len;
 		size -= len;
@@ -1975,6 +1994,7 @@ int ext4_fwrite(ext4_file *file, const void *buf, size_t size, size_t *wcnt)
 		goto Finish;
 
 	if (size) {
+		bool block_exists = iblk_idx < ifile_blocks;
 		if (iblk_idx < ifile_blocks) {
 			r = ext4_fs_init_inode_dblk_idx(&ref, iblk_idx, &fblk);
 			if (r != EOK)
@@ -1985,14 +2005,22 @@ int ext4_fwrite(ext4_file *file, const void *buf, size_t size, size_t *wcnt)
 				goto out_fsize;
 		}
 
-		/* Write using ext4_blocks_set_direct for full-block commit.
-		 * For partial writes (< block_size), zero-pad to a full block. */
 		{
 			uint8_t pad_buf[4096];
-			uint32_t write_size = (size < block_size) ? block_size : size;
-			for (uint32_t i = 0; i < write_size; i++) {
-				pad_buf[i] = (i < (uint32_t)size) ? ((const uint8_t*)u8_buf)[i] : 0;
+			if (block_size > sizeof(pad_buf)) {
+				r = EINVAL;
+				goto Finish;
 			}
+			if (block_exists) {
+				r = ext4_blocks_get_direct(file->mp->fs.bdev, pad_buf, fblk, 1);
+				if (r != EOK)
+					goto Finish;
+			} else {
+				for (uint32_t i = 0; i < block_size; i++)
+					pad_buf[i] = 0;
+			}
+			for (uint32_t i = 0; i < (uint32_t)size; i++)
+				pad_buf[i] = ((const uint8_t*)u8_buf)[i];
 			r = ext4_blocks_set_direct(file->mp->fs.bdev, pad_buf, fblk, 1);
 		}
 		if (r != EOK)

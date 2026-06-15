@@ -18,6 +18,7 @@ pub struct SocketFile {
     pub socket_type: SocketType,
     pub nonblock: AtomicBool,
     pub peer_endpoint: UPSafeCell<Option<IpEndpoint>>,
+    pub local_endpoint: UPSafeCell<Option<IpEndpoint>>,
     pub was_listening: AtomicBool,
 }
 
@@ -28,6 +29,7 @@ impl SocketFile {
             socket_type,
             nonblock: AtomicBool::new(nonblock),
             peer_endpoint: unsafe { UPSafeCell::new(None) },
+            local_endpoint: unsafe { UPSafeCell::new(None) },
             was_listening: AtomicBool::new(false),
         }
     }
@@ -50,6 +52,14 @@ impl SocketFile {
 
     pub fn set_peer_endpoint(&self, ep: IpEndpoint) {
         *self.peer_endpoint.exclusive_access() = Some(ep);
+    }
+
+    pub fn get_local_endpoint(&self) -> Option<IpEndpoint> {
+        *self.local_endpoint.exclusive_access()
+    }
+
+    pub fn set_local_endpoint(&self, ep: IpEndpoint) {
+        *self.local_endpoint.exclusive_access() = Some(ep);
     }
 }
 

@@ -93,6 +93,7 @@ all: kernel-rv disk.img disk-rv.img kernel-la disk-la.img
 kernel-rv:
 	@echo "===== Building kernel-rv (riscv64) ====="
 	@$(MAKE) kernel ARCH=riscv64
+	@$(OBJCOPY) target/riscv64gc-unknown-none-elf/release/os --strip-all -O binary target/riscv64gc-unknown-none-elf/release/os.bin
 	@$(OBJCOPY) target/riscv64gc-unknown-none-elf/release/os --strip-all -O binary kernel-rv
 	@echo "kernel-rv ready"
 
@@ -148,6 +149,22 @@ fs-img: $(APPS)
 	@rm -f $(FS_IMG)
 	@rm -rf $(ROOTFS_DIR)
 	@mkdir -p $(ROOTFS_BIN_DIR) $(ROOTFS_MNT_DIR) $(ROOTFS_DIR)/tmp
+	@mkdir -p $(ROOTFS_BIN_DIR)/mnt
+ifdef LM_ONLY
+	@touch $(ROOTFS_DIR)/lmbench_only
+endif
+ifdef LM_GLIBC_ONLY
+	@touch $(ROOTFS_DIR)/lmbench_glibc_only
+endif
+ifdef IOZONE_ONLY
+	@touch $(ROOTFS_DIR)/iozone_only
+endif
+ifdef IOZONE_GLIBC_ONLY
+	@touch $(ROOTFS_DIR)/iozone_glibc_only
+endif
+ifdef LUA_ONLY
+	@touch $(ROOTFS_DIR)/lua_only
+endif
 	@printf "Hi, this is a text file.\nsyscalls testing success!\n" > $(ROOTFS_DIR)/text.txt
 	@for src in user/src/bin/*.rs; do \
 		app=$$(basename $$src .rs); \
@@ -164,43 +181,21 @@ fs-img: $(APPS)
 		fi; \
 		mkdir -p "$(ROOTFS_MNT_DIR)"; \
 	fi
-	@cp -f tmp/hello_riscv64_musl $(ROOTFS_BIN_DIR)/hello 2>/dev/null || true
-	@cp -f tmp/lua $(ROOTFS_BIN_DIR)/lua 2>/dev/null || true
-	@cp -f testsuits-for-oskernel/scripts/lua/*.lua $(ROOTFS_DIR)/ 2>/dev/null || true
-	@cp -f tmp/strings.lua $(ROOTFS_DIR)/strings.lua 2>/dev/null || true
-	@cp -f tmp/hello.lua $(ROOTFS_DIR)/hello.lua 2>/dev/null || true
-	@printf '#!/bin/sh\nfor f in strings sort sin30 round_num max_min file_io remove date random; do ./lua /$$f.lua; if [ $$? = 0 ]; then echo "testcase lua $$f success"; else echo "testcase lua $$f fail"; fi; done\n' > $(ROOTFS_DIR)/lua_testcode.sh 2>/dev/null || true
 	@if [ "$(ARCH)" = "riscv64" ]; then \
 		cp -f tmp/busybox-musl $(ROOTFS_BIN_DIR)/busybox 2>/dev/null || true; \
 		cp -f tmp/busybox-musl $(ROOTFS_DIR)/busybox 2>/dev/null || true; \
 		cp -f tmp/busybox-glibc-riscv64 $(ROOTFS_BIN_DIR)/busybox-glibc 2>/dev/null || true; \
 		cp -f tmp/busybox-glibc-riscv64 $(ROOTFS_DIR)/busybox-glibc 2>/dev/null || true; \
-		cp -f tmp/lmbench-riscv64/lmbench_all $(ROOTFS_DIR)/lmbench_all 2>/dev/null || true; \
-		cp -f tmp/lmbench-riscv64-glibc/lmbench_all $(ROOTFS_DIR)/lmbench_all-glibc 2>/dev/null || true; \
-		printf '#!/bin/sh\n/lmbench_all hello "$$@"\n' > $(ROOTFS_DIR)/hello 2>/dev/null || true; \
-		printf '#!/bin/sh\n/lmbench_all lat_sig "$$@"\n' > $(ROOTFS_DIR)/lat_sig 2>/dev/null || true; \
-		printf '#!/bin/sh\n/lmbench_all-glibc hello "$$@"\n' > $(ROOTFS_DIR)/hello-glibc 2>/dev/null || true; \
-		printf '#!/bin/sh\n/lmbench_all-glibc lat_sig "$$@"\n' > $(ROOTFS_DIR)/lat_sig-glibc 2>/dev/null || true; \
-		cp -f tmp/lmbench-riscv64/lmbench_testcode.sh $(ROOTFS_DIR)/lmbench_testcode.sh 2>/dev/null || true; \
 		cat testsuits-for-oskernel/scripts/busybox/busybox_cmd.txt > $(ROOTFS_DIR)/busybox_cmd.txt 2>/dev/null || cat tmp/busybox_cmd.txt > $(ROOTFS_DIR)/busybox_cmd.txt 2>/dev/null || true; \
 		sed 's|\./busybox|./busybox-glibc|g' $(ROOTFS_DIR)/busybox_cmd.txt > $(ROOTFS_DIR)/busybox_glibc_cmd.txt 2>/dev/null || true; \
 		printf '#!/bin/sh\n./busybox-glibc --install -s /bin 2>/dev/null\necho "#### OS COMP TEST GROUP START busybox-glibc ####"\nwhile IFS= read -r line; do case "$$line" in ""|\\#*) continue ;; esac; eval "./busybox-glibc $$line"; RTN=$$?; if [ $$RTN -ne 0 ] && [ "$$line" != "false" ]; then echo "testcase busybox $$line fail"; else echo "testcase busybox $$line success"; fi; done < ./busybox_glibc_cmd.txt\necho "#### OS COMP TEST GROUP END busybox-glibc ####"\n' > $(ROOTFS_DIR)/busybox_glibc_testcode.sh; \
 		ln -sf busybox $(ROOTFS_BIN_DIR)/ls 2>/dev/null || true; \
 		printf '#!/bin/sh\n./busybox --install -s /bin 2>/dev/null\necho "#### OS COMP TEST GROUP START busybox-musl ####"\nwhile IFS= read -r line; do case "$$line" in ""|\\#*) continue ;; esac; eval "./busybox $$line"; RTN=$$?; if [ $$RTN -ne 0 ] && [ "$$line" != "false" ]; then echo "testcase busybox $$line fail"; else echo "testcase busybox $$line success"; fi; done < ./busybox_cmd.txt\necho "#### OS COMP TEST GROUP END busybox-musl ####"\n' > $(ROOTFS_DIR)/busybox_testcode.sh; \
-	fi
-	@if [ "$(ARCH)" = "loongarch64" ]; then \
-		cp -f tmp/lua-loongarch64 $(ROOTFS_BIN_DIR)/lua 2>/dev/null || true; \
+	elif [ "$(ARCH)" = "loongarch64" ]; then \
 		cp -f tmp/busybox-musl-loongarch64 $(ROOTFS_BIN_DIR)/busybox 2>/dev/null || true; \
 		cp -f tmp/busybox-musl-loongarch64 $(ROOTFS_DIR)/busybox 2>/dev/null || true; \
 		cp -f tmp/busybox-glibc-loongarch64 $(ROOTFS_BIN_DIR)/busybox-glibc 2>/dev/null || true; \
 		cp -f tmp/busybox-glibc-loongarch64 $(ROOTFS_DIR)/busybox-glibc 2>/dev/null || true; \
-		cp -f tmp/lmbench-loongarch64-musl/lmbench_all $(ROOTFS_DIR)/lmbench_all 2>/dev/null || cp -f tmp/lmbench-loongarch64/lmbench_all $(ROOTFS_DIR)/lmbench_all 2>/dev/null || true; \
-		cp -f tmp/lmbench-loongarch64-glibc/lmbench_all $(ROOTFS_DIR)/lmbench_all-glibc 2>/dev/null || true; \
-		printf '#!/bin/sh\n/lmbench_all hello "$$@"\n' > $(ROOTFS_DIR)/hello 2>/dev/null || true; \
-		printf '#!/bin/sh\n/lmbench_all lat_sig "$$@"\n' > $(ROOTFS_DIR)/lat_sig 2>/dev/null || true; \
-		printf '#!/bin/sh\n/lmbench_all-glibc hello "$$@"\n' > $(ROOTFS_DIR)/hello-glibc 2>/dev/null || true; \
-		printf '#!/bin/sh\n/lmbench_all-glibc lat_sig "$$@"\n' > $(ROOTFS_DIR)/lat_sig-glibc 2>/dev/null || true; \
-		cp -f tmp/lmbench-loongarch64-musl/lmbench_testcode.sh $(ROOTFS_DIR)/lmbench_testcode.sh 2>/dev/null || cp -f tmp/lmbench-loongarch64/lmbench_testcode.sh $(ROOTFS_DIR)/lmbench_testcode.sh 2>/dev/null || true; \
 		cat testsuits-for-oskernel/scripts/busybox/busybox_cmd.txt > $(ROOTFS_DIR)/busybox_cmd.txt 2>/dev/null || cat tmp/busybox_cmd.txt > $(ROOTFS_DIR)/busybox_cmd.txt 2>/dev/null || true; \
 		sed 's|\./busybox|./busybox-glibc|g' $(ROOTFS_DIR)/busybox_cmd.txt > $(ROOTFS_DIR)/busybox_glibc_cmd.txt 2>/dev/null || true; \
 		printf '#!/bin/sh\n./busybox-glibc --install -s /bin 2>/dev/null\necho "#### OS COMP TEST GROUP START busybox-glibc ####"\nwhile IFS= read -r line; do case "$$line" in ""|\\#*) continue ;; esac; eval "./busybox-glibc $$line"; RTN=$$?; if [ $$RTN -ne 0 ] && [ "$$line" != "false" ]; then echo "testcase busybox $$line fail"; else echo "testcase busybox $$line success"; fi; done < ./busybox_glibc_cmd.txt\necho "#### OS COMP TEST GROUP END busybox-glibc ####"\n' > $(ROOTFS_DIR)/busybox_glibc_testcode.sh; \
@@ -216,7 +211,7 @@ fs-img: $(APPS)
 			printf '%s\n' 'export TIMING_O=0.0'; \
 			printf '%s\n' 'export LOOP_O=0.0'; \
 			printf '%s\n' ''; \
-			printf '%s\n' 'echo "#### OS COMP TEST GROUP START lmbench ####"'; \
+			printf '%s\n' 'echo "#### OS COMP TEST GROUP START lmbench-musl ####"'; \
 			printf '%s\n' ''; \
 			printf '%s\n' 'echo latency measurements'; \
 			printf '%s\n' '/lmbench_all lat_syscall -P 1 null'; \
@@ -251,22 +246,49 @@ fs-img: $(APPS)
 			printf '%s\n' '/lmbench_all lat_ctx -P 1 -s 32 2 4 8 16 24 32 64 96'; \
 			printf '%s\n' ''; \
 			printf '%s\n' '/busybox sync'; \
-			printf '%s\n' 'echo "#### OS COMP TEST GROUP END lmbench ####"'; \
+			printf '%s\n' 'echo "#### OS COMP TEST GROUP END lmbench-musl ####"'; \
 		} > "$(ROOTFS_DIR)/lmbench_testcode.sh"; \
+		cp "$(ROOTFS_DIR)/lmbench_testcode.sh" "$(ROOTFS_DIR)/lmbench_musl_testcode.sh"; \
 	fi
 	@if [ -f "$(ROOTFS_DIR)/lmbench_all-glibc" ]; then \
 		sed \
-			-e 's|#### OS COMP TEST GROUP START lmbench ####|#### OS COMP TEST GROUP START lmbench-glibc ####|' \
-			-e 's|#### OS COMP TEST GROUP END lmbench ####|#### OS COMP TEST GROUP END lmbench-glibc ####|' \
+			-e 's|#### OS COMP TEST GROUP START lmbench-musl ####|#### OS COMP TEST GROUP START lmbench-glibc ####|' \
+			-e 's|#### OS COMP TEST GROUP END lmbench-musl ####|#### OS COMP TEST GROUP END lmbench-glibc ####|' \
 			-e 's|/busybox cp /hello /tmp/hello|/busybox cp /hello-glibc /tmp/hello|' \
 			-e 's|/busybox|/busybox-glibc|g' \
 			-e 's|/lmbench_all|/lmbench_all-glibc|g' \
 			-e 's|/lat_sig|/lat_sig-glibc|g' \
 			"$(ROOTFS_DIR)/lmbench_testcode.sh" > "$(ROOTFS_DIR)/lmbench_glibc_testcode.sh"; \
 	fi
-	@chmod +x $(ROOTFS_DIR)/hello $(ROOTFS_DIR)/lat_sig $(ROOTFS_DIR)/hello-glibc $(ROOTFS_DIR)/lat_sig-glibc $(ROOTFS_DIR)/lmbench_testcode.sh $(ROOTFS_DIR)/lmbench_glibc_testcode.sh 2>/dev/null || true
+	@if [ -f "$(ROOTFS_BIN_DIR)/iozone" ]; then \
+		{ \
+			printf '%s\n' '#!/bin/sh'; \
+			printf '%s\n' 'echo "#### OS COMP TEST GROUP START iozone-musl ####"'; \
+			printf '%s\n' 'echo iozone throughput write/read measurements'; \
+			printf '%s\n' '/bin/iozone -i 0 -i 1 -r 1k -s 1m 2>&1; echo "iozone exit: $$?"'; \
+			printf '%s\n' 'echo iozone throughput random-read measurements'; \
+			printf '%s\n' '/bin/iozone -i 0 -i 2 -r 1k -s 1m 2>&1'; \
+			printf '%s\n' 'echo iozone throughput read-backwards measurements'; \
+			printf '%s\n' '/bin/iozone -i 0 -i 3 -r 1k -s 1m 2>&1'; \
+			printf '%s\n' 'echo iozone throughput stride-read measurements'; \
+			printf '%s\n' '/bin/iozone -i 0 -i 5 -r 1k -s 1m 2>&1'; \
+			printf '%s\n' 'echo iozone throughput fwrite/fread measurements'; \
+			printf '%s\n' '/bin/iozone -i 6 -i 7 -r 1k -s 1m 2>&1'; \
+			printf '%s\n' 'echo iozone throughput pwrite/pread measurements'; \
+			printf '%s\n' '/bin/iozone -i 9 -i 10 -r 1k -s 1m 2>&1'; \
+			printf '%s\n' 'echo iozone throughtput pwritev/preadv measurements'; \
+			printf '%s\n' '/bin/iozone -i 11 -i 12 -r 1k -s 1m 2>&1'; \
+			printf '%s\n' 'echo "#### OS COMP TEST GROUP END iozone-musl ####"'; \
+		} > "$(ROOTFS_DIR)/iozone_testcode.sh"; \
+		sed \
+			-e 's|iozone-musl|iozone-glibc|g' \
+			-e 's|/bin/iozone |/bin/iozone-glibc |g' \
+			"$(ROOTFS_DIR)/iozone_testcode.sh" > "$(ROOTFS_DIR)/iozone_glibc_testcode.sh"; \
+	fi
+	@chmod +x $(ROOTFS_DIR)/hello $(ROOTFS_DIR)/lat_sig $(ROOTFS_DIR)/hello-glibc $(ROOTFS_DIR)/lat_sig-glibc $(ROOTFS_DIR)/lmbench_testcode.sh $(ROOTFS_DIR)/lmbench_glibc_testcode.sh $(ROOTFS_DIR)/iozone_testcode.sh $(ROOTFS_DIR)/iozone_glibc_testcode.sh 2>/dev/null || true
 	@cp -f tmp/debug_test.sh $(ROOTFS_DIR)/debug_test.sh 2>/dev/null || true
 	@cp -f tmp/run_all.sh $(ROOTFS_DIR)/run_all.sh 2>/dev/null || true
+	@cp -f tmp/contest.sh $(ROOTFS_DIR)/contest.sh 2>/dev/null || true
 	@cp -f tmp/basic_testcode.sh $(ROOTFS_DIR)/basic_testcode.sh 2>/dev/null || true
 	@cp -f tmp/init.sh $(ROOTFS_DIR)/etc/init.sh 2>/dev/null || true
 	@cp -f target/$(TARGET)/release/contest_runner $(ROOTFS_DIR)/contest_runner 2>/dev/null || true
@@ -310,6 +332,7 @@ kernel:
 	@echo Platform: $(BOARD)
 	@mkdir -p .cargo 2>/dev/null || true
 	@cp -f cargo_config/config.toml .cargo/config.toml 2>/dev/null || true
+	@cd user && make build TARGET=$(TARGET)
 	@cargo build --release --target $(TARGET)
 
 clean:
@@ -344,16 +367,18 @@ TEST_DISK ?= fs-img.img
 
 # Dual-disk mode (test disk bus 0, disk.img bus 1, for contest)
 QEMU_ARGS_DUAL := -drive file=$(TEST_DISK),if=none,format=raw,id=x0 \
-			-device $(VIRTIO_BLK_DEVICE),drive=x0$(if $(filter loongarch64,$(ARCH)),,bus=$(VIRTIO_BLK_BUS)) \
+			-device $(VIRTIO_BLK_DEVICE),drive=x0$(if $(filter loongarch64,$(ARCH)),,$(COMMA)bus=$(VIRTIO_BLK_BUS)) \
 			-drive file=disk.img,if=none,format=raw,id=x1 \
-			-device $(VIRTIO_BLK_DEVICE),drive=x1$(if $(filter loongarch64,$(ARCH)),,bus=$(VIRTIO_BLK_BUS))
+			-device $(VIRTIO_BLK_DEVICE),drive=x1$(if $(filter loongarch64,$(ARCH)),,$(COMMA)bus=$(VIRTIO_BLK_BUS2))
 
 # virtio-net network configuration (SLIRP user-mode, riscv64/aarch64)
+QEMU_NET_HOSTFWD ?= hostfwd=tcp::5555-:5001$(COMMA)hostfwd=tcp::5556-:5201
+QEMU_NETDEV_USER := user$(COMMA)id=net0$(if $(QEMU_NET_HOSTFWD),$(COMMA)$(QEMU_NET_HOSTFWD))
 ifeq ($(ARCH), riscv64)
-  QEMU_NET_ARGS := -netdev user,id=net0,hostfwd=tcp::5555-:5001,hostfwd=tcp::5556-:5201 \
+  QEMU_NET_ARGS := -netdev $(QEMU_NETDEV_USER) \
 			-device virtio-net-device,netdev=net0,bus=virtio-mmio-bus.2
 else ifeq ($(ARCH), aarch64)
-  QEMU_NET_ARGS := -netdev user,id=net0,hostfwd=tcp::5555-:5001,hostfwd=tcp::5556-:5201 \
+  QEMU_NET_ARGS := -netdev $(QEMU_NETDEV_USER) \
 			-device virtio-net-device,netdev=net0,bus=virtio-mmio-bus.2
 else
   QEMU_NET_ARGS :=
@@ -364,6 +389,17 @@ run-inner: build
 
 run-dual: build disk.img
 	@echo "Running with dual-disk: $(TEST_DISK) + disk.img"
+	$(QEMU_EXEC) $(QEMU_ARGS_DUAL) $(QEMU_NET_ARGS)
+
+run-dual-prebuilt:
+	@test -f $(if $(filter loongarch64,$(ARCH)),$(KERNEL_ELF),$(KERNEL_BIN)) || { \
+		echo "missing kernel image: $(if $(filter loongarch64,$(ARCH)),$(KERNEL_ELF),$(KERNEL_BIN))"; \
+		echo "run make build ARCH=$(ARCH) first"; \
+		exit 1; \
+	}
+	@test -f disk.img || { echo "missing root disk: disk.img"; exit 1; }
+	@test -f $(TEST_DISK) || { echo "missing test disk: $(TEST_DISK)"; exit 1; }
+	@echo "Running with prebuilt dual-disk: $(TEST_DISK) + disk.img"
 	$(QEMU_EXEC) $(QEMU_ARGS_DUAL) $(QEMU_NET_ARGS)
 
 debug: build
@@ -379,4 +415,4 @@ gdbserver: build
 gdbclient:
 	@gdb -ex 'file $(KERNEL_ELF)' -ex 'set arch riscv:rv64' -ex 'target remote localhost:1234'
 
-.PHONY: all kernel-rv kernel-la disk.img disk-rv.img disk-la.img build env kernel clean disasm disasm-vim run-inner run-dual fs-img gdbserver gdbclient
+.PHONY: all kernel-rv kernel-la disk.img disk-rv.img disk-la.img build env kernel clean disasm disasm-vim run-inner run-dual run-dual-prebuilt fs-img gdbserver gdbclient

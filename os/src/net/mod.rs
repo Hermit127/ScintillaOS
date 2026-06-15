@@ -233,13 +233,13 @@ pub fn net_poll() {
                 let clock = state.clock_ms;
                 let timestamp = smoltcp::time::Instant::from_millis(clock as i64);
                 let NetworkState {
-                ref mut iface,
-                ref mut device,
-                ref mut sockets,
-                ref mut dhcp_handle,
-                ref mut dhcp_logged,
-                ..
-            } = state;
+                    ref mut iface,
+                    ref mut device,
+                    ref mut sockets,
+                    ref mut dhcp_handle,
+                    ref mut dhcp_logged,
+                    ..
+                } = state;
                 iface.poll(timestamp, device, sockets);
 
                 if !*dhcp_logged && iface.ip_addrs().len() > 2 {
@@ -258,9 +258,7 @@ pub fn net_poll() {
 #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
 pub fn net_device_present() -> bool {
     let ptr = polyhal::PhysAddr::new(VIRTIO_NET_MMIO + VIRTIO_MMIO_DEVICE_ID).get_mut_ptr();
-    let device_id = unsafe {
-        core::ptr::read_volatile(ptr as *const u32)
-    };
+    let device_id = unsafe { core::ptr::read_volatile(ptr as *const u32) };
     device_id == VIRTIO_NET_DEVICE_ID
 }
 
@@ -295,12 +293,8 @@ pub fn with_net_iface_tcp_connect(
         let sock: &mut smoltcp::socket::tcp::Socket = state.sockets.get_mut(handle);
         let cx: &mut smoltcp::iface::Context = unsafe { core::mem::transmute(&mut state.iface) };
         match sock.connect(cx, remote, local) {
-            Ok(()) => {
-                0
-            }
-            Err(e) => {
-                -111
-            }
+            Ok(()) => 0,
+            Err(e) => -111,
         }
     } else {
         -1
@@ -365,6 +359,7 @@ pub fn wake_net_blocked_tasks() {
                         .unwrap_or(true)
                     }
                     Some(BlockReason::PollWait) => true,
+                    Some(BlockReason::PipeRead(_)) | Some(BlockReason::PipeWrite(_)) => false,
                     None => true, // block_reason cleared, should be woken
                 }
             };
@@ -378,8 +373,7 @@ pub fn wake_net_blocked_tasks() {
     if !to_wake.is_empty() {
     } else if orig_blocked > 0 {
     }
-    if !to_wake.is_empty() {
-    }
+    if !to_wake.is_empty() {}
     for task in &to_wake {
         add_task(task.clone());
     }

@@ -1,4 +1,4 @@
-use super::{current_task, SignalActions};
+use super::{current_task, SignalActions, UserFloatState};
 use super::{pid_alloc, PidHandle, SignalFlags};
 use crate::config::KERNEL_STACK_SIZE;
 use crate::fs::vfs::{Dentry, ROOT_DENTRY};
@@ -48,6 +48,7 @@ impl KernelStack {
 
 pub struct TaskControlBlockInner {
     pub trap_cx: TrapFrame,
+    pub fp_state: UserFloatState,
     pub base_size: usize,
     pub task_cx: KContext,
     pub task_status: TaskStatus,
@@ -61,6 +62,8 @@ pub struct TaskControlBlockInner {
     pub cwd: Arc<Dentry>,
     pub root: Arc<Dentry>,
     pub tid_ptr: usize,
+    pub pgid: usize,
+    pub sid: usize,
     pub uid: u32,
     pub euid: u32,
     pub gid: u32,
@@ -68,6 +71,7 @@ pub struct TaskControlBlockInner {
     pub umask: u32,
     pub signals: SignalFlags,
     pub signal_mask: SignalFlags,
+    pub signal_mask_backup: Option<SignalFlags>,
     // the signal which is being handling
     pub handling_sig: isize,
     // Signal actions
@@ -95,8 +99,6 @@ pub struct TaskControlBlockInner {
     pub alt_stack_flags: u32,
     pub in_syscall: bool,
     pub exit_signal: i32,
-    pub clone_vm: bool,
-    pub saved_signal_mask: SignalFlags,
 }
 
 impl TaskControlBlockInner {
@@ -116,7 +118,7 @@ impl TaskControlBlockInner {
         self.get_status() == TaskStatus::Zombie
     }
     pub fn alloc_fd(&mut self) -> usize {
-        const MAX_FD: usize = 256;
+        const MAX_FD: usize = 1024;
         let search_end = self.fd_table.len().min(MAX_FD);
         if let Some(fd) = (0..search_end).find(|fd| self.fd_table[*fd].is_none()) {
             self.fd_cloexec[fd] = false;
@@ -145,18 +147,24 @@ impl TaskControlBlockInner {
         self.fd_table.clear();
         self.fd_cloexec.clear();
     }
+
+    pub fn close_cloexec_fds(&mut self) {
+        let len = self.fd_table.len().min(self.fd_cloexec.len());
+        for fd in 0..len {
+            if self.fd_cloexec[fd] {
+                self.close_fd(fd);
+            }
+        }
+    }
 }
 
 fn task_entry() {
     trace!("os::task::task_entry");
-    let task = current_task()
-        .unwrap()
-        .inner
-        .exclusive_access()
-        .get_trap_cx() as *mut TrapFrame;
-    // run_user_task_forever(unsafe { task.as_mut().unwrap() })
-    let ctx_mut = unsafe { task.as_mut().unwrap() };
     loop {
+        let task = current_task().unwrap();
+        task.restore_user_float_state();
+        let trap_cx = task.inner.exclusive_access().get_trap_cx() as *mut TrapFrame;
+        let ctx_mut = unsafe { trap_cx.as_mut().unwrap() };
         run_user_task(ctx_mut);
     }
 }
@@ -191,96 +199,166 @@ impl TaskControlBlock {
             None => None,
         }
     }
+    pub fn save_user_float_state(&self) {
+        if let Some(mut inner) = self.try_inner_exclusive_access() {
+            inner.fp_state.save_current();
+        }
+    }
+    pub fn restore_user_float_state(&self) {
+        let fp_state = {
+            let inner = self.inner_exclusive_access();
+            inner.fp_state
+        };
+        fp_state.restore_current();
+    }
     pub fn new(elf_data: &[u8]) -> Self {
         trace!("os::task::TaskControlBlock::new");
         let LoadedElf {
             memory_set,
             user_sp,
             entry_point,
+            tls_base,
+            tls_size,
             ..
         } = MemorySet::from_elf(elf_data);
 
         let heap_bottom = user_sp;
         // alloc a pid and a kernel stack in kernel space
         let pid_handle = pid_alloc();
+        let pid_value = pid_handle.0;
         let kstack = KernelStack::new();
         let task_control_block = Self {
             pid: pid_handle,
             inner: unsafe {
-                UPSafeCell::new_named(TaskControlBlockInner {
-                    trap_cx: TrapFrame::new(),
-                    base_size: user_sp,
-                    task_cx: blank_kcontext(kstack.get_position().1), // Set task_cx's Kernel Stack Top
-                    task_status: TaskStatus::Ready,
-                    memory_set,
-                    parent: None,
-                    children: Vec::new(),
-                    exit_code: 0,
-                    fd_table: vec![
-                        // 0 -> stdin
-                        Some(Arc::new(Stdin)),
-                        // 1 -> stdout
-                        Some(Arc::new(Stdout)),
-                        // 2 -> stderr
-                        Some(Arc::new(Stdout)),
-                    ],
-                    fd_cloexec: vec![false, false, false],
-                    cwd: ROOT_DENTRY.clone(),
-                    root: ROOT_DENTRY.clone(),
-                    tid_ptr: 0,
-                    uid: 0,
-                    euid: 0,
-                    gid: 0,
-                    egid: 0,
-                    umask: 0o022,
-                    signals: SignalFlags::empty(),
-                    signal_mask: SignalFlags::empty(),
-                    handling_sig: -1,
-                    signal_actions: SignalActions::default(),
-                    killed: false,
-                    frozen: false,
-                    trap_ctx_backup: None,
-                    kernel_stack: kstack,
-                    // added
-                    heap_bottom,
-                    program_brk: heap_bottom,
-                    sleeping: None,
-                    utime: 0,
-                    stime: 0,
-                    cutime: 0,
-                    cstime: 0,
-                    last_time: polyhal::time::Time::now().to_nsec() as usize,
-                    block_reason: None,
-                    itimer_expire: 0,
-                    itimer_interval_us: 0,
-                    child_tid: 0,
-                    alt_stack: 0,
-                    alt_stack_size: 0,
-                    alt_stack_flags: 0,
-                    in_syscall: false,
-                    exit_signal: 0,
-                    clone_vm: false,
-                    saved_signal_mask: SignalFlags::empty(),
-                }, "TaskInner")
+                UPSafeCell::new_named(
+                    TaskControlBlockInner {
+                        trap_cx: TrapFrame::new(),
+                        fp_state: UserFloatState::new(),
+                        base_size: user_sp,
+                        task_cx: blank_kcontext(kstack.get_position().1), // Set task_cx's Kernel Stack Top
+                        task_status: TaskStatus::Ready,
+                        memory_set,
+                        parent: None,
+                        children: Vec::new(),
+                        exit_code: 0,
+                        fd_table: vec![
+                            // 0 -> stdin
+                            Some(Arc::new(Stdin)),
+                            // 1 -> stdout
+                            Some(Arc::new(Stdout)),
+                            // 2 -> stderr
+                            Some(Arc::new(Stdout)),
+                        ],
+                        fd_cloexec: vec![false, false, false],
+                        cwd: ROOT_DENTRY.clone(),
+                        root: ROOT_DENTRY.clone(),
+                        tid_ptr: 0,
+                        pgid: pid_value,
+                        sid: pid_value,
+                        uid: 0,
+                        euid: 0,
+                        gid: 0,
+                        egid: 0,
+                        umask: 0o022,
+                        signals: SignalFlags::empty(),
+                        signal_mask: SignalFlags::empty(),
+                        signal_mask_backup: None,
+                        handling_sig: -1,
+                        signal_actions: SignalActions::default(),
+                        killed: false,
+                        frozen: false,
+                        trap_ctx_backup: None,
+                        kernel_stack: kstack,
+                        // added
+                        heap_bottom,
+                        program_brk: heap_bottom,
+                        sleeping: None,
+                        utime: 0,
+                        stime: 0,
+                        cutime: 0,
+                        cstime: 0,
+                        last_time: polyhal::time::Time::now().to_nsec() as usize,
+                        block_reason: None,
+                        itimer_expire: 0,
+                        itimer_interval_us: 0,
+                        child_tid: 0,
+                        alt_stack: 0,
+                        alt_stack_size: 0,
+                        alt_stack_flags: 0,
+                        in_syscall: false,
+                        exit_signal: 0,
+                    },
+                    "TaskInner",
+                )
             },
         };
         // prepare TrapContext in user space
+        let tp_val = {
+            let mut inner = task_control_block.inner_exclusive_access();
+            inner.trap_cx[TrapFrameArgs::SEPC] = entry_point;
+            inner.trap_cx[TrapFrameArgs::SP] = user_sp;
+            inner.trap_cx[TrapFrameArgs::ARG0] = 0;
+            inner.trap_cx[TrapFrameArgs::ARG1] = 0;
+            inner.trap_cx[TrapFrameArgs::ARG2] = 0;
+            if tls_size > 0 {
+                tls_base + tls_size
+            } else {
+                let max_va: usize = inner.memory_set.max_end_vaddr().into();
+                let tls_va = (max_va + crate::config::PAGE_SIZE - 1) / crate::config::PAGE_SIZE
+                    * crate::config::PAGE_SIZE;
+                let ok = inner.memory_set.insert_framed_area(
+                    tls_va.into(),
+                    (tls_va + crate::config::PAGE_SIZE).into(),
+                    crate::mm::MapPermission::R
+                        | crate::mm::MapPermission::W
+                        | crate::mm::MapPermission::U,
+                );
+                if ok {
+                    tls_va + crate::config::PAGE_SIZE
+                } else {
+                    0
+                }
+            }
+        };
         let trap_cx = task_control_block.inner_exclusive_access().get_trap_cx();
-        trap_cx[TrapFrameArgs::SEPC] = entry_point;
-        trap_cx[TrapFrameArgs::SP] = user_sp;
+        trap_cx[TrapFrameArgs::TLS] = tp_val;
         task_control_block
     }
     pub fn exec(&self, elf_data: &[u8], args: Vec<String>, envs: Vec<String>) {
-        trace!("os::task::TaskControlBlock::exec");
-        let LoadedElf {
-            memory_set,
-            user_sp: stack_top,
-            entry_point,
-            ph_addr,
-            ph_entsize,
-            ph_num,
-        } = MemorySet::from_elf(elf_data);
-        let heap_bottom = stack_top;
+        self.exec_with_interp(elf_data, None, args, envs);
+    }
+
+    pub fn exec_with_interp(
+        &self,
+        elf_data: &[u8],
+        interp_data: Option<&[u8]>,
+        args: Vec<String>,
+        envs: Vec<String>,
+    ) {
+        trace!("os::task::TaskControlBlock::exec_with_interp");
+        const INTERP_BASE: usize = 0x10_0000_0000;
+
+        let mut loaded = MemorySet::from_elf(elf_data);
+        let mut entry_point = loaded.entry_point;
+        let program_entry = loaded.program_entry;
+        let program_break = loaded.program_break;
+
+        // Load dynamic linker/interpreter at a fixed high address
+        if let Some(id) = interp_data {
+            let (interp_entry, interp_base) =
+                MemorySet::load_interp_elf(&mut loaded.memory_set, id, INTERP_BASE);
+            entry_point = interp_entry;
+            loaded.interp_base = interp_base;
+        }
+        let stack_top = loaded.user_sp;
+        let heap_bottom = program_break;
+        let ph_addr = loaded.ph_addr;
+        let ph_entsize = loaded.ph_entsize;
+        let ph_num = loaded.ph_num;
+        let tls_base = loaded.tls_base;
+        let tls_size = loaded.tls_size;
+        let interp_base = loaded.interp_base;
+        let memory_set = loaded.memory_set;
 
         memory_set.activate();
         let token = memory_set.token();
@@ -304,7 +382,7 @@ impl TaskControlBlock {
         const AT_RANDOM: u64 = 25;
         const AT_HWCAP: u64 = 16;
         const AT_PLATFORM: u64 = 15;
-        const AUXV_COUNT: usize = 17;
+        const AUXV_COUNT: usize = 18;
 
         // Stack layout (high to low):
         //   [platform str] [env strings] [arg strings] [16-align] [random 16B]
@@ -383,8 +461,8 @@ impl TaskControlBlock {
         auxv_write!(AT_PHENT, ph_entsize as u64);
         auxv_write!(AT_PHNUM, ph_num as u64);
         auxv_write!(AT_PAGESZ, crate::config::PAGE_SIZE as u64);
-        auxv_write!(AT_ENTRY, entry_point as u64);
-        auxv_write!(AT_BASE, 0u64);
+        auxv_write!(AT_ENTRY, program_entry as u64);
+        auxv_write!(AT_BASE, interp_base as u64);
         auxv_write!(AT_FLAGS, 0u64);
         auxv_write!(AT_UID, 0u64);
         auxv_write!(AT_EUID, 0u64);
@@ -395,6 +473,9 @@ impl TaskControlBlock {
         auxv_write!(AT_HWCAP, 0u64);
         auxv_write!(AT_PLATFORM, platform_addr as u64);
         auxv_write!(AT_RANDOM, random_addr as u64);
+        // AT_EXECFN normally points at argv[0]. Some internal runners are
+        // launched with argc=0, so keep auxv construction tolerant of that.
+        auxv_write!(31, string_addrs.first().copied().unwrap_or(platform_addr) as u64);
         auxv_write!(AT_NULL, 0u64);
 
         // Step 5: envp NULL and pointers
@@ -423,29 +504,42 @@ impl TaskControlBlock {
         let crt_sp = sp;
 
         let mut inner = self.inner_exclusive_access();
+        inner.close_cloexec_fds();
         inner.memory_set = memory_set;
         inner.heap_bottom = heap_bottom;
         inner.program_brk = heap_bottom;
+        inner.fp_state = UserFloatState::new();
         inner.trap_cx = TrapFrame::new();
 
         let mut trap_cx = TrapFrame::new();
         trap_cx[TrapFrameArgs::SEPC] = entry_point;
         trap_cx[TrapFrameArgs::SP] = crt_sp;
-        trap_cx[TrapFrameArgs::ARG0] = 0; // a0 = 0: argc on stack only, so rtld_fini=NULL for glibc
+        trap_cx[TrapFrameArgs::ARG0] = argc;
         trap_cx[TrapFrameArgs::ARG1] = argv_base;
+        trap_cx[TrapFrameArgs::ARG2] = envp_base;
+        if tls_size > 0 {
+            trap_cx[TrapFrameArgs::TLS] = tls_base + tls_size;
+        } else {
+            let max_va: usize = inner.memory_set.max_end_vaddr().into();
+            let tls_va = (max_va + crate::config::PAGE_SIZE - 1) / crate::config::PAGE_SIZE
+                * crate::config::PAGE_SIZE;
+            let ok = inner.memory_set.insert_framed_area(
+                tls_va.into(),
+                (tls_va + crate::config::PAGE_SIZE).into(),
+                crate::mm::MapPermission::R
+                    | crate::mm::MapPermission::W
+                    | crate::mm::MapPermission::U,
+            );
+            if ok {
+                trap_cx[TrapFrameArgs::TLS] = tls_va + crate::config::PAGE_SIZE;
+            }
+        }
         *inner.get_trap_cx() = trap_cx;
     }
-    pub fn fork_with_flags(self: &Arc<TaskControlBlock>, flags: usize) -> Option<Arc<TaskControlBlock>> {
-        const CLONE_VM: usize = 0x100;
-        const CLONE_FILES: usize = 0x400;
-        const CLONE_SIGHAND: usize = 0x800;
-        const CLONE_THREAD: usize = 0x10000;
-
-        trace!("os::task::TaskControlBlock::fork_with_flags");
-        let memory_set = if flags & CLONE_VM != 0 {
-            let parent_inner = self.inner_exclusive_access();
-            MemorySet::clone_shared(&parent_inner.memory_set)
-        } else {
+    pub fn fork(self: &Arc<TaskControlBlock>) -> Option<Arc<TaskControlBlock>> {
+        trace!("os::task::TaskControlBlock::fork");
+        // Copy the user address space before collecting the remaining task state.
+        let memory_set = {
             let parent_inner = self.inner_exclusive_access();
             MemorySet::from_existed_user(&parent_inner.memory_set)?
         };
@@ -458,6 +552,8 @@ impl TaskControlBlock {
             cwd,
             root,
             tid_ptr,
+            pgid,
+            sid,
             uid,
             euid,
             gid,
@@ -467,50 +563,38 @@ impl TaskControlBlock {
             signal_actions,
             heap_bottom,
             program_brk,
+            fp_state,
         ) = {
             let parent_inner = self.inner_exclusive_access();
             (
                 parent_inner.trap_cx.clone(),
                 parent_inner.base_size,
-                if flags & CLONE_FILES != 0 {
-                    parent_inner.fd_table.clone()
-                } else {
-                    parent_inner
-                        .fd_table
-                        .iter()
-                        .map(|f| {
-                            f.as_ref().map(|x| {
-                                x.dup_ref();
-                                x.clone()
-                            })
+                parent_inner
+                    .fd_table
+                    .iter()
+                    .map(|f| {
+                        f.as_ref().map(|x| {
+                            x.dup_ref();
+                            x.clone()
                         })
-                        .collect::<Vec<_>>()
-                },
-                if flags & CLONE_FILES != 0 {
-                    parent_inner.fd_cloexec.clone()
-                } else {
-                    parent_inner.fd_cloexec.clone()
-                },
+                    })
+                    .collect::<Vec<_>>(),
+                parent_inner.fd_cloexec.clone(),
                 parent_inner.cwd.clone(),
                 parent_inner.root.clone(),
                 parent_inner.tid_ptr,
+                parent_inner.pgid,
+                parent_inner.sid,
                 parent_inner.uid,
                 parent_inner.euid,
                 parent_inner.gid,
                 parent_inner.egid,
                 parent_inner.umask,
-                if flags & CLONE_THREAD != 0 {
-                    parent_inner.signal_mask
-                } else {
-                    parent_inner.signal_mask
-                },
-                if flags & CLONE_SIGHAND != 0 {
-                    parent_inner.signal_actions.clone()
-                } else {
-                    parent_inner.signal_actions.clone()
-                },
+                parent_inner.signal_mask,
+                parent_inner.signal_actions.clone(),
                 parent_inner.heap_bottom,
                 parent_inner.program_brk,
+                parent_inner.fp_state,
             )
         };
 
@@ -519,53 +603,58 @@ impl TaskControlBlock {
         let task_control_block = Arc::new(TaskControlBlock {
             pid: pid_handle,
             inner: unsafe {
-                UPSafeCell::new_named(TaskControlBlockInner {
-                    trap_cx: trap_cx_clone,
-                    base_size,
-                    task_cx: blank_kcontext(kstack.get_position().1), // Set task_cx's Kernel Stack Top
-                    task_status: TaskStatus::Ready,
-                    memory_set,
-                    parent: Some(Arc::downgrade(self)),
-                    children: Vec::new(),
-                    exit_code: 0,
-                    fd_table,
-                    fd_cloexec,
-                    cwd,
-                    root,
-                    tid_ptr,
-                    uid,
-                    euid,
-                    gid,
-                    egid,
-                    umask,
-                    signals: SignalFlags::empty(),
-                    signal_mask,
-                    handling_sig: -1,
-                    signal_actions,
-                    killed: false,
-                    frozen: false,
-                    trap_ctx_backup: None,
-                    kernel_stack: kstack,
-                    heap_bottom,
-                    program_brk,
-                    sleeping: None,
-                    utime: 0,
-                    stime: 0,
-                    cutime: 0,
-                    cstime: 0,
-                    last_time: polyhal::time::Time::now().to_nsec() as usize,
-                    block_reason: None,
-                    itimer_expire: 0,
-                    itimer_interval_us: 0,
-                    child_tid: 0,
-                    alt_stack: 0,
-                    alt_stack_size: 0,
-                    alt_stack_flags: 0,
-                    in_syscall: false,
-                    exit_signal: 0,
-                    clone_vm: flags & CLONE_VM != 0 || flags & CLONE_THREAD != 0,
-                    saved_signal_mask: SignalFlags::empty(),
-                }, "TaskInner")
+                UPSafeCell::new_named(
+                    TaskControlBlockInner {
+                        trap_cx: trap_cx_clone,
+                        fp_state,
+                        base_size,
+                        task_cx: blank_kcontext(kstack.get_position().1), // Set task_cx's Kernel Stack Top
+                        task_status: TaskStatus::Ready,
+                        memory_set,
+                        parent: Some(Arc::downgrade(self)),
+                        children: Vec::new(),
+                        exit_code: 0,
+                        fd_table,
+                        fd_cloexec,
+                        cwd,
+                        root,
+                        tid_ptr,
+                        pgid,
+                        sid,
+                        uid,
+                        euid,
+                        gid,
+                        egid,
+                        umask,
+                        signals: SignalFlags::empty(),
+                        signal_mask,
+                        signal_mask_backup: None,
+                        handling_sig: -1,
+                        signal_actions,
+                        killed: false,
+                        frozen: false,
+                        trap_ctx_backup: None,
+                        kernel_stack: kstack,
+                        heap_bottom,
+                        program_brk,
+                        sleeping: None,
+                        utime: 0,
+                        stime: 0,
+                        cutime: 0,
+                        cstime: 0,
+                        last_time: polyhal::time::Time::now().to_nsec() as usize,
+                        block_reason: None,
+                        itimer_expire: 0,
+                        itimer_interval_us: 0,
+                        child_tid: 0,
+                        alt_stack: 0,
+                        alt_stack_size: 0,
+                        alt_stack_flags: 0,
+                        in_syscall: false,
+                        exit_signal: 0,
+                    },
+                    "TaskInner",
+                )
             },
         });
         // add child to parent's children list
@@ -574,9 +663,6 @@ impl TaskControlBlock {
             parent_inner.children.push(task_control_block.clone());
         }
         Some(task_control_block)
-    }
-    pub fn fork(self: &Arc<TaskControlBlock>) -> Option<Arc<TaskControlBlock>> {
-        self.fork_with_flags(0)
     }
     pub fn getpid(&self) -> usize {
         self.pid.0
@@ -621,11 +707,14 @@ pub enum BlockReason {
     TcpConnect(usize),
     UdpRecv(usize),
     PollWait,
+    PipeRead(usize),
+    PipeWrite(usize),
 }
 
 #[derive(Copy, Clone, PartialEq)]
 pub enum TaskStatus {
     Ready,
     Running,
+    Blocked,
     Zombie,
 }

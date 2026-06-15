@@ -1,9 +1,13 @@
 use super::{File, Kstat, S_IFIFO};
 use crate::sync::UPSafeCell;
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
+use alloc::vec;
+use alloc::vec::Vec;
 
-use crate::task::{current_task, suspend_current_and_run_next, wake_poll_wait_tasks};
-use crate::task::has_pending_signals;
+use crate::task::{
+    block_current_and_run_next, current_task, wake_pipe_read_tasks, wake_pipe_write_tasks,
+    wake_poll_wait_tasks, BlockReason,
+};
 
 use crate::fs::stdio::stdout_release_if_owner;
 
@@ -17,29 +21,29 @@ pub struct Pipe {
     readable: bool,
     writable: bool,
     buffer: Arc<UPSafeCell<PipeRingBuffer>>,
-    is_nonblock: bool,
 }
 
 impl Pipe {
-    pub fn read_end_with_buffer(buffer: Arc<UPSafeCell<PipeRingBuffer>>, is_nonblock: bool) -> Self {
+    pub fn read_end_with_buffer(buffer: Arc<UPSafeCell<PipeRingBuffer>>) -> Self {
         Self {
             readable: true,
             writable: false,
             buffer,
-            is_nonblock,
         }
     }
-    pub fn write_end_with_buffer(buffer: Arc<UPSafeCell<PipeRingBuffer>>, is_nonblock: bool) -> Self {
+    pub fn write_end_with_buffer(buffer: Arc<UPSafeCell<PipeRingBuffer>>) -> Self {
         Self {
             readable: false,
             writable: true,
             buffer,
-            is_nonblock,
         }
+    }
+    fn wait_key(&self) -> usize {
+        Arc::as_ptr(&self.buffer) as usize
     }
 }
 
-const RING_BUFFER_SIZE: usize = 4096;
+const RING_BUFFER_SIZE: usize = 8192;
 
 #[derive(Copy, Clone, PartialEq)]
 enum RingBufferStatus {
@@ -49,51 +53,64 @@ enum RingBufferStatus {
 }
 
 pub struct PipeRingBuffer {
-    arr: [u8; RING_BUFFER_SIZE],
+    arr: Vec<u8>,
     head: usize,
     tail: usize,
     status: RingBufferStatus,
     read_open: usize,
     write_open: usize,
-    write_end: Option<Weak<Pipe>>,
-    read_end: Option<Weak<Pipe>>,
 }
 
 impl PipeRingBuffer {
     pub fn new() -> Self {
         Self {
-            arr: [0; RING_BUFFER_SIZE],
+            arr: vec![0; RING_BUFFER_SIZE],
             head: 0,
             tail: 0,
             status: RingBufferStatus::Empty,
             read_open: 1,
             write_open: 1,
-            write_end: None,
-            read_end: None,
         }
     }
-    pub fn set_write_end(&mut self, write_end: &Arc<Pipe>) {
-        self.write_end = Some(Arc::downgrade(write_end));
-    }
-    pub fn set_read_end(&mut self, read_end: &Arc<Pipe>) {
-        self.read_end = Some(Arc::downgrade(read_end));
-    }
-    pub fn write_byte(&mut self, byte: u8) {
-        self.status = RingBufferStatus::Normal;
-        self.arr[self.tail] = byte;
-        self.tail = (self.tail + 1) % RING_BUFFER_SIZE;
-        if self.tail == self.head {
-            self.status = RingBufferStatus::Full;
+    pub fn write_buf(&mut self, src: &[u8]) -> usize {
+        let count = src.len().min(self.available_write());
+        if count == 0 {
+            return 0;
         }
-    }
-    pub fn read_byte(&mut self) -> u8 {
-        self.status = RingBufferStatus::Normal;
-        let c = self.arr[self.head];
-        self.head = (self.head + 1) % RING_BUFFER_SIZE;
-        if self.head == self.tail {
-            self.status = RingBufferStatus::Empty;
+        let first = count.min(RING_BUFFER_SIZE - self.tail);
+        self.arr[self.tail..self.tail + first].copy_from_slice(&src[..first]);
+        self.tail = (self.tail + first) % RING_BUFFER_SIZE;
+        if count > first {
+            let second = count - first;
+            self.arr[..second].copy_from_slice(&src[first..count]);
+            self.tail = second;
         }
-        c
+        self.status = if self.tail == self.head {
+            RingBufferStatus::Full
+        } else {
+            RingBufferStatus::Normal
+        };
+        count
+    }
+    pub fn read_buf(&mut self, dst: &mut [u8]) -> usize {
+        let count = dst.len().min(self.available_read());
+        if count == 0 {
+            return 0;
+        }
+        let first = count.min(RING_BUFFER_SIZE - self.head);
+        dst[..first].copy_from_slice(&self.arr[self.head..self.head + first]);
+        self.head = (self.head + first) % RING_BUFFER_SIZE;
+        if count > first {
+            let second = count - first;
+            dst[first..count].copy_from_slice(&self.arr[..second]);
+            self.head = second;
+        }
+        self.status = if self.head == self.tail {
+            RingBufferStatus::Empty
+        } else {
+            RingBufferStatus::Normal
+        };
+        count
     }
     pub fn available_read(&self) -> usize {
         if self.status == RingBufferStatus::Empty {
@@ -112,10 +129,10 @@ impl PipeRingBuffer {
         }
     }
     pub fn all_write_ends_closed(&self) -> bool {
-        self.write_end.as_ref().map_or(true, |w| w.upgrade().is_none()) && self.write_open == 0
+        self.write_open == 0
     }
     pub fn all_read_ends_closed(&self) -> bool {
-        self.read_end.as_ref().map_or(true, |r| r.upgrade().is_none()) && self.read_open == 0
+        self.read_open == 0
     }
     pub fn add_read_end(&mut self) {
         self.read_open += 1;
@@ -123,27 +140,26 @@ impl PipeRingBuffer {
     pub fn add_write_end(&mut self) {
         self.write_open += 1;
     }
-    pub fn close_read_end(&mut self) {
+    pub fn close_read_end(&mut self) -> bool {
         if self.read_open > 0 {
             self.read_open -= 1;
         }
+        self.read_open == 0
     }
-    pub fn close_write_end(&mut self) {
+    pub fn close_write_end(&mut self) -> bool {
         if self.write_open > 0 {
             self.write_open -= 1;
         }
+        self.write_open == 0
     }
 }
 
 /// Return (read_end, write_end)
-pub fn make_pipe(flags: usize) -> (Arc<Pipe>, Arc<Pipe>) {
-    const O_NONBLOCK: usize = 0x800;
-    let is_nonblock = (flags & O_NONBLOCK) != 0;
-    let buffer = Arc::new(unsafe { UPSafeCell::new_named(PipeRingBuffer::new(), "PipeRingBuffer") });
-    let read_end = Arc::new(Pipe::read_end_with_buffer(buffer.clone(), is_nonblock));
-    let write_end = Arc::new(Pipe::write_end_with_buffer(buffer.clone(), is_nonblock));
-    buffer.exclusive_access().set_write_end(&write_end);
-    buffer.exclusive_access().set_read_end(&read_end);
+pub fn make_pipe() -> (Arc<Pipe>, Arc<Pipe>) {
+    let buffer =
+        Arc::new(unsafe { UPSafeCell::new_named(PipeRingBuffer::new(), "PipeRingBuffer") });
+    let read_end = Arc::new(Pipe::read_end_with_buffer(buffer.clone()));
+    let write_end = Arc::new(Pipe::write_end_with_buffer(buffer.clone()));
     (read_end, write_end)
 }
 
@@ -160,7 +176,6 @@ impl File for Pipe {
         if want_to_read == 0 {
             return 0;
         }
-        let mut buf_iter = buf.into_iter();
         let mut already_read = 0usize;
         loop {
             if current_task_killed() {
@@ -173,108 +188,65 @@ impl File for Pipe {
                 (n, closed)
             };
             if loop_read == 0 {
-                if write_end_closed {
-                    return already_read as isize;
-                }
                 if already_read > 0 {
                     return already_read as isize;
                 }
-                if self.is_nonblock {
-                    return -11;
-                }
-                if has_pending_signals() {
+                if write_end_closed {
                     return already_read as isize;
                 }
                 stdout_release_if_owner();
-                suspend_current_and_run_next();
+                block_current_and_run_next(BlockReason::PipeRead(self.wait_key()));
                 continue;
             }
             let mut ring_buffer = self.buffer.exclusive_access();
-            let mut made_progress = false;
-            for _ in 0..loop_read {
-                if let Some(byte_ref) = buf_iter.next() {
-                    *byte_ref = ring_buffer.read_byte();
-                    already_read += 1;
-                    made_progress = true;
-                    if already_read == want_to_read {
-                        drop(ring_buffer);
-                        wake_poll_wait_tasks();
-                        return want_to_read as isize;
-                    }
-                } else {
-                    drop(ring_buffer);
-                    if made_progress {
-                        wake_poll_wait_tasks();
-                    }
-                    return already_read as isize;
-                }
-            }
+            let n = ring_buffer.read_buf(&mut buf[already_read..want_to_read]);
+            already_read += n;
             drop(ring_buffer);
-            if made_progress {
+            if n > 0 {
+                wake_pipe_write_tasks(self.wait_key());
                 wake_poll_wait_tasks();
+            }
+            if already_read == want_to_read || already_read > 0 {
+                return already_read as isize;
             }
         }
     }
     fn write(&self, buf: &mut [u8]) -> isize {
         assert!(self.writable());
-        let mut already_write = 0usize;
-        // Check if read end is closed → EPIPE
-        if self.buffer.exclusive_access().all_read_ends_closed() {
-            return -32;
-        }
         let want_to_write = buf.len();
         if want_to_write == 0 {
             return 0;
         }
-        let mut buf_iter = buf.into_iter();
+        let mut already_write = 0usize;
         loop {
             if current_task_killed() {
                 return -4;
             }
             let (loop_write, read_end_closed) = {
                 let ring_buffer = self.buffer.exclusive_access();
-                (ring_buffer.available_write(), ring_buffer.all_read_ends_closed())
+                (
+                    ring_buffer.available_write(),
+                    ring_buffer.all_read_ends_closed(),
+                )
             };
             if read_end_closed {
                 return -32;
             }
             if loop_write == 0 {
-                if self.is_nonblock && already_write == 0 {
-                    return -11;
-                }
-                if already_write > 0 {
-                    return already_write as isize;
-                }
-                if has_pending_signals() {
-                    return -4;
-                }
                 stdout_release_if_owner();
-                suspend_current_and_run_next();
+                block_current_and_run_next(BlockReason::PipeWrite(self.wait_key()));
                 continue;
             }
             let mut ring_buffer = self.buffer.exclusive_access();
-            let mut made_progress = false;
-            for _ in 0..loop_write {
-                if let Some(byte_ref) = buf_iter.next() {
-                    ring_buffer.write_byte(*byte_ref);
-                    already_write += 1;
-                    made_progress = true;
-                    if already_write == want_to_write {
-                        drop(ring_buffer);
-                        wake_poll_wait_tasks();
-                        return want_to_write as isize;
-                    }
-                } else {
-                    drop(ring_buffer);
-                    if made_progress {
-                        wake_poll_wait_tasks();
-                    }
-                    return already_write as isize;
-                }
-            }
+            let n = ring_buffer.write_buf(&buf[already_write..want_to_write]);
+            already_write += n;
             drop(ring_buffer);
-            if made_progress {
+            if n > 0 {
+                wake_pipe_read_tasks(self.wait_key());
                 wake_poll_wait_tasks();
+            }
+            if already_write == want_to_write {
+                return want_to_write as isize;
             }
         }
     }
@@ -304,17 +276,23 @@ impl File for Pipe {
     }
     fn close_ref(&self) {
         let mut ring_buffer = self.buffer.exclusive_access();
-        let mut changed = false;
+        let mut last_read_closed = false;
+        let mut last_write_closed = false;
         if self.readable {
-            ring_buffer.close_read_end();
-            changed = true;
+            last_read_closed = ring_buffer.close_read_end();
         }
         if self.writable {
-            ring_buffer.close_write_end();
-            changed = true;
+            last_write_closed = ring_buffer.close_write_end();
         }
         drop(ring_buffer);
-        if changed {
+        if last_read_closed || last_write_closed {
+            let key = self.wait_key();
+            if last_read_closed {
+                wake_pipe_write_tasks(key);
+            }
+            if last_write_closed {
+                wake_pipe_read_tasks(key);
+            }
             wake_poll_wait_tasks();
         }
     }

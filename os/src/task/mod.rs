@@ -1,4 +1,5 @@
 mod action;
+mod fp;
 mod manager;
 mod pid;
 mod processor;
@@ -6,9 +7,6 @@ mod signal;
 #[allow(clippy::module_inception)]
 mod task;
 
-use crate::fs::{open_file, OpenFlags};
-use crate::mm::translated_refmut;
-use crate::mm::translated_byte_buffer;
 use crate::sync::UPSafeCell;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -20,14 +18,19 @@ use polyhal::instruction::shutdown;
 use polyhal::kcontext::KContext;
 use polyhal_trap::trapframe::TrapFrameArgs;
 
+pub const SIGNAL_RETURN_TRAMPOLINE: usize = 0x7ffeff000;
+
 pub use action::{SignalAction, SignalActions};
+pub use fp::UserFloatState;
 pub use manager::{add_priority_task, add_task, pid2task, ready_queue_len, PID2TCB};
 pub use pid::{pid_alloc, PidHandle};
 pub use processor::{
     current_task, current_user_token, init_kernel_page, run_tasks, schedule, take_current_task,
 };
 pub use signal::{SignalFlags, MAX_SIG};
-pub use task::{BlockReason, KernelStack, TaskControlBlock, TaskControlBlockInner, TaskStatus, blank_kcontext};
+pub use task::{
+    blank_kcontext, BlockReason, KernelStack, TaskControlBlock, TaskControlBlockInner, TaskStatus,
+};
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -49,46 +52,9 @@ lazy_static! {
     pub static ref NET_BLOCK_QUEUE: UPSafeCell<Vec<Arc<TaskControlBlock>>> = unsafe {
         UPSafeCell::new_named(Vec::new(), "NetBlockQueue")
     };
-    pub static ref WAITPID_QUEUE: UPSafeCell<Vec<Arc<TaskControlBlock>>> = unsafe {
+pub static ref WAITPID_QUEUE: UPSafeCell<Vec<Arc<TaskControlBlock>>> = unsafe {
         UPSafeCell::new_named(Vec::new(), "WaitpidQueue")
     };
-    pub static ref FUTEX_QUEUE: UPSafeCell<Vec<(usize, Arc<TaskControlBlock>)>> = unsafe {
-        UPSafeCell::new_named(Vec::new(), "FutexQueue")
-    };
-}
-
-pub fn wake_futex(addr: usize, count: usize) {
-    let mut queue = FUTEX_QUEUE.exclusive_access();
-    let mut woken = 0;
-    let mut remaining = Vec::new();
-    for (a, task) in queue.drain(..) {
-        if woken < count && a == addr {
-            let mut inner = task.inner_exclusive_access();
-            inner.task_status = TaskStatus::Ready;
-            drop(inner);
-            add_task(task);
-            woken += 1;
-        } else {
-            remaining.push((a, task));
-        }
-    }
-    *queue = remaining;
-}
-
-pub fn wake_futex_for_task(target: &Arc<TaskControlBlock>) {
-    let mut queue = FUTEX_QUEUE.exclusive_access();
-    let mut remaining = Vec::new();
-    for (a, task) in queue.drain(..) {
-        if Arc::ptr_eq(&task, target) {
-            let mut inner = task.inner_exclusive_access();
-            inner.task_status = TaskStatus::Ready;
-            drop(inner);
-            add_task(task);
-        } else {
-            remaining.push((a, task));
-        }
-    }
-    *queue = remaining;
 }
 
 pub fn suspend_current_and_run_next() {
@@ -98,7 +64,6 @@ pub fn suspend_current_and_run_next() {
 
     //added for kernel time accounting
     task.record_time_suspend();
-
     // ---- access current TCB exclusively
     let mut task_inner = task.inner_exclusive_access();
     let task_cx_ptr = &mut task_inner.task_cx as *mut KContext;
@@ -122,6 +87,7 @@ pub fn sleep_current_and_run_next() {
     let task = current_task().unwrap();
     task.record_time_suspend();
     let mut task_inner = task.inner_exclusive_access();
+    task_inner.task_status = TaskStatus::Blocked;
     let task_cx_ptr = &mut task_inner.task_cx as *mut KContext;
     drop(task_inner);
     take_current_task();
@@ -133,13 +99,18 @@ pub fn block_current_and_run_next(block_reason: BlockReason) {
     static mut C: u64 = 0;
     crate::fs::stdio::stdout_release_if_owner();
     let task = current_task().unwrap();
+    let pid = task.getpid();
     task.record_time_suspend();
     let mut task_inner = task.inner_exclusive_access();
     task_inner.block_reason = Some(block_reason);
+    task_inner.task_status = TaskStatus::Blocked;
     let task_cx_ptr = &mut task_inner.task_cx as *mut KContext;
     drop(task_inner);
     take_current_task();
-    NET_BLOCK_QUEUE.exclusive_access().push(task.clone());
+    let mut queue = NET_BLOCK_QUEUE.exclusive_access();
+    queue.retain(|queued| queued.getpid() != pid);
+    queue.push(task.clone());
+    drop(queue);
     schedule(task_cx_ptr);
     task.record_time_resume();
 }
@@ -170,6 +141,143 @@ pub fn wake_poll_wait_tasks() {
     }
 }
 
+pub fn wake_pipe_read_tasks(pipe_id: usize) {
+    wake_pipe_tasks(pipe_id, true);
+}
+
+pub fn wake_pipe_write_tasks(pipe_id: usize) {
+    wake_pipe_tasks(pipe_id, false);
+}
+
+fn wake_pipe_tasks(pipe_id: usize, read_waiters: bool) {
+    let mut to_wake = Vec::new();
+    {
+        let mut queue = NET_BLOCK_QUEUE.exclusive_access();
+        let mut i = 0;
+        while i < queue.len() {
+            let should_wake = {
+                let inner = queue[i].inner_exclusive_access();
+                match inner.block_reason {
+                    Some(BlockReason::PipeRead(id)) => read_waiters && id == pipe_id,
+                    Some(BlockReason::PipeWrite(id)) => !read_waiters && id == pipe_id,
+                    _ => false,
+                }
+            };
+            if should_wake {
+                to_wake.push(queue.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+    }
+    for task in to_wake {
+        let mut inner = task.inner_exclusive_access();
+        inner.task_status = TaskStatus::Ready;
+        inner.block_reason = None;
+        drop(inner);
+        add_priority_task(task);
+    }
+}
+
+pub fn wake_blocked_task(task: &Arc<TaskControlBlock>) {
+    let pid = task.getpid();
+    let removed = remove_task_from_block_queues(pid);
+    let mut inner = task.inner_exclusive_access();
+    let should_wake = inner.task_status == TaskStatus::Blocked || removed;
+    if should_wake && inner.task_status != TaskStatus::Zombie {
+        inner.task_status = TaskStatus::Ready;
+        inner.block_reason = None;
+        drop(inner);
+        add_priority_task(task.clone());
+    }
+}
+
+fn notify_parent_sigchld(parent: &Arc<TaskControlBlock>) {
+    let should_wake = {
+        let mut inner = parent.inner_exclusive_access();
+        if inner.signal_mask.contains(SignalFlags::SIGCHLD) {
+            inner.signals.insert(SignalFlags::SIGCHLD);
+            true
+        } else {
+            false
+        }
+    };
+    if should_wake {
+        wake_blocked_task(parent);
+    }
+}
+
+fn remove_task_from_block_queues(pid: usize) -> bool {
+    let mut removed = false;
+    {
+        let mut queue = NET_BLOCK_QUEUE.exclusive_access();
+        let old_len = queue.len();
+        queue.retain(|t| t.getpid() != pid);
+        if queue.len() != old_len {
+            removed = true;
+        }
+    }
+    {
+        let mut queue = WAITPID_QUEUE.exclusive_access();
+        let old_len = queue.len();
+        queue.retain(|t| t.getpid() != pid);
+        if queue.len() != old_len {
+            removed = true;
+        }
+    }
+    {
+        let mut queue = SLEEP_QUEUE.exclusive_access();
+        let old_len = queue.len();
+        queue.retain(|sleep_task| sleep_task.task.getpid() != pid);
+        if queue.len() != old_len {
+            removed = true;
+        }
+    }
+    removed
+}
+
+pub fn force_exit_task(task: &Arc<TaskControlBlock>, exit_code: i32) {
+    let pid = task.getpid();
+    remove_task_from_block_queues(pid);
+    remove_from_pid2task(pid);
+
+    let (parent, orphan_children) = {
+        let mut inner = task.inner_exclusive_access();
+        if inner.task_status == TaskStatus::Zombie {
+            return;
+        }
+        inner.task_status = TaskStatus::Zombie;
+        inner.exit_code = exit_code;
+        inner.block_reason = None;
+        let parent = inner.parent.as_ref().and_then(|w| w.upgrade());
+        let orphan_children = core::mem::take(&mut inner.children);
+        inner.memory_set.recycle_data_pages();
+        inner.clear_fd_table();
+        (parent, orphan_children)
+    };
+
+    if let Some(parent) = parent {
+        notify_parent_sigchld(&parent);
+        let mut queue = WAITPID_QUEUE.exclusive_access();
+        if let Some(idx) = queue.iter().position(|t| t.getpid() == parent.getpid()) {
+            let parent_task = queue.remove(idx);
+            drop(queue);
+            let mut pinner = parent_task.inner_exclusive_access();
+            pinner.task_status = TaskStatus::Ready;
+            drop(pinner);
+            add_task(parent_task);
+        }
+    }
+
+    if !orphan_children.is_empty() {
+        let mut initproc_inner = INITPROC.inner_exclusive_access();
+        for child in orphan_children.iter() {
+            child.inner_exclusive_access().parent = Some(Arc::downgrade(&INITPROC));
+            initproc_inner.children.push(child.clone());
+        }
+    }
+}
+
 pub const IDLE_PID: usize = 0;
 
 /// Exit the current 'Running' task and run the next task in task list.
@@ -190,7 +298,7 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
 
     // remove from pid2task
     remove_from_pid2task(task.getpid());
-    let (parent, orphan_children, is_thread, tid_ptr, token) = {
+    let (parent, orphan_children) = {
         // **** access current TCB exclusively
         let mut inner = task.inner_exclusive_access();
         // Change status to Zombie
@@ -199,21 +307,17 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
         inner.exit_code = exit_code;
         let parent = inner.parent.as_ref().and_then(|w| w.upgrade());
         let orphan_children = core::mem::take(&mut inner.children);
-        let tid_ptr = inner.tid_ptr;
-        let is_thread = inner.clone_vm;
-        let token = inner.memory_set.token();
-        // deallocate user space (skip for threads sharing vm)
-        if !is_thread {
-            inner.memory_set.recycle_data_pages();
-        }
+        // deallocate user space
+        inner.memory_set.recycle_data_pages();
         // drop file descriptors
         inner.clear_fd_table();
-        (parent, orphan_children, is_thread, tid_ptr, token)
+        (parent, orphan_children)
     };
     // **** release current PCB before touching parent/initproc
 
-    // wake parent waiting in waitpid and send SIGCHLD
+    // wake parent waiting in waitpid
     if let Some(parent) = parent {
+        notify_parent_sigchld(&parent);
         let mut queue = WAITPID_QUEUE.exclusive_access();
         if let Some(idx) = queue.iter().position(|t| t.getpid() == parent.getpid()) {
             let parent_task = queue.remove(idx);
@@ -222,15 +326,6 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
             pinner.task_status = TaskStatus::Ready;
             drop(pinner);
             add_task(parent_task);
-        } else {
-            drop(queue);
-        }
-        // Send SIGCHLD to parent
-        {
-            let mut pinner = parent.inner_exclusive_access();
-            if !pinner.signal_mask.contains(SignalFlags::SIGCHLD) {
-                pinner.signals.insert(SignalFlags::SIGCHLD);
-            }
         }
     }
 
@@ -243,11 +338,6 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
         }
     }
     // ++++++ release parent PCB
-    // Thread exit: clear child tid and wake futex waiter
-    if is_thread && tid_ptr != 0 {
-        *translated_refmut(token, tid_ptr as *mut i32) = 0;
-        wake_futex(tid_ptr, 1);
-    }
     // drop task manually to maintain rc correctly
     drop(task);
     // we do not have to save task context
@@ -259,19 +349,17 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
 }
 
 lazy_static! {
-    pub static ref INITPROC: Arc<TaskControlBlock> = Arc::new({
-        println!("[kernel] loading initproc binary...");
-        let inode = match open_file("/bin/contest_runner", OpenFlags::RDONLY) {
-            Some(f) => f,
-            None => panic!("initproc not found!"),
-        };
-        let v = inode.read_all();
-        println!("[kernel] initproc binary size: {} bytes", v.len());
-        let tcb = TaskControlBlock::new(v.as_slice());
-        println!("[kernel] initproc TCB created, pid={}", tcb.getpid());
-        tcb
-    });
+    pub static ref INITPROC: Arc<TaskControlBlock> =
+        Arc::new({ TaskControlBlock::new(EMBEDDED_INITPROC) });
 }
+
+#[cfg(target_arch = "riscv64")]
+static EMBEDDED_INITPROC: &[u8] =
+    include_bytes!("../../../target/riscv64gc-unknown-none-elf/release/initproc");
+
+#[cfg(target_arch = "loongarch64")]
+static EMBEDDED_INITPROC: &[u8] =
+    include_bytes!("../../../target/loongarch64-unknown-none/release/initproc");
 
 pub fn add_initproc() {
     trace!("os::task::add_initproc");
@@ -316,17 +404,16 @@ fn call_kernel_signal_handler(signal: SignalFlags) {
                 task_inner.frozen = false;
             }
         }
-        SignalFlags::SIGCHLD | SignalFlags::SIGURG | SignalFlags::SIGWINCH
-        | SignalFlags::SIGIO => {
-            task_inner.signals ^= signal;
-        }
-        SignalFlags::SIGTSTP | SignalFlags::SIGTTIN | SignalFlags::SIGTTOU => {
-            task_inner.frozen = true;
+        SignalFlags::SIGTERM | SignalFlags::SIGKILL => {
+            task_inner.killed = true;
             task_inner.signals ^= signal;
         }
         _ => {
+            // println!(
+            //     "[K] call_kernel_signal_handler:: current task sigflag {:?}",
+            //     task_inner.signals
+            // );
             task_inner.killed = true;
-            task_inner.signals ^= signal;
         }
     }
 }
@@ -344,26 +431,22 @@ fn call_user_signal_handler(sig: usize, signal: SignalFlags) {
     if handler != 0 {
         let action = task_inner.signal_actions.table[sig];
 
-        // SA_NODEFER: block this signal + sa_mask during handler
-        const SA_NODEFER: usize = 0x40000000;
-        if action.flags & SA_NODEFER == 0 {
-            task_inner.signal_mask |= signal;
-            task_inner.signal_mask |= action.mask_flags();
-        }
-        task_inner.handling_sig = sig as isize;
+        // handle flag
+        let old_mask = task_inner.signal_mask;
         task_inner.signals ^= signal;
+        task_inner.handling_sig = sig as isize;
+        task_inner.signal_mask_backup = Some(old_mask);
+        task_inner.signal_mask |= action.mask | signal;
 
         // backup trapframe
         let trap_ctx = task_inner.get_trap_cx();
         task_inner.trap_ctx_backup = Some(trap_ctx.clone());
-        let saved_sepc = trap_ctx[TrapFrameArgs::SEPC];
-
         // modify trapframe
         trap_ctx[TrapFrameArgs::SEPC] = handler;
         trap_ctx[TrapFrameArgs::RA] = if action.restorer != 0 {
             action.restorer
         } else {
-            saved_sepc
+            SIGNAL_RETURN_TRAMPOLINE
         };
 
         // put args (a0)
@@ -401,6 +484,20 @@ fn call_user_signal_handler(sig: usize, signal: SignalFlags) {
     }
 }
 
+pub fn restore_current_signal_context() -> Option<isize> {
+    let task = current_task()?;
+    let mut inner = task.inner_exclusive_access();
+    inner.handling_sig = -1;
+    if let Some(mask) = inner.signal_mask_backup.take() {
+        inner.signal_mask = mask;
+    }
+    let backup = inner.trap_ctx_backup.take()?;
+    let ret = backup[TrapFrameArgs::RET] as isize;
+    let trap_ctx = inner.get_trap_cx();
+    *trap_ctx = backup;
+    Some(ret)
+}
+
 fn check_pending_signals() {
     trace!("os::task::check_pending_signals");
     let task = match current_task() {
@@ -421,7 +518,7 @@ fn check_pending_signals() {
                 m = false;
             } else {
                 let hs = task_inner.handling_sig as usize;
-                if !task_inner.signal_actions.table[hs].mask_flags().contains(signal) {
+                if !task_inner.signal_actions.table[hs].mask.contains(signal) {
                     m = false;
                 }
             }
@@ -463,7 +560,11 @@ pub fn handle_signals() {
                 let task = current_task().unwrap();
                 let inner = task.inner_exclusive_access();
                 let sig = inner.exit_signal;
-                if sig != 0 { sig } else { -9 }
+                if sig != 0 {
+                    sig
+                } else {
+                    -9
+                }
             };
             exit_current_and_run_next(exit_code);
         }
@@ -509,12 +610,4 @@ pub fn check_and_wake_up_tasks() {
             i += 1;
         }
     }
-}
-
-/// Check if current task has pending non-masked signals that should interrupt blocking syscalls
-pub fn has_pending_signals() -> bool {
-    let Some(task) = current_task() else { return false };
-    let Some(inner) = task.try_inner_borrow() else { return false };
-    let pending = inner.signals.bits() & !inner.signal_mask.bits();
-    pending != 0
 }

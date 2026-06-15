@@ -1,4 +1,7 @@
 pub trait BlockDevice: Send + Sync {
     fn read_block(&self, block_id: usize, buf: &mut [u8]);
     fn write_block(&self, block_id: usize, buf: &[u8]);
+    fn capacity_bytes(&self) -> Option<u64> {
+        None
+    }
 }

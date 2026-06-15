@@ -16,6 +16,7 @@ mod virtio_blk;
 pub use virtio_blk::{VirtIOBlock, VirtioHal};
 
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 pub use device::BlockDevice;
 use lazy_static::*;
 
@@ -28,24 +29,23 @@ use ram_blk::RamDiskBlock;
     target_arch = "loongarch64"
 ))]
 lazy_static! {
-    /// Test disk on virtio bus 0 (provided by evaluation system)
-    pub static ref BLOCK_DEVICE: Arc<dyn BlockDevice> = Arc::new(VirtIOBlock::new());
+    static ref BLOCK_DEVICES: Vec<Arc<dyn BlockDevice>> = virtio_blk::probe_all();
 }
 
-#[cfg(any(
-    target_arch = "riscv64",
-    target_arch = "aarch64",
-    target_arch = "loongarch64"
-))]
+pub fn get_block_device(index: usize) -> Option<Arc<dyn BlockDevice>> {
+    BLOCK_DEVICES.get(index).cloned()
+}
+
 lazy_static! {
-    /// Root filesystem disk on virtio bus 1 (user's disk.img)
+    /// Test disk (first device found = bus 0)
+    pub static ref BLOCK_DEVICE: Arc<dyn BlockDevice> = {
+        BLOCK_DEVICES.first().cloned()
+            .unwrap_or_else(|| Arc::new(VirtIOBlock::new_at(polyhal::pa!(0x10001000))))
+    };
+    /// Root filesystem disk (second device found = bus 1)
     pub static ref ROOT_BLOCK_DEVICE: Arc<dyn BlockDevice> = {
-        let addr = if cfg!(target_arch = "aarch64") {
-            polyhal::pa!(0xa00_0200)
-        } else {
-            polyhal::pa!(0x10002000)
-        };
-        Arc::new(VirtIOBlock::new_at(addr))
+        BLOCK_DEVICES.get(1).cloned()
+            .unwrap_or_else(|| BLOCK_DEVICE.clone())
     };
 }
 

@@ -141,6 +141,9 @@ pub fn exec(path: &str, args: &[*const u8]) -> isize {
 pub fn execve(path: &str, args: &[*const u8], envs: &[*const u8]) -> isize {
     sys_exec(path, args, envs)
 }
+pub fn chroot(path: &str) -> isize {
+    sys_chroot(path)
+}
 pub fn wait(exit_code: &mut i32) -> isize {
     loop {
         match sys_waitpid(-1, exit_code as *mut _) {
@@ -166,7 +169,8 @@ pub fn waitpid(pid: usize, exit_code: &mut i32) -> isize {
 }
 
 pub fn waitpid_nb(pid: usize, exit_code: &mut i32) -> isize {
-    sys_waitpid(pid as isize, exit_code as *mut _)
+    const WNOHANG: usize = 1;
+    sys_waitpid_options(pid as isize, exit_code as *mut _, WNOHANG)
 }
 
 pub fn sleep(period_ms: usize) {
@@ -271,7 +275,15 @@ bitflags! {
 }
 
 pub fn kill(pid: usize, signum: i32) -> isize {
-    sys_kill(pid, signum)
+    sys_kill(pid as isize, signum)
+}
+
+pub fn kill_pgrp(pgid: usize, signum: i32) -> isize {
+    sys_kill(-(pgid as isize), signum)
+}
+
+pub fn setsid() -> isize {
+    sys_setsid()
 }
 
 pub fn sigaction(
@@ -320,4 +332,15 @@ pub fn mount(source: &str, target: &str, fstype: &str, flags: usize, data: &[u8]
 
 pub fn umount2(target: &str, flags: usize) -> isize {
     sys_umount2(target, flags)
+}
+
+pub fn symlinkat(target: &str, linkpath: &str) -> isize {
+    let target = alloc::format!("{}\0", target.trim_end_matches('\0'));
+    let linkpath = alloc::format!("{}\0", linkpath.trim_end_matches('\0'));
+    sys_symlinkat(target.as_ptr(), linkpath.as_ptr())
+}
+
+pub fn unlinkat(path: &str) -> isize {
+    let path = alloc::format!("{}\0", path.trim_end_matches('\0'));
+    sys_unlinkat_path(path.as_ptr(), 0)
 }

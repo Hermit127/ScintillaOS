@@ -4,6 +4,7 @@ use lwext4_rust::Ext4BlockWrapper;
 use lwext4_rust::KernelDevOp;
 
 const SECTOR_SIZE: usize = 512;
+const MAX_BULK_IO_SIZE: usize = 64 * 1024;
 
 pub struct BlockDeviceStream {
     pub inner: Arc<dyn BlockDevice>,
@@ -28,12 +29,14 @@ impl KernelDevOp for BlockDeviceStreamOp {
         let end_sector = (end + SECTOR_SIZE - 1) / SECTOR_SIZE;
 
         if offset == 0 && buf.len() % SECTOR_SIZE == 0 {
-            for i in sector..end_sector {
-                let start = (i - sector) * SECTOR_SIZE;
+            let mut written = 0;
+            while written < buf.len() {
+                let chunk = (buf.len() - written).min(MAX_BULK_IO_SIZE);
                 dev.inner.write_block(
-                    i,
-                    &buf[start..core::cmp::min(start + SECTOR_SIZE, buf.len())],
+                    sector + written / SECTOR_SIZE,
+                    &buf[written..written + chunk],
                 );
+                written += chunk;
             }
         } else {
             let total_sectors = end_sector - sector;
@@ -64,10 +67,14 @@ impl KernelDevOp for BlockDeviceStreamOp {
         let offset = pos % SECTOR_SIZE;
 
         if offset == 0 && buf.len() % SECTOR_SIZE == 0 {
-            for i in 0..(buf.len() / SECTOR_SIZE) {
-                let begin = i * SECTOR_SIZE;
-                dev.inner
-                    .read_block(sector + i, &mut buf[begin..begin + SECTOR_SIZE]);
+            let mut read = 0;
+            while read < buf.len() {
+                let chunk = (buf.len() - read).min(MAX_BULK_IO_SIZE);
+                dev.inner.read_block(
+                    sector + read / SECTOR_SIZE,
+                    &mut buf[read..read + chunk],
+                );
+                read += chunk;
             }
             dev.pos = pos + buf.len();
         } else {

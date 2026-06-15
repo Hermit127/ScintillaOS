@@ -88,7 +88,9 @@ impl File for Stdout {
             DebugConsole::putchar(*byte);
         }
         STDOUT_BUSY.store(false, Ordering::Release);
-        stdout_release_if_owner();
+        // Do NOT release stdout here; keep ownership until the process yields.
+        // This prevents interleaved output when userspace splits a logical
+        // printf into multiple write() calls (e.g. loongarch64 musl).
         user_buf.len() as isize
     }
     fn stat(&self) -> Kstat {
