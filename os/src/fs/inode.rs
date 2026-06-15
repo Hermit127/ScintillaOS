@@ -4,14 +4,57 @@ use super::vfs::{
 };
 use super::{File, Kstat, S_IFDIR, S_IFREG};
 use crate::sync::UPSafeCell;
+use alloc::collections::BTreeMap;
 use alloc::ffi::CString;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use bitflags::*;
+use lazy_static::*;
 use lwext4_rust::bindings::*;
 
 const EXT4_BLOCK_SIZE: u32 = 4096;
+
+#[derive(Clone, Copy, Default)]
+struct CachedTimes {
+    atime: Option<i64>,
+    mtime: Option<i64>,
+    ctime: Option<i64>,
+}
+
+lazy_static! {
+    static ref PATH_TIME_CACHE: UPSafeCell<BTreeMap<String, CachedTimes>> =
+        unsafe { UPSafeCell::new(BTreeMap::new()) };
+}
+
+pub fn update_path_cached_times(
+    fs_path: &str,
+    atime: Option<i64>,
+    mtime: Option<i64>,
+    ctime: Option<i64>,
+) {
+    let mut cache = PATH_TIME_CACHE.exclusive_access();
+    let entry = cache
+        .entry(String::from(fs_path))
+        .or_insert_with(CachedTimes::default);
+    if let Some(atime) = atime {
+        entry.atime = Some(atime);
+    }
+    if let Some(mtime) = mtime {
+        entry.mtime = Some(mtime);
+    }
+    if let Some(ctime) = ctime {
+        entry.ctime = Some(ctime);
+    }
+}
+
+fn path_cached_times(fs_path: &str) -> CachedTimes {
+    PATH_TIME_CACHE
+        .exclusive_access()
+        .get(fs_path)
+        .copied()
+        .unwrap_or_default()
+}
 
 // ==================== OSInode ====================
 
@@ -180,6 +223,17 @@ impl OSInode {
                 st.st_atime_sec = info.atime as i64;
                 st.st_mtime_sec = info.mtime as i64;
                 st.st_ctime_sec = info.ctime as i64;
+                let cached_times = path_cached_times(&self.dentry.fs_path);
+                let now_sec = (polyhal::time::Time::now().to_msec() / 1000) as i64;
+                st.st_atime_sec = cached_times
+                    .atime
+                    .unwrap_or_else(|| st.st_atime_sec.min(now_sec));
+                st.st_mtime_sec = cached_times
+                    .mtime
+                    .unwrap_or_else(|| st.st_mtime_sec.min(now_sec));
+                st.st_ctime_sec = cached_times
+                    .ctime
+                    .unwrap_or_else(|| st.st_ctime_sec.min(now_sec));
                 st
             }
             None => {
@@ -201,6 +255,26 @@ impl OSInode {
         if let Some(ref mut st) = inner.cached_stat {
             st.st_size = size;
             st.st_blocks = ((size.max(0) as u64) + 511) / 512;
+        }
+    }
+
+    pub fn update_cached_times(
+        &self,
+        atime: Option<i64>,
+        mtime: Option<i64>,
+        ctime: Option<i64>,
+    ) {
+        let mut inner = self.inner.exclusive_access();
+        if let Some(ref mut st) = inner.cached_stat {
+            if let Some(atime) = atime {
+                st.st_atime_sec = atime;
+            }
+            if let Some(mtime) = mtime {
+                st.st_mtime_sec = mtime;
+            }
+            if let Some(ctime) = ctime {
+                st.st_ctime_sec = ctime;
+            }
         }
     }
 

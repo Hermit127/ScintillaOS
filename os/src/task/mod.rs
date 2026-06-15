@@ -192,6 +192,21 @@ pub fn wake_blocked_task(task: &Arc<TaskControlBlock>) {
     }
 }
 
+fn notify_parent_sigchld(parent: &Arc<TaskControlBlock>) {
+    let should_wake = {
+        let mut inner = parent.inner_exclusive_access();
+        if inner.signal_mask.contains(SignalFlags::SIGCHLD) {
+            inner.signals.insert(SignalFlags::SIGCHLD);
+            true
+        } else {
+            false
+        }
+    };
+    if should_wake {
+        wake_blocked_task(parent);
+    }
+}
+
 fn remove_task_from_block_queues(pid: usize) -> bool {
     let mut removed = false;
     {
@@ -242,6 +257,7 @@ pub fn force_exit_task(task: &Arc<TaskControlBlock>, exit_code: i32) {
     };
 
     if let Some(parent) = parent {
+        notify_parent_sigchld(&parent);
         let mut queue = WAITPID_QUEUE.exclusive_access();
         if let Some(idx) = queue.iter().position(|t| t.getpid() == parent.getpid()) {
             let parent_task = queue.remove(idx);
@@ -301,6 +317,7 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
 
     // wake parent waiting in waitpid
     if let Some(parent) = parent {
+        notify_parent_sigchld(&parent);
         let mut queue = WAITPID_QUEUE.exclusive_access();
         if let Some(idx) = queue.iter().position(|t| t.getpid() == parent.getpid()) {
             let parent_task = queue.remove(idx);

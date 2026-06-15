@@ -38,6 +38,7 @@ const SYSCALL_YIELD: usize = 124;
 const SYSCALL_KILL: usize = 129;
 const SYSCALL_SIGACTION: usize = 134;
 const SYSCALL_SIGPROCMASK: usize = 135;
+const SYSCALL_RT_SIGTIMEDWAIT: usize = 137;
 const SYSCALL_SIGRETURN: usize = 139;
 const SYSCALL_GETITIMER: usize = 102;
 const SYSCALL_SETITIMER: usize = 103;
@@ -235,6 +236,12 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[0] as i32,
             args[1] as *const u8,
             args[2] as *mut u8,
+            args[3],
+        ),
+        SYSCALL_RT_SIGTIMEDWAIT => sys_rt_sigtimedwait(
+            args[0] as *const u8,
+            args[1] as *mut u8,
+            args[2] as *const u8,
             args[3],
         ),
         SYSCALL_SIGRETURN => sys_sigreturn(),

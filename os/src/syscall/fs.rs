@@ -5,11 +5,17 @@ use crate::fs::{
 };
 use crate::mm::{translated_byte_buffer, translated_refmut, translated_str};
 use crate::task::{current_task, current_user_token};
+use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 const AT_FDCWD: isize = -100;
+const O_TMPFILE: u32 = 0x410000;
+const FILE_TIME_NOW_GUARD_SEC: i64 = 5;
+
+static TMPFILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn resolve_base_dir(dirfd: isize) -> Option<Arc<Dentry>> {
     let task = current_task()?;
@@ -144,8 +150,15 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> isize
     if path == "/dev/zero" {
         let mut inner = task.inner_exclusive_access();
         let fd = inner.alloc_fd();
+        if fd >= inner.fd_table.len() {
+            return -24;
+        }
         inner.fd_table[fd] = Some(Arc::new(DevZero));
         return fd as isize;
+    }
+
+    if flags & O_TMPFILE == O_TMPFILE {
+        return sys_open_tmpfile(dirfd, path.as_str(), mode);
     }
 
     let open_flags = OpenFlags::from_raw(flags);
@@ -182,6 +195,42 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> isize
     }
 }
 
+fn sys_open_tmpfile(dirfd: isize, path: &str, mode: u32) -> isize {
+    let base = match resolve_base_dir(dirfd) {
+        Some(base) => base,
+        None => return -2,
+    };
+    let dir = match vfs_resolve_with_fallback(&base, path).and_then(|d| {
+        if d.is_dir {
+            Some(d)
+        } else {
+            crate::fs::follow_symlink(&base, d, 0).filter(|target| target.is_dir)
+        }
+    }) {
+        Some(dir) => dir,
+        None => return -20,
+    };
+
+    let perm = if mode == 0 { 0o600 } else { mode & 0o777 };
+    let pid = current_task().map(|task| task.getpid()).unwrap_or(0);
+    for _ in 0..16 {
+        let id = TMPFILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let name = format!(".tmpfile.{}.{}", pid, id);
+        if let Some(dentry) = crate::fs::vfs::vfs_create(&dir, &name, false, perm) {
+            let inode = Arc::new(crate::fs::inode::OSInode::new(true, true, false, dentry));
+            let task = current_task().unwrap();
+            let mut inner = task.inner_exclusive_access();
+            let fd = inner.alloc_fd();
+            if fd >= inner.fd_table.len() {
+                return -24;
+            }
+            inner.fd_table[fd] = Some(inode);
+            return fd as isize;
+        }
+    }
+    -17
+}
+
 fn open_proc(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
     use crate::fs::proc::{
         DevRtcFile, ProcDirFile, ProcMeminfoFile, ProcMountsFile, ProcPidStatFile,
@@ -207,6 +256,34 @@ fn open_proc(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
         }
     }
     None
+}
+
+fn special_device_stat(path: &str) -> Option<Kstat> {
+    let mut st = match path {
+        "/dev/null" => Kstat::new(crate::fs::S_IFCHR | 0o666),
+        "/dev/zero" => Kstat::new(crate::fs::S_IFCHR | 0o666),
+        "/dev/random" | "/dev/urandom" => Kstat::new(crate::fs::S_IFCHR | 0o444),
+        "/dev/rtc" | "/dev/misc/rtc" => Kstat::new(crate::fs::S_IFCHR | 0o444),
+        _ => return None,
+    };
+    st.st_rdev = match path {
+        "/dev/null" => 0x0103,
+        "/dev/zero" => 0x0105,
+        "/dev/random" => 0x0108,
+        "/dev/urandom" => 0x0109,
+        "/dev/rtc" | "/dev/misc/rtc" => 0x0a00,
+        _ => 0,
+    };
+    Some(st)
+}
+
+fn special_device_as_parent(path: &str) -> bool {
+    path.starts_with("/dev/null/")
+        || path.starts_with("/dev/zero/")
+        || path.starts_with("/dev/random/")
+        || path.starts_with("/dev/urandom/")
+        || path.starts_with("/dev/rtc/")
+        || path.starts_with("/dev/misc/rtc/")
 }
 
 pub fn sys_mkdir(path: *const u8, mode: u32) -> isize {
@@ -378,14 +455,38 @@ pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const u8, _flags: us
     }
 
     let token = current_user_token();
-    let path_str = translated_str(token, path);
-    let base = match resolve_base_dir(dirfd) {
-        Some(b) => b,
-        None => return -2,
+    let fd_file = if path.is_null() {
+        let fd = if dirfd < 0 { return -9 } else { dirfd as usize };
+        let task = current_task().unwrap();
+        let inner = task.inner_exclusive_access();
+        if fd >= inner.fd_table.len() {
+            return -9;
+        }
+        inner.fd_table[fd].as_ref().cloned()
+    } else {
+        None
     };
-    let dentry = match vfs_resolve_with_fallback(&base, &path_str) {
-        Some(d) => d,
-        None => return -2,
+    let dentry = if let Some(file) = &fd_file {
+        let Some(inode) = file.as_any().downcast_ref::<crate::fs::inode::OSInode>() else {
+            return -9;
+        };
+        inode.get_dentry().clone()
+    } else {
+        let path_str = translated_str(token, path);
+        if special_device_as_parent(path_str.as_str()) {
+            return -20;
+        }
+        if special_device_stat(path_str.as_str()).is_some() {
+            return 0;
+        }
+        let base = match resolve_base_dir(dirfd) {
+            Some(b) => b,
+            None => return -2,
+        };
+        match vfs_resolve_with_fallback(&base, &path_str) {
+            Some(d) => d,
+            None => return -2,
+        }
     };
 
     let task = current_task().unwrap();
@@ -416,7 +517,8 @@ pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const u8, _flags: us
         }
     }
 
-    let now_sec = (polyhal::time::Time::now().to_msec() / 1000) as u32;
+    let now_sec = super::process::user_realtime_sec_ceil().saturating_add(FILE_TIME_NOW_GUARD_SEC);
+    let now_sec_u32 = now_sec.clamp(0, u32::MAX as i64) as u32;
 
     let (new_atime, new_mtime, changed) = if times.is_null() {
         (Some(now_sec), Some(now_sec), true)
@@ -432,7 +534,7 @@ pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const u8, _flags: us
             Some(now_sec)
         } else {
             ch = true;
-            Some(ts0.tv_sec as u32)
+            Some(ts0.tv_sec)
         };
 
         let mt = if ts1.tv_nsec == UTIME_OMIT {
@@ -442,7 +544,7 @@ pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const u8, _flags: us
             Some(now_sec)
         } else {
             ch = true;
-            Some(ts1.tv_sec as u32)
+            Some(ts1.tv_sec)
         };
 
         if !ch {
@@ -453,13 +555,32 @@ pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const u8, _flags: us
 
     let fs_path = &dentry.fs_path;
     if let Some(a) = new_atime {
-        dentry.super_block.set_atime(fs_path, a);
+        dentry
+            .super_block
+            .set_atime(fs_path, a.clamp(0, u32::MAX as i64) as u32);
     }
     if let Some(m) = new_mtime {
-        dentry.super_block.set_mtime(fs_path, m);
+        dentry
+            .super_block
+            .set_mtime(fs_path, m.clamp(0, u32::MAX as i64) as u32);
     }
     if changed {
-        dentry.super_block.set_ctime(fs_path, now_sec);
+        dentry.super_block.set_ctime(fs_path, now_sec_u32);
+    }
+    crate::fs::inode::update_path_cached_times(
+        fs_path,
+        new_atime,
+        new_mtime,
+        if changed { Some(now_sec) } else { None },
+    );
+    if let Some(file) = &fd_file {
+        if let Some(inode) = file.as_any().downcast_ref::<crate::fs::inode::OSInode>() {
+            inode.update_cached_times(
+                new_atime,
+                new_mtime,
+                if changed { Some(now_sec) } else { None },
+            );
+        }
     }
 
     0
@@ -489,6 +610,21 @@ pub fn sys_faccessat2(dirfd: isize, path: *const u8, mode: usize, flags: usize) 
 
     if path_str.is_empty() && flags & AT_EMPTY_PATH == 0 {
         return -2;
+    }
+    if let Some(st) = special_device_stat(path_str.as_str()) {
+        if mode == F_OK {
+            return 0;
+        }
+        if (mode & X_OK) != 0 {
+            return -13;
+        }
+        if (mode & W_OK) != 0 && (st.st_mode & 0o222) == 0 {
+            return -13;
+        }
+        if (mode & R_OK) != 0 && (st.st_mode & 0o444) == 0 {
+            return -13;
+        }
+        return 0;
     }
     let base = match resolve_base_dir(dirfd) {
         Some(b) => b,
@@ -706,6 +842,7 @@ pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
     const F_SETFL: usize = 4;
     const F_DUPFD_CLOEXEC: usize = 1030;
     const FD_CLOEXEC: usize = 1;
+    const MAX_FD: usize = 1024;
 
     let task = current_task().unwrap();
     let mut inner = task.inner_exclusive_access();
@@ -716,17 +853,24 @@ pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
 
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => {
-            while inner.fd_table.len() <= arg {
+            if arg >= MAX_FD {
+                return -22;
+            }
+            while inner.fd_table.len() <= arg && inner.fd_table.len() < MAX_FD {
                 inner.fd_table.push(None);
                 inner.fd_cloexec.push(false);
             }
-            let new_fd = (arg..inner.fd_table.len())
-                .find(|&i| inner.fd_table[i].is_none())
-                .unwrap_or_else(|| {
-                    inner.fd_table.push(None);
-                    inner.fd_cloexec.push(false);
-                    inner.fd_table.len() - 1
-                });
+            let new_fd = if let Some(fd) =
+                (arg..inner.fd_table.len()).find(|&i| inner.fd_table[i].is_none())
+            {
+                fd
+            } else if inner.fd_table.len() < MAX_FD {
+                inner.fd_table.push(None);
+                inner.fd_cloexec.push(false);
+                inner.fd_table.len() - 1
+            } else {
+                return -24;
+            };
             let file = inner.fd_table[fd].as_ref().unwrap().clone();
             file.dup_ref();
             inner.fd_table[new_fd] = Some(file);
@@ -1003,6 +1147,9 @@ pub fn sys_dup(fd: usize) -> isize {
         return -9;
     }
     let new_fd = inner.alloc_fd();
+    if new_fd >= inner.fd_table.len() {
+        return -24;
+    }
     let file = Arc::clone(inner.fd_table[fd].as_ref().unwrap());
     file.dup_ref();
     inner.fd_table[new_fd] = Some(file);
@@ -1194,6 +1341,10 @@ pub fn sys_fstatat(dirfd: isize, path: *const u8, stat_buf: *mut u8, flags: usiz
     if path_str.is_empty() {
         return -2; // ENOENT
     }
+    if let Some(st) = special_device_stat(path_str.as_str()) {
+        *translated_refmut(token, stat_buf as *mut Kstat) = st;
+        return 0;
+    }
 
     let base = match resolve_base_dir(dirfd) {
         Some(b) => b,
@@ -1251,6 +1402,10 @@ pub fn sys_statx(
     let path_str = translated_str(token, path);
     if path_str.is_empty() {
         return -2;
+    }
+    if let Some(st) = special_device_stat(path_str.as_str()) {
+        write_statx(statx_buf, &st, mask);
+        return 0;
     }
 
     let base = match resolve_base_dir(dirfd) {

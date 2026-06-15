@@ -69,6 +69,14 @@ fn monotonic_user_times_tick() -> u64 {
     }
 }
 
+pub fn user_realtime_sec() -> i64 {
+    (monotonic_user_time_us() / 1_000_000) as i64
+}
+
+pub fn user_realtime_sec_ceil() -> i64 {
+    ((monotonic_user_time_us() + 999_999) / 1_000_000) as i64
+}
+
 fn nsec_to_timeval(ns: usize) -> TimeVal {
     let usec = if ns == 0 {
         0
@@ -753,13 +761,13 @@ pub fn sys_sigprocmask(how: i32, set: *const u8, old_set: *mut u8, _sigsetsize: 
         let mut inner = task.inner_exclusive_access();
         let old_mask = inner.signal_mask;
         if !old_set.is_null() {
-            *translated_refmut(token, old_set as *mut u64) = old_mask.bits() as u64;
+            *translated_refmut(token, old_set as *mut u64) = flags_to_user_sigset(old_mask);
         }
         if set.is_null() {
             return 0;
         }
-        let raw_mask = *translated_ref(token, set as *const u64) as u32;
-        let mut new_mask = SignalFlags::from_bits_truncate(raw_mask);
+        let raw_mask = *translated_ref(token, set as *const u64);
+        let mut new_mask = user_sigset_to_flags(raw_mask);
         new_mask.remove(SignalFlags::SIGKILL | SignalFlags::SIGSTOP);
         inner.signal_mask = match how {
             SIG_BLOCK => old_mask | new_mask,
@@ -1687,9 +1695,8 @@ pub fn sys_rt_sigpending(set: *mut u8, _sigsize: usize) -> isize {
     let token = current_user_token();
     let task = current_task().unwrap();
     let inner = task.inner_exclusive_access();
-    let pending = inner.signals.bits() & !inner.signal_mask.bits();
     let dst = crate::mm::translated_refmut(token, set as *mut u64);
-    *dst = pending as u64;
+    *dst = flags_to_user_sigset(inner.signals);
     0
 }
 
@@ -1702,7 +1709,7 @@ pub fn sys_rt_sigsuspend(mask: *const u8, _sigsize: usize) -> isize {
 
     let saved_mask = inner.signal_mask;
     let new_mask_u64 = *crate::mm::translated_ref(token, mask as *const u64);
-    inner.signal_mask = SignalFlags::from_bits_truncate(new_mask_u64 as u32);
+    inner.signal_mask = user_sigset_to_flags(new_mask_u64);
     drop(inner);
 
     loop {
@@ -1718,6 +1725,123 @@ pub fn sys_rt_sigsuspend(mask: *const u8, _sigsize: usize) -> isize {
             inner2.signal_mask = saved_mask;
             return -4;
         }
+    }
+}
+
+fn signal_number(signal: SignalFlags) -> i32 {
+    for sig in 1..=MAX_SIG {
+        if let Some(flag) = SignalFlags::from_bits(1u32 << sig) {
+            if flag == signal {
+                return sig as i32;
+            }
+        }
+    }
+    0
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RtSignalInfo {
+    si_signo: i32,
+    si_errno: i32,
+    si_code: i32,
+    _pad0: i32,
+    si_pid: i32,
+    si_uid: u32,
+    si_status: i32,
+    _pad1: i32,
+    si_utime: isize,
+    si_stime: isize,
+    _pad: [u8; 128 - 40],
+}
+
+fn write_signal_siginfo(info_ptr: *mut u8, signum: i32) {
+    if info_ptr.is_null() {
+        return;
+    }
+    let token = current_user_token();
+    *translated_refmut(token, info_ptr as *mut RtSignalInfo) = RtSignalInfo {
+        si_signo: signum,
+        si_errno: 0,
+        si_code: 0,
+        _pad0: 0,
+        si_pid: 0,
+        si_uid: 0,
+        si_status: 0,
+        _pad1: 0,
+        si_utime: 0,
+        si_stime: 0,
+        _pad: [0; 128 - 40],
+    };
+}
+
+pub fn sys_rt_sigtimedwait(
+    set: *const u8,
+    info: *mut u8,
+    timeout: *const u8,
+    _sigsetsize: usize,
+) -> isize {
+    if set.is_null() {
+        return -14;
+    }
+    let token = current_user_token();
+    let raw_set = *translated_ref(token, set as *const u64);
+    let mut wanted = user_sigset_to_flags(raw_set);
+    wanted.remove(SignalFlags::SIGKILL | SignalFlags::SIGSTOP);
+    if wanted.is_empty() {
+        return -22;
+    }
+
+    let timeout_ns = if timeout.is_null() {
+        None
+    } else {
+        let ts = *translated_ref(token, timeout as *const crate::task::TimeSpec);
+        if ts.tv_nsec >= 1_000_000_000 {
+            return -22;
+        }
+        Some(ts.tv_sec.saturating_mul(1_000_000_000).saturating_add(ts.tv_nsec))
+    };
+    let start_ns = Time::now().to_nsec() as usize;
+
+    loop {
+        let task = current_task().unwrap();
+        let found = {
+            let mut inner = task.inner_exclusive_access();
+            if inner.killed {
+                return -4;
+            }
+            let pending = inner.signals & wanted;
+            let mut selected = None;
+            for sig in 1..=MAX_SIG {
+                if let Some(flag) = SignalFlags::from_bits(1u32 << sig) {
+                    if pending.contains(flag) {
+                        inner.signals.remove(flag);
+                        selected = Some(flag);
+                        break;
+                    }
+                }
+            }
+            selected
+        };
+
+        if let Some(signal) = found {
+            let signum = signal_number(signal);
+            write_signal_siginfo(info, signum);
+            return signum as isize;
+        }
+
+        if let Some(limit_ns) = timeout_ns {
+            if limit_ns == 0 {
+                return -11;
+            }
+            let now_ns = Time::now().to_nsec() as usize;
+            if now_ns.saturating_sub(start_ns) >= limit_ns {
+                return -11;
+            }
+        }
+
+        stdout_release_if_owner();
+        suspend_current_and_run_next();
     }
 }
 
