@@ -166,6 +166,8 @@ fn setup_runtime_for_dir(dir: &str, script: &str) {
     let root = dir.trim_end_matches('\0').trim_end_matches('/');
     let (musl_root, glibc_root) = runtime_roots(root);
     let (chroot_root, chroot_cwd) = chroot_root_and_cwd(root);
+    let setup_musl = !root.ends_with("/glibc");
+    let setup_glibc = !root.ends_with("/musl");
     println!(
         "[initproc] runtime root {} chroot {} cwd {} musl {} glibc {}",
         root, chroot_root, chroot_cwd, musl_root, glibc_root
@@ -173,8 +175,12 @@ fn setup_runtime_for_dir(dir: &str, script: &str) {
     setup_busybox_applets();
     sys_mkdir(b"/lib\0".as_ptr(), 0o777);
     sys_mkdir(b"/lib64\0".as_ptr(), 0o777);
-    setup_runtime_dirs(&musl_root);
-    setup_runtime_dirs(&glibc_root);
+    if setup_musl {
+        setup_runtime_dirs(&musl_root);
+    }
+    if setup_glibc {
+        setup_runtime_dirs(&glibc_root);
+    }
     setup_runtime_dirs(&chroot_root);
     let busybox = chroot_cwd.clone() + "/busybox";
     force_symlink(&busybox, &(chroot_root.clone() + "/busybox\0"));
@@ -185,73 +191,81 @@ fn setup_runtime_for_dir(dir: &str, script: &str) {
 
     #[cfg(target_arch = "riscv64")]
     {
-        bind_library(
-            &chroot_root,
-            &glibc_root,
-            "/lib/ld-linux-riscv64-lp64d.so.1",
-            "/lib/ld-linux-riscv64-lp64d.so.1",
-        );
-        bind_library(
-            &chroot_root,
-            &glibc_root,
-            "/lib/ld-linux-riscv64-lp64d.so.1",
-            "/lib/ld-linux-riscv64-lp64.so.1",
-        );
-        bind_library(&chroot_root, &glibc_root, "/lib/libc.so", "/lib/libc.so.6");
-        bind_library(&chroot_root, &glibc_root, "/lib/libm.so", "/lib/libm.so.6");
-        bind_library(
-            &chroot_root,
-            &musl_root,
-            "/lib/libc.so",
-            "/lib/ld-musl-riscv64-sf.so.1",
-        );
-        bind_library(
-            &chroot_root,
-            &musl_root,
-            "/lib/libc.so",
-            "/lib/ld-musl-riscv64.so.1",
-        );
-        bind_library(&chroot_root, &musl_root, "/lib/libc.so", "/lib/libc.so");
+        if setup_glibc {
+            bind_library(
+                &chroot_root,
+                &glibc_root,
+                "/lib/ld-linux-riscv64-lp64d.so.1",
+                "/lib/ld-linux-riscv64-lp64d.so.1",
+            );
+            bind_library(
+                &chroot_root,
+                &glibc_root,
+                "/lib/ld-linux-riscv64-lp64d.so.1",
+                "/lib/ld-linux-riscv64-lp64.so.1",
+            );
+            bind_library(&chroot_root, &glibc_root, "/lib/libc.so", "/lib/libc.so.6");
+            bind_library(&chroot_root, &glibc_root, "/lib/libm.so", "/lib/libm.so.6");
+        }
+        if setup_musl {
+            bind_library(
+                &chroot_root,
+                &musl_root,
+                "/lib/libc.so",
+                "/lib/ld-musl-riscv64-sf.so.1",
+            );
+            bind_library(
+                &chroot_root,
+                &musl_root,
+                "/lib/libc.so",
+                "/lib/ld-musl-riscv64.so.1",
+            );
+            bind_library(&chroot_root, &musl_root, "/lib/libc.so", "/lib/libc.so");
+        }
     }
     #[cfg(target_arch = "loongarch64")]
     {
-        bind_library(
-            &chroot_root,
-            &glibc_root,
-            "/lib/ld-linux-loongarch-lp64d.so.1",
-            "/lib/ld-linux-loongarch-lp64d.so.1",
-        );
-        bind_library(
-            &chroot_root,
-            &glibc_root,
-            "/lib/libc.so.6",
-            "/lib/libc.so.6",
-        );
-        bind_library(
-            &chroot_root,
-            &glibc_root,
-            "/lib/libm.so.6",
-            "/lib/libm.so.6",
-        );
-        bind_library(
-            &chroot_root,
-            &musl_root,
-            "/lib/libc.so",
-            "/lib/ld-musl-loongarch64.so.1",
-        );
-        bind_library(
-            &chroot_root,
-            &musl_root,
-            "/lib/libc.so",
-            "/lib/ld-musl-loongarch64-lp64d.so.1",
-        );
-        bind_library(
-            &chroot_root,
-            &musl_root,
-            "/lib/libc.so",
-            "/lib/ld-musl-loongarch-lp64d.so.1",
-        );
-        bind_library(&chroot_root, &musl_root, "/lib/libc.so", "/lib/libc.so");
+        if setup_glibc {
+            bind_library(
+                &chroot_root,
+                &glibc_root,
+                "/lib/ld-linux-loongarch-lp64d.so.1",
+                "/lib/ld-linux-loongarch-lp64d.so.1",
+            );
+            bind_library(
+                &chroot_root,
+                &glibc_root,
+                "/lib/libc.so.6",
+                "/lib/libc.so.6",
+            );
+            bind_library(
+                &chroot_root,
+                &glibc_root,
+                "/lib/libm.so.6",
+                "/lib/libm.so.6",
+            );
+        }
+        if setup_musl {
+            bind_library(
+                &chroot_root,
+                &musl_root,
+                "/lib/libc.so",
+                "/lib/ld-musl-loongarch64.so.1",
+            );
+            bind_library(
+                &chroot_root,
+                &musl_root,
+                "/lib/libc.so",
+                "/lib/ld-musl-loongarch64-lp64d.so.1",
+            );
+            bind_library(
+                &chroot_root,
+                &musl_root,
+                "/lib/libc.so",
+                "/lib/ld-musl-loongarch-lp64d.so.1",
+            );
+            bind_library(&chroot_root, &musl_root, "/lib/libc.so", "/lib/libc.so");
+        }
     }
 }
 
@@ -432,15 +446,19 @@ fn collect_known_scripts(dir: &str, out: &mut Vec<TestScript>) -> usize {
     found
 }
 
-fn collect_existing_standard_dirs(out: &mut Vec<TestScript>) {
+fn run_known_dir(dir: &str) -> bool {
+    let mut scripts = Vec::new();
+    collect_known_scripts(dir, &mut scripts);
+    run_collected_scripts(scripts)
+}
+
+fn run_existing_standard_dirs() -> bool {
     let root_entries = list_dir("/mnt/\0");
     println!("[initproc] /mnt/ root has {} entries", root_entries.len());
+    let mut found = false;
 
     if has_entry(&root_entries, "musl") {
-        collect_known_scripts("/mnt/musl/\0", out);
-    }
-    if has_entry(&root_entries, "glibc") {
-        collect_known_scripts("/mnt/glibc/\0", out);
+        found |= run_known_dir("/mnt/musl/\0");
     }
 
     #[cfg(target_arch = "riscv64")]
@@ -450,23 +468,29 @@ fn collect_existing_standard_dirs(out: &mut Vec<TestScript>) {
     #[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
     let arch_dir = "";
 
+    let mut arch_entries = Vec::new();
     if !arch_dir.is_empty() && has_entry(&root_entries, arch_dir) {
         let arch_root = String::from("/mnt/") + arch_dir + "/\0";
-        let arch_entries = list_dir(&arch_root);
+        arch_entries = list_dir(&arch_root);
         println!(
             "[initproc] /mnt/{}/ root has {} entries",
             arch_dir,
             arch_entries.len()
         );
         if has_entry(&arch_entries, "musl") {
-            collect_known_scripts(&(String::from("/mnt/") + arch_dir + "/musl/\0"), out);
-        }
-        if has_entry(&arch_entries, "glibc") {
-            collect_known_scripts(&(String::from("/mnt/") + arch_dir + "/glibc/\0"), out);
+            found |= run_known_dir(&(String::from("/mnt/") + arch_dir + "/musl/\0"));
         }
     }
 
-    collect_known_scripts("/mnt/\0", out);
+    if has_entry(&root_entries, "glibc") {
+        found |= run_known_dir("/mnt/glibc/\0");
+    }
+    if !arch_dir.is_empty() && has_entry(&arch_entries, "glibc") {
+        found |= run_known_dir(&(String::from("/mnt/") + arch_dir + "/glibc/\0"));
+    }
+    found |= run_known_dir("/mnt/\0");
+
+    found
 }
 
 fn run_script(dir: &str, script: &str) {
@@ -611,12 +635,12 @@ fn main() -> i32 {
     let r = sys_mount("vda\0", "/mnt\0", "ext4\0", 0, &[]);
     println!("[initproc] mount vda -> /mnt: {}", r);
 
-    let mut scripts = Vec::new();
-    collect_existing_standard_dirs(&mut scripts);
-    if scripts.is_empty() {
+    let mut found = run_existing_standard_dirs();
+    if !found {
+        let mut scripts = Vec::new();
         collect_scripts("/mnt/\0", 4, &mut scripts);
+        found = run_collected_scripts(scripts);
     }
-    let found = run_collected_scripts(scripts);
     if !found {
         println!("[initproc] no test scripts found");
     }
