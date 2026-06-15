@@ -8,7 +8,7 @@ extern crate alloc;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use user_lib::{execve, exit, fork, mount, shutdown, waitpid};
+use user_lib::{exec, execve, exit, fork, mount, shutdown, waitpid};
 
 const TEST_LIST: &[&str] = &[
     "brk",

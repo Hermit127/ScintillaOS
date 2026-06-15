@@ -706,10 +706,11 @@ fn main() -> i32 {
     install_busybox();
 
     sys_mkdir(b"/mnt\0".as_ptr(), 0o777);
+    let mut found = run_embedded_basics();
+
     let r = sys_mount("vda\0", "/mnt\0", "ext4\0", 0, &[]);
     println!("[initproc] mount vda -> /mnt: {}", r);
 
-    let mut found = run_embedded_basics();
     found |= run_existing_standard_dirs();
     if !found {
         let mut scripts = Vec::new();
