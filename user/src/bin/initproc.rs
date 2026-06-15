@@ -21,12 +21,14 @@ const BUSYBOX_APPLETS: [&str; 68] = [
     "mknod", "mktemp", "chgrp", "dmesg", "ps", "free", "hostname", "md5sum", "diff", "unlink",
 ];
 
-const KNOWN_TEST_SCRIPTS: [&str; 5] = [
+const KNOWN_TEST_SCRIPTS: [&str; 7] = [
     "basic_testcode.sh",
     "busybox_testcode.sh",
     "lua_testcode.sh",
     "iozone_testcode.sh",
     "lmbench_testcode.sh",
+    "iperf_testcode.sh",
+    "libctest_testcode.sh",
 ];
 
 fn force_symlink(target: &str, linkpath: &str) -> isize {
@@ -160,25 +162,26 @@ fn chroot_root_and_cwd(dir: &str) -> (String, String) {
     }
 }
 
-fn setup_runtime_for_dir(dir: &str) {
-    setup_busybox_applets();
-    sys_mkdir(b"/lib\0".as_ptr(), 0o777);
-    sys_mkdir(b"/lib64\0".as_ptr(), 0o777);
-
+fn setup_runtime_for_dir(dir: &str, script: &str) {
     let root = dir.trim_end_matches('\0').trim_end_matches('/');
     let (musl_root, glibc_root) = runtime_roots(root);
     let (chroot_root, chroot_cwd) = chroot_root_and_cwd(root);
+    println!(
+        "[initproc] runtime root {} chroot {} cwd {} musl {} glibc {}",
+        root, chroot_root, chroot_cwd, musl_root, glibc_root
+    );
+    setup_busybox_applets();
+    sys_mkdir(b"/lib\0".as_ptr(), 0o777);
+    sys_mkdir(b"/lib64\0".as_ptr(), 0o777);
     setup_runtime_dirs(&musl_root);
     setup_runtime_dirs(&glibc_root);
     setup_runtime_dirs(&chroot_root);
     let busybox = chroot_cwd.clone() + "/busybox";
     force_symlink(&busybox, &(chroot_root.clone() + "/busybox\0"));
     setup_busybox_applets_at(&chroot_root);
-    setup_lmbench_wrapper_paths(&chroot_root, &chroot_cwd);
-    println!(
-        "[initproc] runtime root {} chroot {} cwd {} musl {} glibc {}",
-        root, chroot_root, chroot_cwd, musl_root, glibc_root
-    );
+    if script.starts_with("lmbench_") {
+        setup_lmbench_wrapper_paths(&chroot_root, &chroot_cwd);
+    }
 
     #[cfg(target_arch = "riscv64")]
     {
@@ -331,6 +334,10 @@ fn script_priority(script: &str) -> u8 {
         3
     } else if script.starts_with("lmbench_") {
         4
+    } else if script.starts_with("iperf_") {
+        5
+    } else if script.starts_with("libctest_") {
+        6
     } else {
         50
     }
@@ -342,6 +349,8 @@ fn should_run_script(script: &str) -> bool {
         || script.starts_with("lua_")
         || script.starts_with("iozone_")
         || script.starts_with("lmbench_")
+        || script.starts_with("iperf_")
+        || script.starts_with("libctest_")
 }
 
 fn script_budget(script: &str) -> &'static str {
@@ -355,6 +364,10 @@ fn script_budget(script: &str) -> &'static str {
         "720"
     } else if script.starts_with("lmbench_") {
         "1800"
+    } else if script.starts_with("iperf_") {
+        "300"
+    } else if script.starts_with("libctest_") {
+        "600"
     } else {
         "90"
     }
@@ -377,6 +390,10 @@ struct TestScript {
     script: String,
 }
 
+fn has_entry(entries: &[String], name: &str) -> bool {
+    entries.iter().any(|entry| entry == name)
+}
+
 fn script_path(dir: &str, script: &str) -> String {
     let mut path = String::from(dir.trim_end_matches('\0'));
     if !path.ends_with('/') {
@@ -387,12 +404,14 @@ fn script_path(dir: &str, script: &str) -> String {
 }
 
 fn collect_known_scripts(dir: &str, out: &mut Vec<TestScript>) -> usize {
+    println!("[initproc] scan known {}", dir.trim_end_matches('\0'));
+    let entries = list_dir(dir);
     let mut found = 0usize;
     for script in KNOWN_TEST_SCRIPTS {
-        let path = script_path(dir, script);
-        if !path_exists(&path) {
+        if !entries.iter().any(|entry| entry == script) {
             continue;
         }
+        let path = script_path(dir, script);
         if out
             .iter()
             .any(|old| script_path(&old.dir, &old.script) == path)
@@ -411,6 +430,43 @@ fn collect_known_scripts(dir: &str, out: &mut Vec<TestScript>) -> usize {
         found
     );
     found
+}
+
+fn collect_existing_standard_dirs(out: &mut Vec<TestScript>) {
+    let root_entries = list_dir("/mnt/\0");
+    println!("[initproc] /mnt/ root has {} entries", root_entries.len());
+
+    if has_entry(&root_entries, "musl") {
+        collect_known_scripts("/mnt/musl/\0", out);
+    }
+    if has_entry(&root_entries, "glibc") {
+        collect_known_scripts("/mnt/glibc/\0", out);
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    let arch_dir = "riscv";
+    #[cfg(target_arch = "loongarch64")]
+    let arch_dir = "loongarch";
+    #[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
+    let arch_dir = "";
+
+    if !arch_dir.is_empty() && has_entry(&root_entries, arch_dir) {
+        let arch_root = String::from("/mnt/") + arch_dir + "/\0";
+        let arch_entries = list_dir(&arch_root);
+        println!(
+            "[initproc] /mnt/{}/ root has {} entries",
+            arch_dir,
+            arch_entries.len()
+        );
+        if has_entry(&arch_entries, "musl") {
+            collect_known_scripts(&(String::from("/mnt/") + arch_dir + "/musl/\0"), out);
+        }
+        if has_entry(&arch_entries, "glibc") {
+            collect_known_scripts(&(String::from("/mnt/") + arch_dir + "/glibc/\0"), out);
+        }
+    }
+
+    collect_known_scripts("/mnt/\0", out);
 }
 
 fn run_script(dir: &str, script: &str) {
@@ -536,8 +592,10 @@ fn run_collected_scripts(mut scripts: Vec<TestScript>) -> bool {
     sort_collected_scripts(&mut scripts);
     for item in scripts {
         reap_zombies();
-        setup_runtime_for_dir(&item.dir);
-        println!("[initproc] [RUN] {}", script_path(&item.dir, &item.script));
+        let path = script_path(&item.dir, &item.script);
+        println!("[initproc] [PREP] {}", path);
+        setup_runtime_for_dir(&item.dir, &item.script);
+        println!("[initproc] [RUN] {}", path);
         run_script(&item.dir, &item.script);
     }
     true
@@ -554,20 +612,7 @@ fn main() -> i32 {
     println!("[initproc] mount vda -> /mnt: {}", r);
 
     let mut scripts = Vec::new();
-    for dir in ["/mnt/musl/\0", "/mnt/glibc/\0"] {
-        collect_known_scripts(dir, &mut scripts);
-    }
-    #[cfg(target_arch = "riscv64")]
-    let arch_dirs: [&str; 2] = ["/mnt/riscv/musl/\0", "/mnt/riscv/glibc/\0"];
-    #[cfg(target_arch = "loongarch64")]
-    let arch_dirs: [&str; 2] = ["/mnt/loongarch/musl/\0", "/mnt/loongarch/glibc/\0"];
-    #[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
-    let arch_dirs: [&str; 0] = [];
-    if scripts.is_empty() {
-        for dir in arch_dirs {
-            collect_known_scripts(dir, &mut scripts);
-        }
-    }
+    collect_existing_standard_dirs(&mut scripts);
     if scripts.is_empty() {
         collect_scripts("/mnt/\0", 4, &mut scripts);
     }
