@@ -166,26 +166,11 @@ impl VfsSuperBlock {
                 ext4_ctime_get(c_path3.as_ptr() as *const c_char, &mut ctime);
             }
 
-            let is_link = mode & 0xA000 == 0xA000;
-            let mut file: ext4_file = unsafe { core::mem::zeroed() };
-            let c_path_file = CString::new(fs_path).ok()?;
-            let flags = CString::new("rb").ok()?;
-            let file_rc = unsafe {
-                ext4_fopen(
-                    &mut file,
-                    c_path_file.as_ptr() as *const c_char,
-                    flags.as_ptr() as *const c_char,
-                )
-            };
+            let file_type = mode & 0o170000;
+            let is_link = file_type == 0o120000;
+            let is_dir_mode = file_type == 0o040000;
 
-            let (inode_num, size, is_dir) = if file_rc == EOK as i32 {
-                let inode_num = file.inode;
-                let size = unsafe { ext4_fsize(&mut file) };
-                unsafe {
-                    ext4_fclose(&mut file);
-                }
-                (inode_num, size, (mode & 0x4000) != 0)
-            } else {
+            let (inode_num, size, is_dir) = if is_dir_mode {
                 let mut dir: ext4_dir = unsafe { core::mem::zeroed() };
                 let c_path_dir = CString::new(fs_path).ok()?;
                 let dir_rc =
@@ -198,11 +183,46 @@ impl VfsSuperBlock {
                     }
                     mode = (mode & 0o7777) | 0o040000;
                     (inode_num, size, true)
-                } else if is_link {
-                    // Symlink: both fopen and dir_open fail, but mode indicates a link
-                    (0, 0, false)
                 } else {
                     return None;
+                }
+            } else {
+                let mut file: ext4_file = unsafe { core::mem::zeroed() };
+                let c_path_file = CString::new(fs_path).ok()?;
+                let flags = CString::new("rb").ok()?;
+                let file_rc = unsafe {
+                    ext4_fopen(
+                        &mut file,
+                        c_path_file.as_ptr() as *const c_char,
+                        flags.as_ptr() as *const c_char,
+                    )
+                };
+
+                if file_rc == EOK as i32 {
+                    let inode_num = file.inode;
+                    let size = unsafe { ext4_fsize(&mut file) };
+                    unsafe {
+                        ext4_fclose(&mut file);
+                    }
+                    (inode_num, size, false)
+                } else if is_link {
+                    // Symlink lookup only needs the link flag and path.
+                    (0, 0, false)
+                } else {
+                    let mut dir: ext4_dir = unsafe { core::mem::zeroed() };
+                    let c_path_dir = CString::new(fs_path).ok()?;
+                    let dir_rc =
+                        unsafe { ext4_dir_open(&mut dir, c_path_dir.as_ptr() as *const c_char) };
+                    if dir_rc != EOK as i32 {
+                        return None;
+                    }
+                    let inode_num = dir.f.inode;
+                    let size = dir.f.fsize;
+                    unsafe {
+                        ext4_dir_close(&mut dir);
+                    }
+                    mode = (mode & 0o7777) | 0o040000;
+                    (inode_num, size, true)
                 }
             };
 
@@ -653,18 +673,8 @@ pub fn vfs_lookup(parent: &Arc<Dentry>, name: &str) -> Option<Arc<Dentry>> {
         format!("{}/{}", parent.fs_path, name)
     };
 
-    let (child_inode, is_dir, is_link) = {
-        let entries = parent.super_block.dir_get_entries(&parent.fs_path);
-        let found = entries.iter().find(|e| e.get_name() == name)?;
-        let inode_num = found.inode;
-        let info = parent.super_block.get_inode_info(&child_fs_path);
-        let is_dir = match &info {
-            Some(info) => info.is_dir,
-            None => found.de_type == 2,
-        };
-        let is_link = info.map(|info| info.is_link).unwrap_or(false);
-        (inode_num, is_dir, is_link)
-    };
+    let info = parent.super_block.get_inode_info(&child_fs_path)?;
+    let (child_inode, is_dir, is_link) = (info.inode_num, info.is_dir, info.is_link);
 
     let child = Dentry::new_child(parent, name, child_inode, is_dir, is_link);
 

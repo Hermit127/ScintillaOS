@@ -418,14 +418,13 @@ fn script_path(dir: &str, script: &str) -> String {
 }
 
 fn collect_known_scripts(dir: &str, out: &mut Vec<TestScript>) -> usize {
-    println!("[initproc] scan known {}", dir.trim_end_matches('\0'));
-    let entries = list_dir(dir);
+    println!("[initproc] probe known {}", dir.trim_end_matches('\0'));
     let mut found = 0usize;
     for script in KNOWN_TEST_SCRIPTS {
-        if !entries.iter().any(|entry| entry == script) {
+        let path = script_path(dir, script);
+        if !path_exists(&path) {
             continue;
         }
-        let path = script_path(dir, script);
         if out
             .iter()
             .any(|old| script_path(&old.dir, &old.script) == path)
