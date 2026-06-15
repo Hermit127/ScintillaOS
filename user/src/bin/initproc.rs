@@ -402,6 +402,17 @@ fn sort_scripts(scripts: &mut Vec<String>) {
     });
 }
 
+fn dir_flavor_priority(dir: &str) -> u8 {
+    let dir = dir.trim_end_matches('\0').trim_end_matches('/');
+    if dir.ends_with("/musl") {
+        0
+    } else if dir.ends_with("/glibc") {
+        1
+    } else {
+        2
+    }
+}
+
 struct TestScript {
     dir: String,
     script: String,
@@ -455,19 +466,13 @@ fn collect_known_scripts(dir: &str, out: &mut Vec<TestScript>) -> usize {
     found
 }
 
-fn run_known_dir(dir: &str) -> bool {
-    let mut scripts = Vec::new();
-    collect_known_scripts(dir, &mut scripts);
-    run_collected_scripts(scripts)
-}
-
 fn run_existing_standard_dirs() -> bool {
     let root_entries = list_dir("/mnt/\0");
     println!("[initproc] /mnt/ root has {} entries", root_entries.len());
-    let mut found = false;
+    let mut scripts = Vec::new();
 
     if has_entry(&root_entries, "musl") {
-        found |= run_known_dir("/mnt/musl/\0");
+        collect_known_scripts("/mnt/musl/\0", &mut scripts);
     }
 
     #[cfg(target_arch = "riscv64")]
@@ -487,19 +492,25 @@ fn run_existing_standard_dirs() -> bool {
             arch_entries.len()
         );
         if has_entry(&arch_entries, "musl") {
-            found |= run_known_dir(&(String::from("/mnt/") + arch_dir + "/musl/\0"));
+            collect_known_scripts(
+                &(String::from("/mnt/") + arch_dir + "/musl/\0"),
+                &mut scripts,
+            );
         }
     }
 
     if has_entry(&root_entries, "glibc") {
-        found |= run_known_dir("/mnt/glibc/\0");
+        collect_known_scripts("/mnt/glibc/\0", &mut scripts);
     }
     if !arch_dir.is_empty() && has_entry(&arch_entries, "glibc") {
-        found |= run_known_dir(&(String::from("/mnt/") + arch_dir + "/glibc/\0"));
+        collect_known_scripts(
+            &(String::from("/mnt/") + arch_dir + "/glibc/\0"),
+            &mut scripts,
+        );
     }
-    found |= run_known_dir("/mnt/\0");
 
-    found
+    collect_known_scripts("/mnt/\0", &mut scripts);
+    run_collected_scripts(scripts)
 }
 
 fn run_script(dir: &str, script: &str) {
@@ -675,6 +686,11 @@ fn sort_collected_scripts(scripts: &mut Vec<TestScript>) {
         let pb = script_priority(&b.script);
         if pa != pb {
             return pa.cmp(&pb);
+        }
+        let da = dir_flavor_priority(&a.dir);
+        let db = dir_flavor_priority(&b.dir);
+        if da != db {
+            return da.cmp(&db);
         }
         let sa = a.script.as_str();
         let sb = b.script.as_str();
