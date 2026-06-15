@@ -346,11 +346,11 @@ fn script_priority(script: &str) -> u8 {
         0
     } else if script.starts_with("busybox_") {
         1
-    } else if script.starts_with("lmbench_") {
-        2
     } else if script.starts_with("lua_") {
-        3
+        2
     } else if script.starts_with("iozone_") {
+        3
+    } else if script.starts_with("lmbench_") {
         4
     } else if script.starts_with("iperf_") {
         5

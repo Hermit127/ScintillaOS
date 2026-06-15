@@ -77,6 +77,11 @@ impl BlockDevice for VirtIOBlock {
             done += chunk;
         }
     }
+
+    fn capacity_bytes(&self) -> Option<u64> {
+        let blk = self.0.exclusive_access();
+        Some((blk.capacity() as u64) * (SECTOR_SIZE as u64))
+    }
 }
 
 impl VirtIOBlock {

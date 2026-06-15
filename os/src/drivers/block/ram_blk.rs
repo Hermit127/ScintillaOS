@@ -44,6 +44,10 @@ impl BlockDevice for RamDiskBlock {
             // dest.as_mut().unwrap().copy_from_slice(buf);
         }
     }
+
+    fn capacity_bytes(&self) -> Option<u64> {
+        Some(self.size as u64)
+    }
 }
 
 impl RamDiskBlock {

@@ -70,11 +70,12 @@ impl VfsSuperBlock {
         fs_type: &'static str,
         mount_point: &str,
     ) -> Option<Arc<Self>> {
-        const DISK_SIZE_512M: u64 = 512 * 1024 * 1024;
+        const FALLBACK_DISK_SIZE: u64 = 512 * 1024 * 1024;
+        let total_size = blk_device.capacity_bytes().unwrap_or(FALLBACK_DISK_SIZE);
         let stream = BlockDeviceStream {
             inner: blk_device,
             pos: 0,
-            total_size: DISK_SIZE_512M,
+            total_size,
         };
         let ext4 =
             Ext4BlockWrapper::<BlockDeviceStreamOp>::new_with_name(stream, "ext4_fs", mount_point)
