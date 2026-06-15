@@ -93,8 +93,14 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
                 exit_current_and_run_next(-11);
             }
         }
-        InstructionPageFault(_paddr) => {
-            current_add_signal(SignalFlags::SIGSEGV);
+        InstructionPageFault(bad_addr) => {
+            let vaddr = polyhal::VirtAddr::from(bad_addr);
+            let task = crate::task::current_task().unwrap();
+            let mut inner = task.inner_exclusive_access();
+            if !inner.memory_set.handle_page_fault(vaddr, false) {
+                drop(inner);
+                current_add_signal(SignalFlags::SIGSEGV);
+            }
         }
         IllegalInstruction(_) => {
             current_add_signal(SignalFlags::SIGILL);
@@ -108,7 +114,9 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             net::wake_net_blocked_tasks();
             check_and_wake_up_tasks();
             check_itimer();
-            suspend_current_and_run_next();
+            if current_task().is_some() {
+                suspend_current_and_run_next();
+            }
         }
         _ => {
             warn!("unsuspended trap type: {:?}", trap_type);

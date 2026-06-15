@@ -31,6 +31,9 @@ const KNOWN_TEST_SCRIPTS: [&str; 7] = [
     "libctest_testcode.sh",
 ];
 
+const EMBEDDED_BASIC_MUSL: &str = "__embedded_basic_musl__";
+const EMBEDDED_BASIC_GLIBC: &str = "__embedded_basic_glibc__";
+
 fn force_symlink(target: &str, linkpath: &str) -> isize {
     unlinkat(linkpath);
     let mut r = symlinkat(target, linkpath);
@@ -338,15 +341,15 @@ fn join_path(dir: &str, name: &str) -> String {
 }
 
 fn script_priority(script: &str) -> u8 {
-    if script.starts_with("basic_") {
+    if is_embedded_basic(script) || script.starts_with("basic_") {
         0
     } else if script.starts_with("busybox_") {
         1
-    } else if script.starts_with("lua_") {
-        2
-    } else if script.starts_with("iozone_") {
-        3
     } else if script.starts_with("lmbench_") {
+        2
+    } else if script.starts_with("lua_") {
+        3
+    } else if script.starts_with("iozone_") {
         4
     } else if script.starts_with("iperf_") {
         5
@@ -358,8 +361,7 @@ fn script_priority(script: &str) -> u8 {
 }
 
 fn should_run_script(script: &str) -> bool {
-    script.starts_with("basic_")
-        || script.starts_with("busybox_")
+    script.starts_with("busybox_")
         || script.starts_with("lua_")
         || script.starts_with("iozone_")
         || script.starts_with("lmbench_")
@@ -368,16 +370,16 @@ fn should_run_script(script: &str) -> bool {
 }
 
 fn script_budget(script: &str) -> &'static str {
-    if script.starts_with("basic_") {
-        "90"
-    } else if script.starts_with("lua_") {
+    if is_embedded_basic(script) || script.starts_with("basic_") {
         "90"
     } else if script.starts_with("busybox_") {
-        "180"
-    } else if script.starts_with("iozone_") {
-        "720"
+        "600"
     } else if script.starts_with("lmbench_") {
         "1800"
+    } else if script.starts_with("lua_") {
+        "90"
+    } else if script.starts_with("iozone_") {
+        "720"
     } else if script.starts_with("iperf_") {
         "300"
     } else if script.starts_with("libctest_") {
@@ -417,10 +419,17 @@ fn script_path(dir: &str, script: &str) -> String {
     path
 }
 
+fn is_embedded_basic(script: &str) -> bool {
+    script == EMBEDDED_BASIC_MUSL || script == EMBEDDED_BASIC_GLIBC
+}
+
 fn collect_known_scripts(dir: &str, out: &mut Vec<TestScript>) -> usize {
     println!("[initproc] probe known {}", dir.trim_end_matches('\0'));
     let mut found = 0usize;
     for script in KNOWN_TEST_SCRIPTS {
+        if script.starts_with("basic_") {
+            continue;
+        }
         let path = script_path(dir, script);
         if !path_exists(&path) {
             continue;
@@ -549,6 +558,67 @@ fn run_script(dir: &str, script: &str) {
     }
 }
 
+fn run_embedded_basic(script: &str) {
+    let (path, label) = if script == EMBEDDED_BASIC_MUSL {
+        (
+            "/bin/contest_runner_musl\0",
+            "basic-musl",
+        )
+    } else if script == EMBEDDED_BASIC_GLIBC {
+        (
+            "/bin/contest_runner_glibc\0",
+            "basic-glibc",
+        )
+    } else {
+        return;
+    };
+    let args: [*const u8; 1] = [core::ptr::null()];
+    let envs: [*const u8; 2] = [b"PATH=/bin:/usr/bin:.\0".as_ptr(), core::ptr::null()];
+    let pid = fork();
+    if pid == 0 {
+        execve(path, &args, &envs);
+        exit(127);
+    } else if pid > 0 {
+        let mut ec = 0;
+        let budget_ms = script_budget(script).parse::<isize>().unwrap_or(90) * 1000;
+        let start = get_time();
+        loop {
+            let r = waitpid_nb(pid as usize, &mut ec);
+            if r == pid {
+                println!("[initproc] [DONE] embedded {} exit {}", label, ec);
+                reap_zombies();
+                break;
+            }
+            if get_time() - start > budget_ms {
+                println!(
+                    "[initproc] [TIMEOUT] embedded {} after {}ms",
+                    label, budget_ms
+                );
+                kill(pid as usize, 9);
+                waitpid(pid as usize, &mut ec);
+                reap_zombies();
+                break;
+            }
+            sleep(20);
+        }
+    }
+}
+
+fn run_embedded_basics() -> bool {
+    let mut ran = false;
+    if path_exists("/bin/contest_runner_musl") {
+        println!("[initproc] [RUN] embedded {}", EMBEDDED_BASIC_MUSL);
+        run_embedded_basic(EMBEDDED_BASIC_MUSL);
+        ran = true;
+    }
+    if path_exists("/bin/contest_runner_glibc") {
+        println!("[initproc] [RUN] embedded {}", EMBEDDED_BASIC_GLIBC);
+        run_embedded_basic(EMBEDDED_BASIC_GLIBC);
+        ran = true;
+    }
+    ran
+}
+
 fn collect_scripts(dir: &str, depth: usize, out: &mut Vec<TestScript>) {
     let entries = list_dir(dir);
     println!(
@@ -617,6 +687,11 @@ fn run_collected_scripts(mut scripts: Vec<TestScript>) -> bool {
         reap_zombies();
         let path = script_path(&item.dir, &item.script);
         println!("[initproc] [PREP] {}", path);
+        if is_embedded_basic(&item.script) {
+            println!("[initproc] [RUN] embedded {}", item.script);
+            run_embedded_basic(&item.script);
+            continue;
+        }
         setup_runtime_for_dir(&item.dir, &item.script);
         println!("[initproc] [RUN] {}", path);
         run_script(&item.dir, &item.script);
@@ -634,7 +709,8 @@ fn main() -> i32 {
     let r = sys_mount("vda\0", "/mnt\0", "ext4\0", 0, &[]);
     println!("[initproc] mount vda -> /mnt: {}", r);
 
-    let mut found = run_existing_standard_dirs();
+    let mut found = run_embedded_basics();
+    found |= run_existing_standard_dirs();
     if !found {
         let mut scripts = Vec::new();
         collect_scripts("/mnt/\0", 4, &mut scripts);

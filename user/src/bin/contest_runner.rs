@@ -8,7 +8,7 @@ extern crate alloc;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use user_lib::{exec, exit, fork, mount, shutdown, waitpid};
+use user_lib::{execve, exit, fork, mount, shutdown, waitpid};
 
 const TEST_LIST: &[&str] = &[
     "brk",
@@ -48,7 +48,10 @@ fn run_test(name: &str) -> i32 {
     println!("Testing {} :", name);
     let pid = fork();
     if pid == 0 {
-        exec(path.as_str(), &[core::ptr::null::<u8>()]);
+        let args: [*const u8; 2] = [path.as_ptr(), core::ptr::null()];
+        let envs: [*const u8; 1] = [core::ptr::null()];
+        execve(path.as_str(), &args, &envs);
+        exit(127);
     }
     let mut exit_code: i32 = -1;
     waitpid(pid as usize, &mut exit_code);

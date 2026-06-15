@@ -476,11 +476,11 @@ impl MemorySet {
         area.file_offset = offset;
         file.seek(offset);
         for vaddr in area.vaddr_range.clone() {
-            let (paddr, _) = match self.page_table.translate(vaddr) {
-                Some(x) => x,
+            let frame = match area.data_frames.get(&vaddr) {
+                Some(frame) => frame,
                 None => break,
             };
-            let page = paddr.slice_mut_with_len(crate::config::PAGE_SIZE);
+            let page = frame.paddr.slice_mut_with_len(crate::config::PAGE_SIZE);
             if file.read(page) <= 0 {
                 break;
             }
@@ -701,37 +701,28 @@ impl MapArea {
     /// data: start-aligned but maybe with shorter length
     /// assume that all frames were cleared before
     /// page_off: offset within the first page where data should start
-    pub fn copy_data(&mut self, page_table: &Arc<PageTableWrapper>, data: &[u8], page_off: usize) {
+    pub fn copy_data(
+        &mut self,
+        _page_table: &Arc<PageTableWrapper>,
+        data: &[u8],
+        page_off: usize,
+    ) {
         trace!("os::mm::memory_set::MapArea::copy_data");
         assert_eq!(self.map_type, MapType::Framed);
         let mut data_pos: usize = 0;
         let mut curr_vaddr = self.vaddr_range.get_start();
+        let mut page_off = page_off;
         let len = data.len();
 
-        if page_off > 0 {
-            let first_chunk = (PAGE_SIZE - page_off).min(len);
-            let dst = &mut page_table
-                .translate((curr_vaddr.raw() + page_off).into())
-                .unwrap()
-                .0
-                .slice_mut_with_len(first_chunk);
-            dst.copy_from_slice(&data[..first_chunk]);
-            data_pos = first_chunk;
-            curr_vaddr = curr_vaddr + PAGE_SIZE;
-        }
-
         while data_pos < len {
-            let chunk = len - data_pos;
-            let chunk = chunk.min(PAGE_SIZE);
+            let chunk = (PAGE_SIZE - page_off).min(len - data_pos);
             let src = &data[data_pos..data_pos + chunk];
-            let dst = &mut page_table
-                .translate(curr_vaddr.into())
-                .unwrap()
-                .0
-                .slice_mut_with_len(chunk);
+            let frame = self.data_frames.get(&curr_vaddr).unwrap();
+            let dst = &mut (frame.paddr + page_off).slice_mut_with_len(chunk);
             dst.copy_from_slice(src);
             data_pos += chunk;
             curr_vaddr = curr_vaddr + PAGE_SIZE;
+            page_off = 0;
         }
     }
 }

@@ -6,7 +6,7 @@ extern crate user_lib;
 extern crate alloc;
 
 use alloc::format;
-use user_lib::{exec, fork, waitpid};
+use user_lib::{execve, exit, fork, waitpid};
 
 const TEST_LIST: &[&str] = &[
     "brk",
@@ -47,7 +47,10 @@ fn run_test(name: &str) {
     let path = format!("/bin/{}\0", name);
     let pid = fork();
     if pid == 0 {
-        exec(path.as_str(), &[core::ptr::null::<u8>()]);
+        let args: [*const u8; 2] = [path.as_ptr(), core::ptr::null()];
+        let envs: [*const u8; 1] = [core::ptr::null()];
+        execve(path.as_str(), &args, &envs);
+        exit(127);
     }
     let mut exit_code: i32 = 0;
     waitpid(pid as usize, &mut exit_code);

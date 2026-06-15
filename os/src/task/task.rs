@@ -292,6 +292,9 @@ impl TaskControlBlock {
             let mut inner = task_control_block.inner_exclusive_access();
             inner.trap_cx[TrapFrameArgs::SEPC] = entry_point;
             inner.trap_cx[TrapFrameArgs::SP] = user_sp;
+            inner.trap_cx[TrapFrameArgs::ARG0] = 0;
+            inner.trap_cx[TrapFrameArgs::ARG1] = 0;
+            inner.trap_cx[TrapFrameArgs::ARG2] = 0;
             if tls_size > 0 {
                 tls_base + tls_size
             } else {
@@ -465,8 +468,9 @@ impl TaskControlBlock {
         auxv_write!(AT_HWCAP, 0u64);
         auxv_write!(AT_PLATFORM, platform_addr as u64);
         auxv_write!(AT_RANDOM, random_addr as u64);
-        // AT_EXECFN
-        auxv_write!(31, string_addrs[0] as u64);
+        // AT_EXECFN normally points at argv[0]. Some internal runners are
+        // launched with argc=0, so keep auxv construction tolerant of that.
+        auxv_write!(31, string_addrs.first().copied().unwrap_or(platform_addr) as u64);
         auxv_write!(AT_NULL, 0u64);
 
         // Step 5: envp NULL and pointers
