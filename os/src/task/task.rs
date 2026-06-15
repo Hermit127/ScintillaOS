@@ -1,4 +1,4 @@
-use super::{current_task, SignalActions};
+use super::{current_task, SignalActions, UserFloatState};
 use super::{pid_alloc, PidHandle, SignalFlags};
 use crate::config::KERNEL_STACK_SIZE;
 use crate::fs::vfs::{Dentry, ROOT_DENTRY};
@@ -48,6 +48,7 @@ impl KernelStack {
 
 pub struct TaskControlBlockInner {
     pub trap_cx: TrapFrame,
+    pub fp_state: UserFloatState,
     pub base_size: usize,
     pub task_cx: KContext,
     pub task_status: TaskStatus,
@@ -157,14 +158,11 @@ impl TaskControlBlockInner {
 
 fn task_entry() {
     trace!("os::task::task_entry");
-    let task = current_task()
-        .unwrap()
-        .inner
-        .exclusive_access()
-        .get_trap_cx() as *mut TrapFrame;
-    // run_user_task_forever(unsafe { task.as_mut().unwrap() })
-    let ctx_mut = unsafe { task.as_mut().unwrap() };
     loop {
+        let task = current_task().unwrap();
+        task.restore_user_float_state();
+        let trap_cx = task.inner.exclusive_access().get_trap_cx() as *mut TrapFrame;
+        let ctx_mut = unsafe { trap_cx.as_mut().unwrap() };
         run_user_task(ctx_mut);
     }
 }
@@ -199,6 +197,18 @@ impl TaskControlBlock {
             None => None,
         }
     }
+    pub fn save_user_float_state(&self) {
+        if let Some(mut inner) = self.try_inner_exclusive_access() {
+            inner.fp_state.save_current();
+        }
+    }
+    pub fn restore_user_float_state(&self) {
+        let fp_state = {
+            let inner = self.inner_exclusive_access();
+            inner.fp_state
+        };
+        fp_state.restore_current();
+    }
     pub fn new(elf_data: &[u8]) -> Self {
         trace!("os::task::TaskControlBlock::new");
         let LoadedElf {
@@ -220,6 +230,7 @@ impl TaskControlBlock {
                 UPSafeCell::new_named(
                     TaskControlBlockInner {
                         trap_cx: TrapFrame::new(),
+                        fp_state: UserFloatState::new(),
                         base_size: user_sp,
                         task_cx: blank_kcontext(kstack.get_position().1), // Set task_cx's Kernel Stack Top
                         task_status: TaskStatus::Ready,
@@ -363,7 +374,7 @@ impl TaskControlBlock {
         const AT_RANDOM: u64 = 25;
         const AT_HWCAP: u64 = 16;
         const AT_PLATFORM: u64 = 15;
-        const AUXV_COUNT: usize = 17;
+        const AUXV_COUNT: usize = 18;
 
         // Stack layout (high to low):
         //   [platform str] [env strings] [arg strings] [16-align] [random 16B]
@@ -488,13 +499,15 @@ impl TaskControlBlock {
         inner.memory_set = memory_set;
         inner.heap_bottom = heap_bottom;
         inner.program_brk = heap_bottom;
+        inner.fp_state = UserFloatState::new();
         inner.trap_cx = TrapFrame::new();
 
         let mut trap_cx = TrapFrame::new();
         trap_cx[TrapFrameArgs::SEPC] = entry_point;
         trap_cx[TrapFrameArgs::SP] = crt_sp;
-        trap_cx[TrapFrameArgs::ARG0] = 0;
+        trap_cx[TrapFrameArgs::ARG0] = argc;
         trap_cx[TrapFrameArgs::ARG1] = argv_base;
+        trap_cx[TrapFrameArgs::ARG2] = envp_base;
         if tls_size > 0 {
             trap_cx[TrapFrameArgs::TLS] = tls_base + tls_size;
         } else {
@@ -539,6 +552,7 @@ impl TaskControlBlock {
             signal_actions,
             heap_bottom,
             program_brk,
+            fp_state,
         ) = {
             let parent_inner = self.inner_exclusive_access();
             (
@@ -567,6 +581,7 @@ impl TaskControlBlock {
                 parent_inner.signal_actions.clone(),
                 parent_inner.heap_bottom,
                 parent_inner.program_brk,
+                parent_inner.fp_state,
             )
         };
 
@@ -578,6 +593,7 @@ impl TaskControlBlock {
                 UPSafeCell::new_named(
                     TaskControlBlockInner {
                         trap_cx: trap_cx_clone,
+                        fp_state,
                         base_size,
                         task_cx: blank_kcontext(kstack.get_position().1), // Set task_cx's Kernel Stack Top
                         task_status: TaskStatus::Ready,

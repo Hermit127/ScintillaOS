@@ -36,6 +36,8 @@ const VIRTIO0: PhysAddr = polyhal::pa!(0xa00_0000);
 #[cfg(target_arch = "loongarch64")]
 const PCI_ECAM_BASE: PhysAddr = polyhal::pa!(0x20000000);
 
+const DMA_BOUNCE_SIZE: usize = 4096;
+
 #[cfg(not(target_arch = "loongarch64"))]
 pub struct VirtIOBlock(UPSafeCell<VirtIOBlk<VirtioHal, MmioTransport>>);
 #[cfg(target_arch = "loongarch64")]
@@ -51,17 +53,29 @@ unsafe impl Send for VirtIOBlock {}
 impl BlockDevice for VirtIOBlock {
     fn read_block(&self, block_id: usize, buf: &mut [u8]) {
         assert_eq!(buf.len() % SECTOR_SIZE, 0);
-        self.0
-            .exclusive_access()
-            .read_blocks(block_id, buf)
-            .expect("Error when reading VirtIOBlk");
+        let mut blk = self.0.exclusive_access();
+        let mut done = 0;
+        while done < buf.len() {
+            let chunk = (buf.len() - done).min(DMA_BOUNCE_SIZE);
+            let mut bounce = alloc::vec![0u8; chunk];
+            blk.read_blocks(block_id + done / SECTOR_SIZE, &mut bounce)
+                .expect("Error when reading VirtIOBlk");
+            buf[done..done + chunk].copy_from_slice(&bounce);
+            done += chunk;
+        }
     }
     fn write_block(&self, block_id: usize, buf: &[u8]) {
         assert_eq!(buf.len() % SECTOR_SIZE, 0);
-        self.0
-            .exclusive_access()
-            .write_blocks(block_id, buf)
-            .expect("Error when writing VirtIOBlk");
+        let mut blk = self.0.exclusive_access();
+        let mut done = 0;
+        while done < buf.len() {
+            let chunk = (buf.len() - done).min(DMA_BOUNCE_SIZE);
+            let mut bounce = alloc::vec![0u8; chunk];
+            bounce.copy_from_slice(&buf[done..done + chunk]);
+            blk.write_blocks(block_id + done / SECTOR_SIZE, &bounce)
+                .expect("Error when writing VirtIOBlk");
+            done += chunk;
+        }
     }
 }
 

@@ -41,6 +41,9 @@ pub struct ArchInterfaceImpl;
 /// kernel interrupt
 #[polyhal::arch_interrupt]
 fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
+    if let Some(task) = crate::task::current_task() {
+        task.save_user_float_state();
+    }
     //user time accounting
     if let Some(task) = crate::task::current_task() {
         task.record_time_user_to_kernel();
@@ -71,7 +74,17 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
                 current_add_signal(SignalFlags::SIGSEGV);
             }
         }
-        LoadPageFault(bad_addr) | InstructionPageFault(bad_addr) => {
+        InstructionPageFault(bad_addr)
+            if bad_addr == task::SIGNAL_RETURN_TRAMPOLINE
+                || ctx[TrapFrameArgs::SEPC] == task::SIGNAL_RETURN_TRAMPOLINE =>
+        {
+            if let Some(ret) = task::restore_current_signal_context() {
+                ctx[TrapFrameArgs::RET] = ret as usize;
+            } else {
+                current_add_signal(SignalFlags::SIGSEGV);
+            }
+        }
+        LoadPageFault(bad_addr) => {
             let vaddr = polyhal::VirtAddr::from(bad_addr);
             let task = crate::task::current_task().unwrap();
             let mut inner = task.inner_exclusive_access();

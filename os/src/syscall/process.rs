@@ -34,7 +34,12 @@ lazy_static! {
 }
 
 static LAST_USER_TIME_US: AtomicU64 = AtomicU64::new(0);
+static LAST_USER_TIMES_TICK: AtomicU64 = AtomicU64::new(0);
 const USER_TIME_MIN_STEP_US: u64 = 1;
+const USER_CLOCK_TICK_US: u64 = 10_000;
+const USER_CLOCK_TICK_NS: usize = USER_CLOCK_TICK_US as usize * 1_000;
+const NSEC_PER_SEC: usize = 1_000_000_000;
+const NSEC_PER_USEC: usize = 1_000;
 
 fn monotonic_user_time_us() -> u64 {
     let hw_us = (Time::now().to_nsec() / 1000) as u64;
@@ -48,6 +53,61 @@ fn monotonic_user_time_us() -> u64 {
             return next;
         }
     }
+}
+
+fn monotonic_user_times_tick() -> u64 {
+    let hw_tick = monotonic_user_time_us() / USER_CLOCK_TICK_US;
+    loop {
+        let last = LAST_USER_TIMES_TICK.load(Ordering::Relaxed);
+        let next = hw_tick.max(last.saturating_add(1));
+        if LAST_USER_TIMES_TICK
+            .compare_exchange(last, next, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            return next;
+        }
+    }
+}
+
+fn nsec_to_timeval(ns: usize) -> TimeVal {
+    let usec = if ns == 0 {
+        0
+    } else {
+        (ns + NSEC_PER_USEC - 1) / NSEC_PER_USEC
+    };
+    TimeVal {
+        sec: (usec / 1_000_000) as isize,
+        usec: (usec % 1_000_000) as isize,
+    }
+}
+
+fn nsec_to_clock_ticks(ns: usize) -> isize {
+    if ns == 0 {
+        0
+    } else {
+        ((ns + USER_CLOCK_TICK_NS - 1) / USER_CLOCK_TICK_NS) as isize
+    }
+}
+
+fn looks_like_text_script(data: &[u8]) -> bool {
+    if data.is_empty() {
+        return false;
+    }
+    let sample_len = data.len().min(256);
+    let mut has_text = false;
+    for &b in data[..sample_len].iter() {
+        if b == 0 {
+            return false;
+        }
+        if b == b'\n' || b == b'\r' || b == b'\t' || (b >= 0x20 && b <= 0x7e) {
+            if b > b' ' {
+                has_text = true;
+            }
+        } else {
+            return false;
+        }
+    }
+    has_text
 }
 
 const PROT_NONE: usize = 0;
@@ -238,17 +298,22 @@ pub fn sys_exec(path: *const u8, mut args: *const usize, mut envp: *const usize)
             }
         }
     }
-    let cwd = {
+    let (cwd, root) = {
         let task = current_task().unwrap();
         let inner = task.inner_exclusive_access();
-        inner.cwd.clone()
+        (inner.cwd.clone(), inner.root.clone())
     };
-    let app_inode = if path.starts_with('/') {
-        open_file(path.as_str(), OpenFlags::RDONLY)
-    } else {
-        open_file_at(Some(cwd), path.as_str(), OpenFlags::RDONLY, 0)
-            .or_else(|| open_file(format!("/bin/{}", path).as_str(), OpenFlags::RDONLY))
+    let open_exec = |path: &str| {
+        if let Some(stripped) = path.strip_prefix('/') {
+            open_file_at(Some(root.clone()), stripped, OpenFlags::RDONLY, 0)
+        } else {
+            open_file_at(Some(cwd.clone()), path, OpenFlags::RDONLY, 0).or_else(|| {
+                let bin_path = format!("bin/{}", path);
+                open_file_at(Some(root.clone()), bin_path.as_str(), OpenFlags::RDONLY, 0)
+            })
+        }
     };
+    let app_inode = open_exec(path.as_str());
     if let Some(app_inode) = app_inode {
         let all_data = app_inode.read_all();
         if all_data.len() >= 2 && &all_data[..2] == b"#!" {
@@ -273,9 +338,7 @@ pub fn sys_exec(path: *const u8, mut args: *const usize, mut envp: *const usize)
                     new_args.push(a.clone());
                 }
                 drop(app_inode);
-                if let Some(i2) = open_file(&ipath, OpenFlags::RDONLY)
-                    .or_else(|| open_file(&alloc::format!("/bin/{}", ipath), OpenFlags::RDONLY))
-                {
+                if let Some(i2) = open_exec(&ipath) {
                     let d2 = i2.read_all();
                     current_task().unwrap().exec(&d2, new_args, env_vec);
                     return 0;
@@ -285,13 +348,46 @@ pub fn sys_exec(path: *const u8, mut args: *const usize, mut envp: *const usize)
         }
         let task = current_task().unwrap();
         if all_data.len() < 4 || &all_data[..4] != b"\x7fELF" {
-            return -1;
+            if looks_like_text_script(&all_data) {
+                let mut sh_args = alloc::vec![alloc::string::String::from("/bin/sh"), path.clone()];
+                for a in args_vec.iter().skip(1) {
+                    sh_args.push(a.clone());
+                }
+                drop(app_inode);
+                if let Some(sh_inode) = open_exec("/bin/sh").or_else(|| open_exec("/busybox")) {
+                    let sh_data = sh_inode.read_all();
+                    if sh_data.len() >= 4 && &sh_data[..4] == b"\x7fELF" {
+                        if let Some(interp_path) = crate::mm::get_elf_interp(&sh_data) {
+                            let interp_inode = open_exec(&interp_path).or_else(|| {
+                                let usr_interp = alloc::format!("/usr{}", interp_path);
+                                open_exec(&usr_interp)
+                            });
+                            if let Some(interp_inode) = interp_inode {
+                                let interp_data = interp_inode.read_all();
+                                current_task().unwrap().exec_with_interp(
+                                    sh_data.as_slice(),
+                                    Some(&interp_data),
+                                    sh_args,
+                                    env_vec,
+                                );
+                                return 0;
+                            }
+                        } else {
+                            current_task().unwrap().exec(sh_data.as_slice(), sh_args, env_vec);
+                            return 0;
+                        }
+                    }
+                }
+            }
+            return -8;
         }
         // Check for dynamically linked ELF (has PT_INTERP)
         if let Some(interp_path) = crate::mm::get_elf_interp(&all_data) {
-            if let Some(interp_inode) = open_file(&interp_path, OpenFlags::RDONLY)
-                .or_else(|| open_file(&alloc::format!("/usr{}", interp_path), OpenFlags::RDONLY))
-            {
+            let interp_inode = open_exec(&interp_path).or_else(|| {
+                let usr_interp = alloc::format!("/usr{}", interp_path);
+                open_exec(&usr_interp)
+            });
+            if let Some(interp_inode) = interp_inode {
                 let interp_data = interp_inode.read_all();
                 task.exec_with_interp(all_data.as_slice(), Some(&interp_data), args_vec, env_vec);
                 return 0;
@@ -332,15 +428,24 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: usize) -> isize
             if !has_child {
                 return -10;
             }
-            zombie_idx.map(|idx| (inner.children.remove(idx), inner.memory_set.token()))
+            zombie_idx.map(|idx| {
+                let child = inner.children.remove(idx);
+                let found_pid = child.getpid();
+                let child_inner = child.inner_exclusive_access();
+                let exit_code = child_inner.exit_code;
+                inner.cutime = inner
+                    .cutime
+                    .saturating_add(child_inner.utime)
+                    .saturating_add(child_inner.cutime);
+                inner.cstime = inner
+                    .cstime
+                    .saturating_add(child_inner.stime)
+                    .saturating_add(child_inner.cstime);
+                (found_pid, exit_code, inner.memory_set.token())
+            })
         };
 
-        if let Some((child, token)) = zombie {
-            let found_pid = child.getpid();
-            let exit_code = {
-                let inner = child.inner_exclusive_access();
-                inner.exit_code
-            };
+        if let Some((found_pid, exit_code, token)) = zombie {
             if !exit_code_ptr.is_null() {
                 if exit_code < 0 {
                     *translated_refmut(token, exit_code_ptr) = -exit_code;
@@ -455,8 +560,18 @@ pub fn sys_waitid(
         if let Some(child) = zombie {
             let found_pid = child.getpid();
             let exit_code = {
-                let inner = child.inner_exclusive_access();
-                inner.exit_code
+                let child_inner = child.inner_exclusive_access();
+                let exit_code = child_inner.exit_code;
+                let mut parent_inner = task.inner_exclusive_access();
+                parent_inner.cutime = parent_inner
+                    .cutime
+                    .saturating_add(child_inner.utime)
+                    .saturating_add(child_inner.cutime);
+                parent_inner.cstime = parent_inner
+                    .cstime
+                    .saturating_add(child_inner.stime)
+                    .saturating_add(child_inner.cstime);
+                exit_code
             };
             write_wait_siginfo(info_ptr, found_pid as i32, exit_code);
             return 0;
@@ -576,22 +691,7 @@ pub fn sys_sigprocmask(how: i32, set: *const u8, old_set: *mut u8, _sigsetsize: 
 }
 
 pub fn sys_sigreturn() -> isize {
-    if let Some(task) = current_task() {
-        let mut inner = task.inner_exclusive_access();
-        inner.handling_sig = -1;
-        if let Some(mask) = inner.signal_mask_backup.take() {
-            inner.signal_mask = mask;
-        }
-        // restore the trap context
-        let trap_ctx = inner.get_trap_cx();
-        *trap_ctx = inner.trap_ctx_backup.take().unwrap();
-        // Here we return the value of a0 in the trap_ctx,
-        // otherwise it will be overwritten after we trap
-        // back to the original execution of the application.
-        trap_ctx[TrapFrameArgs::RET] as isize
-    } else {
-        -1
-    }
+    crate::task::restore_current_signal_context().unwrap_or(-1)
 }
 
 fn check_sigaction_error(signal: SignalFlags, _action: usize, _old_action: usize) -> bool {
@@ -891,17 +991,17 @@ pub fn sys_times(tms_ptr: usize) -> isize {
     if tms_ptr != 0 {
         let inner = task.inner_exclusive_access();
         let tms = Tms {
-            tms_utime: (inner.utime / 10_000_000) as isize,
-            tms_stime: (inner.stime / 10_000_000) as isize,
-            tms_cutime: (inner.cutime / 10_000_000) as isize,
-            tms_cstime: (inner.cstime / 10_000_000) as isize,
+            tms_utime: nsec_to_clock_ticks(inner.utime),
+            tms_stime: nsec_to_clock_ticks(inner.stime),
+            tms_cutime: nsec_to_clock_ticks(inner.cutime),
+            tms_cstime: nsec_to_clock_ticks(inner.cstime),
         };
         let token = inner.get_user_token();
         drop(inner);
         *crate::mm::translated_refmut(token, tms_ptr as *mut Tms) = tms;
     }
 
-    (polyhal::time::Time::now().to_nsec() / 10_000_000) as isize
+    monotonic_user_times_tick() as isize
 }
 
 pub fn sys_uname(uts_ptr: usize) -> isize {
@@ -2223,10 +2323,20 @@ pub fn sys_getrusage(who: usize, usage: *mut u8) -> isize {
     if usage.is_null() {
         return -14;
     }
-    let token = current_user_token();
+    let task = current_task().unwrap();
+    task.record_time_suspend();
+    task.record_time_resume();
+    let inner = task.inner_exclusive_access();
+    let (utime, stime) = if who == RUSAGE_SELF {
+        (inner.utime, inner.stime)
+    } else {
+        (inner.cutime, inner.cstime)
+    };
+    let token = inner.get_user_token();
+    drop(inner);
     let rusage = RUsage {
-        ru_utime: TimeVal { sec: 0, usec: 0 },
-        ru_stime: TimeVal { sec: 0, usec: 0 },
+        ru_utime: nsec_to_timeval(utime),
+        ru_stime: nsec_to_timeval(stime),
         ru_maxrss: 0,
         ru_ixrss: 0,
         ru_idrss: 0,

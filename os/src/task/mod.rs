@@ -1,4 +1,5 @@
 mod action;
+mod fp;
 mod manager;
 mod pid;
 mod processor;
@@ -17,7 +18,10 @@ use polyhal::instruction::shutdown;
 use polyhal::kcontext::KContext;
 use polyhal_trap::trapframe::TrapFrameArgs;
 
+pub const SIGNAL_RETURN_TRAMPOLINE: usize = 0x7ffeff000;
+
 pub use action::{SignalAction, SignalActions};
+pub use fp::UserFloatState;
 pub use manager::{add_priority_task, add_task, pid2task, ready_queue_len, PID2TCB};
 pub use pid::{pid_alloc, PidHandle};
 pub use processor::{
@@ -409,33 +413,23 @@ fn call_user_signal_handler(sig: usize, signal: SignalFlags) {
     }
     if handler != 0 {
         let action = task_inner.signal_actions.table[sig];
-        if action.restorer == 0 && signal == SignalFlags::SIGUSR1 {
-            task_inner.signals ^= signal;
-            return;
-        }
 
         // handle flag
         let old_mask = task_inner.signal_mask;
         task_inner.signals ^= signal;
-        if action.restorer != 0 {
-            task_inner.handling_sig = sig as isize;
-            task_inner.signal_mask_backup = Some(old_mask);
-            task_inner.signal_mask |= action.mask | signal;
-        }
+        task_inner.handling_sig = sig as isize;
+        task_inner.signal_mask_backup = Some(old_mask);
+        task_inner.signal_mask |= action.mask | signal;
 
         // backup trapframe
         let trap_ctx = task_inner.get_trap_cx();
-        if action.restorer != 0 {
-            task_inner.trap_ctx_backup = Some(trap_ctx.clone());
-        }
-        let saved_sepc = trap_ctx[TrapFrameArgs::SEPC];
-
+        task_inner.trap_ctx_backup = Some(trap_ctx.clone());
         // modify trapframe
         trap_ctx[TrapFrameArgs::SEPC] = handler;
         trap_ctx[TrapFrameArgs::RA] = if action.restorer != 0 {
             action.restorer
         } else {
-            saved_sepc
+            SIGNAL_RETURN_TRAMPOLINE
         };
 
         // put args (a0)
@@ -471,6 +465,20 @@ fn call_user_signal_handler(sig: usize, signal: SignalFlags) {
         }
         task_inner.signals ^= signal;
     }
+}
+
+pub fn restore_current_signal_context() -> Option<isize> {
+    let task = current_task()?;
+    let mut inner = task.inner_exclusive_access();
+    inner.handling_sig = -1;
+    if let Some(mask) = inner.signal_mask_backup.take() {
+        inner.signal_mask = mask;
+    }
+    let backup = inner.trap_ctx_backup.take()?;
+    let ret = backup[TrapFrameArgs::RET] as isize;
+    let trap_ctx = inner.get_trap_cx();
+    *trap_ctx = backup;
+    Some(ret)
 }
 
 fn check_pending_signals() {

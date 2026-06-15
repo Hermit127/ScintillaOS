@@ -106,6 +106,7 @@ impl VfsSuperBlock {
     // ---------- path-based ext4 operations ----------
 
     pub fn dir_get_entries(&self, fs_path: &str) -> Vec<DirEntry> {
+        const MAX_DIR_ENTRIES: usize = 4096;
         self.with_fs(|_fs| {
             let c_path = match CString::new(fs_path) {
                 Ok(s) => s,
@@ -120,12 +121,15 @@ impl VfsSuperBlock {
                     return entries;
                 }
                 loop {
+                    if entries.len() >= MAX_DIR_ENTRIES {
+                        break;
+                    }
                     let de = ext4_dir_entry_next(&mut d);
                     if de.is_null() {
                         break;
                     }
                     let dentry = &*de;
-                    let name_len = dentry.name_length as usize;
+                    let name_len = (dentry.name_length as usize).min(dentry.name.len());
                     let name_bytes = dentry.name[..name_len].to_vec();
                     entries.push(DirEntry {
                         inode: dentry.inode,

@@ -1561,16 +1561,9 @@ pub fn sys_pread64(fd: usize, buf: *mut u8, len: usize, offset: usize) -> isize 
     if !file.readable() {
         return -1;
     }
-    let dentry = match file.as_any().downcast_ref::<crate::fs::inode::OSInode>() {
-        Some(inode) => inode.dentry().clone(),
-        None => return -1,
-    };
     drop(inner);
     let user_buf = translated_byte_buffer(token, buf, len);
-    let n = dentry
-        .super_block
-        .read_at(&dentry.fs_path, offset, user_buf);
-    n as isize
+    file.read_at(offset, user_buf)
 }
 
 pub fn sys_pwrite64(fd: usize, buf: *mut u8, len: usize, offset: usize) -> isize {
@@ -1584,16 +1577,9 @@ pub fn sys_pwrite64(fd: usize, buf: *mut u8, len: usize, offset: usize) -> isize
     if !file.writable() {
         return -1;
     }
-    let dentry = match file.as_any().downcast_ref::<crate::fs::inode::OSInode>() {
-        Some(inode) => inode.dentry().clone(),
-        None => return -1,
-    };
     drop(inner);
     let user_buf = translated_byte_buffer(token, buf, len);
-    let n = dentry
-        .super_block
-        .write_at(&dentry.fs_path, offset, user_buf);
-    n as isize
+    file.write_at(offset, user_buf)
 }
 
 pub fn sys_preadv(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> isize {
@@ -1615,10 +1601,6 @@ pub fn sys_preadv(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> is
         return -9;
     }
     let file = inner.fd_table[fd].as_ref().unwrap().clone();
-    let dentry = match file.as_any().downcast_ref::<crate::fs::inode::OSInode>() {
-        Some(inode) => inode.dentry().clone(),
-        None => return -22,
-    };
     if !file.readable() {
         return -9;
     }
@@ -1650,7 +1632,11 @@ pub fn sys_preadv(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> is
         }
         let user_buf =
             crate::mm::translated_byte_buffer(token, iov.iov_base as *mut u8, iov.iov_len);
-        let n = dentry.super_block.read_at(&dentry.fs_path, off, user_buf);
+        let n = file.read_at(off, user_buf);
+        if n < 0 {
+            return if total == 0 { n } else { total };
+        }
+        let n = n as usize;
         total += n as isize;
         off += n;
         if n < iov.iov_len {
@@ -1680,10 +1666,6 @@ pub fn sys_pwritev(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> i
         return -9;
     }
     let file = inner.fd_table[fd].as_ref().unwrap().clone();
-    let dentry = match file.as_any().downcast_ref::<crate::fs::inode::OSInode>() {
-        Some(inode) => inode.dentry().clone(),
-        None => return -29,
-    };
     if !file.writable() {
         return -9;
     }
@@ -1715,7 +1697,11 @@ pub fn sys_pwritev(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> i
         }
         let user_buf =
             crate::mm::translated_byte_buffer(token, iov.iov_base as *mut u8, iov.iov_len);
-        let n = dentry.super_block.write_at(&dentry.fs_path, off, user_buf);
+        let n = file.write_at(off, user_buf);
+        if n < 0 {
+            return if total == 0 { n } else { total };
+        }
+        let n = n as usize;
         total += n as isize;
         off += n;
         if n < iov.iov_len {

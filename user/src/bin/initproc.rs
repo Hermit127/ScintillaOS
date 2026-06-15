@@ -9,7 +9,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use user_lib::{
     chroot, close, execve, exit, fork, get_time, getdents64, kill, open, shutdown, sleep,
-    symlinkat, sys_mkdir, sys_mount, unlinkat, waitpid, waitpid_nb, OpenFlags,
+    symlinkat, sys_mkdir, sys_mount, sys_waitpid_options, unlinkat, waitpid, waitpid_nb, OpenFlags,
 };
 
 const BUSYBOX_APPLETS: [&str; 68] = [
@@ -19,6 +19,14 @@ const BUSYBOX_APPLETS: [&str; 68] = [
     "printf", "date", "chmod", "chown", "ln", "dd", "sync", "cmp", "od", "awk", "sed", "xargs",
     "readlink", "mkfifo", "du", "df", "mount", "umount", "chattr", "getconf", "tee", "yes",
     "mknod", "mktemp", "chgrp", "dmesg", "ps", "free", "hostname", "md5sum", "diff", "unlink",
+];
+
+const KNOWN_TEST_SCRIPTS: [&str; 5] = [
+    "basic_testcode.sh",
+    "busybox_testcode.sh",
+    "lua_testcode.sh",
+    "iozone_testcode.sh",
+    "lmbench_testcode.sh",
 ];
 
 fn force_symlink(target: &str, linkpath: &str) -> isize {
@@ -31,6 +39,29 @@ fn force_symlink(target: &str, linkpath: &str) -> isize {
         tries += 1;
     }
     r
+}
+
+fn nul_terminated_path(path: &str) -> String {
+    String::from(path.trim_end_matches('\0')) + "\0"
+}
+
+fn path_exists(path: &str) -> bool {
+    let p = nul_terminated_path(path);
+    let fd = open(&p, OpenFlags::RDONLY);
+    if fd >= 0 {
+        close(fd as usize);
+        true
+    } else {
+        false
+    }
+}
+
+fn ensure_symlink(target: &str, linkpath: &str) -> isize {
+    if path_exists(linkpath) {
+        0
+    } else {
+        force_symlink(target, linkpath)
+    }
 }
 
 fn mkdir_path(path: &str) {
@@ -67,24 +98,44 @@ fn setup_runtime_dirs(root: &str) {
     mkdir_path(&(String::from(root) + "/lib64"));
 }
 
+fn setup_lmbench_wrapper_paths(chroot_root: &str, chroot_cwd: &str) {
+    let chroot_root = chroot_root.trim_end_matches('\0').trim_end_matches('/');
+    let chroot_cwd = chroot_cwd.trim_end_matches('\0').trim_end_matches('/');
+    let prefixes = [
+        "/code/lmbench_src/bin/build",
+        "/coursegrader/submit/testsuits-for-oskernel/lmbench_src/bin/build",
+    ];
+    for prefix in prefixes {
+        let mut path = String::from(chroot_root);
+        for part in prefix.trim_matches('/').split('/') {
+            path.push('/');
+            path.push_str(part);
+            mkdir_path(&path);
+        }
+        let target = String::from(chroot_cwd) + "/lmbench_all";
+        let link = path + "/lmbench_all\0";
+        force_symlink(&target, &link);
+    }
+}
+
 fn setup_busybox_applets_at(root: &str) {
     let root = root.trim_end_matches('\0').trim_end_matches('/');
     setup_runtime_dirs(root);
-    force_symlink("/busybox", &(String::from(root) + "/bin/busybox\0"));
-    force_symlink("/busybox", &(String::from(root) + "/bin/sh\0"));
+    ensure_symlink("/busybox", &(String::from(root) + "/bin/busybox\0"));
+    ensure_symlink("/busybox", &(String::from(root) + "/bin/sh\0"));
     for applet in BUSYBOX_APPLETS {
         let path = String::from(root) + "/bin/" + applet + "\0";
-        force_symlink("/busybox", &path);
+        ensure_symlink("/busybox", &path);
     }
 }
 
 fn setup_busybox_applets() {
     sys_mkdir(b"/bin\0".as_ptr(), 0o777);
-    force_symlink("/busybox", "/bin/busybox\0");
-    force_symlink("/busybox", "/bin/sh\0");
+    ensure_symlink("/busybox", "/bin/busybox\0");
+    ensure_symlink("/busybox", "/bin/sh\0");
     for applet in BUSYBOX_APPLETS {
         let path = String::from("/bin/") + applet + "\0";
-        force_symlink("/busybox", &path);
+        ensure_symlink("/busybox", &path);
     }
 }
 
@@ -123,6 +174,7 @@ fn setup_runtime_for_dir(dir: &str) {
     let busybox = chroot_cwd.clone() + "/busybox";
     force_symlink(&busybox, &(chroot_root.clone() + "/busybox\0"));
     setup_busybox_applets_at(&chroot_root);
+    setup_lmbench_wrapper_paths(&chroot_root, &chroot_cwd);
     println!(
         "[initproc] runtime root {} chroot {} cwd {} musl {} glibc {}",
         root, chroot_root, chroot_cwd, musl_root, glibc_root
@@ -202,6 +254,16 @@ fn setup_runtime_for_dir(dir: &str) {
 
 fn install_busybox() {
     setup_busybox_applets();
+}
+
+fn reap_zombies() {
+    let mut exit_code = 0;
+    loop {
+        let pid = sys_waitpid_options(-1, &mut exit_code as *mut i32, 1);
+        if pid <= 0 {
+            break;
+        }
+    }
 }
 
 fn list_dir(path: &str) -> Vec<String> {
@@ -324,15 +386,43 @@ fn script_path(dir: &str, script: &str) -> String {
     path
 }
 
+fn collect_known_scripts(dir: &str, out: &mut Vec<TestScript>) -> usize {
+    let mut found = 0usize;
+    for script in KNOWN_TEST_SCRIPTS {
+        let path = script_path(dir, script);
+        if !path_exists(&path) {
+            continue;
+        }
+        if out
+            .iter()
+            .any(|old| script_path(&old.dir, &old.script) == path)
+        {
+            continue;
+        }
+        out.push(TestScript {
+            dir: String::from(dir),
+            script: String::from(script),
+        });
+        found += 1;
+    }
+    println!(
+        "[initproc] {} has {} known test scripts",
+        dir.trim_end_matches('\0'),
+        found
+    );
+    found
+}
+
 fn run_script(dir: &str, script: &str) {
     let (chroot_root, chroot_cwd) = chroot_root_and_cwd(dir);
     let script_arg = String::from("./") + script + "\0";
     let args: [*const u8; 3] = [b"sh\0".as_ptr(), script_arg.as_ptr(), core::ptr::null()];
-    let envs: [*const u8; 5] = [
+    let envs: [*const u8; 6] = [
         b"PATH=/bin:/usr/bin:.\0".as_ptr(),
         b"LD_LIBRARY_PATH=/lib:/lib64:.\0".as_ptr(),
         b"HOME=/\0".as_ptr(),
         b"TMPDIR=/tmp\0".as_ptr(),
+        b"ENOUGH=50000\0".as_ptr(),
         core::ptr::null(),
     ];
     let pid = fork();
@@ -360,6 +450,7 @@ fn run_script(dir: &str, script: &str) {
                     script,
                     ec
                 );
+                reap_zombies();
                 break;
             }
             if get_time() - start > budget_ms {
@@ -371,6 +462,7 @@ fn run_script(dir: &str, script: &str) {
                 );
                 kill(pid as usize, 9);
                 waitpid(pid as usize, &mut ec);
+                reap_zombies();
                 break;
             }
             sleep(20);
@@ -443,6 +535,7 @@ fn run_collected_scripts(mut scripts: Vec<TestScript>) -> bool {
     }
     sort_collected_scripts(&mut scripts);
     for item in scripts {
+        reap_zombies();
         setup_runtime_for_dir(&item.dir);
         println!("[initproc] [RUN] {}", script_path(&item.dir, &item.script));
         run_script(&item.dir, &item.script);
@@ -462,7 +555,7 @@ fn main() -> i32 {
 
     let mut scripts = Vec::new();
     for dir in ["/mnt/musl/\0", "/mnt/glibc/\0"] {
-        collect_scripts(dir, 0, &mut scripts);
+        collect_known_scripts(dir, &mut scripts);
     }
     #[cfg(target_arch = "riscv64")]
     let arch_dirs: [&str; 2] = ["/mnt/riscv/musl/\0", "/mnt/riscv/glibc/\0"];
@@ -472,7 +565,7 @@ fn main() -> i32 {
     let arch_dirs: [&str; 0] = [];
     if scripts.is_empty() {
         for dir in arch_dirs {
-            collect_scripts(dir, 0, &mut scripts);
+            collect_known_scripts(dir, &mut scripts);
         }
     }
     if scripts.is_empty() {
@@ -482,6 +575,7 @@ fn main() -> i32 {
     if !found {
         println!("[initproc] no test scripts found");
     }
+    reap_zombies();
 
     println!("[initproc] === DONE ===");
     shutdown();
