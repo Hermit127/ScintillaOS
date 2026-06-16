@@ -1,4 +1,8 @@
-#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+#[cfg(any(
+    target_arch = "riscv64",
+    target_arch = "aarch64",
+    target_arch = "loongarch64"
+))]
 mod imp {
     use core::sync::atomic::{AtomicBool, Ordering};
     use smoltcp::iface::{Config, Interface, SocketSet};
@@ -6,14 +10,94 @@ mod imp {
     use smoltcp::time::Instant;
     use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, Ipv4Address, Ipv4Cidr};
 
-    use crate::drivers::net::VirtIONetAdapter;
     use crate::sync::UPSafeCell;
     use lazy_static::lazy_static;
+
+    #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+    use crate::drivers::net::VirtIONetAdapter as NetDevice;
+    #[cfg(target_arch = "loongarch64")]
+    use self::loopback::LoopbackOnlyAdapter as NetDevice;
+
+    #[cfg(target_arch = "loongarch64")]
+    mod loopback {
+        use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+        use smoltcp::time::Instant;
+
+        const NET_BUF_SIZE: usize = 1536;
+
+        pub struct LoopbackOnlyAdapter {
+            tx_buf: [u8; NET_BUF_SIZE],
+            mac_addr: [u8; 6],
+        }
+
+        impl LoopbackOnlyAdapter {
+            pub fn new() -> Option<Self> {
+                Some(Self {
+                    tx_buf: [0u8; NET_BUF_SIZE],
+                    mac_addr: [0x52, 0x54, 0x00, 0x12, 0x34, 0x57],
+                })
+            }
+
+            pub fn mac_address(&self) -> [u8; 6] {
+                self.mac_addr
+            }
+        }
+
+        pub struct LoopbackRxToken;
+
+        impl RxToken for LoopbackRxToken {
+            fn consume<R, F>(self, f: F) -> R
+            where
+                F: FnOnce(&mut [u8]) -> R,
+            {
+                f(&mut [])
+            }
+        }
+
+        pub struct LoopbackTxToken<'a> {
+            buf: &'a mut [u8; NET_BUF_SIZE],
+        }
+
+        impl TxToken for LoopbackTxToken<'_> {
+            fn consume<R, F>(self, len: usize, f: F) -> R
+            where
+                F: FnOnce(&mut [u8]) -> R,
+            {
+                f(&mut self.buf[..len.min(NET_BUF_SIZE)])
+            }
+        }
+
+        impl Device for LoopbackOnlyAdapter {
+            type RxToken<'a> = LoopbackRxToken;
+            type TxToken<'a> = LoopbackTxToken<'a>;
+
+            fn receive(
+                &mut self,
+                _timestamp: Instant,
+            ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+                None
+            }
+
+            fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
+                Some(LoopbackTxToken {
+                    buf: &mut self.tx_buf,
+                })
+            }
+
+            fn capabilities(&self) -> DeviceCapabilities {
+                let mut caps = DeviceCapabilities::default();
+                caps.max_transmission_unit = 1500;
+                caps.max_burst_size = Some(1);
+                caps.medium = Medium::Ethernet;
+                caps
+            }
+        }
+    }
 
     pub static NET_INITED: AtomicBool = AtomicBool::new(false);
 
     pub struct NetworkState {
-        pub device: VirtIONetAdapter,
+        pub device: NetDevice,
         pub iface: Interface,
         pub sockets: SocketSet<'static>,
         pub dhcp_handle: Option<smoltcp::iface::SocketHandle>,
@@ -24,7 +108,7 @@ mod imp {
 
     impl NetworkState {
         pub fn new() -> Option<Self> {
-            let mut device = VirtIONetAdapter::new()?;
+            let mut device = NetDevice::new()?;
             let mac_addr = device.mac_address();
             let config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac_addr)));
             let now = Instant::from_millis(0);
@@ -74,10 +158,18 @@ mod imp {
 
 pub mod socket;
 
-#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+#[cfg(any(
+    target_arch = "riscv64",
+    target_arch = "aarch64",
+    target_arch = "loongarch64"
+))]
 pub mod syscall;
 
-#[cfg(not(any(target_arch = "riscv64", target_arch = "aarch64")))]
+#[cfg(not(any(
+    target_arch = "riscv64",
+    target_arch = "aarch64",
+    target_arch = "loongarch64"
+)))]
 pub mod syscall {
     pub fn sys_socket(_domain: usize, _type_: usize, _protocol: usize) -> isize {
         -38
@@ -89,6 +181,14 @@ pub mod syscall {
         -38
     }
     pub fn sys_accept(_sockfd: usize, _addr: *mut u8, _addrlen: *mut usize) -> isize {
+        -38
+    }
+    pub fn sys_accept4(
+        _sockfd: usize,
+        _addr: *mut u8,
+        _addrlen: *mut usize,
+        _flags: usize,
+    ) -> isize {
         -38
     }
     pub fn sys_connect(_sockfd: usize, _addr: *const u8, _addrlen: usize) -> isize {
@@ -175,6 +275,14 @@ pub mod syscall {
     ) -> isize {
         -38
     }
+    pub(crate) fn udp_write_with_endpoint(
+        _handle: smoltcp::iface::SocketHandle,
+        _data: &[u8],
+        _local: Option<smoltcp::wire::IpEndpoint>,
+        _peer: Option<smoltcp::wire::IpEndpoint>,
+    ) -> isize {
+        -38
+    }
     pub(crate) fn udp_recv(
         _handle: smoltcp::iface::SocketHandle,
         _nonblock: bool,
@@ -182,24 +290,74 @@ pub mod syscall {
     ) -> isize {
         -38
     }
+    pub(crate) fn udp_recv_with_endpoints(
+        _handle: smoltcp::iface::SocketHandle,
+        _nonblock: bool,
+        _buf: &mut [u8],
+        _local: Option<smoltcp::wire::IpEndpoint>,
+        _peer: Option<smoltcp::wire::IpEndpoint>,
+    ) -> isize {
+        -38
+    }
+    pub(crate) fn local_udp_pending_on(_port: u16) -> bool {
+        false
+    }
+    pub(crate) fn local_udp_close(
+        _local: smoltcp::wire::IpEndpoint,
+        _peer: Option<smoltcp::wire::IpEndpoint>,
+    ) {
+    }
+    pub(crate) fn local_tcp_send(
+        _conn_id: usize,
+        _server_side: bool,
+        _nonblock: bool,
+        _data: &[u8],
+    ) -> isize {
+        -38
+    }
+    pub(crate) fn local_tcp_recv(
+        _conn_id: usize,
+        _server_side: bool,
+        _nonblock: bool,
+        _buf: &mut [u8],
+    ) -> isize {
+        -38
+    }
+    pub(crate) fn local_tcp_close(_conn_id: usize, _server_side: bool) {}
+    pub(crate) fn local_tcp_unlisten(_port: u16) {}
+    pub(crate) fn local_tcp_poll(_conn_id: usize, _server_side: bool) -> (bool, bool, bool) {
+        (false, false, false)
+    }
+    pub(crate) fn local_tcp_pending_on(_port: u16) -> bool {
+        false
+    }
 }
 
-#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+#[cfg(any(
+    target_arch = "riscv64",
+    target_arch = "aarch64",
+    target_arch = "loongarch64"
+))]
 use imp::NetworkState;
-#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+#[cfg(any(
+    target_arch = "riscv64",
+    target_arch = "aarch64",
+    target_arch = "loongarch64"
+))]
 use imp::NET_IFACE;
-#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+#[cfg(any(
+    target_arch = "riscv64",
+    target_arch = "aarch64",
+    target_arch = "loongarch64"
+))]
 use imp::NET_INITED;
 
-#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
-const VIRTIO_NET_MMIO: usize = 0x10003000;
-#[cfg(target_arch = "aarch64")]
-const VIRTIO_NET_MMIO: usize = 0xa00_0300;
-const VIRTIO_MMIO_DEVICE_ID: usize = 0x08;
-const VIRTIO_NET_DEVICE_ID: u32 = 1;
-
 pub fn net_init() {
-    #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+    #[cfg(any(
+        target_arch = "riscv64",
+        target_arch = "aarch64",
+        target_arch = "loongarch64"
+    ))]
     {
         let mut state = NET_IFACE.exclusive_access();
         if let Some(state) = state.as_mut() {
@@ -218,7 +376,11 @@ pub fn net_init() {
 }
 
 pub fn net_poll() {
-    #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+    #[cfg(any(
+        target_arch = "riscv64",
+        target_arch = "aarch64",
+        target_arch = "loongarch64"
+    ))]
     {
         if !NET_INITED.load(core::sync::atomic::Ordering::Relaxed) {
             return;
@@ -255,25 +417,46 @@ pub fn net_poll() {
     }
 }
 
-#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+#[cfg(any(
+    target_arch = "riscv64",
+    target_arch = "aarch64",
+    target_arch = "loongarch64"
+))]
 pub fn net_device_present() -> bool {
-    let ptr = polyhal::PhysAddr::new(VIRTIO_NET_MMIO + VIRTIO_MMIO_DEVICE_ID).get_mut_ptr();
-    let device_id = unsafe { core::ptr::read_volatile(ptr as *const u32) };
-    device_id == VIRTIO_NET_DEVICE_ID
+    #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+    {
+        crate::drivers::net::has_mmio_net_device()
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        true
+    }
 }
 
-#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+#[cfg(any(
+    target_arch = "riscv64",
+    target_arch = "aarch64",
+    target_arch = "loongarch64"
+))]
 pub fn net_available() -> bool {
     let guard = NET_IFACE.exclusive_access();
     guard.as_ref().map(|state| state.inited).unwrap_or(false)
 }
 
-#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+#[cfg(any(
+    target_arch = "riscv64",
+    target_arch = "aarch64",
+    target_arch = "loongarch64"
+))]
 pub fn net_available_fast() -> bool {
     NET_INITED.load(core::sync::atomic::Ordering::Relaxed)
 }
 
-#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+#[cfg(any(
+    target_arch = "riscv64",
+    target_arch = "aarch64",
+    target_arch = "loongarch64"
+))]
 pub fn with_net_iface<F, R>(f: F) -> Option<R>
 where
     F: FnOnce(&mut NetworkState) -> R,
@@ -282,7 +465,11 @@ where
     guard.as_mut().map(|state| f(state))
 }
 
-#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+#[cfg(any(
+    target_arch = "riscv64",
+    target_arch = "aarch64",
+    target_arch = "loongarch64"
+))]
 pub fn with_net_iface_tcp_connect(
     handle: smoltcp::iface::SocketHandle,
     remote: smoltcp::wire::IpEndpoint,
@@ -301,7 +488,11 @@ pub fn with_net_iface_tcp_connect(
     }
 }
 
-#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+#[cfg(any(
+    target_arch = "riscv64",
+    target_arch = "aarch64",
+    target_arch = "loongarch64"
+))]
 pub fn wake_net_blocked_tasks() {
     use crate::task::{add_priority_task, add_task, BlockReason, TaskStatus, NET_BLOCK_QUEUE};
     use smoltcp::iface::SocketHandle;
@@ -359,7 +550,9 @@ pub fn wake_net_blocked_tasks() {
                         .unwrap_or(true)
                     }
                     Some(BlockReason::PollWait) => true,
-                    Some(BlockReason::PipeRead(_)) | Some(BlockReason::PipeWrite(_)) => false,
+                    Some(BlockReason::PipeRead(_))
+                    | Some(BlockReason::PipeWrite(_))
+                    | Some(BlockReason::Futex(_)) => false,
                     None => true, // block_reason cleared, should be woken
                 }
             };
@@ -379,5 +572,9 @@ pub fn wake_net_blocked_tasks() {
     }
 }
 
-#[cfg(not(any(target_arch = "riscv64", target_arch = "aarch64")))]
+#[cfg(not(any(
+    target_arch = "riscv64",
+    target_arch = "aarch64",
+    target_arch = "loongarch64"
+)))]
 pub fn wake_net_blocked_tasks() {}

@@ -9,7 +9,8 @@ use crate::task::{
     add_task, blank_kcontext, block_current_and_run_next, current_task, current_user_token,
     exit_current_and_run_next, force_exit_task, pid2task, pid_alloc, sleep_current_and_run_next,
     suspend_current_and_run_next, wake_blocked_task, BlockReason, KernelStack, SignalAction,
-    SignalFlags, TaskControlBlock, TaskControlBlockInner, TaskStatus, PID2TCB, MAX_SIG,
+    SignalFlags, TaskControlBlock, TaskControlBlockInner, TaskStatus, NET_BLOCK_QUEUE, PID2TCB,
+    MAX_SIG,
 };
 use alloc::format;
 use alloc::string::String;
@@ -2129,19 +2130,31 @@ pub fn sys_pselect6(
                 continue;
             }
 
-            let mut readable = false;
-            let mut writable = false;
-            let mut error = false;
-
             if fd < inner.fd_table.len() {
                 if let Some(file) = &inner.fd_table[fd] {
                     let file = file.clone();
                     drop(inner);
                     let (r, w, e) = file.poll();
-                    readable = r;
-                    writable = w;
-                    error = e;
                     inner = task.inner_exclusive_access();
+
+                    if check_read && r {
+                        fd_set(&mut rfds, fd);
+                        ready += 1;
+                    } else {
+                        fd_clr(&mut rfds, fd);
+                    }
+                    if check_write && w {
+                        fd_set(&mut wfds, fd);
+                        ready += 1;
+                    } else {
+                        fd_clr(&mut wfds, fd);
+                    }
+                    if check_except && e {
+                        fd_set(&mut efds, fd);
+                        ready += 1;
+                    } else {
+                        fd_clr(&mut efds, fd);
+                    }
                 } else {
                     drop(inner);
                     return -9;
@@ -2149,25 +2162,6 @@ pub fn sys_pselect6(
             } else {
                 drop(inner);
                 return -9;
-            }
-
-            if check_read && readable {
-                fd_set(&mut rfds, fd);
-                ready += 1;
-            } else {
-                fd_clr(&mut rfds, fd);
-            }
-            if check_write && writable {
-                fd_set(&mut wfds, fd);
-                ready += 1;
-            } else {
-                fd_clr(&mut wfds, fd);
-            }
-            if check_except && error {
-                fd_set(&mut efds, fd);
-                ready += 1;
-            } else {
-                fd_clr(&mut efds, fd);
             }
 
             fd += 1;
@@ -2237,16 +2231,44 @@ pub fn sys_futex(
         0 | 9 => {
             if cur == val as u32 {
                 stdout_release_if_owner();
-                suspend_current_and_run_next();
+                block_current_and_run_next(BlockReason::Futex(uaddr as usize));
                 0
             } else {
                 -11
             }
         }
-        1 | 10 => 0,
+        1 | 10 => wake_futex_tasks(uaddr as usize, val),
         6..=8 | 11..=13 => 0,
         _ => -38,
     }
+}
+
+fn wake_futex_tasks(addr: usize, max_wake: usize) -> isize {
+    let mut to_wake = Vec::new();
+    {
+        let mut queue = NET_BLOCK_QUEUE.exclusive_access();
+        let mut i = 0;
+        while i < queue.len() && to_wake.len() < max_wake {
+            let should_wake = {
+                let inner = queue[i].inner_exclusive_access();
+                matches!(inner.block_reason, Some(BlockReason::Futex(a)) if a == addr)
+            };
+            if should_wake {
+                to_wake.push(queue.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+    }
+    let count = to_wake.len();
+    for task in to_wake {
+        let mut inner = task.inner_exclusive_access();
+        inner.task_status = TaskStatus::Ready;
+        inner.block_reason = None;
+        drop(inner);
+        add_task(task);
+    }
+    count as isize
 }
 
 pub fn sys_madvise(_start: usize, _len: usize, _advice: usize) -> isize {

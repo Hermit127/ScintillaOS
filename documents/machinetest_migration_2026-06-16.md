@@ -34,17 +34,17 @@ iperf、ltp、netperf、cyclictest、libcbench：本次仍为 0
 qemu-system-riscv64 ... -drive file=sdcard-rv.img ... id=x0 ... -drive file=disk-rv.img ... id=x1
 qemu-system-loongarch64 ... -drive file=sdcard-la.img ... id=x0 ... -drive file=disk-la.img ... id=x1
 
-这里真正的评测用例不是我们自己塞进 rootfs 的固定输出，而是在官方提供的 sdcard/test disk 里。
-内核启动后有两块 virtio-blk：
-第一块是启动/rootfs 盘；
-第二块是官方测试盘，里面包含 /musl、/glibc 目录以及 basic、busybox、lmbench、lua、iozone、iperf、ltp 等 testcode.sh 和对应二进制。
+这里真正的评测用例不是我们自己塞进 rootfs 的固定输出，而是在官方提供的 sdcard 里。
+内核启动后有两块 virtio-blk。按官网命令顺序，第一块 `sdcard-rv.img` / `sdcard-la.img` 会被内核识别为 `vda`，它才是官方测试盘；第二块 `disk-rv.img` / `disk-la.img` 会被识别为 `vdb`，它是我们构建出的 rootfs。
+我们在本地找到并保存过官方镜像：`tmp/official-20250615/sdcard-rv.img` 和 `tmp/official-20250615/sdcard-la.img`。用 Docker 里的 `debugfs` 读取 `sdcard-rv.img` 根目录，可以看到 `/musl`、`/glibc`、`/lost+found`。在 QEMU 里用 busybox 手动挂载也能复现：`/busybox mount -t ext4 vda /mnt` 后 `/mnt` 下是 `glibc`、`musl`、`lost+found`；而挂载 `vdb` 后看到的是 rootfs 内容，例如 `bin`、`busybox`、`contest.sh`、`basic_testcode.sh` 等。
+因此这次修复里提到的官方 sdcard / 测试盘，精确地说就是第一块 virtio-blk，也就是 `vda`。
 
 这件事后来通过 initproc 的 mount 日志和 getdents 日志确认：
 mount vda -> /mnt 成功后，/mnt/musl/ 和 /mnt/glibc/ 能看到官方脚本。
 官网卡在 “scan known /mnt/glibc/” 或 “/mnt/musl/ has N known test scripts” 时，本质是我们已经找到官方 sdcard，但执行脚本、动态链接、文件系统读写或进程调度中某一步卡住。
 
 因此这段时间的正确修复方向是：
-1. 让内核能稳定挂载官方第二块盘。
+1. 让内核能稳定挂载官方第一块盘，也就是 `vda`。
 2. 让 exec 能从 /mnt/musl 和 /mnt/glibc 执行官方二进制。
 3. 让 busybox sh、动态链接器、libc、读写文件、pipe、fork/wait/signal 能支撑官方脚本。
 4. 不把测试结果写死在内核或用户程序里。
@@ -62,7 +62,7 @@ Makefile：
 
 os/src/drivers/block/virtio_blk.rs：
 1. VirtIOBlock::new / probe 相关逻辑增加了对多块 virtio-blk 的识别。
-2. 在 RISC-V 上扫描多个 MMIO virtio 地址，官网命令里第一个 virtio-blk 是 sdcard，第二个 virtio-blk 是 disk/test disk。
+2. 在 RISC-V 上扫描多个 MMIO virtio 地址，官网命令里第一个 virtio-blk 是官方 sdcard/test disk，第二个 virtio-blk 是我们构建出的 disk/rootfs。
 3. 在 LoongArch 上通过 PCI virtio-blk probe 获取两块盘。
 4. 修复容量获取逻辑，后续 005cb597 使用真实 block capacity，避免把官方测试盘容量识别错导致 ext4 读写越界或目录扫描异常。
 
@@ -279,3 +279,150 @@ main 上继续工作的边界
 2. 后续只在 main 上修 iperf，先找根因，再修真实 socket/clone/poll 语义。
 3. iperf 修完后可以用官方 sdcard 试跑 LTP，记录现有功能能拿多少分。
 4. LTP 阶段只评测已有实现，不添加新的 LTP 功能，不绕过 LTP 用例，不为了 LTP 分数改测试选择。
+
+
+2026/6/16
+main 上 iperf 修复记录
+
+本轮 iperf 修复仍然使用官方 sdcard：
+1. RISC-V 使用 `tmp/official-20250615/sdcard-rv.img`，QEMU 命令中的第一块盘挂载为 `vda`。
+2. LoongArch 使用 `tmp/official-20250615/sdcard-la.img`，QEMU 命令中的第一块 PCI virtio-blk 盘同样挂载为 `vda`。
+3. 手动测试命令均先执行 `/busybox mount -t ext4 vda /mnt`，再分别进入 `/mnt/musl` 或 `/mnt/glibc` 执行官方 `iperf_testcode.sh`。
+4. 没有修改官方 `iperf_testcode.sh`，没有在内核或用户态硬编码 iperf 输出，也没有跳过官方六组用例。
+
+最终验证结果：
+1. `musl-rv`：`BASIC_UDP`、`BASIC_TCP`、`PARALLEL_UDP`、`PARALLEL_TCP`、`REVERSE_UDP`、`REVERSE_TCP` 全部 success，日志为 `tmp/final-iperf-musl-rv.log`。
+2. `glibc-rv`：同六组全部 success，日志为 `tmp/final-iperf-glibc-rv.log`。
+3. `musl-la`：同六组全部 success，日志为 `tmp/final-iperf-musl-la.log`。
+4. `glibc-la`：同六组全部 success，日志为 `tmp/main-iperf-glibc-la-statx.log`。
+
+os/src/drivers/net/virtio_net.rs：
+1. `VirtIONetAdapter::new` 不再固定使用 `0x10003000`。官方 RISC-V QEMU 命令里有两块 virtio-blk 和一块 virtio-net，实际 net 设备可能落在后面的 MMIO slot；固定地址会探测到空设备或块设备，从而导致网络未初始化。
+2. 新增 `find_net_mmio`，按 `VIRTIO_NET_BASES` 扫描 `0x10001000` 到 `0x10008000`，先校验 virtio magic，再读取 device id，只接受 device id 为 1 的 virtio-net。
+3. 新增 `has_mmio_net_device`，让上层能在不创建 `VirtIONetAdapter` 的情况下判断是否存在 RISC-V/AArch64 MMIO 网卡。
+4. `VirtIONetAdapter::new` 通过 `find_net_mmio` 得到真实 base 和 MMIO 虚拟地址，再创建 `MmioTransport` 和 `VirtIONet`。这样 RISC-V 官方环境中 net 设备位于 `0x10008000` 时也能初始化。
+
+os/src/net/mod.rs：
+1. `imp` 模块的条件编译范围加入 `loongarch64`，让 LoongArch 也使用同一套 socket syscall 和 smoltcp socket set。
+2. 增加 `NetDevice` 类型别名。RISC-V/AArch64 使用 `VirtIONetAdapter`，LoongArch 使用本文件内的 `LoopbackOnlyAdapter`。
+3. 新增 `loopback::LoopbackOnlyAdapter`。它实现 smoltcp `Device` trait，只提供本地 socket 所需的设备抽象，不做 PCI 网卡寄存器级实现。官方 iperf 用的是 `127.0.0.1`，本轮先保证本机 TCP/UDP socket 语义正确。
+4. `LoopbackOnlyAdapter::new` 返回固定 MAC 的本地设备；`mac_address` 提供给 `NetworkState::new` 构造 smoltcp `Interface`。
+5. `LoopbackRxToken::consume` 和 `LoopbackTxToken::consume` 满足 smoltcp `Device` 的收发 token 接口。LoongArch 本地 iperf 的真实数据不走这里，而是走 `net/syscall.rs` 中的本地 TCP/UDP 队列。
+6. `NetworkState::new` 改为调用 `NetDevice::new`，同一段初始化逻辑可以服务 RISC-V 的真实 virtio-net 和 LoongArch 的本地-only 设备。
+7. `net_device_present` 在 RISC-V/AArch64 上继续调用 `has_mmio_net_device`，在 LoongArch 上返回 true，使本地 socket 层可用。
+8. `net_available`、`net_available_fast`、`with_net_iface`、`with_net_iface_tcp_connect`、`wake_net_blocked_tasks` 的条件编译同步加入 LoongArch。
+
+os/src/net/socket.rs：
+1. `SocketFile` 增加 `ref_count`，让 `dup`、`fork`、`accept` 后的 socket fd 能区分“fd 引用减少”和“最后一个引用关闭”。
+2. `SocketFile` 增加 `local_tcp`，记录本地 TCP 连接 id 和当前 fd 属于服务端还是客户端。
+3. `SocketFile::read` 对 TCP 先检查 `local_tcp`，本地连接走 `local_tcp_recv`；否则走原来的 smoltcp `tcp_recv`。UDP 读改为调用 `udp_recv_with_endpoints`，把本 fd 的 local endpoint 和 peer endpoint 一起传下去。
+4. `SocketFile::write` 对 TCP 先走 `local_tcp_send`；UDP 写改为调用 `udp_write_with_endpoint`，支持 connected UDP 的 `write()` 和 `sendmsg()`。
+5. `SocketFile::close_ref` 在最后一个 fd 引用关闭时，分别清理 `local_tcp_close`、`local_udp_close` 或 `local_tcp_unlisten`。这个修复避免前一组 UDP/TCP 测试残留队列污染后一组测试。
+6. `SocketFile::poll` 对本地 TCP 连接调用 `local_tcp_poll`，监听 socket 调用 `local_tcp_pending_on` 判断 accept 是否可读。UDP poll 同时检查 smoltcp socket 和 `local_udp_pending_on`。
+7. `SocketFile::poll` 对监听 TCP socket 不再把 `!may_recv()` 直接当成可读，否则 `ppoll/pselect6` 会把 listen fd 误判成普通连接可读。
+
+os/src/net/syscall.rs：
+1. 新增 `LocalUdpPacket`，记录 UDP packet 的目标端口、源 endpoint 和 payload。之前只按端口取包，多路并行 UDP 会互相取错包。
+2. 新增 `LOCAL_UDP_QUEUE` 和 `LOCAL_UDP_QUEUE_LIMIT`，用于 127.0.0.1 UDP 的内核内投递。
+3. `local_udp_packet_matches` 用目标端口和可选 peer endpoint 过滤 packet。connected UDP 只接收对应 peer 的包，修复 `PARALLEL_UDP` 的竞态。
+4. `enqueue_local_udp` 入队本地 UDP packet，队列满时丢最旧包并主动让出 CPU，避免发送端长时间独占执行。
+5. `try_send_local_udp` 在目标地址是 `127.x.x.x`、`0.0.0.0` 或 `10.0.2.15` 时走本地投递，不依赖真实网卡。
+6. `local_udp_pending_on` 给 `SocketFile::poll` 判断 UDP fd 是否可读。
+7. `local_udp_close` 在 UDP socket 最后一个 fd 引用关闭时清理匹配 local/peer 的残留包，避免 `BASIC_UDP` 的旧包影响 `PARALLEL_UDP` 和 `REVERSE_UDP`。
+8. `try_recv_local_udp` 用 socket fd 找到 local endpoint，再按 peer 过滤队列，同时在 `recvfrom` 需要时写回源地址。
+9. `try_recv_local_udp_by_endpoint` 给 `SocketFile::read` 和 connected UDP 使用，不依赖当前 syscall 的 fd 参数。
+10. 新增 `LocalTcpConn`，用 `c2s` 和 `s2c` 两个 `VecDeque<u8>` 保存本地 TCP 两个方向的数据流，同时记录 client/server endpoint 和关闭状态。
+11. `create_local_tcp` 在连接目标端口已经 listen 时创建本地连接，分配 ephemeral port，写入客户端 socket 的 local/peer endpoint，并把连接 id 放入 `LOCAL_TCP_PENDING`。
+12. `accept_local_tcp` 从 `LOCAL_TCP_PENDING` 取出连接，创建新的 `SocketFile`，设置服务端 local/peer endpoint 和 `local_tcp` 标记，并写回 `accept/accept4` 的 peer 地址。
+13. `local_tcp_send` 写入对应方向队列，队列满时阻塞/yield；peer 已关闭时返回 EPIPE 语义。
+14. `local_tcp_recv` 从对应方向队列读取，队列空且 peer 未关闭时按阻塞/非阻塞语义处理。
+15. `local_tcp_close` 标记某一端关闭，并在两端都关闭且队列清空后移除连接。
+16. `local_tcp_unlisten` 在监听 socket 最后关闭时移除监听端口和 pending 队列。
+17. `local_tcp_poll` 返回本地连接的可读、可写、错误状态，支撑 iperf3 的 `select/poll` 等待。
+18. `local_tcp_pending_on` 给监听 socket 判断 accept 队列是否非空。
+19. `local_tcp_peer_endpoint` 给 `getpeername` 返回本地 TCP 对端地址。
+20. `sys_socket` 仍创建真实 `SocketFile` 和 smoltcp handle，没有硬编码 iperf 结果。
+21. `sys_bind` 对 UDP 总是记录 local endpoint。即使 smoltcp bind 因端口复用限制失败，本地 UDP 队列仍能按 local/peer 语义工作，支撑 iperf 并行 UDP。
+22. `sys_listen` 标记 TCP 监听端口，`sys_connect` 对本地 TCP 优先调用 `create_local_tcp`。
+23. `sys_accept` 和新增 `sys_accept4` 都先尝试 `accept_local_tcp`，没有 pending 连接时再走原 smoltcp 路径。
+24. `sys_sendto`、`sys_recvfrom`、`sys_sendmsg`、`sys_recvmsg` 对本地 TCP/UDP 分别走本地队列；非本地地址保留原 smoltcp 路径。
+25. `udp_write_with_endpoint` 修复 connected UDP 的 `write()` 路径，`REVERSE_UDP` 中 server 端通过 connected UDP 回发数据依赖这个函数。
+26. `udp_recv_with_endpoints` 修复 connected UDP 的 `read()` 路径，保证只读当前 peer 的包。
+27. `sys_getsockname`、`sys_getpeername` 能从 `SocketFile` 记录的 local/peer endpoint 返回本地 TCP/UDP 地址。
+28. `sys_getsockopt` 增加 `SO_ERROR`、`TCP_MAXSEG`、`TCP_CONGESTION`、`TCP_INFO` 的兼容返回。glibc/musl 版 iperf3 会读取这些选项决定连接状态和输出信息。
+29. `sys_sock_shutdown` 对本地 TCP 调用 `local_tcp_close`，使 reverse TCP 结束时读端能看到 EOF。
+
+os/src/syscall/mod.rs：
+1. 新增 `SYSCALL_ACCEPT4 = 242`。
+2. syscall 分发中把 `accept4` 接到 `sys_accept4`，LTP 和 glibc 网络程序会直接调用该入口。
+
+os/src/syscall/process.rs：
+1. `sys_futex` 增加最小 WAIT/WAKE 支持。WAIT 时检查用户态 futex word 是否仍等于期望值，匹配才把当前任务放入 futex 阻塞状态；WAKE 时按地址唤醒最多指定数量任务。
+2. 新增 `wake_futex_tasks`，只唤醒 `BlockReason::Futex(addr)` 匹配的任务，避免把 socket/pipe 阻塞任务误唤醒。
+3. `sys_pselect6` 保持已有 fd poll 语义，清理调试输出后用于 iperf3 等待 socket 可读/可写。
+
+os/src/task/task.rs：
+1. `BlockReason` 增加 `Futex(usize)`，记录 futex wait 的用户地址。
+
+os/src/task/mod.rs：
+1. `wake_net_blocked_tasks` 明确不唤醒 `BlockReason::Futex(_)`，避免网络 poll 轮询误扰 futex wait。
+2. `check_pending_signals` 遇到未知 signal bit 时跳过，不再对 `SignalFlags::from_bits` 结果直接 unwrap，避免 LTP/复杂程序触发异常 signal bit 时 panic。
+
+os/src/fs/stdio.rs：
+1. 新增 `char_device_stat`，统一构造字符设备 `Kstat`。
+2. `Urandom::stat` 返回 `S_IFCHR | 0444` 和 `st_rdev = 0x0109`。
+3. `DevNull::stat` 返回 `S_IFCHR | 0666` 和 `st_rdev = 0x0103`。
+4. `DevZero::stat` 返回 `S_IFCHR | 0666` 和 `st_rdev = 0x0105`。
+5. 这个修复解决 glibc 版 iperf3 `daemon(0, 0)` 对 `/dev/null` fd 做 `fstat/statx` 后判定设备号为 0，从而报 “unable to become a daemon: No such device” 的问题。
+
+os/src/syscall/fs.rs：
+1. `write_statx` 新增 `dev_major` 和 `dev_minor`，按 Linux dev_t 编码把 `Kstat.st_rdev` 和 `Kstat.st_dev` 写成 `statx.stx_rdev_major/minor` 与 `statx.stx_dev_major/minor`。
+2. RISC-V glibc daemon 主要走 `fstatat(AT_EMPTY_PATH)`，修 `DevNull::stat` 后已通过；LoongArch glibc daemon 会走 `statx(AT_EMPTY_PATH)`，还需要 `write_statx` 写出 rdev major/minor 才能通过。
+
+本轮 iperf 根因总结：
+1. RISC-V 一开始的问题是 virtio-net 探测固定地址错误，官方 QEMU 下 net 设备不一定在 `0x10003000`。
+2. LoongArch 一开始的问题是网络模块没有启用，且不应该为了 iperf 去做难维护的 PCI 网卡寄存器级修补；官方 iperf 使用 `127.0.0.1`，因此先实现本地 socket/loopback 语义。
+3. UDP 并行和 reverse 的问题是 connected UDP 没有按 local/peer endpoint 过滤队列，导致不同 stream 互相消费 packet。
+4. TCP 并行和 reverse 的问题是没有本地 TCP accept 队列和双向字节流，listen fd 的 poll 状态也会被误判。
+5. glibc 版 iperf 的问题是 `daemon()` 对 `/dev/null` fd 做设备校验，fd/statx 返回的字符设备号不完整。
+
+
+2026/6/16
+LTP 官方 sdcard 探测记录
+
+本轮 LTP 只做探测，不新增 LTP 功能：
+1. 没有修改 `user/src/bin/ltp_runner.rs` 的测试列表。
+2. 没有向内核添加新的 LTP 专用 syscall。
+3. 没有删减官方 sdcard 里的 LTP 用例。
+4. 没有为了让 LTP 分数变高而更改官方脚本或用例输出。
+
+官方 sdcard 中 LTP 内容：
+1. `tmp/official-20250615/sdcard-rv.img` 的 `/musl/ltp` 和 `/glibc/ltp` 都存在。
+2. `tmp/official-20250615/sdcard-la.img` 的 `/musl/ltp` 和 `/glibc/ltp` 也都存在。
+3. `/musl/ltp/testcases/bin` 和 `/glibc/ltp/testcases/bin` 下是大量 LTP 二进制和脚本。
+4. 官方 sdcard 根目录没有 `/ltp`。main 分支 rootfs 中的 `ltp_runner` 默认路径是 `/ltp/testcases/bin/`，因此直接运行 rootfs 的 `ltp_runner` 不能代表官方 sdcard 上的 LTP。
+
+本次探测方式：
+1. 使用最终 RISC-V 内核和官方 `sdcard-rv.img`。
+2. QEMU 启动后执行 `/busybox mount -t ext4 vda /mnt`。
+3. 进入 `/mnt/musl` 后按 `testsuits-for-oskernel/scripts/ltp/ltp_testcode.sh` 的逻辑遍历 `ltp/testcases/bin/*`。
+4. 外层 QEMU 使用 240 秒总超时，因为官方全量 LTP 没有单用例超时保护，某个用例卡住会阻塞后续用例。
+
+探测结果：
+1. 日志文件：`tmp/probe-ltp-musl-rv.log`。
+2. 外层状态码：124，表示 240 秒超时终止。
+3. 已看到 `#### OS COMP TEST GROUP START ltp ####`，没有看到 `#### OS COMP TEST GROUP END ltp ####`，因此这不是完整官网评分结果。
+4. 已开始运行的 case 数：4。
+5. 统计到的 `TPASS` 行数：4。
+6. 统计到的 `TFAIL` 行数：2。
+7. 统计到的 `TBROK` 行数：0。
+8. 统计到的 `TCONF` 行数：0。
+9. `abort01` 中触发 `SIGSEGV`，LTP 输出 `abort() failed to dump core` 和 `abort() raised SIGSEGV` 两个 `TFAIL`。
+10. `abs01` 输出 3 个 `TPASS`。
+11. `accept01` 至少输出 1 个 `TPASS`：`bad file descriptor : EBADF (9)`，随后没有在 240 秒窗口内继续完成，外层 timeout 杀掉 QEMU。
+
+LTP 结论：
+1. 当前 main 的 LTP 不能给出完整分数；本次只确认官方 sdcard 的 LTP 目录可见、部分 LTP 二进制能从 `/mnt/musl` 执行。
+2. 现有实现至少能支撑 `abs01` 的简单 libc 测试和 `accept01` 的第一段 EBADF 检查。
+3. `abort01` 暴露了 core dump / abort signal 语义不足，但本轮按要求不新增 LTP 功能。
+4. `accept01` 后续卡住需要进一步分析 socket accept 的阻塞/超时/信号交互；本轮不为 LTP 分数新增功能。

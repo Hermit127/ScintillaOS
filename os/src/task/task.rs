@@ -709,6 +709,7 @@ pub enum BlockReason {
     PollWait,
     PipeRead(usize),
     PipeWrite(usize),
+    Futex(usize),
 }
 
 #[derive(Copy, Clone, PartialEq)]

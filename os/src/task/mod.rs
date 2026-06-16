@@ -505,7 +505,9 @@ fn check_pending_signals() {
         None => return,
     };
     for sig in 0..(MAX_SIG + 1) {
-        let signal = SignalFlags::from_bits(1 << sig).unwrap();
+        let Some(signal) = SignalFlags::from_bits(1u64 << sig) else {
+            continue;
+        };
         let (masked, kernel_signal) = {
             let Some(mut task_inner) = task.try_inner_exclusive_access() else {
                 return;

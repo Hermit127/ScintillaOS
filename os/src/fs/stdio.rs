@@ -103,6 +103,12 @@ impl File for Stdout {
 
 pub struct Urandom;
 
+fn char_device_stat(mode: u32, rdev: u64) -> Kstat {
+    let mut st = Kstat::new(S_IFCHR | mode);
+    st.st_rdev = rdev;
+    st
+}
+
 impl File for Urandom {
     fn readable(&self) -> bool {
         true
@@ -126,7 +132,7 @@ impl File for Urandom {
         0
     }
     fn stat(&self) -> Kstat {
-        Kstat::new(S_IFCHR)
+        char_device_stat(0o444, 0x0109)
     }
     fn as_any(&self) -> &dyn core::any::Any {
         self
@@ -149,7 +155,7 @@ impl File for DevNull {
         buf.len() as isize
     }
     fn stat(&self) -> Kstat {
-        Kstat::new(S_IFCHR)
+        char_device_stat(0o666, 0x0103)
     }
     fn as_any(&self) -> &dyn core::any::Any {
         self
@@ -175,7 +181,7 @@ impl File for DevZero {
         buf.len() as isize
     }
     fn stat(&self) -> Kstat {
-        Kstat::new(S_IFCHR)
+        char_device_stat(0o666, 0x0105)
     }
     fn as_any(&self) -> &dyn core::any::Any {
         self

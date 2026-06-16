@@ -122,6 +122,7 @@ const SYSCALL_SOCK_SHUTDOWN: usize = 210;
 const SYSCALL_SHUTDOWN: usize = 403;
 const SYSCALL_SENDMSG: usize = 211;
 const SYSCALL_RECVMSG: usize = 212;
+const SYSCALL_ACCEPT4: usize = 242;
 
 const SYSCALL_SET_TID_ADDRESS: usize = 96;
 const SYSCALL_EXIT_GROUP: usize = 94;
@@ -131,7 +132,7 @@ mod fs;
 mod process;
 
 use crate::net::syscall::{
-    sys_accept, sys_bind, sys_connect, sys_getpeername, sys_getsockname, sys_getsockopt,
+    sys_accept, sys_accept4, sys_bind, sys_connect, sys_getpeername, sys_getsockname, sys_getsockopt,
     sys_listen, sys_recvfrom, sys_recvmsg, sys_sendmsg, sys_sendto, sys_setsockopt,
     sys_sock_shutdown, sys_socket,
 };
@@ -307,6 +308,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_BIND => sys_bind(args[0], args[1] as *const u8, args[2]),
         SYSCALL_LISTEN => sys_listen(args[0], args[1]),
         SYSCALL_ACCEPT => sys_accept(args[0], args[1] as *mut u8, args[2] as *mut usize),
+        SYSCALL_ACCEPT4 => sys_accept4(args[0], args[1] as *mut u8, args[2] as *mut usize, args[3]),
         SYSCALL_CONNECT => sys_connect(args[0], args[1] as *const u8, args[2]),
         SYSCALL_GETSOCKNAME => sys_getsockname(args[0], args[1] as *mut u8, args[2] as *mut usize),
         SYSCALL_GETPEERNAME => sys_getpeername(args[0], args[1] as *mut u8, args[2] as *mut usize),

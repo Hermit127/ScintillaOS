@@ -1509,6 +1509,14 @@ pub fn sys_statx(
 }
 
 fn write_statx(buf: *mut u8, st: &Kstat, mask: u32) {
+    fn dev_major(dev: u64) -> u32 {
+        (((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff)) as u32
+    }
+
+    fn dev_minor(dev: u64) -> u32 {
+        ((dev & 0xff) | ((dev >> 12) & !0xff)) as u32
+    }
+
     let token = current_user_token();
     let statx = translated_refmut(token, buf as *mut Statx);
     statx.stx_mask = mask & 0x7ff; // STATX_BASIC_STATS
@@ -1535,10 +1543,10 @@ fn write_statx(buf: *mut u8, st: &Kstat, mask: u32) {
     statx.stx_mtime.tv_sec = st.st_mtime_sec;
     statx.stx_mtime.tv_nsec = st.st_mtime_nsec as u32;
     statx.stx_mtime.pad = 0;
-    statx.stx_rdev_major = 0;
-    statx.stx_rdev_minor = 0;
-    statx.stx_dev_major = 0;
-    statx.stx_dev_minor = 0;
+    statx.stx_rdev_major = dev_major(st.st_rdev);
+    statx.stx_rdev_minor = dev_minor(st.st_rdev);
+    statx.stx_dev_major = dev_major(st.st_dev);
+    statx.stx_dev_minor = dev_minor(st.st_dev);
 }
 
 #[repr(C)]

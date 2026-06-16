@@ -7,15 +7,27 @@ use alloc::vec::Vec;
 
 use crate::drivers::block::VirtioHal;
 use crate::sync::UPSafeCell;
-use polyhal::PhysAddr;
+use polyhal::consts::VIRT_ADDR_START;
 use virtio_drivers::device::net::VirtIONet;
 use virtio_drivers::transport::mmio::MmioTransport;
 
-#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
-const VIRTIO2: usize = 0x10003000;
+#[cfg(target_arch = "riscv64")]
+const VIRTIO_NET_BASES: &[usize] = &[
+    0x1000_1000,
+    0x1000_2000,
+    0x1000_3000,
+    0x1000_4000,
+    0x1000_5000,
+    0x1000_6000,
+    0x1000_7000,
+    0x1000_8000,
+];
 
 #[cfg(target_arch = "aarch64")]
-const VIRTIO2: usize = 0xa00_0300;
+const VIRTIO_NET_BASES: &[usize] = &[0xa00_0300];
+
+const VIRTIO_MMIO_MAGIC: u32 = 0x7472_6976;
+const VIRTIO_NET_DEVICE_ID: u32 = 1;
 
 const NET_BUF_SIZE: usize = 1536; // must be multiple of 8 for RxBuffer alignment
 const QUEUE_SIZE: usize = 64;
@@ -39,19 +51,20 @@ pub struct VirtIONetAdapter {
 
 impl VirtIONetAdapter {
     pub fn new() -> Option<Self> {
-        let ptr = PhysAddr::new(VIRTIO2).get_mut_ptr();
-        println!("[net] probing VirtIO at {:#x}", VIRTIO2);
-        let transport = match unsafe { MmioTransport::new(NonNull::new_unchecked(ptr)) } {
+        let (base, ptr) = find_net_mmio()?;
+        println!("[net] probing VirtIO net at {:#x}", base);
+        let header = unsafe { NonNull::new_unchecked(ptr).cast() };
+        let transport = match unsafe { MmioTransport::new(header) } {
             Ok(t) => t,
             Err(e) => {
-                println!("[net] MmioTransport::new failed: {:?}", e);
+                println!("[net] MmioTransport::new failed at {:#x}: {:?}", base, e);
                 return None;
             }
         };
         let net = match VirtIONet::new(transport, NET_BUF_SIZE) {
             Ok(n) => n,
             Err(e) => {
-                println!("[net] VirtIONet::new failed: {:?}", e);
+                println!("[net] VirtIONet::new failed at {:#x}: {:?}", base, e);
                 return None;
             }
         };
@@ -83,6 +96,26 @@ impl VirtIONetAdapter {
     pub fn mac_address(&self) -> [u8; 6] {
         self.mac_addr
     }
+}
+
+pub fn has_mmio_net_device() -> bool {
+    find_net_mmio().is_some()
+}
+
+fn find_net_mmio() -> Option<(usize, *mut u8)> {
+    for &base in VIRTIO_NET_BASES {
+        let va = base | VIRT_ADDR_START;
+        let magic = unsafe { core::ptr::read_volatile(va as *const u32) };
+        if magic != VIRTIO_MMIO_MAGIC {
+            continue;
+        }
+        let device_id = unsafe { core::ptr::read_volatile((va + 0x08) as *const u32) };
+        println!("[net] probe {:#x}: device_id={}", base, device_id);
+        if device_id == VIRTIO_NET_DEVICE_ID {
+            return Some((base, va as *mut u8));
+        }
+    }
+    None
 }
 
 unsafe impl Sync for VirtIONetAdapter {}
