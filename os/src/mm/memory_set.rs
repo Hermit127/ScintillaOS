@@ -1,6 +1,7 @@
 use super::vpn_range::VAddrRange;
 use super::{frame_alloc, FrameTracker};
 use crate::config::{PAGE_SIZE, USER_STACK_SIZE};
+use crate::fs::File;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -53,6 +54,79 @@ pub fn get_elf_interp(elf_data: &[u8]) -> Option<String> {
     None
 }
 
+const ELF_HEADER_READ_SIZE: usize = 64;
+const MAX_ELF_HEADER_TABLE_SIZE: usize = 64 * 1024;
+const MAX_INTERP_PATH_LEN: usize = 4096;
+
+fn read_exact_at(file: &dyn File, mut offset: usize, buf: &mut [u8]) -> bool {
+    let mut done = 0usize;
+    while done < buf.len() {
+        let n = file.read_at(offset, &mut buf[done..]);
+        if n <= 0 {
+            return false;
+        }
+        let n = n as usize;
+        done += n;
+        offset += n;
+    }
+    true
+}
+
+fn read_elf_header_table(file: &dyn File) -> Option<Vec<u8>> {
+    let mut ident = [0u8; ELF_HEADER_READ_SIZE];
+    if !read_exact_at(file, 0, &mut ident) {
+        return None;
+    }
+    if ident[..4] != [0x7f, b'E', b'L', b'F'] {
+        return None;
+    }
+    let header = xmas_elf::ElfFile::new(&ident).ok()?.header;
+    let ph_offset = header.pt2.ph_offset() as usize;
+    let ph_entsize = header.pt2.ph_entry_size() as usize;
+    let ph_count = header.pt2.ph_count() as usize;
+    if ph_offset == 0 || ph_entsize == 0 || ph_count == 0 {
+        return None;
+    }
+    let ph_size = ph_entsize.checked_mul(ph_count)?;
+    let total = ph_offset.checked_add(ph_size)?;
+    if total < ELF_HEADER_READ_SIZE || total > MAX_ELF_HEADER_TABLE_SIZE {
+        return None;
+    }
+    let mut data = alloc::vec![0u8; total];
+    if !read_exact_at(file, 0, &mut data) {
+        return None;
+    }
+    Some(data)
+}
+
+fn read_small_file_region(file: &dyn File, offset: usize, size: usize) -> Option<Vec<u8>> {
+    if size > MAX_INTERP_PATH_LEN {
+        return None;
+    }
+    let mut data = alloc::vec![0u8; size];
+    if !read_exact_at(file, offset, &mut data) {
+        return None;
+    }
+    Some(data)
+}
+
+pub fn get_elf_interp_file(file: &dyn File) -> Option<String> {
+    let header_data = read_elf_header_table(file)?;
+    let elf = xmas_elf::ElfFile::new(&header_data).ok()?;
+    let ph_count = elf.header.pt2.ph_count();
+    for i in 0..ph_count {
+        let ph = elf.program_header(i).ok()?;
+        if ph.get_type().ok()? == xmas_elf::program::Type::Interp {
+            let offset = ph.offset() as usize;
+            let size = ph.file_size() as usize;
+            let raw = read_small_file_region(file, offset, size)?;
+            let end = raw.iter().position(|&b| b == 0).unwrap_or(size);
+            return core::str::from_utf8(&raw[..end]).ok().map(|s| s.into());
+        }
+    }
+    None
+}
+
 impl MemorySet {
     pub fn new_bare() -> Self {
         Self {
@@ -69,6 +143,25 @@ impl MemorySet {
         }
         if let Some(data) = data {
             map_area.copy_data(&self.page_table, data, page_off);
+        }
+        self.areas.push(map_area);
+        true
+    }
+
+    fn push_file_segment(
+        &mut self,
+        mut map_area: MapArea,
+        file: &dyn File,
+        file_offset: usize,
+        file_size: usize,
+        page_off: usize,
+    ) -> bool {
+        if map_area.map(&self.page_table).is_err() {
+            return false;
+        }
+        if !map_area.copy_file_data(file, file_offset, file_size, page_off) {
+            map_area.unmap(&self.page_table);
+            return false;
         }
         self.areas.push(map_area);
         true
@@ -178,6 +271,108 @@ impl MemorySet {
         }
     }
 
+    pub fn from_elf_file(file: &dyn File) -> Option<LoadedElf> {
+        trace!("os::mm::MemorySet::from_elf_file");
+        let header_data = read_elf_header_table(file)?;
+        let elf = xmas_elf::ElfFile::new(&header_data).ok()?;
+        let elf_header = elf.header;
+        if elf_header.pt1.magic != [0x7f, 0x45, 0x4c, 0x46] {
+            return None;
+        }
+        let ph_count = elf_header.pt2.ph_count();
+        let e_phoff = elf_header.pt2.ph_offset() as usize;
+        let e_phentsize = elf_header.pt2.ph_entry_size() as usize;
+        let is_pie = elf.header.pt2.type_().as_type() == ElfType::SharedObject;
+        let pie_base: usize = if is_pie { 0x1_0000 } else { 0 };
+        let mut memory_set = Self::new_bare();
+        let mut max_end_va = VirtAddr::new(0);
+        let mut ph_addr = 0usize;
+        let mut first_load = true;
+        let mut tls_base: usize = 0;
+        let mut tls_size: usize = 0;
+        let mut interp_path: Option<alloc::string::String> = None;
+        let program_entry = elf.header.pt2.entry_point() as usize + pie_base;
+
+        for i in 0..ph_count {
+            let ph = elf.program_header(i).ok()?;
+            let ph_type = ph.get_type().ok()?;
+            let va_offset = pie_base;
+            if ph_type == xmas_elf::program::Type::Load {
+                let start_va: VirtAddr = (ph.virtual_addr() as usize + va_offset).into();
+                let end_va: VirtAddr =
+                    ((ph.virtual_addr() + ph.mem_size()) as usize + va_offset).into();
+                if first_load {
+                    ph_addr = start_va.raw() + e_phoff;
+                    first_load = false;
+                }
+                let mut map_perm = MapPermission::U;
+                let ph_flags = ph.flags();
+                if ph_flags.is_read() {
+                    map_perm |= MapPermission::R;
+                }
+                if ph_flags.is_write() {
+                    map_perm |= MapPermission::W;
+                }
+                if ph_flags.is_execute() {
+                    map_perm |= MapPermission::X;
+                }
+                let page_off = start_va.raw() % PAGE_SIZE;
+                let aligned_start = start_va.raw() - page_off;
+                let map_area = MapArea::new(aligned_start.into(), end_va, MapType::Framed, map_perm);
+                max_end_va = max_end_va.max(map_area.vaddr_range.get_end());
+                if !memory_set.push_file_segment(
+                    map_area,
+                    file,
+                    ph.offset() as usize,
+                    ph.file_size() as usize,
+                    page_off,
+                ) {
+                    return None;
+                }
+            } else if ph_type == xmas_elf::program::Type::Tls {
+                tls_base = ph.virtual_addr() as usize + va_offset;
+                tls_size = ph.mem_size() as usize;
+            } else if ph_type == xmas_elf::program::Type::Interp {
+                let offset = ph.offset() as usize;
+                let size = ph.file_size() as usize;
+                let raw = read_small_file_region(file, offset, size)?;
+                let end = raw.iter().position(|&b| b == 0).unwrap_or(size);
+                interp_path = core::str::from_utf8(&raw[..end]).ok().map(|s| s.into());
+            }
+        }
+
+        let program_break = (max_end_va.raw() + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE;
+        let user_stack_top: usize = 0x8_0000_0000;
+        let user_stack_bottom = user_stack_top - USER_STACK_SIZE;
+        let user_stack_top = user_stack_bottom + USER_STACK_SIZE;
+        if !memory_set.push(
+            MapArea::new(
+                user_stack_bottom.into(),
+                user_stack_top.into(),
+                MapType::Framed,
+                MapPermission::R | MapPermission::W | MapPermission::U,
+            ),
+            None,
+            0,
+        ) {
+            return None;
+        }
+        Some(LoadedElf {
+            memory_set,
+            user_sp: user_stack_top,
+            entry_point: program_entry,
+            program_break,
+            ph_addr,
+            ph_entsize: e_phentsize,
+            ph_num: ph_count as usize,
+            tls_base,
+            tls_size,
+            interp_path,
+            interp_base: 0,
+            program_entry,
+        })
+    }
+
     /// Load a dynamic linker/interpreter ELF at a fixed base address.
     /// Returns (entry_point, base_addr).
     pub fn load_interp_elf(
@@ -227,6 +422,48 @@ impl MemorySet {
             }
         }
         (entry, base)
+    }
+
+    pub fn load_interp_file(
+        memory_set: &mut MemorySet,
+        file: &dyn File,
+        base: usize,
+    ) -> Option<(usize, usize)> {
+        let header_data = read_elf_header_table(file)?;
+        let elf = xmas_elf::ElfFile::new(&header_data).ok()?;
+        let entry = elf.header.pt2.entry_point() as usize + base;
+        let ph_count = elf.header.pt2.ph_count();
+        for i in 0..ph_count {
+            let ph = elf.program_header(i).ok()?;
+            if ph.get_type().ok()? == xmas_elf::program::Type::Load {
+                let start_va: VirtAddr = (ph.virtual_addr() as usize + base).into();
+                let end_va: VirtAddr = ((ph.virtual_addr() + ph.mem_size()) as usize + base).into();
+                let mut map_perm = MapPermission::U;
+                let ph_flags = ph.flags();
+                if ph_flags.is_read() {
+                    map_perm |= MapPermission::R;
+                }
+                if ph_flags.is_write() {
+                    map_perm |= MapPermission::W;
+                }
+                if ph_flags.is_execute() {
+                    map_perm |= MapPermission::X;
+                }
+                let page_off = start_va.raw() % PAGE_SIZE;
+                let aligned_start = start_va.raw() - page_off;
+                let map_area = MapArea::new(aligned_start.into(), end_va, MapType::Framed, map_perm);
+                if !memory_set.push_file_segment(
+                    map_area,
+                    file,
+                    ph.offset() as usize,
+                    ph.file_size() as usize,
+                    page_off,
+                ) {
+                    return None;
+                }
+            }
+        }
+        Some((entry, base))
     }
 
     pub fn from_existed_user(user_space: &MemorySet) -> Option<MemorySet> {
@@ -391,7 +628,9 @@ impl MemorySet {
         true
     }
     pub fn recycle_data_pages(&mut self) {
-        //*self = Self::new_bare();
+        for area in self.areas.iter_mut() {
+            area.unmap(&self.page_table);
+        }
         self.areas.clear();
     }
     pub fn shrink_to(&mut self, limit_va: VirtAddr) {
@@ -470,7 +709,9 @@ impl MemorySet {
         file: alloc::sync::Arc<dyn crate::fs::File>,
         offset: usize,
     ) -> bool {
-        self.insert_framed_area(start_addr, end_addr, permission);
+        if !self.insert_framed_area(start_addr, end_addr, permission) {
+            return false;
+        }
         let area = self.areas.last_mut().unwrap();
         area.file = Some(file.clone());
         area.file_offset = offset;
@@ -677,7 +918,14 @@ impl MapArea {
     pub fn map(&mut self, page_table: &Arc<PageTableWrapper>) -> Result<(), ()> {
         trace!("os::mm::memory_set::MapArea::map");
         for vaddr in self.vaddr_range {
-            let p_tracker = frame_alloc().ok_or(())?;
+            let p_tracker = match frame_alloc() {
+                Some(frame) => frame,
+                None => {
+                    self.unmap(page_table);
+                    self.data_frames.clear();
+                    return Err(());
+                }
+            };
             page_table.map_page(
                 vaddr,
                 p_tracker.paddr,
@@ -694,19 +942,19 @@ impl MapArea {
     pub fn unmap(&mut self, page_table: &Arc<PageTableWrapper>) {
         trace!("os::mm::memory_set::MapArea::unmap");
         for vpn in self.vaddr_range {
-            page_table.unmap_page(vpn);
+            if page_table
+                .translate(vpn)
+                .is_some_and(|(_, flags)| flags.contains(MappingFlags::P))
+            {
+                page_table.unmap_page(vpn);
+            }
         }
     }
 
     /// data: start-aligned but maybe with shorter length
     /// assume that all frames were cleared before
     /// page_off: offset within the first page where data should start
-    pub fn copy_data(
-        &mut self,
-        _page_table: &Arc<PageTableWrapper>,
-        data: &[u8],
-        page_off: usize,
-    ) {
+    pub fn copy_data(&mut self, _page_table: &Arc<PageTableWrapper>, data: &[u8], page_off: usize) {
         trace!("os::mm::memory_set::MapArea::copy_data");
         assert_eq!(self.map_type, MapType::Framed);
         let mut data_pos: usize = 0;
@@ -724,6 +972,36 @@ impl MapArea {
             curr_vaddr = curr_vaddr + PAGE_SIZE;
             page_off = 0;
         }
+    }
+
+    fn copy_file_data(
+        &mut self,
+        file: &dyn File,
+        mut file_offset: usize,
+        file_size: usize,
+        page_off: usize,
+    ) -> bool {
+        trace!("os::mm::memory_set::MapArea::copy_file_data");
+        assert_eq!(self.map_type, MapType::Framed);
+        let mut copied = 0usize;
+        let mut curr_vaddr = self.vaddr_range.get_start();
+        let mut page_off = page_off;
+
+        while copied < file_size {
+            let chunk = (PAGE_SIZE - page_off).min(file_size - copied);
+            let Some(frame) = self.data_frames.get(&curr_vaddr) else {
+                return false;
+            };
+            let dst = &mut (frame.paddr + page_off).slice_mut_with_len(chunk);
+            if !read_exact_at(file, file_offset, dst) {
+                return false;
+            }
+            copied += chunk;
+            file_offset += chunk;
+            curr_vaddr = curr_vaddr + PAGE_SIZE;
+            page_off = 0;
+        }
+        true
     }
 }
 

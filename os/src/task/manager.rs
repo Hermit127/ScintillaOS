@@ -16,13 +16,20 @@ impl TaskManager {
         }
     }
     pub fn add(&mut self, task: Arc<TaskControlBlock>) {
+        self.remove(task.getpid());
         self.ready_queue.push_back(task);
     }
     pub fn add_priority(&mut self, task: Arc<TaskControlBlock>) {
+        self.remove(task.getpid());
         self.ready_queue.push_front(task);
     }
     pub fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
         self.ready_queue.pop_front()
+    }
+    pub fn remove(&mut self, pid: usize) -> bool {
+        let old_len = self.ready_queue.len();
+        self.ready_queue.retain(|task| task.getpid() != pid);
+        self.ready_queue.len() != old_len
     }
 }
 
@@ -63,9 +70,43 @@ pub fn ready_queue_len() -> usize {
     TASK_MANAGER.exclusive_access().ready_queue.len()
 }
 
+pub fn ready_queue_counts() -> Option<(usize, usize)> {
+    let manager = TASK_MANAGER.try_borrow()?;
+    let mut zombies = 0;
+    for task in manager.ready_queue.iter() {
+        if task
+            .try_inner_borrow()
+            .map(|inner| inner.task_status == TaskStatus::Zombie)
+            .unwrap_or(false)
+        {
+            zombies += 1;
+        }
+    }
+    Some((manager.ready_queue.len(), zombies))
+}
+
+pub fn remove_from_ready_queue(pid: usize) -> bool {
+    TASK_MANAGER.exclusive_access().remove(pid)
+}
+
 pub fn pid2task(pid: usize) -> Option<Arc<TaskControlBlock>> {
     let map = PID2TCB.exclusive_access();
     map.get(&pid).map(Arc::clone)
+}
+
+pub fn pid2task_counts() -> Option<(usize, usize)> {
+    let map = PID2TCB.try_borrow()?;
+    let mut zombies = 0;
+    for task in map.values() {
+        if task
+            .try_inner_borrow()
+            .map(|inner| inner.task_status == TaskStatus::Zombie)
+            .unwrap_or(false)
+        {
+            zombies += 1;
+        }
+    }
+    Some((map.len(), zombies))
 }
 
 pub fn remove_from_pid2task(pid: usize) {

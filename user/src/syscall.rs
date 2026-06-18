@@ -42,6 +42,7 @@ const SYSCALL_NANOSLEEP: usize = 101;
 const SYSCALL_MOUNT: usize = 40;
 const SYSCALL_UMOUNT2: usize = 39;
 const SYSCALL_SYMLINKAT: usize = 36;
+const SYSCALL_READLINKAT: usize = 78;
 
 const SYSCALL_GETDENTS64: usize = 61;
 
@@ -237,6 +238,13 @@ pub fn sys_exec(path: &str, args: &[*const u8], envs: &[*const u8]) -> isize {
 
 pub fn sys_chroot(path: &str) -> isize {
     syscall(SYSCALL_CHROOT, [path.as_ptr() as usize, 0, 0, 0, 0, 0])
+}
+
+pub fn sys_readlinkat(dirfd: isize, path: *const u8, buf: *mut u8, bufsiz: usize) -> isize {
+    syscall(
+        SYSCALL_READLINKAT,
+        [dirfd as usize, path as usize, buf as usize, bufsiz, 0, 0],
+    )
 }
 
 pub fn sys_waitpid(pid: isize, exit_code: *mut i32) -> isize {

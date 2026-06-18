@@ -191,10 +191,17 @@ unsafe impl Hal for VirtioHal {
         //     QUEUE_FRAMES.exclusive_access().push(frame);
         // }
         // unsafe { (paddr.raw(), NonNull::new_unchecked(paddr.get_mut_ptr())) }
-        let frames = frames_alloc(pages).unwrap();
-        let paddr = frames[0].paddr;
-        QUEUE_FRAMES.exclusive_access().extend(frames);
-        unsafe { (paddr.raw(), NonNull::new_unchecked(paddr.get_mut_ptr())) }
+        for _ in 0..16 {
+            let Some(frames) = frames_alloc(pages) else {
+                return (0, NonNull::dangling());
+            };
+            let paddr = frames[0].paddr;
+            if paddr.raw() != 0 {
+                QUEUE_FRAMES.exclusive_access().extend(frames);
+                return unsafe { (paddr.raw(), NonNull::new_unchecked(paddr.get_mut_ptr())) };
+            }
+        }
+        (0, NonNull::dangling())
     }
 
     unsafe fn dma_dealloc(paddr: usize, _vaddr: NonNull<u8>, pages: usize) -> i32 {

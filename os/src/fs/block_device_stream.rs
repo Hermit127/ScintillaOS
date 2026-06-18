@@ -70,10 +70,8 @@ impl KernelDevOp for BlockDeviceStreamOp {
             let mut read = 0;
             while read < buf.len() {
                 let chunk = (buf.len() - read).min(MAX_BULK_IO_SIZE);
-                dev.inner.read_block(
-                    sector + read / SECTOR_SIZE,
-                    &mut buf[read..read + chunk],
-                );
+                dev.inner
+                    .read_block(sector + read / SECTOR_SIZE, &mut buf[read..read + chunk]);
                 read += chunk;
             }
             dev.pos = pos + buf.len();

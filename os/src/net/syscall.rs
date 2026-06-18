@@ -254,8 +254,7 @@ fn smoltcp_udp_endpoint(handle: SocketHandle) -> Option<IpEndpoint> {
             None
         } else {
             Some(IpEndpoint::new(
-                ep.addr
-                    .unwrap_or(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED)),
+                ep.addr.unwrap_or(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED)),
                 ep.port,
             ))
         }
@@ -351,7 +350,9 @@ fn try_recv_local_udp(
 ) -> Option<isize> {
     let local = local_recv_endpoint(sockfd, handle)?;
     let mut queue = LOCAL_UDP_QUEUE.exclusive_access();
-    let pos = queue.iter().position(|packet| packet.dst_port == local.port)?;
+    let pos = queue
+        .iter()
+        .position(|packet| packet.dst_port == local.port)?;
     let packet = if peek {
         queue[pos].clone()
     } else {
@@ -790,8 +791,7 @@ pub fn sys_recvfrom(
     let result = match st {
         SocketType::Tcp => tcp_recv(handle, dontwait, recv_buf),
         SocketType::Udp => loop {
-            if let Some(ret) =
-                try_recv_local_udp(sockfd, handle, recv_buf, src_addr, addrlen, peek)
+            if let Some(ret) = try_recv_local_udp(sockfd, handle, recv_buf, src_addr, addrlen, peek)
             {
                 return ret;
             }
@@ -1120,7 +1120,12 @@ pub fn sys_getpeername(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isi
             let sock: &UdpSocket = iface.sockets.get(handle);
             sock.endpoint()
         })
-            .map(|ep| IpEndpoint::new(ep.addr.unwrap_or(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED)), ep.port)),
+        .map(|ep| {
+            IpEndpoint::new(
+                ep.addr.unwrap_or(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED)),
+                ep.port,
+            )
+        }),
     };
 
     match peer {
@@ -1165,8 +1170,7 @@ pub fn sys_getsockname(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isi
         })
         .map(|ep| {
             IpEndpoint::new(
-                ep.addr
-                    .unwrap_or(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED)),
+                ep.addr.unwrap_or(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED)),
                 ep.port,
             )
         })

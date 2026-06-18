@@ -2,8 +2,7 @@ use crate::sync::UPSafeCell;
 use alloc::ffi::CString;
 use alloc::format;
 use alloc::string::String;
-use alloc::sync::Arc;
-use alloc::vec;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::ffi::c_char;
 use lazy_static::*;
@@ -149,6 +148,20 @@ impl VfsSuperBlock {
             let mut mode: u32 = 0;
             let c_path2 = CString::new(fs_path).ok()?;
             let _mode_rc = unsafe { ext4_mode_get(c_path2.as_ptr() as *const c_char, &mut mode) };
+            let mut raw_ino: u32 = 0;
+            let mut raw_inode: ext4_inode = unsafe { core::mem::zeroed() };
+            let raw_rc = unsafe {
+                ext4_raw_inode_fill(
+                    c_path2.as_ptr() as *const c_char,
+                    &mut raw_ino,
+                    &mut raw_inode,
+                )
+            };
+            let links_count = if raw_rc == EOK as i32 {
+                raw_inode.links_count as u32
+            } else {
+                1
+            };
 
             let mut uid: u32 = 0;
             let mut gid: u32 = 0;
@@ -237,7 +250,7 @@ impl VfsSuperBlock {
                 mtime,
                 ctime,
                 blocks_count: 0,
-                links_count: 0,
+                links_count,
                 uid,
                 gid,
             })
@@ -532,7 +545,7 @@ pub struct Dentry {
     pub inode_num: u32,
     pub is_dir: bool,
     pub is_link: bool,
-    pub parent: Option<Arc<Dentry>>,
+    pub parent: Option<Weak<Dentry>>,
     pub super_block: Arc<VfsSuperBlock>,
     pub children: UPSafeCell<Option<Vec<Arc<Dentry>>>>,
 }
@@ -592,7 +605,7 @@ impl Dentry {
             inode_num,
             is_dir,
             is_link,
-            parent: Some(parent.clone()),
+            parent: Some(Arc::downgrade(parent)),
             super_block: parent.super_block.clone(),
             children: unsafe { UPSafeCell::new(None) },
         })
@@ -632,11 +645,40 @@ fn is_mount_root(dentry: &Arc<Dentry>) -> Option<Arc<Dentry>> {
 
 // ==================== Path Resolution ====================
 
+const DENTRY_CHILD_CACHE_LIMIT: usize = 128;
+
+pub fn dentry_parent(dentry: &Arc<Dentry>) -> Option<Arc<Dentry>> {
+    dentry.parent.as_ref().and_then(Weak::upgrade)
+}
+
 fn vfs_parent(dentry: &Arc<Dentry>) -> Option<Arc<Dentry>> {
     if let Some(mnt_point) = is_mount_root(dentry) {
-        return mnt_point.parent.clone();
+        return dentry_parent(&mnt_point);
     }
-    dentry.parent.clone()
+    dentry_parent(dentry)
+}
+
+fn cache_child(parent: &Arc<Dentry>, child: Arc<Dentry>) {
+    let mut children = parent.children.exclusive_access();
+    let list = children.get_or_insert_with(Vec::new);
+
+    if let Some(slot) = list.iter_mut().find(|cached| cached.name == child.name) {
+        *slot = child;
+        return;
+    }
+
+    if list.len() >= DENTRY_CHILD_CACHE_LIMIT {
+        if let Some(idx) = list
+            .iter()
+            .position(|cached| Arc::strong_count(cached) == 1)
+        {
+            list.remove(idx);
+        }
+    }
+
+    if list.len() < DENTRY_CHILD_CACHE_LIMIT {
+        list.push(child);
+    }
 }
 
 pub fn vfs_lookup(parent: &Arc<Dentry>, name: &str) -> Option<Arc<Dentry>> {
@@ -679,14 +721,7 @@ pub fn vfs_lookup(parent: &Arc<Dentry>, name: &str) -> Option<Arc<Dentry>> {
 
     let child = Dentry::new_child(parent, name, child_inode, is_dir, is_link);
 
-    {
-        let mut children = parent.children.exclusive_access();
-        if let Some(list) = children.as_mut() {
-            list.push(child.clone());
-        } else {
-            *children = Some(vec![child.clone()]);
-        }
-    }
+    cache_child(parent, child.clone());
 
     if let Some(mnt_root) = lookup_mount(&child) {
         return Some(mnt_root);
@@ -787,19 +822,19 @@ pub fn vfs_create(
     let umask = crate::task::current_task()
         .map(|t| t.inner_exclusive_access().umask)
         .unwrap_or(0o22);
-    let file_type = if is_dir { 0o040000 } else { 0o100000 };
+    let mode_type = mode & 0o170000;
+    let file_type = if is_dir {
+        0o040000
+    } else if mode_type != 0 {
+        mode_type
+    } else {
+        0o100000
+    };
     let effective_mode = file_type | (mode & !umask & 0o7777);
     let fs_path = child.fs_path.clone();
     child.super_block.set_mode(&fs_path, effective_mode);
 
-    {
-        let mut children = parent.children.exclusive_access();
-        if let Some(list) = children.as_mut() {
-            list.push(child.clone());
-        } else {
-            *children = Some(vec![child.clone()]);
-        }
-    }
+    cache_child(parent, child.clone());
 
     Some(child)
 }

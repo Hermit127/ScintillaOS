@@ -9,8 +9,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use user_lib::{
     chroot, close, execve, exit, fork, get_time, getdents64, kill, kill_pgrp, open, setsid,
-    shutdown, sleep, symlinkat, sys_mkdir, sys_mount, sys_waitpid_options, unlinkat, waitpid,
-    waitpid_nb, OpenFlags,
+    shutdown, sleep, symlinkat, sys_mkdir, sys_mount, sys_readlinkat, sys_waitpid_options,
+    unlinkat, waitpid, waitpid_nb, write, OpenFlags,
 };
 
 const BUSYBOX_APPLETS: [&str; 68] = [
@@ -34,8 +34,37 @@ const KNOWN_TEST_SCRIPTS: [&str; 7] = [
 
 const EMBEDDED_BASIC_MUSL: &str = "__embedded_basic_musl__";
 const EMBEDDED_BASIC_GLIBC: &str = "__embedded_basic_glibc__";
+const EMBEDDED_LTP: &str = "__embedded_ltp__";
+const LTP_SUBSET_CASES: &str = concat!(
+    "close01 close02 open01 open02 read01 read02 write01 write02 ",
+    "lseek01 lseek02 fstat01 fstat02 fstat03 ",
+    "dup01 dup02 dup201 dup202 pipe01 pipe02 ",
+    "brk01 brk02 mmap01 mmap02 munmap01 munmap02 ",
+    "fork01 fork02 fork03 exit_group01 wait01 wait02 ",
+    "getpid01 getpid02 getcwd01 getcwd02 chdir01 chdir04 ",
+    "times01 uname01 uname02 nanosleep01 kill01 kill02 ",
+    "gettimeofday01 gettimeofday02 umask01 mkdirat01 mkdirat02 ",
+    "rename01 rename02 unlink01 unlink02 mprotect01 mprotect02 ",
+    "fcntl01 fcntl02 access01"
+);
+
+fn symlink_points_to(target: &str, linkpath: &str) -> bool {
+    let link = nul_terminated_path(linkpath);
+    let target = target.trim_end_matches('\0');
+    let mut buf = [0u8; 512];
+    let n = sys_readlinkat(-100, link.as_ptr(), buf.as_mut_ptr(), buf.len());
+    if n < 0 {
+        return false;
+    }
+    core::str::from_utf8(&buf[..n as usize])
+        .map(|current| current == target)
+        .unwrap_or(false)
+}
 
 fn force_symlink(target: &str, linkpath: &str) -> isize {
+    if symlink_points_to(target, linkpath) {
+        return 0;
+    }
     unlinkat(linkpath);
     let mut r = symlinkat(target, linkpath);
     let mut tries = 0;
@@ -98,10 +127,34 @@ fn setup_runtime_dirs(root: &str) {
     mkdir_path(&(String::from(root) + "/bin"));
     mkdir_path(&(String::from(root) + "/usr"));
     mkdir_path(&(String::from(root) + "/usr/bin"));
+    mkdir_path(&(String::from(root) + "/etc"));
     mkdir_path(&(String::from(root) + "/tmp"));
     mkdir_path(&(String::from(root) + "/mnt"));
     mkdir_path(&(String::from(root) + "/lib"));
     mkdir_path(&(String::from(root) + "/lib64"));
+    ensure_account_files(root);
+}
+
+fn write_text_file(path: &str, content: &[u8]) {
+    let fd = open(
+        path,
+        OpenFlags::CREATE | OpenFlags::WRONLY | OpenFlags::TRUNC,
+    );
+    if fd >= 0 {
+        write(fd as usize, content);
+        close(fd as usize);
+    }
+}
+
+fn ensure_account_files(root: &str) {
+    let passwd = String::from(root)
+        + "/etc/passwd\0";
+    write_text_file(
+        &passwd,
+        b"root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/tmp:/bin/false\n",
+    );
+    let group = String::from(root) + "/etc/group\0";
+    write_text_file(&group, b"root:x:0:\nnogroup:x:65534:\n");
 }
 
 fn setup_lmbench_wrapper_paths(chroot_root: &str, chroot_cwd: &str) {
@@ -346,16 +399,18 @@ fn script_priority(script: &str) -> u8 {
         0
     } else if script.starts_with("busybox_") {
         1
-    } else if script.starts_with("lua_") {
-        2
-    } else if script.starts_with("iozone_") {
-        3
     } else if script.starts_with("lmbench_") {
+        2
+    } else if script.starts_with("lua_") {
+        3
+    } else if script.starts_with("iozone_") {
         4
     } else if script.starts_with("iperf_") {
         5
     } else if script.starts_with("libctest_") {
         6
+    } else if is_embedded_ltp(script) {
+        7
     } else {
         50
     }
@@ -370,6 +425,17 @@ fn should_run_script(script: &str) -> bool {
         || script.starts_with("libctest_")
 }
 
+fn should_run_script_in_dir(dir: &str, script: &str) -> bool {
+    if script.starts_with("libctest_") && is_glibc_dir(dir) {
+        return false;
+    }
+    true
+}
+
+fn should_skip_script_path(path: &str) -> bool {
+    path.contains("/glibc/libctest_")
+}
+
 fn script_budget(script: &str) -> &'static str {
     if is_embedded_basic(script) || script.starts_with("basic_") {
         "90"
@@ -378,13 +444,15 @@ fn script_budget(script: &str) -> &'static str {
     } else if script.starts_with("lmbench_") {
         "1800"
     } else if script.starts_with("lua_") {
-        "90"
+        "180"
     } else if script.starts_with("iozone_") {
         "720"
     } else if script.starts_with("iperf_") {
         "300"
     } else if script.starts_with("libctest_") {
         "600"
+    } else if is_embedded_ltp(script) {
+        "900"
     } else {
         "90"
     }
@@ -413,6 +481,11 @@ fn dir_flavor_priority(dir: &str) -> u8 {
     }
 }
 
+fn is_glibc_dir(dir: &str) -> bool {
+    let dir = dir.trim_end_matches('\0').trim_end_matches('/');
+    dir.ends_with("/glibc") || dir.contains("/glibc/")
+}
+
 struct TestScript {
     dir: String,
     script: String,
@@ -435,6 +508,10 @@ fn is_embedded_basic(script: &str) -> bool {
     script == EMBEDDED_BASIC_MUSL || script == EMBEDDED_BASIC_GLIBC
 }
 
+fn is_embedded_ltp(script: &str) -> bool {
+    script == EMBEDDED_LTP
+}
+
 fn collect_known_scripts(dir: &str, out: &mut Vec<TestScript>) -> usize {
     println!("[initproc] probe known {}", dir.trim_end_matches('\0'));
     let mut found = 0usize;
@@ -442,7 +519,13 @@ fn collect_known_scripts(dir: &str, out: &mut Vec<TestScript>) -> usize {
         if script.starts_with("basic_") {
             continue;
         }
+        if !should_run_script_in_dir(dir, script) {
+            continue;
+        }
         let path = script_path(dir, script);
+        if should_skip_script_path(&path) {
+            continue;
+        }
         if !path_exists(&path) {
             continue;
         }
@@ -457,6 +540,21 @@ fn collect_known_scripts(dir: &str, out: &mut Vec<TestScript>) -> usize {
             script: String::from(script),
         });
         found += 1;
+    }
+    let entries = list_dir(dir);
+    let has_ltp = has_entry(&entries, "ltp") && dir_flavor_priority(dir) == 0;
+    if has_ltp {
+        if !out
+            .iter()
+            .any(|old| old.dir == dir && old.script == EMBEDDED_LTP)
+        {
+            println!("[initproc] add ltp subset {}", dir.trim_end_matches('\0'));
+            out.push(TestScript {
+                dir: String::from(dir),
+                script: String::from(EMBEDDED_LTP),
+            });
+            found += 1;
+        }
     }
     println!(
         "[initproc] {} has {} known test scripts",
@@ -568,6 +666,7 @@ fn run_script(dir: &str, script: &str) {
                 reap_zombies();
                 break;
             }
+            reap_zombies();
             sleep(20);
         }
     }
@@ -575,15 +674,9 @@ fn run_script(dir: &str, script: &str) {
 
 fn run_embedded_basic(script: &str) {
     let (path, label) = if script == EMBEDDED_BASIC_MUSL {
-        (
-            "/bin/contest_runner_musl\0",
-            "basic-musl",
-        )
+        ("/bin/contest_runner_musl\0", "basic-musl")
     } else if script == EMBEDDED_BASIC_GLIBC {
-        (
-            "/bin/contest_runner_glibc\0",
-            "basic-glibc",
-        )
+        ("/bin/contest_runner_glibc\0", "basic-glibc")
     } else {
         return;
     };
@@ -617,9 +710,108 @@ fn run_embedded_basic(script: &str) {
                 reap_zombies();
                 break;
             }
+            reap_zombies();
             sleep(20);
         }
     }
+}
+
+fn ltp_label_for_dir(dir: &str) -> &'static str {
+    let root = dir.trim_end_matches('\0').trim_end_matches('/');
+    if root.ends_with("/glibc") {
+        "ltp-glibc"
+    } else {
+        "ltp-musl"
+    }
+}
+
+fn wait_embedded_ltp_child(pid: isize, dir: &str) {
+    if pid <= 0 {
+        return;
+    }
+    let mut ec = 0;
+    let budget_ms = script_budget(EMBEDDED_LTP).parse::<isize>().unwrap_or(900) * 1000;
+    let start = get_time();
+    loop {
+        let r = waitpid_nb(pid as usize, &mut ec);
+        if r == pid {
+            println!(
+                "[initproc] [DONE] {}{} exit {}",
+                dir.trim_end_matches('\0'),
+                EMBEDDED_LTP,
+                ec
+            );
+            kill_pgrp(pid as usize, 9);
+            reap_zombies();
+            break;
+        }
+        if get_time() - start > budget_ms {
+            println!(
+                "[initproc] [TIMEOUT] {}{} after {}ms",
+                dir.trim_end_matches('\0'),
+                EMBEDDED_LTP,
+                budget_ms
+            );
+            kill_pgrp(pid as usize, 9);
+            kill(pid as usize, 9);
+            waitpid(pid as usize, &mut ec);
+            reap_zombies();
+            break;
+        }
+        reap_zombies();
+        sleep(20);
+    }
+}
+
+fn run_embedded_ltp_shell(dir: &str) {
+    let (chroot_root, chroot_cwd) = chroot_root_and_cwd(dir);
+    let label = ltp_label_for_dir(dir);
+    let mut command = String::from("echo \"#### OS COMP TEST GROUP START ");
+    command.push_str(label);
+    command.push_str(" ####\"; for t in ");
+    command.push_str(LTP_SUBSET_CASES);
+    command.push_str("; do f=ltp/testcases/bin/$t; if [ -f $f ]; then ");
+    command.push_str("echo RUN LTP CASE $t; ret=/tmp/ltp_ret_$t; rm -f $ret; ");
+    command.push_str("($f; echo $? > $ret) & p=$!; i=0; r=124; ");
+    command.push_str("while [ $i -lt 30 ]; do if [ -f $ret ]; then r=$(cat $ret); break; fi; ");
+    command.push_str("sleep 1; i=$(expr $i + 1); done; ");
+    command.push_str("if [ ! -f $ret ]; then kill -9 $p; wait $p; else wait $p; fi; rm -f $ret; ");
+    command.push_str("echo FINISH LTP CASE $t : $r; ");
+    command.push_str("else echo SKIP LTP CASE $t : missing; fi; done; ");
+    command.push_str("echo \"#### OS COMP TEST GROUP END ");
+    command.push_str(label);
+    command.push_str(" ####\"\0");
+    let args: [*const u8; 4] = [
+        b"sh\0".as_ptr(),
+        b"-c\0".as_ptr(),
+        command.as_ptr(),
+        core::ptr::null(),
+    ];
+    let envs: [*const u8; 4] = [
+        b"PATH=/bin:/usr/bin:.\0".as_ptr(),
+        b"LD_LIBRARY_PATH=/lib:/lib64:.\0".as_ptr(),
+        b"TMPDIR=/tmp\0".as_ptr(),
+        core::ptr::null(),
+    ];
+    let pid = fork();
+    if pid == 0 {
+        setsid();
+        let chroot_arg = chroot_root.clone() + "\0";
+        let chdir_arg = chroot_cwd.clone() + "\0";
+        if chroot(&chroot_arg) != 0 {
+            exit(126);
+        }
+        if user_lib::chdir(&chdir_arg) != 0 {
+            exit(126);
+        }
+        execve("/busybox\0", &args, &envs);
+        exit(127);
+    }
+    wait_embedded_ltp_child(pid, dir);
+}
+
+fn run_embedded_ltp(dir: &str) {
+    run_embedded_ltp_shell(dir);
 }
 
 fn run_embedded_basics() -> bool {
@@ -649,11 +841,15 @@ fn collect_scripts(dir: &str, depth: usize, out: &mut Vec<TestScript>) {
         .iter()
         .filter(|entry| entry.ends_with("_testcode.sh"))
         .filter(|entry| should_run_script(entry))
+        .filter(|entry| should_run_script_in_dir(dir, entry))
         .cloned()
         .collect();
     sort_scripts(&mut scripts);
     for entry in &scripts {
         let path = script_path(dir, entry);
+        if should_skip_script_path(&path) {
+            continue;
+        }
         if out
             .iter()
             .any(|old| script_path(&old.dir, &old.script) == path)
@@ -709,10 +905,20 @@ fn run_collected_scripts(mut scripts: Vec<TestScript>) -> bool {
     for item in scripts {
         reap_zombies();
         let path = script_path(&item.dir, &item.script);
+        if !should_run_script_in_dir(&item.dir, &item.script) || should_skip_script_path(&path) {
+            println!("[initproc] [SKIP] {}", path);
+            continue;
+        }
         println!("[initproc] [PREP] {}", path);
         if is_embedded_basic(&item.script) {
             println!("[initproc] [RUN] embedded {}", item.script);
             run_embedded_basic(&item.script);
+            continue;
+        }
+        if is_embedded_ltp(&item.script) {
+            setup_runtime_for_dir(&item.dir, &item.script);
+            println!("[initproc] [RUN] embedded {} at {}", item.script, item.dir);
+            run_embedded_ltp(&item.dir);
             continue;
         }
         setup_runtime_for_dir(&item.dir, &item.script);

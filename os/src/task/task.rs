@@ -59,9 +59,12 @@ pub struct TaskControlBlockInner {
     pub exit_code: i32,
     pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
     pub fd_cloexec: Vec<bool>,
+    pub rlimit_nofile: usize,
+    pub rlimit_nofile_max: usize,
     pub cwd: Arc<Dentry>,
     pub root: Arc<Dentry>,
     pub tid_ptr: usize,
+    pub tgid: usize,
     pub pgid: usize,
     pub sid: usize,
     pub uid: u32,
@@ -118,17 +121,17 @@ impl TaskControlBlockInner {
         self.get_status() == TaskStatus::Zombie
     }
     pub fn alloc_fd(&mut self) -> usize {
-        const MAX_FD: usize = 1024;
-        let search_end = self.fd_table.len().min(MAX_FD);
+        let max_fd = self.rlimit_nofile.min(1024);
+        let search_end = self.fd_table.len().min(max_fd);
         if let Some(fd) = (0..search_end).find(|fd| self.fd_table[*fd].is_none()) {
             self.fd_cloexec[fd] = false;
             fd
-        } else if self.fd_table.len() < MAX_FD {
+        } else if self.fd_table.len() < max_fd {
             self.fd_table.push(None);
             self.fd_cloexec.push(false);
             self.fd_table.len() - 1
         } else {
-            MAX_FD
+            max_fd
         }
     }
     pub fn close_fd(&mut self, fd: usize) -> bool {
@@ -250,9 +253,12 @@ impl TaskControlBlock {
                             Some(Arc::new(Stdout)),
                         ],
                         fd_cloexec: vec![false, false, false],
+                        rlimit_nofile: 1024,
+                        rlimit_nofile_max: 1024,
                         cwd: ROOT_DENTRY.clone(),
                         root: ROOT_DENTRY.clone(),
                         tid_ptr: 0,
+                        tgid: pid_value,
                         pgid: pid_value,
                         sid: pid_value,
                         uid: 0,
@@ -339,17 +345,46 @@ impl TaskControlBlock {
         const INTERP_BASE: usize = 0x10_0000_0000;
 
         let mut loaded = MemorySet::from_elf(elf_data);
-        let mut entry_point = loaded.entry_point;
-        let program_entry = loaded.program_entry;
-        let program_break = loaded.program_break;
-
-        // Load dynamic linker/interpreter at a fixed high address
         if let Some(id) = interp_data {
             let (interp_entry, interp_base) =
                 MemorySet::load_interp_elf(&mut loaded.memory_set, id, INTERP_BASE);
-            entry_point = interp_entry;
+            loaded.entry_point = interp_entry;
             loaded.interp_base = interp_base;
         }
+        self.exec_loaded(loaded, args, envs);
+    }
+
+    pub fn exec_file_with_interp(
+        &self,
+        elf_file: &dyn File,
+        interp_file: Option<&dyn File>,
+        args: Vec<String>,
+        envs: Vec<String>,
+    ) -> bool {
+        trace!("os::task::TaskControlBlock::exec_file_with_interp");
+        const INTERP_BASE: usize = 0x10_0000_0000;
+
+        let mut loaded = match MemorySet::from_elf_file(elf_file) {
+            Some(loaded) => loaded,
+            None => return false,
+        };
+        if let Some(file) = interp_file {
+            let Some((interp_entry, interp_base)) =
+                MemorySet::load_interp_file(&mut loaded.memory_set, file, INTERP_BASE)
+            else {
+                return false;
+            };
+            loaded.entry_point = interp_entry;
+            loaded.interp_base = interp_base;
+        }
+        self.exec_loaded(loaded, args, envs);
+        true
+    }
+
+    fn exec_loaded(&self, loaded: LoadedElf, args: Vec<String>, envs: Vec<String>) {
+        let entry_point = loaded.entry_point;
+        let program_entry = loaded.program_entry;
+        let program_break = loaded.program_break;
         let stack_top = loaded.user_sp;
         let heap_bottom = program_break;
         let ph_addr = loaded.ph_addr;
@@ -475,7 +510,10 @@ impl TaskControlBlock {
         auxv_write!(AT_RANDOM, random_addr as u64);
         // AT_EXECFN normally points at argv[0]. Some internal runners are
         // launched with argc=0, so keep auxv construction tolerant of that.
-        auxv_write!(31, string_addrs.first().copied().unwrap_or(platform_addr) as u64);
+        auxv_write!(
+            31,
+            string_addrs.first().copied().unwrap_or(platform_addr) as u64
+        );
         auxv_write!(AT_NULL, 0u64);
 
         // Step 5: envp NULL and pointers
@@ -549,9 +587,12 @@ impl TaskControlBlock {
             base_size,
             fd_table,
             fd_cloexec,
+            rlimit_nofile,
+            rlimit_nofile_max,
             cwd,
             root,
             tid_ptr,
+            _parent_tgid,
             pgid,
             sid,
             uid,
@@ -580,9 +621,12 @@ impl TaskControlBlock {
                     })
                     .collect::<Vec<_>>(),
                 parent_inner.fd_cloexec.clone(),
+                parent_inner.rlimit_nofile,
+                parent_inner.rlimit_nofile_max,
                 parent_inner.cwd.clone(),
                 parent_inner.root.clone(),
                 parent_inner.tid_ptr,
+                parent_inner.tgid,
                 parent_inner.pgid,
                 parent_inner.sid,
                 parent_inner.uid,
@@ -599,6 +643,7 @@ impl TaskControlBlock {
         };
 
         let pid_handle = pid_alloc();
+        let pid_value = pid_handle.0;
         let kstack = KernelStack::new();
         let task_control_block = Arc::new(TaskControlBlock {
             pid: pid_handle,
@@ -616,9 +661,12 @@ impl TaskControlBlock {
                         exit_code: 0,
                         fd_table,
                         fd_cloexec,
+                        rlimit_nofile,
+                        rlimit_nofile_max,
                         cwd,
                         root,
                         tid_ptr,
+                        tgid: pid_value,
                         pgid,
                         sid,
                         uid,

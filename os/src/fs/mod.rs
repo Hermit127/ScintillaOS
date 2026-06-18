@@ -110,7 +110,8 @@ pub trait File: Send + Sync {
 }
 
 pub use inode::{
-    follow_symlink, mkdir_at, open_file, open_file_at, rename_at, symlink_at, unlink_at, OpenFlags,
+    follow_symlink, link_at, mkdir_at, open_file, open_file_at, rename_at, symlink_at, unlink_at,
+    OpenFlags,
 };
 pub use pipe::make_pipe;
 pub use stdio::{DevNull, DevZero, Stdin, Stdout, Urandom};

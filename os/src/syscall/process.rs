@@ -1,15 +1,16 @@
 use crate::fs::stdio::stdout_release_if_owner;
 use crate::fs::{open_file, open_file_at, File, OpenFlags};
 use crate::mm::{
-    frames_alloc, get_elf_interp, translated_byte_buffer, translated_ref, translated_refmut,
+    frames_alloc, get_elf_interp_file, translated_byte_buffer, translated_ref, translated_refmut,
     translated_str, FrameTracker, MapPermission,
 };
 use crate::sync::UPSafeCell;
 use crate::task::{
     add_task, blank_kcontext, block_current_and_run_next, current_task, current_user_token,
-    exit_current_and_run_next, force_exit_task, pid2task, pid_alloc, sleep_current_and_run_next,
-    suspend_current_and_run_next, wake_blocked_task, BlockReason, KernelStack, SignalAction,
-    SignalFlags, TaskControlBlock, TaskControlBlockInner, TaskStatus, PID2TCB, MAX_SIG,
+    exit_current_and_run_next, force_exit_task, force_exit_task_group, pid2task, pid_alloc,
+    sleep_current_and_run_next, suspend_current_and_run_next, wake_blocked_task, BlockReason,
+    KernelStack, SignalAction, SignalFlags, TaskControlBlock, TaskControlBlockInner, TaskStatus,
+    MAX_SIG, PID2TCB,
 };
 use alloc::format;
 use alloc::string::String;
@@ -66,6 +67,19 @@ fn monotonic_user_times_tick() -> u64 {
         {
             return next;
         }
+    }
+}
+
+const EXEC_PREFIX_LEN: usize = 512;
+
+fn read_exec_prefix(inode: &Arc<crate::fs::inode::OSInode>) -> Vec<u8> {
+    let mut buf = alloc::vec![0u8; EXEC_PREFIX_LEN];
+    let n = inode.read_at(0, &mut buf);
+    if n <= 0 {
+        Vec::new()
+    } else {
+        buf.truncate(n as usize);
+        buf
     }
 }
 
@@ -168,6 +182,13 @@ struct TimeVal {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
+struct TimeZone {
+    minuteswest: i32,
+    dsttime: i32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
 struct RUsage {
     ru_utime: TimeVal,
     ru_stime: TimeVal,
@@ -187,7 +208,21 @@ struct RUsage {
     ru_nivcsw: isize,
 }
 
+fn clear_current_tid_ptr() {
+    let Some(task) = current_task() else {
+        return;
+    };
+    let tid = {
+        let inner = task.inner_exclusive_access();
+        inner.tid_ptr
+    };
+    if tid != 0 {
+        *translated_refmut(current_user_token(), tid as *mut i32) = 0;
+    }
+}
+
 pub fn sys_exit(exit_code: i32) -> ! {
+    clear_current_tid_ptr();
     exit_current_and_run_next(exit_code)
 }
 
@@ -197,21 +232,49 @@ pub fn sys_yield() -> isize {
     0
 }
 
-pub fn sys_get_time(ts_ptr: usize, _tz: usize) -> isize {
+pub fn sys_get_time(ts_ptr: usize, tz_ptr: usize) -> isize {
     let now_us = monotonic_user_time_us();
+    if ts_ptr == 0 && tz_ptr == 0 {
+        return (now_us / 1000) as isize;
+    }
+
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+    if ts_ptr != 0
+        && !inner
+            .memory_set
+            .valid_user_buf(ts_ptr as *const u8, core::mem::size_of::<TimeVal>(), true)
+    {
+        return -14;
+    }
+    if tz_ptr != 0
+        && !inner
+            .memory_set
+            .valid_user_buf(tz_ptr as *const u8, core::mem::size_of::<TimeZone>(), true)
+    {
+        return -14;
+    }
+    let token = inner.get_user_token();
+    drop(inner);
+
     if ts_ptr != 0 {
-        let token = current_user_token();
-        let ts = crate::mm::translated_refmut(token, ts_ptr as *mut TimeVal);
+        let ts = translated_refmut(token, ts_ptr as *mut TimeVal);
         ts.sec = (now_us / 1_000_000) as isize;
         ts.usec = (now_us % 1_000_000) as isize;
-        0
-    } else {
-        (now_us / 1000) as isize
     }
+    if tz_ptr != 0 {
+        *translated_refmut(token, tz_ptr as *mut TimeZone) = TimeZone {
+            minuteswest: 0,
+            dsttime: 0,
+        };
+    }
+    0
 }
 
 pub fn sys_getpid() -> isize {
-    current_task().unwrap().pid.0 as isize
+    current_task()
+        .map(|t| t.inner_exclusive_access().tgid as isize)
+        .unwrap_or(-1)
 }
 
 pub fn sys_getppid() -> isize {
@@ -238,6 +301,11 @@ const CLONE_CHILD_SETTID: usize = 0x01000000;
 
 pub fn sys_clone(flags: usize, stack: usize, ptid: usize, tls: usize, ctid: usize) -> isize {
     let current_task = current_task().unwrap();
+    let parent_tgid = {
+        let inner = current_task.inner_exclusive_access();
+        inner.tgid
+    };
+    let is_thread = flags & CLONE_THREAD != 0;
     let Some(new_task) = current_task.fork() else {
         return -12;
     };
@@ -249,6 +317,12 @@ pub fn sys_clone(flags: usize, stack: usize, ptid: usize, tls: usize, ctid: usiz
         if stack != 0 {
             inner.trap_cx[TrapFrameArgs::SP] = stack;
         }
+        if is_thread {
+            inner.tgid = parent_tgid;
+        }
+        if flags & CLONE_SETTLS != 0 && tls != 0 {
+            inner.trap_cx[TrapFrameArgs::TLS] = tls;
+        }
         if flags & CLONE_CHILD_CLEARTID != 0 && ctid != 0 {
             inner.tid_ptr = ctid;
         }
@@ -258,7 +332,16 @@ pub fn sys_clone(flags: usize, stack: usize, ptid: usize, tls: usize, ctid: usiz
     if flags & CLONE_CHILD_SETTID != 0 && ctid != 0 {
         *translated_refmut(child_token, ctid as *mut i32) = new_pid as i32;
     }
+    if flags & CLONE_PARENT_SETTID != 0 && ptid != 0 {
+        *translated_refmut(current_user_token(), ptid as *mut i32) = new_pid as i32;
+    }
 
+    if is_thread {
+        current_task
+            .inner_exclusive_access()
+            .children
+            .retain(|child| child.getpid() != new_pid);
+    }
     add_task(new_task);
     new_pid as isize
 }
@@ -323,13 +406,13 @@ pub fn sys_exec(path: *const u8, mut args: *const usize, mut envp: *const usize)
     };
     let app_inode = open_exec(path.as_str());
     if let Some(app_inode) = app_inode {
-        let all_data = app_inode.read_all();
-        if all_data.len() >= 2 && &all_data[..2] == b"#!" {
-            let end = all_data
+        let prefix = read_exec_prefix(&app_inode);
+        if prefix.len() >= 2 && &prefix[..2] == b"#!" {
+            let end = prefix
                 .iter()
                 .position(|&b| b == b'\n')
-                .unwrap_or(all_data.len());
-            let line = core::str::from_utf8(&all_data[2..end]).unwrap_or("");
+                .unwrap_or(prefix.len());
+            let line = core::str::from_utf8(&prefix[2..end]).unwrap_or("");
             let parts: alloc::vec::Vec<&str> = line.split_whitespace().collect();
             if !parts.is_empty() {
                 let ipath = if parts[0].starts_with('/') {
@@ -347,41 +430,55 @@ pub fn sys_exec(path: *const u8, mut args: *const usize, mut envp: *const usize)
                 }
                 drop(app_inode);
                 if let Some(i2) = open_exec(&ipath) {
-                    let d2 = i2.read_all();
-                    current_task().unwrap().exec(&d2, new_args, env_vec);
-                    return 0;
+                    let interp_inode = get_elf_interp_file(i2.as_ref()).and_then(|interp_path| {
+                        open_exec(&interp_path).or_else(|| {
+                            let usr_interp = alloc::format!("/usr{}", interp_path);
+                            open_exec(&usr_interp)
+                        })
+                    });
+                    let interp_file = interp_inode
+                        .as_ref()
+                        .map(|inode| inode.as_ref() as &dyn File);
+                    if current_task().unwrap().exec_file_with_interp(
+                        i2.as_ref(),
+                        interp_file,
+                        new_args,
+                        env_vec,
+                    ) {
+                        return 0;
+                    }
+                    return -1;
                 }
             }
             return -1;
         }
         let task = current_task().unwrap();
-        if all_data.len() < 4 || &all_data[..4] != b"\x7fELF" {
-            if looks_like_text_script(&all_data) {
+        if prefix.len() < 4 || &prefix[..4] != b"\x7fELF" {
+            if looks_like_text_script(prefix.as_slice()) {
                 let mut sh_args = alloc::vec![alloc::string::String::from("/bin/sh"), path.clone()];
                 for a in args_vec.iter().skip(1) {
                     sh_args.push(a.clone());
                 }
                 drop(app_inode);
                 if let Some(sh_inode) = open_exec("/bin/sh").or_else(|| open_exec("/busybox")) {
-                    let sh_data = sh_inode.read_all();
-                    if sh_data.len() >= 4 && &sh_data[..4] == b"\x7fELF" {
-                        if let Some(interp_path) = crate::mm::get_elf_interp(&sh_data) {
-                            let interp_inode = open_exec(&interp_path).or_else(|| {
-                                let usr_interp = alloc::format!("/usr{}", interp_path);
-                                open_exec(&usr_interp)
+                    let sh_prefix = read_exec_prefix(&sh_inode);
+                    if sh_prefix.len() >= 4 && &sh_prefix[..4] == b"\x7fELF" {
+                        let interp_inode =
+                            get_elf_interp_file(sh_inode.as_ref()).and_then(|interp_path| {
+                                open_exec(&interp_path).or_else(|| {
+                                    let usr_interp = alloc::format!("/usr{}", interp_path);
+                                    open_exec(&usr_interp)
+                                })
                             });
-                            if let Some(interp_inode) = interp_inode {
-                                let interp_data = interp_inode.read_all();
-                                current_task().unwrap().exec_with_interp(
-                                    sh_data.as_slice(),
-                                    Some(&interp_data),
-                                    sh_args,
-                                    env_vec,
-                                );
-                                return 0;
-                            }
-                        } else {
-                            current_task().unwrap().exec(sh_data.as_slice(), sh_args, env_vec);
+                        let interp_file = interp_inode
+                            .as_ref()
+                            .map(|inode| inode.as_ref() as &dyn File);
+                        if current_task().unwrap().exec_file_with_interp(
+                            sh_inode.as_ref(),
+                            interp_file,
+                            sh_args,
+                            env_vec,
+                        ) {
                             return 0;
                         }
                     }
@@ -390,20 +487,29 @@ pub fn sys_exec(path: *const u8, mut args: *const usize, mut envp: *const usize)
             return -8;
         }
         // Check for dynamically linked ELF (has PT_INTERP)
-        if let Some(interp_path) = crate::mm::get_elf_interp(&all_data) {
+        if let Some(interp_path) = get_elf_interp_file(app_inode.as_ref()) {
             let interp_inode = open_exec(&interp_path).or_else(|| {
                 let usr_interp = alloc::format!("/usr{}", interp_path);
                 open_exec(&usr_interp)
             });
             if let Some(interp_inode) = interp_inode {
-                let interp_data = interp_inode.read_all();
-                task.exec_with_interp(all_data.as_slice(), Some(&interp_data), args_vec, env_vec);
-                return 0;
+                if task.exec_file_with_interp(
+                    app_inode.as_ref(),
+                    Some(interp_inode.as_ref() as &dyn File),
+                    args_vec,
+                    env_vec,
+                ) {
+                    return 0;
+                }
+                return -1;
             }
             return -1;
         }
-        task.exec(all_data.as_slice(), args_vec, env_vec);
-        0
+        if task.exec_file_with_interp(app_inode.as_ref(), None, args_vec, env_vec) {
+            0
+        } else {
+            -1
+        }
     } else {
         -1
     }
@@ -602,6 +708,7 @@ pub fn sys_waitid(
 fn signal_task(task: &Arc<TaskControlBlock>, signum: i32) {
     let target = task.getpid();
     if signum == 9 && current_task().map(|t| t.getpid() != target).unwrap_or(true) {
+        force_exit_task_group(task, -9);
         force_exit_task(task, -9);
         return;
     }
@@ -1227,8 +1334,9 @@ pub fn sys_set_tid_address(tidptr: *mut i32) -> isize {
 }
 
 pub fn sys_exit_group(status: i32) -> ! {
+    let task = current_task().unwrap();
+    force_exit_task_group(&task, status);
     let tid = {
-        let task = current_task().unwrap();
         let inner = task.inner_exclusive_access();
         inner.tid_ptr
     };
@@ -1569,8 +1677,10 @@ pub fn sys_getrlimit(resource: usize, rlim_ptr: *mut u8) -> isize {
     let token = current_user_token();
     let rlim = crate::mm::translated_refmut(token, rlim_ptr as *mut RLimit);
     if resource == RLIMIT_NOFILE {
-        rlim.rlim_cur = 1024;
-        rlim.rlim_max = 1024;
+        let task = current_task().unwrap();
+        let inner = task.inner_exclusive_access();
+        rlim.rlim_cur = inner.rlimit_nofile;
+        rlim.rlim_max = inner.rlimit_nofile_max;
     } else {
         rlim.rlim_cur = RLIM_INFINITY;
         rlim.rlim_max = RLIM_INFINITY;
@@ -1581,6 +1691,52 @@ pub fn sys_getrlimit(resource: usize, rlim_ptr: *mut u8) -> isize {
 pub fn sys_setrlimit(resource: usize, rlim_ptr: *const u8) -> isize {
     if rlim_ptr.is_null() || resource >= RLIM_NLIMITS {
         return -22;
+    }
+    if resource == RLIMIT_NOFILE {
+        let token = current_user_token();
+        let rlim = translated_ref(token, rlim_ptr as *const RLimit);
+        let task = current_task().unwrap();
+        let mut inner = task.inner_exclusive_access();
+        inner.rlimit_nofile = rlim.rlim_cur.min(1024);
+        inner.rlimit_nofile_max = rlim.rlim_max.min(1024);
+    }
+    0
+}
+
+pub fn sys_prlimit64(
+    pid: usize,
+    resource: usize,
+    new_limit: *const u8,
+    old_limit: *mut u8,
+) -> isize {
+    if resource >= RLIM_NLIMITS {
+        return -22;
+    }
+    let task = if pid == 0 {
+        current_task().unwrap()
+    } else {
+        match pid2task(pid) {
+            Some(task) => task,
+            None => return -3,
+        }
+    };
+    let token = current_user_token();
+    if !old_limit.is_null() {
+        let old = translated_refmut(token, old_limit as *mut RLimit);
+        if resource == RLIMIT_NOFILE {
+            let inner = task.inner_exclusive_access();
+            old.rlim_cur = inner.rlimit_nofile;
+            old.rlim_max = inner.rlimit_nofile_max;
+        } else {
+            old.rlim_cur = RLIM_INFINITY;
+            old.rlim_max = RLIM_INFINITY;
+        }
+    }
+    if !new_limit.is_null() && resource == RLIMIT_NOFILE {
+        let new = translated_ref(token, new_limit as *const RLimit);
+        let mut inner = task.inner_exclusive_access();
+        inner.rlimit_nofile = new.rlim_cur.min(1024);
+        inner.rlimit_nofile_max = new.rlim_max.min(1024);
     }
     0
 }
@@ -1799,7 +1955,11 @@ pub fn sys_rt_sigtimedwait(
         if ts.tv_nsec >= 1_000_000_000 {
             return -22;
         }
-        Some(ts.tv_sec.saturating_mul(1_000_000_000).saturating_add(ts.tv_nsec))
+        Some(
+            ts.tv_sec
+                .saturating_mul(1_000_000_000)
+                .saturating_add(ts.tv_nsec),
+        )
     };
     let start_ns = Time::now().to_nsec() as usize;
 

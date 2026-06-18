@@ -1,6 +1,6 @@
 use super::vfs::{
-    vfs_create, vfs_resolve_parent_and_name, vfs_resolve_path, vfs_resolve_with_fallback, Dentry,
-    DirEntry,
+    dentry_parent, vfs_create, vfs_resolve_parent_and_name, vfs_resolve_path,
+    vfs_resolve_with_fallback, Dentry, DirEntry,
 };
 use super::{File, Kstat, S_IFDIR, S_IFREG};
 use crate::sync::UPSafeCell;
@@ -14,6 +14,7 @@ use lazy_static::*;
 use lwext4_rust::bindings::*;
 
 const EXT4_BLOCK_SIZE: u32 = 4096;
+const PATH_TIME_CACHE_MAX_ENTRIES: usize = 1024;
 
 #[derive(Clone, Copy, Default)]
 struct CachedTimes {
@@ -34,6 +35,9 @@ pub fn update_path_cached_times(
     ctime: Option<i64>,
 ) {
     let mut cache = PATH_TIME_CACHE.exclusive_access();
+    if !cache.contains_key(fs_path) && cache.len() >= PATH_TIME_CACHE_MAX_ENTRIES {
+        cache.clear();
+    }
     let entry = cache
         .entry(String::from(fs_path))
         .or_insert_with(CachedTimes::default);
@@ -220,6 +224,7 @@ impl OSInode {
                 st.st_size = info.size as i64;
                 st.st_blksize = EXT4_BLOCK_SIZE;
                 st.st_blocks = info.blocks_count;
+                st.st_nlink = info.links_count.max(1);
                 st.st_atime_sec = info.atime as i64;
                 st.st_mtime_sec = info.mtime as i64;
                 st.st_ctime_sec = info.ctime as i64;
@@ -258,12 +263,7 @@ impl OSInode {
         }
     }
 
-    pub fn update_cached_times(
-        &self,
-        atime: Option<i64>,
-        mtime: Option<i64>,
-        ctime: Option<i64>,
-    ) {
+    pub fn update_cached_times(&self, atime: Option<i64>, mtime: Option<i64>, ctime: Option<i64>) {
         let mut inner = self.inner.exclusive_access();
         if let Some(ref mut st) = inner.cached_stat {
             if let Some(atime) = atime {
@@ -384,12 +384,6 @@ fn open_file_new(
                 if flags.excl_requested() {
                     return None;
                 }
-                if flags.trunc_requested()
-                    || flags.contains(OpenFlags::WRONLY)
-                    || flags.contains(OpenFlags::RDWR)
-                {
-                    root_make_accessible(&dentry, 0o666);
-                }
                 if flags.trunc_requested() {
                     let truncated = dentry.super_block.truncate_file(&dentry.fs_path, 0);
                     if !truncated {
@@ -488,7 +482,7 @@ pub fn follow_symlink(
             .map(|task| task.inner_exclusive_access().root.clone())
             .unwrap_or_else(|| crate::fs::vfs::ROOT_DENTRY.clone())
     } else {
-        dentry.parent.clone().unwrap_or_else(|| start.clone())
+        dentry_parent(&dentry).unwrap_or_else(|| start.clone())
     };
     let next = vfs_resolve_with_fallback(&base, target)?;
     follow_symlink(&base, next, depth + 1)
@@ -521,7 +515,7 @@ pub fn unlink_at(base: Option<Arc<Dentry>>, path: &str, is_dir: bool) -> bool {
         return false;
     }
 
-    let parent = match dentry.parent.clone() {
+    let parent = match dentry_parent(&dentry) {
         Some(p) => p,
         None => return false,
     };
@@ -925,7 +919,7 @@ pub fn rename_at(
     };
 
     if rc == EOK as i32 {
-        if let Some(old_parent) = old_dentry.parent.clone() {
+        if let Some(old_parent) = dentry_parent(&old_dentry) {
             let mut children = old_parent.children.exclusive_access();
             if let Some(list) = children.as_mut() {
                 list.retain(|c| c.name != old_dentry.name);
@@ -978,4 +972,59 @@ pub fn symlink_at(base: Option<Arc<Dentry>>, target: &str, linkpath: &str) -> bo
     };
 
     rc == EOK as i32
+}
+
+// ==================== link_at ====================
+
+pub fn link_at(
+    old_base: Option<Arc<Dentry>>,
+    old_path: &str,
+    new_base: Option<Arc<Dentry>>,
+    new_path: &str,
+) -> bool {
+    use alloc::ffi::CString;
+    use lwext4_rust::bindings::{ext4_flink, EOK};
+
+    let old_start = old_base.unwrap_or_else(|| crate::fs::vfs::ROOT_DENTRY.clone());
+    let old_dentry = match vfs_resolve_path(&old_start, old_path) {
+        Some(d) if !d.is_dir => d,
+        _ => return false,
+    };
+    let old_cpath = match CString::new(old_dentry.fs_path.as_bytes()) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+
+    let new_start = new_base.unwrap_or_else(|| crate::fs::vfs::ROOT_DENTRY.clone());
+    let (new_parent, new_name) = match vfs_resolve_parent_and_name(&new_start, new_path) {
+        Some(x) => x,
+        None => return false,
+    };
+    let new_fs_path = if new_parent.fs_path == "/" {
+        alloc::format!("/{}", new_name)
+    } else if new_parent.fs_path.ends_with('/') {
+        alloc::format!("{}{}", new_parent.fs_path, new_name)
+    } else {
+        alloc::format!("{}/{}", new_parent.fs_path, new_name)
+    };
+    let new_cpath = match CString::new(new_fs_path.as_bytes()) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+
+    let rc = unsafe {
+        ext4_flink(
+            old_cpath.as_ptr() as *const core::ffi::c_char,
+            new_cpath.as_ptr() as *const core::ffi::c_char,
+        )
+    };
+    if rc == EOK as i32 {
+        let mut children = new_parent.children.exclusive_access();
+        if let Some(list) = children.as_mut() {
+            list.retain(|c| c.name != new_name);
+        }
+        true
+    } else {
+        false
+    }
 }

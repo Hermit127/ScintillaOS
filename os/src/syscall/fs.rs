@@ -1,7 +1,7 @@
 use crate::fs::vfs::{vfs_resolve_path, vfs_resolve_with_fallback, Dentry, VfsSuperBlock};
 use crate::fs::{
-    make_pipe, mkdir_at, open_file_at, rename_at, symlink_at, unlink_at, DevNull, DevZero, File,
-    Kstat, OpenFlags, Urandom,
+    link_at, make_pipe, mkdir_at, open_file_at, rename_at, symlink_at, unlink_at, DevNull,
+    DevZero, File, Kstat, OpenFlags, Urandom,
 };
 use crate::mm::{translated_byte_buffer, translated_refmut, translated_str};
 use crate::task::{current_task, current_user_token};
@@ -9,13 +9,54 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 const AT_FDCWD: isize = -100;
+const O_NOATIME: u32 = 0x40000;
 const O_TMPFILE: u32 = 0x410000;
 const FILE_TIME_NOW_GUARD_SEC: i64 = 5;
+const PATH_MAX: usize = 4096;
+const NAME_MAX: usize = 255;
 
 static TMPFILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn translated_path_bounded(path: *const u8) -> Result<String, isize> {
+    if path.is_null() {
+        return Err(-14);
+    }
+
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+    let mut bytes = Vec::new();
+
+    while bytes.len() < PATH_MAX {
+        let offset = bytes.len();
+        let addr = unsafe { path.add(offset) };
+        let page_offset = (addr as usize) & (crate::config::PAGE_SIZE - 1);
+        let page_left = crate::config::PAGE_SIZE - page_offset;
+        let check_len = page_left.min(PATH_MAX - offset);
+
+        if !inner.memory_set.valid_user_buf(addr, check_len, false) {
+            return Err(-14);
+        }
+
+        let chunk = unsafe { core::slice::from_raw_parts(addr, check_len) };
+        if let Some(nul_pos) = chunk.iter().position(|&b| b == 0) {
+            bytes.extend_from_slice(&chunk[..nul_pos]);
+            let s = unsafe { core::str::from_utf8_unchecked(&bytes) };
+            return Ok(String::from(s));
+        }
+        bytes.extend_from_slice(chunk);
+    }
+
+    Err(-36)
+}
+
+fn path_has_too_long_component(path: &str) -> bool {
+    path.split('/')
+        .any(|component| component.as_bytes().len() > NAME_MAX)
+}
 
 fn resolve_base_dir(dirfd: isize) -> Option<Arc<Dentry>> {
     let task = current_task()?;
@@ -176,6 +217,20 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> isize
         }
         if open_flags.create_requested() && open_flags.excl_requested() {
             return -17;
+        }
+        if flags & O_NOATIME != 0 {
+            let euid = {
+                let inner = task.inner_exclusive_access();
+                inner.euid
+            };
+            let owner = existing
+                .super_block
+                .get_inode_info(&existing.fs_path)
+                .map(|info| info.uid)
+                .unwrap_or(0);
+            if euid != 0 && euid != owner {
+                return -1;
+            }
         }
     } else if !open_flags.create_requested() {
         return -2;
@@ -338,24 +393,15 @@ pub fn sys_unlinkat(dirfd: isize, path: *const u8, flags: u32) -> isize {
 }
 
 pub fn sys_chdir(path: *const u8) -> isize {
-    if path.is_null() {
-        return -14;
-    }
-    let token = current_user_token();
-    // Validate user path before reading — only check first page
-    let task = current_task().unwrap();
-    let inner = task.inner_exclusive_access();
-    let max_len = 4096;
-    let end_of_page =
-        ((path as usize) + crate::config::PAGE_SIZE) & !(crate::config::PAGE_SIZE - 1);
-    let first_page_len = max_len.min(end_of_page - (path as usize));
-    if !inner.memory_set.valid_user_buf(path, first_page_len, false) {
-        return -14;
-    }
-    let path_str = translated_str(token, path);
-    if path_str.len() >= max_len {
+    let path_str = match translated_path_bounded(path) {
+        Ok(path) => path,
+        Err(errno) => return errno,
+    };
+    if path_has_too_long_component(&path_str) {
         return -36;
     }
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
     let cwd = inner.cwd.clone();
     drop(inner);
     let Some(dir_dentry) = vfs_resolve_path(&cwd, &path_str) else {
@@ -370,23 +416,15 @@ pub fn sys_chdir(path: *const u8) -> isize {
 }
 
 pub fn sys_chroot(path: *const u8) -> isize {
-    if path.is_null() {
-        return -14;
-    }
-    let token = current_user_token();
-    let task = current_task().unwrap();
-    let inner = task.inner_exclusive_access();
-    let max_len = 4096;
-    let end_of_page =
-        ((path as usize) + crate::config::PAGE_SIZE) & !(crate::config::PAGE_SIZE - 1);
-    let first_page_len = max_len.min(end_of_page - (path as usize));
-    if !inner.memory_set.valid_user_buf(path, first_page_len, false) {
-        return -14;
-    }
-    let path_str = translated_str(token, path);
-    if path_str.len() >= max_len {
+    let path_str = match translated_path_bounded(path) {
+        Ok(path) => path,
+        Err(errno) => return errno,
+    };
+    if path_has_too_long_component(&path_str) {
         return -36;
     }
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
     let cwd = inner.cwd.clone();
     drop(inner);
     let Some(root_dentry) = vfs_resolve_path(&cwd, &path_str) else {
@@ -1206,6 +1244,10 @@ pub fn sys_lseek(fd: usize, offset: i64, whence: i32) -> isize {
     };
     let file = file.clone();
     drop(inner);
+    let mode_type = file.stat().st_mode & 0o170000;
+    if mode_type != 0o100000 && mode_type != 0o040000 {
+        return -29; // ESPIPE
+    }
 
     let new_off: i64 = match whence {
         SEEK_SET => offset,
@@ -1274,6 +1316,41 @@ pub fn sys_symlinkat(target: *const u8, newdirfd: isize, linkpath: *const u8) ->
         None => return -2,
     };
     if symlink_at(Some(base), &target_str, &linkpath_str) {
+        0
+    } else {
+        -1
+    }
+}
+
+pub fn sys_linkat(
+    olddirfd: isize,
+    oldpath: *const u8,
+    newdirfd: isize,
+    newpath: *const u8,
+    flags: u32,
+) -> isize {
+    const AT_SYMLINK_FOLLOW: u32 = 0x400;
+    if oldpath.is_null() || newpath.is_null() {
+        return -14;
+    }
+    if flags & !AT_SYMLINK_FOLLOW != 0 {
+        return -22;
+    }
+    let token = current_user_token();
+    let old_str = translated_str(token, oldpath);
+    let new_str = translated_str(token, newpath);
+    if old_str.is_empty() || new_str.is_empty() {
+        return -2;
+    }
+    let old_base = match resolve_base_dir(olddirfd) {
+        Some(b) => b,
+        None => return -2,
+    };
+    let new_base = match resolve_base_dir(newdirfd) {
+        Some(b) => b,
+        None => return -2,
+    };
+    if link_at(Some(old_base), &old_str, Some(new_base), &new_str) {
         0
     } else {
         -1
@@ -2027,7 +2104,8 @@ pub fn sys_mknodat(dirfd: isize, path: *const u8, mode: u32, _dev: usize) -> isi
         Some(p) => p,
         None => return -2,
     };
-    crate::fs::vfs::vfs_create(&parent, &name, false, 0o666);
+    let create_mode = if mode == 0 { 0o666 } else { mode };
+    crate::fs::vfs::vfs_create(&parent, &name, false, create_mode);
     0
 }
 

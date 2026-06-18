@@ -14,6 +14,7 @@ use lazy_static::*;
 use log::*;
 use manager::fetch_task;
 use manager::remove_from_pid2task;
+use manager::remove_from_ready_queue;
 use polyhal::instruction::shutdown;
 use polyhal::kcontext::KContext;
 use polyhal_trap::trapframe::TrapFrameArgs;
@@ -238,6 +239,7 @@ fn remove_task_from_block_queues(pid: usize) -> bool {
 
 pub fn force_exit_task(task: &Arc<TaskControlBlock>, exit_code: i32) {
     let pid = task.getpid();
+    remove_from_ready_queue(pid);
     remove_task_from_block_queues(pid);
     remove_from_pid2task(pid);
 
@@ -278,6 +280,78 @@ pub fn force_exit_task(task: &Arc<TaskControlBlock>, exit_code: i32) {
     }
 }
 
+pub fn force_exit_task_group(task: &Arc<TaskControlBlock>, exit_code: i32) {
+    let (pid, tgid) = {
+        let inner = task.inner_exclusive_access();
+        (task.getpid(), inner.tgid)
+    };
+    let group_tasks: Vec<Arc<TaskControlBlock>> = {
+        let map = PID2TCB.exclusive_access();
+        map.values()
+            .filter(|other| {
+                other.getpid() != pid
+                    && other
+                        .try_inner_borrow()
+                        .map(|inner| inner.tgid == tgid)
+                        .unwrap_or(false)
+            })
+            .cloned()
+            .collect()
+    };
+    for other in group_tasks {
+        force_exit_task(&other, exit_code);
+    }
+}
+
+pub fn dump_task_stats_for_oom(context: &str) {
+    let (pid_count, pid_zombies) = manager::pid2task_counts().unwrap_or((usize::MAX, usize::MAX));
+    let (ready_count, ready_zombies) =
+        manager::ready_queue_counts().unwrap_or((usize::MAX, usize::MAX));
+    let net_blocked = NET_BLOCK_QUEUE
+        .try_borrow()
+        .map(|queue| queue.len())
+        .unwrap_or(usize::MAX);
+    let waitpid_blocked = WAITPID_QUEUE
+        .try_borrow()
+        .map(|queue| queue.len())
+        .unwrap_or(usize::MAX);
+    let sleeping = SLEEP_QUEUE
+        .try_borrow()
+        .map(|queue| queue.len())
+        .unwrap_or(usize::MAX);
+    let (init_children, init_zombies) = INITPROC
+        .try_inner_borrow()
+        .map(|inner| {
+            let mut zombies = 0;
+            for child in inner.children.iter() {
+                if child
+                    .try_inner_borrow()
+                    .map(|child_inner| child_inner.task_status == TaskStatus::Zombie)
+                    .unwrap_or(false)
+                {
+                    zombies += 1;
+                }
+            }
+            (inner.children.len(), zombies)
+        })
+        .unwrap_or((usize::MAX, usize::MAX));
+    let current_pid = current_task().map(|task| task.getpid()).unwrap_or(0);
+    println!(
+        "[task-debug] {} pid2task={}/{} ready={}/{} net={} waitpid={} sleep={} init_children={}/{} current={}",
+        context,
+        pid_count,
+        pid_zombies,
+        ready_count,
+        ready_zombies,
+        net_blocked,
+        waitpid_blocked,
+        sleeping,
+        init_children,
+        init_zombies,
+        current_pid
+    );
+}
+
 pub const IDLE_PID: usize = 0;
 
 /// Exit the current 'Running' task and run the next task in task list.
@@ -297,6 +371,7 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
     }
 
     // remove from pid2task
+    remove_from_ready_queue(task.getpid());
     remove_from_pid2task(task.getpid());
     let (parent, orphan_children) = {
         // **** access current TCB exclusively
@@ -556,8 +631,8 @@ pub fn handle_signals() {
             task_inner.killed
         };
         if killed {
+            let task = current_task().unwrap();
             let exit_code = {
-                let task = current_task().unwrap();
                 let inner = task.inner_exclusive_access();
                 let sig = inner.exit_signal;
                 if sig != 0 {
@@ -566,6 +641,7 @@ pub fn handle_signals() {
                     -9
                 }
             };
+            force_exit_task_group(&task, exit_code);
             exit_current_and_run_next(exit_code);
         }
         let frozen = {
