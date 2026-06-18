@@ -318,7 +318,8 @@ impl MemorySet {
                 }
                 let page_off = start_va.raw() % PAGE_SIZE;
                 let aligned_start = start_va.raw() - page_off;
-                let map_area = MapArea::new(aligned_start.into(), end_va, MapType::Framed, map_perm);
+                let map_area =
+                    MapArea::new(aligned_start.into(), end_va, MapType::Framed, map_perm);
                 max_end_va = max_end_va.max(map_area.vaddr_range.get_end());
                 if !memory_set.push_file_segment(
                     map_area,
@@ -451,7 +452,8 @@ impl MemorySet {
                 }
                 let page_off = start_va.raw() % PAGE_SIZE;
                 let aligned_start = start_va.raw() - page_off;
-                let map_area = MapArea::new(aligned_start.into(), end_va, MapType::Framed, map_perm);
+                let map_area =
+                    MapArea::new(aligned_start.into(), end_va, MapType::Framed, map_perm);
                 if !memory_set.push_file_segment(
                     map_area,
                     file,

@@ -1,7 +1,7 @@
 use crate::fs::vfs::{vfs_resolve_path, vfs_resolve_with_fallback, Dentry, VfsSuperBlock};
 use crate::fs::{
-    link_at, make_pipe, mkdir_at, open_file_at, rename_at, symlink_at, unlink_at, DevNull,
-    DevZero, File, Kstat, OpenFlags, Urandom,
+    link_at, make_pipe, mkdir_at, open_file_at, rename_at, symlink_at, unlink_at, DevNull, DevZero,
+    File, Kstat, OpenFlags, Urandom,
 };
 use crate::mm::{translated_byte_buffer, translated_refmut, translated_str};
 use crate::task::{current_task, current_user_token};

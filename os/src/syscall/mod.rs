@@ -277,12 +277,16 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETGID => sys_getgid(),
         SYSCALL_GETEGID => sys_getegid(),
         SYSCALL_GETTID => sys_gettid(),
-        SYSCALL_GETRESUID => {
-            sys_getresuid(args[0] as *mut u32, args[1] as *mut u32, args[2] as *mut u32)
-        }
-        SYSCALL_GETRESGID => {
-            sys_getresgid(args[0] as *mut u32, args[1] as *mut u32, args[2] as *mut u32)
-        }
+        SYSCALL_GETRESUID => sys_getresuid(
+            args[0] as *mut u32,
+            args[1] as *mut u32,
+            args[2] as *mut u32,
+        ),
+        SYSCALL_GETRESGID => sys_getresgid(
+            args[0] as *mut u32,
+            args[1] as *mut u32,
+            args[2] as *mut u32,
+        ),
         SYSCALL_GETRUSAGE => sys_getrusage(args[0], args[1] as *mut u8),
         SYSCALL_UMASK => sys_umask(args[0] as u32),
         SYSCALL_SETUID => sys_setuid(args[0] as u32),
@@ -397,12 +401,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_STATFS => sys_statfs(args[0] as *const u8, args[1] as *mut u8),
         SYSCALL_FSTATFS => sys_fstatfs(args[0], args[1] as *mut u8),
         SYSCALL_PRCTL => 0,
-        SYSCALL_PRLIMIT64 => sys_prlimit64(
-            args[0],
-            args[1],
-            args[2] as *const u8,
-            args[3] as *mut u8,
-        ),
+        SYSCALL_PRLIMIT64 => {
+            sys_prlimit64(args[0], args[1], args[2] as *const u8, args[3] as *mut u8)
+        }
         SYSCALL_SYSINFO => -38,
         SYSCALL_SCHED_GETAFFINITY => -38,
         SYSCALL_EPOLL_CREATE1 => -38,

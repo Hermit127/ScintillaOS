@@ -1,6 +1,6 @@
 use polyhal::debug_console::DebugConsole;
 
-use super::{File, Kstat, S_IFCHR};
+use super::{File, Kstat, S_IFCHR, S_IFSOCK};
 use crate::task::{current_task, suspend_current_and_run_next};
 use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
@@ -176,6 +176,32 @@ impl File for DevZero {
     }
     fn stat(&self) -> Kstat {
         Kstat::new(S_IFCHR)
+    }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+pub struct NullSocket;
+
+impl File for NullSocket {
+    fn readable(&self) -> bool {
+        true
+    }
+    fn writable(&self) -> bool {
+        true
+    }
+    fn read(&self, _buf: &mut [u8]) -> isize {
+        -107
+    }
+    fn write(&self, _buf: &mut [u8]) -> isize {
+        -107
+    }
+    fn stat(&self) -> Kstat {
+        Kstat::new(S_IFSOCK)
+    }
+    fn poll(&self) -> (bool, bool, bool) {
+        (false, false, true)
     }
     fn as_any(&self) -> &dyn core::any::Any {
         self

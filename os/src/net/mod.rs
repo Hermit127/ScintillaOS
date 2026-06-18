@@ -79,8 +79,33 @@ pub mod syscall;
 
 #[cfg(not(any(target_arch = "riscv64", target_arch = "aarch64")))]
 pub mod syscall {
-    pub fn sys_socket(_domain: usize, _type_: usize, _protocol: usize) -> isize {
-        -38
+    use alloc::sync::Arc;
+
+    use crate::task::current_task;
+
+    const AF_INET: usize = 2;
+    const SOCK_STREAM: usize = 1;
+    const SOCK_DGRAM: usize = 2;
+    const SOCK_CLOEXEC: usize = 0x80000;
+
+    pub fn sys_socket(domain: usize, type_: usize, _protocol: usize) -> isize {
+        if domain != AF_INET {
+            return -97;
+        }
+        match type_ & 0x0F {
+            SOCK_STREAM | SOCK_DGRAM => {}
+            _ => return -22,
+        }
+
+        let task = current_task().unwrap();
+        let mut inner = task.inner_exclusive_access();
+        let fd = inner.alloc_fd();
+        if fd >= inner.fd_table.len() {
+            return -24;
+        }
+        inner.fd_table[fd] = Some(Arc::new(crate::fs::NullSocket));
+        inner.fd_cloexec[fd] = (type_ & SOCK_CLOEXEC) != 0;
+        fd as isize
     }
     pub fn sys_bind(_sockfd: usize, _addr: *const u8, _addrlen: usize) -> isize {
         -38

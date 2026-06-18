@@ -147,8 +147,7 @@ fn write_text_file(path: &str, content: &[u8]) {
 }
 
 fn ensure_account_files(root: &str) {
-    let passwd = String::from(root)
-        + "/etc/passwd\0";
+    let passwd = String::from(root) + "/etc/passwd\0";
     write_text_file(
         &passwd,
         b"root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/tmp:/bin/false\n",

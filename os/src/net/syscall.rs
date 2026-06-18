@@ -61,6 +61,18 @@ fn net_ready() -> bool {
     crate::net::net_available_fast()
 }
 
+fn alloc_null_socket_fd(cloexec: bool) -> isize {
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    let fd = inner.alloc_fd();
+    if fd >= inner.fd_table.len() {
+        return -24;
+    }
+    inner.fd_table[fd] = Some(Arc::new(crate::fs::NullSocket));
+    inner.fd_cloexec[fd] = cloexec;
+    fd as isize
+}
+
 fn next_ephemeral_port() -> u16 {
     let old = NEXT_EPHEMERAL_PORT.fetch_add(1, Ordering::Relaxed);
     if old < 49152 || old == u16::MAX {
@@ -376,9 +388,6 @@ pub fn sys_socket(domain: usize, type_: usize, _protocol: usize) -> isize {
     if domain != AF_INET {
         return -97;
     }
-    if !net_ready() {
-        return -97;
-    }
 
     let st = match type_ & 0x0F {
         SOCK_STREAM => SocketType::Tcp,
@@ -388,6 +397,10 @@ pub fn sys_socket(domain: usize, type_: usize, _protocol: usize) -> isize {
 
     let nonblock = (type_ & SOCK_NONBLOCK) != 0;
     let cloexec = (type_ & SOCK_CLOEXEC) != 0;
+
+    if !net_ready() {
+        return alloc_null_socket_fd(cloexec);
+    }
 
     let task = current_task().unwrap();
     let mut inner = task.inner_exclusive_access();

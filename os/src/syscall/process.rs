@@ -241,16 +241,20 @@ pub fn sys_get_time(ts_ptr: usize, tz_ptr: usize) -> isize {
     let task = current_task().unwrap();
     let inner = task.inner_exclusive_access();
     if ts_ptr != 0
-        && !inner
-            .memory_set
-            .valid_user_buf(ts_ptr as *const u8, core::mem::size_of::<TimeVal>(), true)
+        && !inner.memory_set.valid_user_buf(
+            ts_ptr as *const u8,
+            core::mem::size_of::<TimeVal>(),
+            true,
+        )
     {
         return -14;
     }
     if tz_ptr != 0
-        && !inner
-            .memory_set
-            .valid_user_buf(tz_ptr as *const u8, core::mem::size_of::<TimeZone>(), true)
+        && !inner.memory_set.valid_user_buf(
+            tz_ptr as *const u8,
+            core::mem::size_of::<TimeZone>(),
+            true,
+        )
     {
         return -14;
     }

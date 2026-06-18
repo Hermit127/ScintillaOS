@@ -61,6 +61,7 @@ pub const S_IFIFO: u32 = 0o010000;
 pub const S_IFCHR: u32 = 0o020000;
 pub const S_IFDIR: u32 = 0o040000;
 pub const S_IFREG: u32 = 0o100000;
+pub const S_IFSOCK: u32 = 0o140000;
 
 pub trait File: Send + Sync {
     fn readable(&self) -> bool;
@@ -114,5 +115,5 @@ pub use inode::{
     OpenFlags,
 };
 pub use pipe::make_pipe;
-pub use stdio::{DevNull, DevZero, Stdin, Stdout, Urandom};
+pub use stdio::{DevNull, DevZero, NullSocket, Stdin, Stdout, Urandom};
 pub use vfs::{list_apps, mount_root};
