@@ -8,14 +8,39 @@ extern crate alloc;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use user_lib::{exec, fork, waitpid, shutdown, mount, exit, chdir};
+use user_lib::{chdir, exec, exit, fork, mount, shutdown, waitpid};
 
 const TEST_LIST: &[&str] = &[
-    "brk", "chdir", "close", "dup", "dup2", "execve", "exit",
-    "fstat", "getcwd", "getdents", "getpid", "getppid", "gettimeofday",
-    "mkdir_", "mmap", "mount", "munmap", "openat", "open", "pipe", "read",
-    "sleep", "times", "umount", "uname", "unlink", "wait", "waitpid",
-    "write", "yield",
+    "brk",
+    "chdir",
+    "close",
+    "dup",
+    "dup2",
+    "execve",
+    "exit",
+    "fstat",
+    "getcwd",
+    "getdents",
+    "getpid",
+    "getppid",
+    "gettimeofday",
+    "mkdir_",
+    "mmap",
+    "mount",
+    "munmap",
+    "openat",
+    "open",
+    "pipe",
+    "read",
+    "sleep",
+    "times",
+    "umount",
+    "uname",
+    "unlink",
+    "wait",
+    "waitpid",
+    "write",
+    "yield",
 ];
 
 fn run_test(name: &str) -> i32 {
@@ -73,17 +98,59 @@ fn run_libctest(dir: &str) -> bool {
     }
     println!("#### OS COMP TEST GROUP START libctest ####");
     let static_tests = &[
-        "argv", "basename", "clocale_mbfuncs", "clock_gettime", "dirname",
-        "env", "fdopen", "fnmatch", "fscanf", "fwscanf", "iconv_open",
-        "inet_pton", "mbc", "memstream", "pthread_cancel_points", "pthread_cancel",
-        "pthread_cond", "pthread_tsd", "qsort", "random",
-        "search_hsearch", "search_insque", "search_lsearch", "search_tsearch",
-        "setjmp", "snprintf", "socket", "sscanf", "sscanf_long", "stat",
-        "strftime", "string", "string_memcpy", "string_memmem", "string_memset",
-        "string_strchr", "string_strcspn", "string_strstr", "strptime",
-        "strtod", "strtod_simple", "strtof", "strtol", "strtold",
-        "swprintf", "tgmath", "time", "tls_align", "udiv", "ungetc",
-        "utime", "wcsstr", "wcstol",
+        "argv",
+        "basename",
+        "clocale_mbfuncs",
+        "clock_gettime",
+        "dirname",
+        "env",
+        "fdopen",
+        "fnmatch",
+        "fscanf",
+        "fwscanf",
+        "iconv_open",
+        "inet_pton",
+        "mbc",
+        "memstream",
+        "pthread_cancel_points",
+        "pthread_cancel",
+        "pthread_cond",
+        "pthread_tsd",
+        "qsort",
+        "random",
+        "search_hsearch",
+        "search_insque",
+        "search_lsearch",
+        "search_tsearch",
+        "setjmp",
+        "snprintf",
+        "socket",
+        "sscanf",
+        "sscanf_long",
+        "stat",
+        "strftime",
+        "string",
+        "string_memcpy",
+        "string_memmem",
+        "string_memset",
+        "string_strchr",
+        "string_strcspn",
+        "string_strstr",
+        "strptime",
+        "strtod",
+        "strtod_simple",
+        "strtof",
+        "strtol",
+        "strtold",
+        "swprintf",
+        "tgmath",
+        "time",
+        "tls_align",
+        "udiv",
+        "ungetc",
+        "utime",
+        "wcsstr",
+        "wcstol",
     ];
     for name in static_tests {
         let pid = fork();
@@ -113,25 +180,50 @@ fn run_iozone() {
     let bin = "/bin/iozone\0";
 
     println!("iozone throughput write/read measurements");
-    run_cmd(bin, &["-i\0", "0\0", "-i\0", "1\0", "-r\0", "1k\0", "-s\0", "1m\0"]);
+    run_cmd(
+        bin,
+        &["-i\0", "0\0", "-i\0", "1\0", "-r\0", "1k\0", "-s\0", "1m\0"],
+    );
 
     println!("iozone throughput random-read measurements");
-    run_cmd(bin, &["-i\0", "0\0", "-i\0", "2\0", "-r\0", "1k\0", "-s\0", "1m\0"]);
+    run_cmd(
+        bin,
+        &["-i\0", "0\0", "-i\0", "2\0", "-r\0", "1k\0", "-s\0", "1m\0"],
+    );
 
     println!("iozone throughput read-backwards measurements");
-    run_cmd(bin, &["-i\0", "0\0", "-i\0", "3\0", "-r\0", "1k\0", "-s\0", "1m\0"]);
+    run_cmd(
+        bin,
+        &["-i\0", "0\0", "-i\0", "3\0", "-r\0", "1k\0", "-s\0", "1m\0"],
+    );
 
     println!("iozone throughput stride-read measurements");
-    run_cmd(bin, &["-i\0", "0\0", "-i\0", "5\0", "-r\0", "1k\0", "-s\0", "1m\0"]);
+    run_cmd(
+        bin,
+        &["-i\0", "0\0", "-i\0", "5\0", "-r\0", "1k\0", "-s\0", "1m\0"],
+    );
 
     println!("iozone throughput fwrite/fread measurements");
-    run_cmd(bin, &["-i\0", "6\0", "-i\0", "7\0", "-r\0", "1k\0", "-s\0", "1m\0"]);
+    run_cmd(
+        bin,
+        &["-i\0", "6\0", "-i\0", "7\0", "-r\0", "1k\0", "-s\0", "1m\0"],
+    );
 
     println!("iozone throughput pwrite/pread measurements");
-    run_cmd(bin, &["-i\0", "9\0", "-i\0", "10\0", "-r\0", "1k\0", "-s\0", "1m\0"]);
+    run_cmd(
+        bin,
+        &[
+            "-i\0", "9\0", "-i\0", "10\0", "-r\0", "1k\0", "-s\0", "1m\0",
+        ],
+    );
 
     println!("iozone throughtput pwritev/preadv measurements");
-    run_cmd(bin, &["-i\0", "11\0", "-i\0", "12\0", "-r\0", "1k\0", "-s\0", "1m\0"]);
+    run_cmd(
+        bin,
+        &[
+            "-i\0", "11\0", "-i\0", "12\0", "-r\0", "1k\0", "-s\0", "1m\0",
+        ],
+    );
 
     println!("#### OS COMP TEST GROUP END iozone ####");
 }

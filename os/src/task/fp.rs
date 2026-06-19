@@ -1,3 +1,4 @@
+// 这里负责操作系统的上下文切换：按架构保存和恢复用户态浮点寄存器上下文。
 #[cfg(target_arch = "riscv64")]
 mod arch {
     use core::arch::asm;
@@ -9,6 +10,7 @@ mod arch {
     }
 
     impl UserFloatState {
+        // 创建一份清零的 RISC-V 用户浮点上下文。
         pub const fn new() -> Self {
             Self {
                 regs: [0; 32],
@@ -16,6 +18,8 @@ mod arch {
             }
         }
 
+        // 保存当前 CPU 上的用户浮点寄存器和 fcsr。
+        // 执行时用 RISC-V 浮点存储指令把 f0-f31 写入数组，并额外读取 fcsr 保存舍入/异常状态。
         pub fn save_current(&mut self) {
             let base = self.regs.as_mut_ptr();
             let fcsr: usize;
@@ -61,6 +65,8 @@ mod arch {
             self.fcsr = fcsr;
         }
 
+        // 把保存过的用户浮点状态恢复到 CPU。
+        // 执行时用 RISC-V 浮点加载指令恢复 f0-f31，并把保存的 fcsr 写回硬件寄存器。
         pub fn restore_current(&self) {
             let base = self.regs.as_ptr();
             let fcsr = self.fcsr;
@@ -117,10 +123,13 @@ mod arch {
     }
 
     impl UserFloatState {
+        // 创建一份清零的 LoongArch 用户浮点上下文。
         pub const fn new() -> Self {
             Self { regs: [0; 32] }
         }
 
+        // 保存当前 CPU 上的用户浮点寄存器。
+        // 执行时用 LoongArch 浮点存储指令把 $f0-$f31 顺序写入任务保存区。
         pub fn save_current(&mut self) {
             let base = self.regs.as_mut_ptr();
             unsafe {
@@ -162,6 +171,8 @@ mod arch {
             }
         }
 
+        // 把保存过的用户浮点寄存器恢复到 CPU。
+        // 执行时用 LoongArch 浮点加载指令从任务保存区恢复 $f0-$f31。
         pub fn restore_current(&self) {
             let base = self.regs.as_ptr();
             unsafe {
@@ -211,12 +222,17 @@ mod arch {
     pub struct UserFloatState;
 
     impl UserFloatState {
+        // 非目标架构下保留一个空实现，方便本地检查编译。
         pub const fn new() -> Self {
             Self
         }
 
+        // 空架构实现里不需要保存浮点状态。
+        // 执行时保持空操作，供非目标架构做本地检查时通过类型接口。
         pub fn save_current(&mut self) {}
 
+        // 空架构实现里不需要恢复浮点状态。
+        // 执行时保持空操作，和 save_current 对称。
         pub fn restore_current(&self) {}
     }
 }

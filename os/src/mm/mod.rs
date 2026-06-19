@@ -1,3 +1,4 @@
+// 这里负责操作系统的内存管理：汇总内存管理模块，导出页表、地址空间、堆和物理页分配接口。
 mod frame_allocator;
 mod heap_allocator;
 mod memory_set;

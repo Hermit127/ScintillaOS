@@ -1,3 +1,4 @@
+// 这里负责操作系统的网络系统调用接口：实现 socket 相关系统调用，以及本地 TCP/UDP 回环兼容层。
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp::Socket as TcpSocket;
 use smoltcp::socket::tcp::SocketBuffer as TcpSocketBuffer;
@@ -81,10 +82,14 @@ lazy_static! {
         unsafe { UPSafeCell::new(BTreeSet::new()) };
 }
 
+// 判断网络子系统是否已经初始化可用。
+// 执行时走快速原子标志，不进入协议栈锁，用在每个 socket syscall 的入口检查。
 fn net_ready() -> bool {
     crate::net::net_available_fast()
 }
 
+// 分配一个临时端口号。
+// 执行时用原子递增拿端口；如果越界或落到保留区，就把序列重置回临时端口起点。
 fn next_ephemeral_port() -> u16 {
     let old = NEXT_EPHEMERAL_PORT.fetch_add(1, Ordering::Relaxed);
     if old < 49152 || old == u16::MAX {
@@ -120,6 +125,8 @@ struct Msghdr {
     msg_flags: i32,
 }
 
+// 从用户传入的 sockaddr_in 解析 IPv4 地址和端口。
+// 执行时先通过当前用户页表翻译指针，再检查地址族，并把网络字节序的端口和地址转回主机序。
 fn parse_sockaddr_in(ptr: *const u8) -> Option<(u32, u16)> {
     if ptr.is_null() {
         return None;
@@ -134,6 +141,8 @@ fn parse_sockaddr_in(ptr: *const u8) -> Option<(u32, u16)> {
     Some((addr, port))
 }
 
+// 把 IPv4 地址和端口写回用户 sockaddr_in。
+// 执行时在内核栈上组装 sockaddr_in，再通过用户页表把结构体写到用户缓冲区。
 fn write_sockaddr_in(ptr: *mut u8, sin_addr: u32, sin_port: u16) {
     let token = current_user_token();
     let sa = SockAddrIn {
@@ -145,6 +154,8 @@ fn write_sockaddr_in(ptr: *mut u8, sin_addr: u32, sin_port: u16) {
     *translated_refmut(token, ptr as *mut SockAddrIn) = sa;
 }
 
+// 统计 iovec 数组总长度。
+// 执行时把 iovec 指针视为调用方已经翻译好的数组，逐项累加长度并用 saturating_add 防溢出。
 fn iov_total_len(iov: *const Iovec, iovcnt: usize) -> usize {
     let iovs = unsafe { core::slice::from_raw_parts(iov, iovcnt) };
     let mut total = 0usize;
@@ -154,6 +165,8 @@ fn iov_total_len(iov: *const Iovec, iovcnt: usize) -> usize {
     total
 }
 
+// 从用户 iovec 拷贝数据到内核缓冲区。
+// 执行时按 iovec 顺序把多段用户数据拼进连续缓冲区，缓冲区满了就停止。
 fn copy_from_iov(buf: &mut [u8], iov: *const Iovec, iovcnt: usize) -> usize {
     let iovs = unsafe { core::slice::from_raw_parts(iov, iovcnt) };
     let mut written = 0usize;
@@ -170,6 +183,8 @@ fn copy_from_iov(buf: &mut [u8], iov: *const Iovec, iovcnt: usize) -> usize {
     written
 }
 
+// 把内核缓冲区数据分散写回用户 iovec。
+// 执行时按 iovec 顺序把连续数据拆回多段用户缓冲区，只写实际收到的字节。
 fn copy_to_iov(buf: &[u8], iov: *mut Iovec, iovcnt: usize) -> usize {
     let iovs = unsafe { core::slice::from_raw_parts(iov, iovcnt) };
     let mut read = 0usize;
@@ -186,6 +201,8 @@ fn copy_to_iov(buf: &[u8], iov: *mut Iovec, iovcnt: usize) -> usize {
     read
 }
 
+// 在 smoltcp socket set 里新建 TCP 或 UDP socket。
+// 执行时进入全局网络状态，为 TCP/UDP 分配收发缓冲区并把 socket 加入 smoltcp 的 SocketSet。
 fn add_to_socket_set(st: SocketType) -> Option<(SocketHandle, SocketType)> {
     crate::net::with_net_iface(|iface| {
         let handle = match st {
@@ -210,6 +227,8 @@ fn add_to_socket_set(st: SocketType) -> Option<(SocketHandle, SocketType)> {
     })
 }
 
+// 通过 fd 找到 SocketFile，并取出 handle、类型和 nonblock 状态。
+// 执行时先按输入条件查缓存或表项，缓存未命中时继续访问底层结构，最后返回找到的对象。
 fn sock_lookup(sockfd: usize) -> Option<(SocketHandle, SocketType, bool)> {
     let task = current_task()?;
     let inner = task.inner_exclusive_access();
@@ -225,6 +244,8 @@ fn sock_lookup(sockfd: usize) -> Option<(SocketHandle, SocketType, bool)> {
     Some((handle, st, nonblock))
 }
 
+// 把本地地址记录到 socket fd 对象里。
+// 执行时从当前进程 fd 表找到 SocketFile，并把 local endpoint 写入 fd 层缓存。
 fn set_socket_local_endpoint(sockfd: usize, endpoint: IpEndpoint) {
     let Some(task) = current_task() else {
         return;
@@ -240,6 +261,8 @@ fn set_socket_local_endpoint(sockfd: usize, endpoint: IpEndpoint) {
     }
 }
 
+// 把对端地址记录到 socket fd 对象里。
+// 执行时从当前进程 fd 表找到 SocketFile，并把 peer endpoint 写入 fd 层缓存。
 fn set_socket_peer_endpoint(sockfd: usize, endpoint: IpEndpoint) {
     let Some(task) = current_task() else {
         return;
@@ -255,6 +278,8 @@ fn set_socket_peer_endpoint(sockfd: usize, endpoint: IpEndpoint) {
     }
 }
 
+// 从 socket fd 对象里读取本地地址。
+// 执行时检查 fd 合法性和具体类型，成功后返回 SocketFile 里保存的 local endpoint。
 fn get_socket_local_endpoint(sockfd: usize) -> Option<IpEndpoint> {
     let task = current_task()?;
     let inner = task.inner_exclusive_access();
@@ -266,6 +291,8 @@ fn get_socket_local_endpoint(sockfd: usize) -> Option<IpEndpoint> {
     sock.get_local_endpoint()
 }
 
+// 从 socket fd 对象里读取对端地址。
+// 执行时检查 fd 合法性和具体类型，成功后返回 SocketFile 里保存的 peer endpoint。
 fn get_socket_peer_endpoint(sockfd: usize) -> Option<IpEndpoint> {
     let task = current_task()?;
     let inner = task.inner_exclusive_access();
@@ -277,6 +304,8 @@ fn get_socket_peer_endpoint(sockfd: usize) -> Option<IpEndpoint> {
     sock.get_peer_endpoint()
 }
 
+// 记录这个 fd 对应的本地 TCP 回环连接。
+// 执行时把连接 id 和端角色写进 SocketFile，后续收发就不再经过 smoltcp TCP。
 fn set_socket_local_tcp(sockfd: usize, conn_id: usize, server_side: bool) {
     let Some(task) = current_task() else {
         return;
@@ -292,6 +321,8 @@ fn set_socket_local_tcp(sockfd: usize, conn_id: usize, server_side: bool) {
     }
 }
 
+// 读取 fd 对应的本地 TCP 回环连接。
+// 执行时从 fd 表取出 SocketFile，再返回里面记录的本地 TCP 连接信息。
 fn get_socket_local_tcp(sockfd: usize) -> Option<(usize, bool)> {
     let task = current_task()?;
     let inner = task.inner_exclusive_access();
@@ -303,11 +334,15 @@ fn get_socket_local_tcp(sockfd: usize) -> Option<(usize, bool)> {
     sock.get_local_tcp()
 }
 
+// 判断目标地址是不是本机回环或本机静态地址。
+// 执行时只看 IPv4 字节：127/8、0.0.0.0 和默认静态地址都按本机路径处理。
 fn is_local_ipv4(addr: IpAddress) -> bool {
     let IpAddress::Ipv4(ipv4) = addr;
     ipv4.0[0] == 127 || ipv4.0 == [0, 0, 0, 0] || ipv4.0 == [10, 0, 2, 15]
 }
 
+// 根据目标地址挑一个合适的本地源地址。
+// 执行时如果已有明确本地 IP 就直接用；否则按目标是否回环选择 127.0.0.1 或 10.0.2.15。
 fn source_addr_for_dest(local: IpEndpoint, dest: IpEndpoint) -> IpEndpoint {
     let IpAddress::Ipv4(local_ip) = local.addr;
     if local_ip.0 != [0, 0, 0, 0] {
@@ -322,6 +357,8 @@ fn source_addr_for_dest(local: IpEndpoint, dest: IpEndpoint) -> IpEndpoint {
     IpEndpoint::new(IpAddress::Ipv4(src_ip), local.port)
 }
 
+// 从 smoltcp UDP socket 里读取当前绑定端点。
+// 执行时进入 SocketSet 查询 UDP endpoint；端口为 0 说明还没绑定，返回 None。
 fn smoltcp_udp_endpoint(handle: SocketHandle) -> Option<IpEndpoint> {
     crate::net::with_net_iface(|iface| {
         let sock: &UdpSocket = iface.sockets.get(handle);
@@ -338,6 +375,8 @@ fn smoltcp_udp_endpoint(handle: SocketHandle) -> Option<IpEndpoint> {
     .flatten()
 }
 
+// 确保 UDP socket 有本地端点，没绑定就自动分配临时端口。
+// 执行时优先复用 fd 缓存或 smoltcp 绑定端点；都没有时自动 bind 临时端口并缓存下来。
 fn ensure_udp_local_endpoint(sockfd: usize, handle: SocketHandle, dest: IpEndpoint) -> IpEndpoint {
     if let Some(local) = get_socket_local_endpoint(sockfd) {
         return source_addr_for_dest(local, dest);
@@ -357,6 +396,8 @@ fn ensure_udp_local_endpoint(sockfd: usize, handle: SocketHandle, dest: IpEndpoi
     source_addr_for_dest(local, dest)
 }
 
+// 唤醒可能在等本地 UDP 包的任务。
+// 执行时先从等待队列里找满足条件的任务，再把它们改回 Ready，最后交给调度器运行。
 fn wake_local_udp_receivers() {
     let mut to_wake = Vec::new();
     {
@@ -384,6 +425,8 @@ fn wake_local_udp_receivers() {
     wake_poll_wait_tasks();
 }
 
+// 把本地 UDP 包放进内核模拟队列。
+// 执行时把数据复制到本地队列；队列满时丢掉最旧包，并主动让出 CPU 给接收方运行。
 fn enqueue_local_udp(src: IpEndpoint, dest: IpEndpoint, data: &[u8]) -> isize {
     let queue_was_full = {
         let mut queue = LOCAL_UDP_QUEUE.exclusive_access();
@@ -406,6 +449,8 @@ fn enqueue_local_udp(src: IpEndpoint, dest: IpEndpoint, data: &[u8]) -> isize {
     data.len() as isize
 }
 
+// 判断队列里的本地 UDP 包是否匹配当前接收端。
+// 执行时比较目标端口，并在 socket 已 connect 的情况下额外要求来源端点一致。
 fn local_udp_packet_matches(
     packet: &LocalUdpPacket,
     local: IpEndpoint,
@@ -414,6 +459,8 @@ fn local_udp_packet_matches(
     packet.dst_port == local.port && peer.map(|peer| packet.src == peer).unwrap_or(true)
 }
 
+// 如果目标是本机地址，就优先走本地 UDP 队列。
+// 执行时先判断目标 IP 是否属于本机；命中时确保本地端点存在，并把数据投递到内核 UDP 队列。
 fn try_send_local_udp(
     sockfd: usize,
     handle: SocketHandle,
@@ -427,6 +474,7 @@ fn try_send_local_udp(
     Some(enqueue_local_udp(src, dest, data))
 }
 
+// 判断本地 UDP 队列里是否有发往指定端口的包。
 pub(crate) fn local_udp_pending_on(port: u16) -> bool {
     LOCAL_UDP_QUEUE
         .exclusive_access()
@@ -434,12 +482,15 @@ pub(crate) fn local_udp_pending_on(port: u16) -> bool {
         .any(|packet| packet.dst_port == port)
 }
 
+// 关闭本地 UDP 端点时清理队列里相关的包。
 pub(crate) fn local_udp_close(local: IpEndpoint, peer: Option<IpEndpoint>) {
     LOCAL_UDP_QUEUE
         .exclusive_access()
         .retain(|packet| !local_udp_packet_matches(packet, local, peer));
 }
 
+// 计算当前 UDP fd 用来接收本地包的端点。
+// 执行时先用 fd 缓存；如果没有，就从 smoltcp UDP 绑定状态补回缓存。
 fn local_recv_endpoint(sockfd: usize, handle: SocketHandle) -> Option<IpEndpoint> {
     get_socket_local_endpoint(sockfd).or_else(|| {
         let ep = smoltcp_udp_endpoint(handle)?;
@@ -448,6 +499,8 @@ fn local_recv_endpoint(sockfd: usize, handle: SocketHandle) -> Option<IpEndpoint
     })
 }
 
+// 从本地 UDP 队列里尝试取一个匹配当前 fd 的包。
+// 执行时按 fd 的本地端点和默认对端匹配队列，支持 MSG_PEEK，并可把来源地址写回用户态。
 fn try_recv_local_udp(
     sockfd: usize,
     handle: SocketHandle,
@@ -481,6 +534,8 @@ fn try_recv_local_udp(
     Some(n as isize)
 }
 
+// 按明确的本地和对端端点从本地 UDP 队列取包。
+// 执行时用传入的 local/peer 直接匹配队列，取到后复制数据并从队列移除。
 fn try_recv_local_udp_by_endpoint(
     local: IpEndpoint,
     peer: Option<IpEndpoint>,
@@ -496,6 +551,8 @@ fn try_recv_local_udp_by_endpoint(
     Some(n as isize)
 }
 
+// 唤醒可能在 accept 本地 TCP 连接的任务。
+// 执行时先从等待队列里找满足条件的任务，再把它们改回 Ready，最后交给调度器运行。
 fn wake_local_tcp_acceptors() {
     let mut to_wake = Vec::new();
     {
@@ -523,6 +580,8 @@ fn wake_local_tcp_acceptors() {
     wake_poll_wait_tasks();
 }
 
+// 连接本地 TCP 监听端口时创建一对内核模拟连接。
+// 执行时确认目标端口正在监听，分配连接 id 和客户端临时端口，再把连接放入待 accept 队列。
 fn create_local_tcp(sockfd: usize, remote: IpEndpoint) -> isize {
     if !LOCAL_TCP_LISTEN_PORTS
         .exclusive_access()
@@ -566,6 +625,8 @@ fn create_local_tcp(sockfd: usize, remote: IpEndpoint) -> isize {
     0
 }
 
+// 从监听端口队列里取出一个待 accept 的本地 TCP 连接。
+// 执行时先弹出 pending 队列里的连接 id，队列空了就删除端口项，再复制连接状态返回给 accept。
 fn pop_local_tcp_pending(port: u16) -> Option<(usize, LocalTcpConn)> {
     let conn_id = {
         let mut pending = LOCAL_TCP_PENDING.exclusive_access();
@@ -580,6 +641,8 @@ fn pop_local_tcp_pending(port: u16) -> Option<(usize, LocalTcpConn)> {
     Some((conn_id, conn))
 }
 
+// 如果监听端口有本地 TCP 连接，就直接创建 accepted fd。
+// 执行时取出本地 pending 连接，为 accepted socket 分配新 fd，并按需把客户端地址写回用户态。
 fn accept_local_tcp(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> Option<isize> {
     let nonblock = sock_lookup(sockfd)
         .map(|(_, _, nonblock)| nonblock)
@@ -631,6 +694,8 @@ fn accept_local_tcp(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> Option
     Some(new_fd as isize)
 }
 
+// 判断本地 TCP 连接的对端是否已经关闭。
+// 执行时根据当前 fd 属于服务端还是客户端，读取另一端的关闭标记。
 fn local_tcp_peer_closed(conn: &LocalTcpConn, server_side: bool) -> bool {
     if server_side {
         conn.client_closed
@@ -639,6 +704,8 @@ fn local_tcp_peer_closed(conn: &LocalTcpConn, server_side: bool) -> bool {
     }
 }
 
+// 往本地 TCP 回环连接的对端接收队列写数据。
+// 执行时按当前端选择 c2s 或 s2c 队列；队列满时阻塞等待，非阻塞模式则返回 EAGAIN。
 pub(crate) fn local_tcp_send(
     conn_id: usize,
     server_side: bool,
@@ -691,6 +758,8 @@ pub(crate) fn local_tcp_send(
     }
 }
 
+// 从本地 TCP 回环连接的当前端接收队列读数据。
+// 执行时按当前端读取对端写入的队列；没有数据时根据对端关闭或非阻塞状态返回 0/EAGAIN。
 pub(crate) fn local_tcp_recv(
     conn_id: usize,
     server_side: bool,
@@ -734,6 +803,8 @@ pub(crate) fn local_tcp_recv(
     }
 }
 
+// 关闭本地 TCP 回环连接的一端。
+// 执行时标记当前端已关闭；等两端都关闭并且队列清空后，才删除连接记录。
 pub(crate) fn local_tcp_close(conn_id: usize, server_side: bool) {
     let mut remove = false;
     {
@@ -756,12 +827,16 @@ pub(crate) fn local_tcp_close(conn_id: usize, server_side: bool) {
     wake_poll_wait_tasks();
 }
 
+// 移除本地 TCP 监听端口。
+// 执行时从监听集合和 pending 队列同时删除端口，再唤醒 poll/accept 等待者重新检查状态。
 pub(crate) fn local_tcp_unlisten(port: u16) {
     LOCAL_TCP_LISTEN_PORTS.exclusive_access().remove(&port);
     LOCAL_TCP_PENDING.exclusive_access().remove(&port);
     wake_poll_wait_tasks();
 }
 
+// 查询本地 TCP 回环连接的 poll 状态。
+// 执行时按端角色读取入队列、出队列和对端关闭位，组合成可读、可写、异常三种状态。
 pub(crate) fn local_tcp_poll(conn_id: usize, server_side: bool) -> (bool, bool, bool) {
     let conns = LOCAL_TCP_CONNS.exclusive_access();
     let Some(conn) = conns.get(&conn_id) else {
@@ -779,6 +854,8 @@ pub(crate) fn local_tcp_poll(conn_id: usize, server_side: bool) -> (bool, bool, 
     )
 }
 
+// 判断指定本地 TCP 端口是否有待 accept 连接。
+// 执行时只看 pending 队列是否存在且非空，用于 listen fd 的 poll 和 accept 快速路径。
 pub(crate) fn local_tcp_pending_on(port: u16) -> bool {
     LOCAL_TCP_PENDING
         .exclusive_access()
@@ -787,6 +864,8 @@ pub(crate) fn local_tcp_pending_on(port: u16) -> bool {
         .unwrap_or(false)
 }
 
+// 返回本地 TCP 连接对端的地址。
+// 执行时按当前端角色返回另一端 endpoint，getpeername 会把它写成 sockaddr_in。
 fn local_tcp_peer_endpoint(conn_id: usize, server_side: bool) -> Option<IpEndpoint> {
     let conns = LOCAL_TCP_CONNS.exclusive_access();
     let conn = conns.get(&conn_id)?;
@@ -797,6 +876,8 @@ fn local_tcp_peer_endpoint(conn_id: usize, server_side: bool) -> Option<IpEndpoi
     }
 }
 
+// 系统调用入口：创建 TCP/UDP socket fd。
+// 执行时校验 AF_INET 和 socket 类型，在 smoltcp 中分配 socket，再放入当前进程 fd 表并设置 cloexec。
 pub fn sys_socket(domain: usize, type_: usize, _protocol: usize) -> isize {
     if domain != AF_INET {
         return -97;
@@ -831,6 +912,8 @@ pub fn sys_socket(domain: usize, type_: usize, _protocol: usize) -> isize {
     fd as isize
 }
 
+// 系统调用入口：把 socket 绑定到本地 IPv4 地址。
+// 执行时解析 sockaddr_in，端口为 0 时分配临时端口；TCP 进入 listen，UDP 调 bind，并缓存本地端点。
 pub fn sys_bind(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
     if !net_ready() {
         return -97;
@@ -896,6 +979,8 @@ pub fn sys_bind(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
     ret
 }
 
+// 系统调用入口：连接 TCP 对端或记录 UDP 默认对端。
+// 执行时 UDP 只保存默认对端；TCP 本机地址走内核回环连接，外部地址交给 smoltcp connect。
 pub fn sys_connect(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
     if !net_ready() {
         return -97;
@@ -973,6 +1058,8 @@ pub fn sys_connect(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
     } // EINPROGRESS
 }
 
+// 系统调用入口：把 TCP socket 切到监听状态。
+// 执行时确认 fd 是 TCP 并且 smoltcp 已处于 listening，再把本地端口登记到本地回环监听表。
 pub fn sys_listen(sockfd: usize, _backlog: usize) -> isize {
     if !net_ready() {
         return -97;
@@ -1013,6 +1100,8 @@ pub fn sys_listen(sockfd: usize, _backlog: usize) -> isize {
     0
 }
 
+// 系统调用入口：接收一个 TCP 连接，优先处理本地回环连接。
+// 执行时先尝试弹出本地 pending 连接；没有时轮询 smoltcp，阻塞模式会挂到 TcpAccept 等待队列。
 pub fn sys_accept(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
     if !net_ready() {
         return -97;
@@ -1111,7 +1200,7 @@ pub fn sys_accept(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
     })
     .expect("NET_IFACE");
 
-    // Update the server socket's handle to the new one
+    // 接收成功后，监听 fd 换成新的监听 socket，旧的 active handle 交给 accepted fd。
     if sockfd < inner.fd_table.len() {
         if let Some(file) = &inner.fd_table[sockfd] {
             if let Some(s) = file.as_any().downcast_ref::<SocketFile>() {
@@ -1120,17 +1209,17 @@ pub fn sys_accept(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
         }
     }
 
-    // The new fd gets the old (now active) handle
+    // 新 fd 接管已经建立连接的旧 handle。
     let new_fd = inner.alloc_fd();
     if new_fd >= inner.fd_table.len() {
         return -24;
     }
     inner.fd_table[new_fd] = Some(Arc::new(SocketFile::new(handle, SocketType::Tcp, nonblock)));
 
-    // Release inner lock before writing peer address (avoids holding lock during net_poll)
+    // 写用户地址前先放掉进程锁，避免网络轮询或地址翻译时持锁过久。
     drop(inner);
 
-    // Ensure any pending data from client is delivered to the accepted socket
+    // 再轮询两次，尽量把客户端已经发出的首批数据送到 accepted socket。
     crate::net::net_poll();
     crate::net::net_poll();
 
@@ -1153,6 +1242,8 @@ pub fn sys_accept(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
     new_fd as isize
 }
 
+// 系统调用入口：accept 后按 flags 设置新 fd 属性。
+// 执行时复用 sys_accept 创建连接，再按 SOCK_CLOEXEC 和 SOCK_NONBLOCK 修改新 fd 状态。
 pub fn sys_accept4(sockfd: usize, addr: *mut u8, addrlen: *mut usize, flags: usize) -> isize {
     if flags & !(SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
         return -22;
@@ -1181,6 +1272,8 @@ pub fn sys_accept4(sockfd: usize, addr: *mut u8, addrlen: *mut usize, flags: usi
     fd as isize
 }
 
+// 系统调用入口：从用户缓冲区取数据并发送到指定或默认 UDP/TCP 对端。
+// 执行时根据 MSG_DONTWAIT 合并非阻塞语义；TCP 用连接状态发送，UDP 解析目标地址并优先走本地队列。
 pub fn sys_sendto(
     sockfd: usize,
     buf: *const u8,
@@ -1199,11 +1292,11 @@ pub fn sys_sendto(
 
     let dontwait = nonblock || (flags & MSG_DONTWAIT) != 0;
 
-    // For UDP, require destination address
+    // UDP 的 sendto 必须带目标地址，否则没有默认目的地。
     if st == SocketType::Udp && (dest_addr.is_null() || addrlen < 8) {
         return -89; // EDESTADDRREQ
     }
-    // For TCP, dest_addr is ignored (use connected peer)
+    // TCP 忽略 dest_addr，直接使用已经建立的连接。
 
     let data = unsafe { core::slice::from_raw_parts(buf, len) };
 
@@ -1232,6 +1325,8 @@ pub fn sys_sendto(
     }
 }
 
+// 系统调用入口：接收 socket 数据，并可选写回来源地址。
+// 执行时 TCP 直接按连接收；UDP 先查本地队列，再查 smoltcp，阻塞模式会挂到 UdpRecv 等待队列。
 pub fn sys_recvfrom(
     sockfd: usize,
     buf: *mut u8,
@@ -1276,7 +1371,7 @@ pub fn sys_recvfrom(
         },
     };
 
-    // Fill source address for UDP if requested
+    // UDP 调用者如果要求来源地址，就把当前 endpoint 写回用户 sockaddr。
     if result > 0 && !src_addr.is_null() && !addrlen.is_null() && st == SocketType::Udp && !peek {
         let token = current_user_token();
         let endpoint = crate::net::with_net_iface(|iface| {
@@ -1297,6 +1392,8 @@ pub fn sys_recvfrom(
     result
 }
 
+// 系统调用入口：按 msghdr/iovec 发送 socket 消息。
+// 执行时先把用户 iovec 聚合到内核缓冲区，再复用 TCP/UDP 发送路径处理默认或显式对端。
 pub fn sys_sendmsg(sockfd: usize, msg: *const u8, flags: usize) -> isize {
     if !net_ready() {
         return -97;
@@ -1354,6 +1451,8 @@ pub fn sys_sendmsg(sockfd: usize, msg: *const u8, flags: usize) -> isize {
     }
 }
 
+// 系统调用入口：按 msghdr/iovec 接收 socket 消息。
+// 执行时接收到连续内核缓冲区后再分散写回 iovec；UDP 本地队列会顺手写回 msg_name。
 pub fn sys_recvmsg(sockfd: usize, msg: *mut u8, flags: usize) -> isize {
     if !net_ready() {
         return -97;
@@ -1429,11 +1528,11 @@ pub fn sys_recvmsg(sockfd: usize, msg: *mut u8, flags: usize) -> isize {
         let n = result as usize;
         copy_to_iov(&buf[..n], iov, iovcnt);
 
-        // Fill msg_flags
+        // 当前没有额外消息标志，按 Linux 习惯清零返回。
         let msghdr_mut: &mut Msghdr = translated_refmut(token, msg as *mut Msghdr);
         msghdr_mut.msg_flags = 0;
 
-        // Fill msg_name with peer address for UDP
+        // UDP 如果调用者提供 msg_name，就写回来源地址。
         if st == SocketType::Udp && !peek {
             let endpoint = crate::net::with_net_iface(|iface| {
                 let sock: &UdpSocket = iface.sockets.get(handle);
@@ -1457,6 +1556,8 @@ pub fn sys_recvmsg(sockfd: usize, msg: *mut u8, flags: usize) -> isize {
     result
 }
 
+// 系统调用入口：处理常见 socket 选项，未实现的选项尽量兼容返回成功。
+// 执行时只真正处理 keepalive 和 TCP_NODELAY，其余常见选项接受但不改变状态，方便 libc 探测通过。
 pub fn sys_setsockopt(
     sockfd: usize,
     level: usize,
@@ -1524,6 +1625,8 @@ pub fn sys_setsockopt(
     }
 }
 
+// 系统调用入口：读取 socket 选项，覆盖 libc 常查的几类。
+// 执行时按 level/optname 写回整数、拥塞算法名或简化 tcp_info，不支持的选项返回 ENOPROTOOPT。
 pub fn sys_getsockopt(
     sockfd: usize,
     level: usize,
@@ -1545,6 +1648,8 @@ pub fn sys_getsockopt(
 
     let token = current_user_token();
 
+    // 把字节形式的 socket 选项写回用户态。
+    // 执行时先尊重用户传入的 optlen 上限，再通过用户页表写入实际字节数。
     fn write_sockopt_bytes(token: PageTable, optval: *mut u8, optlen: *mut usize, data: &[u8]) {
         let requested = *translated_ref(token, optlen as *const u32) as usize;
         let n = requested.min(data.len());
@@ -1552,22 +1657,30 @@ pub fn sys_getsockopt(
         *translated_refmut(token, optlen as *mut u32) = n as u32;
     }
 
+    // 把 i32 形式的 socket 选项写回用户态。
+    // 执行时把整数转成本机字节序，再交给字节写回函数统一处理 optlen。
     fn write_sockopt_i32(token: PageTable, optval: *mut u8, optlen: *mut usize, value: i32) {
         write_sockopt_bytes(token, optval, optlen, &value.to_ne_bytes());
     }
 
+    // 按小端写一个 u32 到临时缓冲区。
+    // 执行时先检查偏移没有越界，再写入本机字节序的 4 字节字段。
     fn put_u32(buf: &mut [u8], offset: usize, value: u32) {
         if offset + 4 <= buf.len() {
             buf[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
         }
     }
 
+    // 按小端写一个 u64 到临时缓冲区。
+    // 执行时先检查偏移没有越界，再写入本机字节序的 8 字节字段。
     fn put_u64(buf: &mut [u8], offset: usize, value: u64) {
         if offset + 8 <= buf.len() {
             buf[offset..offset + 8].copy_from_slice(&value.to_ne_bytes());
         }
     }
 
+    // 写回一份简化版 tcp_info，满足用户态探测。
+    // 执行时填入稳定的 MSS、RTT、窗口等字段，不追求精确统计，只保证常见程序读到合理结构。
     fn write_tcp_info(token: PageTable, optval: *mut u8, optlen: *mut usize) {
         let mut info = [0u8; 232];
         info[0] = 1; // TCP_ESTABLISHED
@@ -1640,6 +1753,8 @@ pub fn sys_getsockopt(
     }
 }
 
+// 系统调用入口：关闭 socket 的读端、写端或两端。
+// 执行时本地 TCP 直接标记一端关闭；普通 smoltcp TCP 调 close，非法 how 返回 EINVAL。
 pub fn sys_sock_shutdown(sockfd: usize, how: usize) -> isize {
     if !net_ready() {
         return -97;
@@ -1676,6 +1791,8 @@ pub fn sys_sock_shutdown(sockfd: usize, how: usize) -> isize {
     .unwrap_or(-1)
 }
 
+// 系统调用入口：读取 socket 对端地址。
+// 执行时优先读取本地 TCP 回环记录，否则从 smoltcp 或 UDP 缓存取 peer endpoint，再写回 sockaddr_in。
 pub fn sys_getpeername(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
     if !net_ready() {
         return -97;
@@ -1718,6 +1835,8 @@ pub fn sys_getpeername(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isi
     }
 }
 
+// 系统调用入口：读取 socket 本地地址。
+// 执行时 TCP 从 smoltcp 或缓存取本地端点；UDP 还会根据默认对端修正 0.0.0.0 的源地址。
 pub fn sys_getsockname(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
     if !net_ready() {
         return -97;
@@ -1776,6 +1895,8 @@ pub fn sys_getsockname(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isi
 
 // ---- Internal helpers ----
 
+// 通过 smoltcp TCP socket 发送数据，必要时阻塞等待可写。
+// 执行时非阻塞路径只尝试一次；阻塞路径循环轮询协议栈，直到全部写入或连接断开。
 pub(crate) fn tcp_send(handle: SocketHandle, nonblock: bool, data: &[u8]) -> isize {
     if data.is_empty() {
         return 0;
@@ -1828,6 +1949,8 @@ pub(crate) fn tcp_send(handle: SocketHandle, nonblock: bool, data: &[u8]) -> isi
     offset as isize
 }
 
+// 通过 smoltcp TCP socket 接收数据，必要时阻塞等待可读。
+// 执行时非阻塞路径无数据返回 EAGAIN；阻塞路径轮询到有数据、EOF 或 socket 消失为止。
 pub(crate) fn tcp_recv(handle: SocketHandle, nonblock: bool, buf: &mut [u8]) -> isize {
     if buf.is_empty() {
         return 0;
@@ -1873,6 +1996,8 @@ pub(crate) fn tcp_recv(handle: SocketHandle, nonblock: bool, buf: &mut [u8]) -> 
     }
 }
 
+// 向指定 UDP 端点发送一段数据。
+// 执行时先轮询协议栈刷新 socket 状态，再调用 smoltcp 的 send_slice，失败按 EAGAIN 处理。
 pub(crate) fn udp_send(handle: SocketHandle, data: &[u8], dest: IpEndpoint) -> isize {
     crate::net::net_poll();
     crate::net::with_net_iface(|iface| {
@@ -1885,6 +2010,8 @@ pub(crate) fn udp_send(handle: SocketHandle, data: &[u8], dest: IpEndpoint) -> i
     .unwrap_or(-1)
 }
 
+// UDP write 路径，带上记录好的本地端点和默认对端。
+// 执行时如果目标是本机地址就投递到本地队列，否则交给 smoltcp；没有默认对端返回 EDESTADDRREQ。
 pub(crate) fn udp_write_with_endpoint(
     handle: SocketHandle,
     data: &[u8],
@@ -1913,10 +2040,14 @@ pub(crate) fn udp_write_with_endpoint(
     }
 }
 
+// UDP write 的简化入口，只依赖默认对端。
+// 执行时先从 smoltcp 取当前本地端点，再转给完整的 UDP write 路径。
 pub(crate) fn udp_write(handle: SocketHandle, data: &[u8], peer: Option<IpEndpoint>) -> isize {
     udp_write_with_endpoint(handle, data, smoltcp_udp_endpoint(handle), peer)
 }
 
+// UDP read 路径，优先从本地队列收包，再走 smoltcp。
+// 执行时先按 local/peer 匹配本地包；没有本地包时才进入真实网卡接收路径。
 pub(crate) fn udp_recv_with_endpoints(
     handle: SocketHandle,
     nonblock: bool,
@@ -1932,11 +2063,15 @@ pub(crate) fn udp_recv_with_endpoints(
     udp_recv_smoltcp(handle, nonblock, buf)
 }
 
+// UDP read 的简化入口。
+// 执行时取出当前 UDP socket 的绑定端点，并按未 connect 的 UDP 语义接收任意来源。
 pub(crate) fn udp_recv(handle: SocketHandle, nonblock: bool, buf: &mut [u8]) -> isize {
     let local = smoltcp_udp_endpoint(handle);
     udp_recv_with_endpoints(handle, nonblock, buf, local, None)
 }
 
+// 从 smoltcp UDP socket 接收真实网卡数据。
+// 执行时非阻塞只试一次；阻塞模式反复轮询，没包时把任务挂到 UdpRecv 等待队列。
 fn udp_recv_smoltcp(handle: SocketHandle, nonblock: bool, buf: &mut [u8]) -> isize {
     if nonblock {
         crate::net::net_poll();
@@ -1971,6 +2106,8 @@ fn udp_recv_smoltcp(handle: SocketHandle, nonblock: bool, buf: &mut [u8]) -> isi
     }
 }
 
+// 查询 smoltcp TCP socket 是否处于 active 状态。
+// 执行时进入 SocketSet 找到 TCP socket，读取 active 状态；网络状态不存在时按断开处理。
 fn sock_is_active_tcp(handle: SocketHandle) -> bool {
     crate::net::with_net_iface(|iface| {
         let sock: &TcpSocket = iface.sockets.get(handle);
@@ -1979,6 +2116,8 @@ fn sock_is_active_tcp(handle: SocketHandle) -> bool {
     .unwrap_or(false)
 }
 
+// 查询 smoltcp TCP socket 是否可发送。
+// 执行时读取 smoltcp 的 can_send 标记，用来决定阻塞发送是否需要让出 CPU。
 fn sock_can_send_tcp(handle: SocketHandle) -> bool {
     crate::net::with_net_iface(|iface| {
         let sock: &TcpSocket = iface.sockets.get(handle);
@@ -1987,6 +2126,8 @@ fn sock_can_send_tcp(handle: SocketHandle) -> bool {
     .unwrap_or(false)
 }
 
+// 查询 smoltcp TCP socket 的接收队列长度。
+// 执行时读取 recv_queue 字节数，连接不活跃时用它判断是否还有残留数据可读。
 fn sock_recv_queue_tcp(handle: SocketHandle) -> usize {
     crate::net::with_net_iface(|iface| {
         let sock: &TcpSocket = iface.sockets.get(handle);

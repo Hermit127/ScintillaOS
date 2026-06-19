@@ -1,3 +1,4 @@
+// 这里负责操作系统的文件管理：实现 VFS 的目录项缓存、路径解析、挂载表和底层 ext4 操作。
 use crate::sync::UPSafeCell;
 use alloc::ffi::CString;
 use alloc::format;
@@ -21,9 +22,13 @@ pub struct DirEntry {
 }
 
 impl DirEntry {
+    // 把 ext4 目录项里的原始名字字节转成 Rust 字符串。
+    // 执行时用 from_utf8_lossy 兼容非 UTF-8 字节，生成给 getdents64 使用的文件名。
     pub fn get_name(&self) -> String {
         String::from_utf8_lossy(&self.name_bytes).into_owned()
     }
+    // 返回目录项类型，后面组装 getdents64 时会用到。
+    // 执行时直接返回 ext4 目录项里记录的 de_type。
     pub fn get_de_type(&self) -> u8 {
         self.de_type
     }
@@ -58,6 +63,8 @@ pub struct VfsSuperBlock {
 }
 
 impl VfsSuperBlock {
+    // 在默认 lwext4 挂载名前创建一个 ext4 超级块。
+    // 执行时把挂载名固定成 /mp/，再转给 new_ext4_at 走统一初始化流程。
     pub fn new_ext4(
         blk_device: Arc<dyn crate::drivers::BlockDevice>,
         fs_type: &'static str,
@@ -65,6 +72,8 @@ impl VfsSuperBlock {
         Self::new_ext4_at(blk_device, fs_type, "/mp/")
     }
 
+    // 用指定的 lwext4 挂载名前创建 ext4 超级块，测试盘挂载会走这里。
+    // 执行时把块设备包装成 BlockDeviceStream，创建 lwext4 wrapper，再放进 VfsSuperBlock 的受控单元里。
     pub fn new_ext4_at(
         blk_device: Arc<dyn crate::drivers::BlockDevice>,
         fs_type: &'static str,
@@ -88,6 +97,8 @@ impl VfsSuperBlock {
         }))
     }
 
+    // 独占访问底层文件系统对象，并把真正操作收束在闭包里。
+    // 执行时先拿到 fs_data 的独占借用，再把 Ext4Wrapper 交给闭包，避免外层长期保存底层引用。
     fn with_fs<R>(&self, f: impl FnOnce(&Ext4Wrapper) -> R) -> R {
         let data = self.fs_data.exclusive_access();
         match &*data {
@@ -95,6 +106,8 @@ impl VfsSuperBlock {
         }
     }
 
+    // 强制卸载 lwext4，主要给出错或关机场景兜底。
+    // 执行时独占底层 wrapper 并调用 lwext4_umount；这是 FFI 资源释放点，所以必须在锁内完成。
     pub fn force_umount(&self) {
         let mut data = self.fs_data.exclusive_access();
         if let FsInner::Ext4(ref mut wrapper) = *data {
@@ -106,6 +119,8 @@ impl VfsSuperBlock {
 
     // ---------- path-based ext4 operations ----------
 
+    // 读取目录下的 ext4 目录项，最多取一批防止坏盘拖死内核。
+    // 执行时把路径转成 C 字符串，用 ext4_dir_open/entry_next 遍历目录，收集完后关闭目录句柄。
     pub fn dir_get_entries(&self, fs_path: &str) -> Vec<DirEntry> {
         const MAX_DIR_ENTRIES: usize = 4096;
         self.with_fs(|_fs| {
@@ -144,6 +159,8 @@ impl VfsSuperBlock {
         })
     }
 
+    // 从 ext4 查询 inode 的模式、大小、时间戳和属主信息。
+    // 执行时先读取 mode/owner/time，再按目录、普通文件、符号链接分别打开对应句柄取 inode 和大小。
     pub fn get_inode_info(&self, fs_path: &str) -> Option<InodeInfo> {
         self.with_fs(|_fs| {
             let mut mode: u32 = 0;
@@ -207,7 +224,7 @@ impl VfsSuperBlock {
                     }
                     (inode_num, size, false)
                 } else if is_link {
-                    // Symlink lookup only needs the link flag and path.
+                    // 符号链接只需要确认存在和记录路径，不把链接内容当普通文件大小处理。
                     (0, 0, false)
                 } else {
                     let mut dir: ext4_dir = unsafe { core::mem::zeroed() };
@@ -244,6 +261,8 @@ impl VfsSuperBlock {
         })
     }
 
+    // 按路径打开文件并从指定偏移读取，读完立即关闭底层句柄。
+    // 执行时把路径和 rb 标志转成 C 字符串，fopen 后检查文件大小，再 seek 到 offset 循环 fread。
     pub fn read_at(&self, fs_path: &str, offset: usize, buf: &mut [u8]) -> usize {
         self.with_fs(|_fs| {
             let c_path = match CString::new(fs_path) {
@@ -307,10 +326,14 @@ impl VfsSuperBlock {
         })
     }
 
+    // 对外暴露的路径写入口，实际写入逻辑放到 raw 版本里。
+    // 执行时不自己处理 FFI，只把参数转给 write_at_raw，保留一个稳定的 VFS 写入口。
     pub fn write_at(&self, fs_path: &str, offset: usize, buf: &[u8]) -> usize {
         self.write_at_raw(fs_path, offset, buf)
     }
 
+    // 按路径打开文件并从指定偏移写入，写完立即关闭底层句柄。
+    // 执行时把路径和 r+ 标志转成 C 字符串，fopen 后 seek 到 offset，调用 fwrite 后关闭句柄。
     fn write_at_raw(&self, fs_path: &str, offset: usize, buf: &[u8]) -> usize {
         self.with_fs(|_fs| {
             let c_path = match CString::new(fs_path) {
@@ -357,6 +380,8 @@ impl VfsSuperBlock {
         })
     }
 
+    // 在指定父目录下创建普通文件或目录，返回新 inode 号。
+    // 执行时先拼出完整 ext4 路径；目录走 ext4_dir_mk，普通文件走 ext4_fopen(\"wb\") 并取 inode。
     pub fn create_file(&self, parent_path: &str, name: &str, is_dir: bool) -> Option<u32> {
         let full_path = if parent_path == "/" {
             format!("/{}", name)
@@ -399,6 +424,8 @@ impl VfsSuperBlock {
         })
     }
 
+    // 把普通文件截断到指定大小。
+    // 执行时以 r+ 打开目标文件，调用 ext4_ftruncate 设置大小，最后关闭句柄并返回是否成功。
     pub fn truncate_file(&self, fs_path: &str, size: u64) -> bool {
         self.with_fs(|_fs| {
             let c_path = match CString::new(fs_path) {
@@ -429,6 +456,8 @@ impl VfsSuperBlock {
         })
     }
 
+    // 删除普通文件或符号链接。
+    // 执行时把路径转成 C 字符串并调用 ext4_fremove，返回底层删除是否成功。
     pub fn unlink_file(&self, fs_path: &str) -> bool {
         self.with_fs(|_fs| {
             let c_path = match CString::new(fs_path) {
@@ -439,6 +468,8 @@ impl VfsSuperBlock {
         })
     }
 
+    // 按底层 ext4 路径删除目录；调用者负责确认目标确实应该按目录删除。
+    // 执行时把路径转成 C 字符串并调用 ext4_dir_rm，返回底层目录删除是否成功。
     pub fn unlink_dir(&self, fs_path: &str) -> bool {
         self.with_fs(|_fs| {
             let c_path = match CString::new(fs_path) {
@@ -449,6 +480,8 @@ impl VfsSuperBlock {
         })
     }
 
+    // 更新文件访问时间。
+    // 执行时把路径转成 C 字符串，成功后调用 ext4_atime_set 写入 atime。
     pub fn set_atime(&self, fs_path: &str, atime: u32) {
         self.with_fs(|_fs| {
             if let Ok(c_path) = CString::new(fs_path) {
@@ -459,6 +492,8 @@ impl VfsSuperBlock {
         })
     }
 
+    // 更新文件修改时间。
+    // 执行时把路径转成 C 字符串，成功后调用 ext4_mtime_set 写入 mtime。
     pub fn set_mtime(&self, fs_path: &str, mtime: u32) {
         self.with_fs(|_fs| {
             if let Ok(c_path) = CString::new(fs_path) {
@@ -469,6 +504,8 @@ impl VfsSuperBlock {
         })
     }
 
+    // 更新 inode 状态变化时间。
+    // 执行时把路径转成 C 字符串，成功后调用 ext4_ctime_set 写入 ctime。
     pub fn set_ctime(&self, fs_path: &str, ctime: u32) {
         self.with_fs(|_fs| {
             if let Ok(c_path) = CString::new(fs_path) {
@@ -479,6 +516,8 @@ impl VfsSuperBlock {
         })
     }
 
+    // 写回文件类型和权限位。
+    // 执行时把路径转成 C 字符串，调用 ext4_mode_set 写入 mode，并把底层返回码传回调用者。
     pub fn set_mode(&self, fs_path: &str, mode: u32) -> i32 {
         self.with_fs(|_fs| {
             if let Ok(c_path) = CString::new(fs_path) {
@@ -490,6 +529,8 @@ impl VfsSuperBlock {
         })
     }
 
+    // 写回文件属主和属组。
+    // 执行时把路径转成 C 字符串，调用 ext4_owner_set 写入 uid/gid，并返回底层结果。
     pub fn set_owner(&self, fs_path: &str, uid: u32, gid: u32) -> i32 {
         self.with_fs(|_fs| {
             if let Ok(c_path) = CString::new(fs_path) {
@@ -501,6 +542,8 @@ impl VfsSuperBlock {
         })
     }
 
+    // 刷新指定路径相关的 ext4 缓存。
+    // 执行时把路径转成 C 字符串，调用 ext4_cache_flush 刷新该路径相关缓存。
     pub fn fsync(&self, fs_path: &str) -> i32 {
         self.with_fs(|_fs| {
             if let Ok(c_path) = CString::new(fs_path) {
@@ -511,6 +554,8 @@ impl VfsSuperBlock {
         })
     }
 
+    // 刷新整个文件系统缓存。
+    // 执行时用根路径调用 ext4_cache_flush，让 lwext4 尽量把全局缓存写回块设备。
     pub fn sync_all(&self) -> i32 {
         self.with_fs(|_fs| {
             let root = CString::new("/").unwrap();
@@ -518,6 +563,8 @@ impl VfsSuperBlock {
         })
     }
 
+    // 读取 lwext4 当前挂载统计。
+    // 执行时进入 with_fs 闭包，直接从 Ext4BlockWrapper 读取 mount stats。
     pub fn get_fs_stats(&self) -> ext4_mount_stats {
         self.with_fs(|wrapper| wrapper.0.get_mount_stats())
     }
@@ -538,6 +585,8 @@ pub struct Dentry {
 }
 
 impl Dentry {
+    // 创建根目录 dentry。
+    // 执行时把 VFS 路径和底层路径都设为 /，inode 号固定为根目录 inode 2，并初始化空 children 缓存。
     fn new_root(sb: Arc<VfsSuperBlock>) -> Arc<Self> {
         Arc::new(Dentry {
             name: String::from("/"),
@@ -552,6 +601,8 @@ impl Dentry {
         })
     }
 
+    // 创建挂载点背后的新根 dentry，VFS 路径和底层 fs 路径分开记录。
+    // 执行时把 VFS 路径设为挂载点路径，把 fs_path 设为 lwext4 挂载名，作为新文件系统的根 dentry。
     fn new_mount_root(sb: Arc<VfsSuperBlock>, mnt_path: String, lwext4_mount: &str) -> Arc<Self> {
         Arc::new(Dentry {
             name: String::from("/"),
@@ -566,6 +617,8 @@ impl Dentry {
         })
     }
 
+    // 按父目录和名字创建子 dentry，同时拼好 VFS 路径和底层路径。
+    // 执行时根据父目录分别拼 VFS path 和底层 fs_path，并继承父目录的超级块和缓存结构。
     fn new_child(
         parent: &Arc<Dentry>,
         name: &str,
@@ -610,6 +663,8 @@ lazy_static! {
     pub static ref MOUNT_TABLE: UPSafeCell<Vec<Mount>> = unsafe { UPSafeCell::new(Vec::new()) };
 }
 
+// 如果这个 dentry 是挂载点，就切到挂载后的根目录。
+// 执行时遍历挂载表，按指针或路径匹配挂载点，命中就返回挂载后的根 dentry。
 fn lookup_mount(dentry: &Arc<Dentry>) -> Option<Arc<Dentry>> {
     let table = MOUNT_TABLE.exclusive_access();
     for m in table.iter() {
@@ -620,6 +675,8 @@ fn lookup_mount(dentry: &Arc<Dentry>) -> Option<Arc<Dentry>> {
     None
 }
 
+// 如果这个 dentry 是某个挂载文件系统的根，返回它挂到的原始挂载点。
+// 执行时遍历挂载表，按指针或路径匹配 mnt_root，命中就返回原始挂载点 dentry。
 fn is_mount_root(dentry: &Arc<Dentry>) -> Option<Arc<Dentry>> {
     let table = MOUNT_TABLE.exclusive_access();
     for m in table.iter() {
@@ -632,6 +689,8 @@ fn is_mount_root(dentry: &Arc<Dentry>) -> Option<Arc<Dentry>> {
 
 // ==================== Path Resolution ====================
 
+// 取父目录，遇到挂载根时要先跳回挂载点再往上走。
+// 执行时先判断当前 dentry 是否是挂载根，是就返回挂载点的父目录，否则直接返回自己的 parent。
 fn vfs_parent(dentry: &Arc<Dentry>) -> Option<Arc<Dentry>> {
     if let Some(mnt_point) = is_mount_root(dentry) {
         return mnt_point.parent.clone();
@@ -639,7 +698,10 @@ fn vfs_parent(dentry: &Arc<Dentry>) -> Option<Arc<Dentry>> {
     dentry.parent.clone()
 }
 
+// 在父目录下查找一个名字，优先走 dentry 缓存，查不到再问底层 ext4。
+// 执行时先处理 . 和 ..，再查 children 缓存；缓存未命中时查询 ext4 inode 并把新 dentry 放回缓存。
 pub fn vfs_lookup(parent: &Arc<Dentry>, name: &str) -> Option<Arc<Dentry>> {
+    // "." 和 ".." 不需要访问底层文件系统；处理 ".." 时还要守住当前任务的 root 边界。
     match name {
         "." => return Some(parent.clone()),
         ".." => {
@@ -654,6 +716,7 @@ pub fn vfs_lookup(parent: &Arc<Dentry>, name: &str) -> Option<Arc<Dentry>> {
         _ => {}
     }
 
+    // 先查父目录的 dentry 缓存，命中后还要检查它是否被挂载点覆盖。
     {
         let children = parent.children.exclusive_access();
         if let Some(list) = children.as_ref() {
@@ -666,6 +729,7 @@ pub fn vfs_lookup(parent: &Arc<Dentry>, name: &str) -> Option<Arc<Dentry>> {
         }
     }
 
+    // 缓存未命中时拼出底层 ext4 路径，再查询 inode 信息。
     let child_fs_path = if parent.fs_path == "/" {
         format!("/{}", name)
     } else if parent.fs_path.ends_with('/') {
@@ -679,6 +743,7 @@ pub fn vfs_lookup(parent: &Arc<Dentry>, name: &str) -> Option<Arc<Dentry>> {
 
     let child = Dentry::new_child(parent, name, child_inode, is_dir, is_link);
 
+    // 新查到的 dentry 写回父目录缓存，后续路径解析就不用再访问 ext4。
     {
         let mut children = parent.children.exclusive_access();
         if let Some(list) = children.as_mut() {
@@ -695,12 +760,15 @@ pub fn vfs_lookup(parent: &Arc<Dentry>, name: &str) -> Option<Arc<Dentry>> {
     Some(child)
 }
 
+// 从给定起点解析绝对或相对路径。
+// 执行时先确定绝对路径或相对路径起点，再逐段调用 vfs_lookup，最后处理挂载点覆盖。
 pub fn vfs_resolve_path(start: &Arc<Dentry>, path: &str) -> Option<Arc<Dentry>> {
     let path = path.trim_matches('\0');
     if path.is_empty() {
         return None;
     }
 
+    // 绝对路径从当前任务的 root 开始解析，这样 chroot 后不会越过新根。
     let is_abs = path.starts_with('/');
     let mut current = if is_abs {
         crate::task::current_task()
@@ -710,6 +778,7 @@ pub fn vfs_resolve_path(start: &Arc<Dentry>, path: &str) -> Option<Arc<Dentry>> 
         start.clone()
     };
 
+    // 按路径分量逐段查找，每一段都交给 vfs_lookup 处理缓存、挂载点和父目录。
     for component in path.split('/') {
         match component {
             "" | "." => continue,
@@ -722,6 +791,8 @@ pub fn vfs_resolve_path(start: &Arc<Dentry>, path: &str) -> Option<Arc<Dentry>> 
     lookup_mount(&current).or(Some(current))
 }
 
+// 解析路径；普通命令名找不到时再尝试 /bin/<name>。
+// 执行时先按原路径解析；若是裸命令名且找不到，再拼成 /bin/<name> 解析一次。
 pub fn vfs_resolve_with_fallback(start: &Arc<Dentry>, path: &str) -> Option<Arc<Dentry>> {
     if let Some(d) = vfs_resolve_path(start, path) {
         return Some(d);
@@ -736,6 +807,8 @@ pub fn vfs_resolve_with_fallback(start: &Arc<Dentry>, path: &str) -> Option<Arc<
     None
 }
 
+// 把路径拆成已存在的父目录 dentry 和最后一个文件名。
+// 执行时先按绝对/相对路径确定起点，再解析除最后一段外的父目录，最后返回父目录和文件名。
 pub fn vfs_resolve_parent_and_name(
     start: &Arc<Dentry>,
     path: &str,
@@ -772,18 +845,22 @@ pub fn vfs_resolve_parent_and_name(
 
 // ==================== File Creation ====================
 
+// 在 VFS 中创建文件或目录，并同步更新父目录的 dentry 缓存。
+// 执行时先让底层 ext4 创建 inode，再创建子 dentry、应用 umask 权限，并插入父目录缓存。
 pub fn vfs_create(
     parent: &Arc<Dentry>,
     name: &str,
     is_dir: bool,
     mode: u32,
 ) -> Option<Arc<Dentry>> {
+    // 先让底层文件系统真正创建 inode，VFS dentry 只是它的缓存视图。
     let inode_num = parent
         .super_block
         .create_file(&parent.fs_path, name, is_dir)?;
 
     let child = Dentry::new_child(parent, name, inode_num, is_dir, false);
 
+    // 创建权限要应用当前进程 umask，再写回到底层 ext4 inode。
     let umask = crate::task::current_task()
         .map(|t| t.inner_exclusive_access().umask)
         .unwrap_or(0o22);
@@ -792,6 +869,7 @@ pub fn vfs_create(
     let fs_path = child.fs_path.clone();
     child.super_block.set_mode(&fs_path, effective_mode);
 
+    // 父目录缓存同步插入新 dentry，避免刚创建后马上查找失败。
     {
         let mut children = parent.children.exclusive_access();
         if let Some(list) = children.as_mut() {
@@ -806,6 +884,8 @@ pub fn vfs_create(
 
 // ==================== Mount Operations ====================
 
+// 把一个超级块挂到指定 dentry 上。
+// 执行时先检查非根挂载点是否已被挂载，再创建挂载根 dentry 并追加到 MOUNT_TABLE。
 pub fn vfs_mount(mnt_point: Arc<Dentry>, sb: Arc<VfsSuperBlock>, fs_path: &str) -> bool {
     let path = mnt_point.path.clone();
     {
@@ -828,6 +908,8 @@ pub fn vfs_mount(mnt_point: Arc<Dentry>, sb: Arc<VfsSuperBlock>, fs_path: &str) 
     true
 }
 
+// 从挂载表里卸掉指定挂载点。
+// 执行时按挂载点路径在 MOUNT_TABLE 中查找记录，找到就删除并返回 true。
 pub fn vfs_umount(mnt_point: &Arc<Dentry>) -> bool {
     let path = &mnt_point.path;
     let mut table = MOUNT_TABLE.exclusive_access();
@@ -851,6 +933,8 @@ lazy_static! {
     pub static ref ROOT_DENTRY: Arc<Dentry> = Dentry::new_root(ROOT_SB.clone());
 }
 
+// 初始化根文件系统挂载表。
+// 执行时把 ROOT_DENTRY 同时作为挂载点和挂载根插入 MOUNT_TABLE。
 pub fn mount_root() {
     let root = ROOT_DENTRY.clone();
     MOUNT_TABLE.exclusive_access().push(Mount {
@@ -859,7 +943,8 @@ pub fn mount_root() {
     });
 }
 
-/// Mount the test disk (bus 0) at the specified mount point dentry.
+// 把测试盘挂到指定目录，比赛的双盘环境会用到。
+// 执行时用测试块设备创建 ext4 超级块，成功后把它挂到调用者传入的 dentry 上。
 pub fn mount_test_disk_at(mnt_point: Arc<Dentry>) -> bool {
     let test_sb = match VfsSuperBlock::new_ext4(BLOCK_DEVICE.clone(), "ext4") {
         Some(sb) => sb,
@@ -868,6 +953,8 @@ pub fn mount_test_disk_at(mnt_point: Arc<Dentry>) -> bool {
     vfs_mount(mnt_point, test_sb, "/__mount_vda/")
 }
 
+// 打印 /bin 下的用户程序列表，启动时调试用。
+// 执行时读取根文件系统 /bin 目录项，过滤 .、.. 和空名后逐行打印。
 pub fn list_apps() {
     println!("/**** APPS ****");
     ROOT_SB

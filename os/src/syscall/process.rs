@@ -1,3 +1,4 @@
+// 这里负责操作系统的系统调用接口：实现进程、内存、信号、时间和资源限制相关系统调用。
 use crate::fs::stdio::stdout_release_if_owner;
 use crate::fs::{open_file, open_file_at, File, OpenFlags};
 use crate::mm::{
@@ -9,8 +10,8 @@ use crate::task::{
     add_task, blank_kcontext, block_current_and_run_next, current_task, current_user_token,
     exit_current_and_run_next, force_exit_task, pid2task, pid_alloc, sleep_current_and_run_next,
     suspend_current_and_run_next, wake_blocked_task, BlockReason, KernelStack, SignalAction,
-    SignalFlags, TaskControlBlock, TaskControlBlockInner, TaskStatus, NET_BLOCK_QUEUE, PID2TCB,
-    MAX_SIG,
+    SignalFlags, TaskControlBlock, TaskControlBlockInner, TaskStatus, MAX_SIG, NET_BLOCK_QUEUE,
+    PID2TCB,
 };
 use alloc::format;
 use alloc::string::String;
@@ -42,6 +43,8 @@ const USER_CLOCK_TICK_NS: usize = USER_CLOCK_TICK_US as usize * 1_000;
 const NSEC_PER_SEC: usize = 1_000_000_000;
 const NSEC_PER_USEC: usize = 1_000;
 
+// 生成用户态可见的单调微秒时间，避免时间倒退。
+// 执行时读取硬件时间，再用原子 CAS 保证返回值至少比上次大一个最小步长。
 fn monotonic_user_time_us() -> u64 {
     let hw_us = (Time::now().to_nsec() / 1000) as u64;
     loop {
@@ -56,6 +59,8 @@ fn monotonic_user_time_us() -> u64 {
     }
 }
 
+// times(2) 使用的单调 tick 计数。
+// 执行时把微秒时间换成 CLK_TCK tick，并用原子 CAS 避免多次调用看到倒退或不前进。
 fn monotonic_user_times_tick() -> u64 {
     let hw_tick = monotonic_user_time_us() / USER_CLOCK_TICK_US;
     loop {
@@ -70,14 +75,20 @@ fn monotonic_user_times_tick() -> u64 {
     }
 }
 
+// 返回用户态看到的当前实时时间秒数。
+// 执行时复用单调微秒时间并向下取整到秒，用于需要秒级时间戳的文件和进程接口。
 pub fn user_realtime_sec() -> i64 {
     (monotonic_user_time_us() / 1_000_000) as i64
 }
 
+// 返回向上取整后的实时时间秒数。
+// 执行时把当前微秒时间按秒向上取整，避免刚写入的文件时间落到测试期望之前。
 pub fn user_realtime_sec_ceil() -> i64 {
     ((monotonic_user_time_us() + 999_999) / 1_000_000) as i64
 }
 
+// 把纳秒转成 timeval。
+// 执行时先把纳秒向上折算成微秒，再拆成 timeval 的秒和微秒字段。
 fn nsec_to_timeval(ns: usize) -> TimeVal {
     let usec = if ns == 0 {
         0
@@ -90,6 +101,8 @@ fn nsec_to_timeval(ns: usize) -> TimeVal {
     }
 }
 
+// 把纳秒换算成 sysconf(_SC_CLK_TCK) 口径的 tick。
+// 执行时按内核定义的 10ms tick 向上取整，保证短时间片也能在 times 里体现。
 fn nsec_to_clock_ticks(ns: usize) -> isize {
     if ns == 0 {
         0
@@ -98,6 +111,8 @@ fn nsec_to_clock_ticks(ns: usize) -> isize {
     }
 }
 
+// 简单判断文件内容是否像文本脚本。
+// 执行时检查前 256 字节，拒绝 NUL 和非文本字符，只要出现可见字符就认为可交给 shell 兜底。
 fn looks_like_text_script(data: &[u8]) -> bool {
     if data.is_empty() {
         return false;
@@ -152,6 +167,8 @@ pub struct UtsName {
 }
 
 impl UtsName {
+    // 把字符串写进 utsname 的固定长度字段。
+    // 执行时最多写 64 个字节并补一个 '\0'，避免覆盖 utsname 后续字段。
     fn set_str(field: &mut [u8; UTSNAME_LEN], s: &str) {
         let bytes = s.as_bytes();
         let len = bytes.len().min(UTSNAME_LEN - 1);
@@ -188,16 +205,22 @@ struct RUsage {
     ru_nivcsw: isize,
 }
 
+// 系统调用入口：退出当前进程。
+// 执行时把退出码交给任务退出路径，清理当前任务后立即切到下一个可运行任务。
 pub fn sys_exit(exit_code: i32) -> ! {
     exit_current_and_run_next(exit_code)
 }
 
+// 系统调用入口：主动让出 CPU。
+// 执行时先释放可能占用 stdout 的所有权，再把当前任务挂回就绪队列并触发调度。
 pub fn sys_yield() -> isize {
     stdout_release_if_owner();
     suspend_current_and_run_next();
     0
 }
 
+// 系统调用入口：把当前时间写到 timeval。
+// 执行时如果用户提供指针就写 timeval；否则按旧接口返回毫秒时间。
 pub fn sys_get_time(ts_ptr: usize, _tz: usize) -> isize {
     let now_us = monotonic_user_time_us();
     if ts_ptr != 0 {
@@ -211,10 +234,14 @@ pub fn sys_get_time(ts_ptr: usize, _tz: usize) -> isize {
     }
 }
 
+// 系统调用入口：返回当前进程 pid。
+// 执行时直接读取当前任务的 pid 句柄编号。
 pub fn sys_getpid() -> isize {
     current_task().unwrap().pid.0 as isize
 }
 
+// 系统调用入口：返回父进程 pid。
+// 执行时尝试升级 parent 弱引用；父进程不存在或当前任务无父进程时按 init pid 1 返回。
 pub fn sys_getppid() -> isize {
     let task = current_task().unwrap();
     let inner = task.inner_exclusive_access();
@@ -237,6 +264,8 @@ const CLONE_PARENT_SETTID: usize = 0x100000;
 const CLONE_CHILD_CLEARTID: usize = 0x200000;
 const CLONE_CHILD_SETTID: usize = 0x01000000;
 
+// 系统调用入口：实现 clone 的常用子集。
+// 执行时先 fork 出子任务，再按 stack、ctid 等 clone 参数修正子任务 trap 上下文和用户态 tid 地址。
 pub fn sys_clone(flags: usize, stack: usize, ptid: usize, tls: usize, ctid: usize) -> isize {
     let current_task = current_task().unwrap();
     let Some(new_task) = current_task.fork() else {
@@ -264,6 +293,8 @@ pub fn sys_clone(flags: usize, stack: usize, ptid: usize, tls: usize, ctid: usiz
     new_pid as isize
 }
 
+// 系统调用入口：传统 fork。
+// 执行时复制当前任务，子进程返回值设为 0，父进程返回新 pid，并把子进程加入调度队列。
 pub fn sys_fork() -> isize {
     let current_task = current_task().unwrap();
     let Some(new_task) = current_task.fork() else {
@@ -278,10 +309,13 @@ pub fn sys_fork() -> isize {
     new_pid as isize
 }
 
+// 系统调用入口：加载新程序并替换当前任务。
+// 执行时读取 path、argv、envp，按 cwd/root 打开程序；脚本交给解释器，动态 ELF 额外装载 PT_INTERP。
 pub fn sys_exec(path: *const u8, mut args: *const usize, mut envp: *const usize) -> isize {
     let token = current_user_token();
     let path = translated_str(token, path);
     let mut args_vec: Vec<String> = Vec::new();
+    // argv/envp 都是用户指针数组，逐项读取直到遇到空指针。
     if !args.is_null() {
         loop {
             let arg_str_ptr = *translated_ref(token, args);
@@ -307,6 +341,7 @@ pub fn sys_exec(path: *const u8, mut args: *const usize, mut envp: *const usize)
             }
         }
     }
+    // exec 打开目标时按当前 cwd/root 解析，不能简单从全局根目录开始找。
     let (cwd, root) = {
         let task = current_task().unwrap();
         let inner = task.inner_exclusive_access();
@@ -325,6 +360,7 @@ pub fn sys_exec(path: *const u8, mut args: *const usize, mut envp: *const usize)
     let app_inode = open_exec(path.as_str());
     if let Some(app_inode) = app_inode {
         let all_data = app_inode.read_all();
+        // 支持 #! 脚本，把解释器路径和脚本路径重新组装成新的 argv。
         if all_data.len() >= 2 && &all_data[..2] == b"#!" {
             let end = all_data
                 .iter()
@@ -356,6 +392,7 @@ pub fn sys_exec(path: *const u8, mut args: *const usize, mut envp: *const usize)
             return -1;
         }
         let task = current_task().unwrap();
+        // 不是 ELF 但像文本脚本时，退回用 /bin/sh 或 busybox 执行。
         if all_data.len() < 4 || &all_data[..4] != b"\x7fELF" {
             if looks_like_text_script(&all_data) {
                 let mut sh_args = alloc::vec![alloc::string::String::from("/bin/sh"), path.clone()];
@@ -382,7 +419,9 @@ pub fn sys_exec(path: *const u8, mut args: *const usize, mut envp: *const usize)
                                 return 0;
                             }
                         } else {
-                            current_task().unwrap().exec(sh_data.as_slice(), sh_args, env_vec);
+                            current_task()
+                                .unwrap()
+                                .exec(sh_data.as_slice(), sh_args, env_vec);
                             return 0;
                         }
                     }
@@ -390,7 +429,7 @@ pub fn sys_exec(path: *const u8, mut args: *const usize, mut envp: *const usize)
             }
             return -8;
         }
-        // Check for dynamically linked ELF (has PT_INTERP)
+        // 动态链接 ELF 带 PT_INTERP，需要先把解释器一起读出来。
         if let Some(interp_path) = crate::mm::get_elf_interp(&all_data) {
             let interp_inode = open_exec(&interp_path).or_else(|| {
                 let usr_interp = alloc::format!("/usr{}", interp_path);
@@ -412,6 +451,8 @@ pub fn sys_exec(path: *const u8, mut args: *const usize, mut envp: *const usize)
 
 /// If there is not a child process whose pid is same as given, return -ECHILD.
 /// Else if there is a child process but it is still running, return -2.
+// 系统调用入口：等待指定子进程退出。
+// 执行时扫描 children 找僵尸进程，回收后写退出状态；没有僵尸时按 WNOHANG 返回或睡眠等待。
 pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: usize) -> isize {
     const WNOHANG: usize = 1;
     loop {
@@ -464,7 +505,7 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: usize) -> isize
             }
             return found_pid as isize;
         }
-        // No zombie: non-blocking return 0, or sleep
+        // 没有僵尸子进程时，WNOHANG 立即返回，否则睡眠后再检查。
         if options & WNOHANG != 0 {
             return 0;
         }
@@ -475,7 +516,7 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: usize) -> isize
         drop(queue);
         drop(task);
         crate::task::sleep_current_and_run_next();
-        // Loop back to check again
+        // 被唤醒后重新扫描 children，防止错过刚退出的子进程。
     }
 }
 
@@ -495,6 +536,8 @@ struct WaitSigInfo {
     _pad: [u8; 128 - 40],
 }
 
+// 给 waitid 写回一份简化 siginfo。
+// 执行时按退出或被信号杀死填 si_code/si_status，pid 为 0 时表示 WNOHANG 没等到子进程。
 fn write_wait_siginfo(info_ptr: *mut u8, pid: i32, exit_code: i32) {
     if info_ptr.is_null() {
         return;
@@ -523,6 +566,8 @@ fn write_wait_siginfo(info_ptr: *mut u8, pid: i32, exit_code: i32) {
     };
 }
 
+// 系统调用入口：按 waitid 语义等待子进程状态。
+// 执行时把 which/id 转成目标 pid，回收匹配的僵尸子进程并写 siginfo；没有结果时按 WNOHANG 或睡眠处理。
 pub fn sys_waitid(
     which: usize,
     id: usize,
@@ -600,6 +645,8 @@ pub fn sys_waitid(
     }
 }
 
+// 给指定任务投递一个信号，并处理立即唤醒。
+// 执行时设置目标任务的 pending 信号；SIGKILL 可直接强制退出，阻塞中的任务会被唤醒重新处理信号。
 fn signal_task(task: &Arc<TaskControlBlock>, signum: i32) {
     let target = task.getpid();
     if signum == 9 && current_task().map(|t| t.getpid() != target).unwrap_or(true) {
@@ -649,6 +696,8 @@ fn signal_task(task: &Arc<TaskControlBlock>, signum: i32) {
     wake_blocked_task(task);
 }
 
+// 系统调用入口：向进程、进程组或当前进程发送信号。
+// 执行时按 pid 规则收集目标任务，signum 为 0 只做存在性检查，否则逐个调用 signal_task 投递信号。
 pub fn sys_kill(pid: isize, signum: i32) -> isize {
     if signum < 0 || signum as usize > MAX_SIG {
         return -22; // EINVAL
@@ -693,6 +742,8 @@ pub fn sys_kill(pid: isize, signum: i32) -> isize {
     0
 }
 
+// 系统调用入口：设置进程组号。
+// 执行时 pid 为 0 表示当前任务，pgid 为 0 表示用目标 pid，然后直接更新目标任务的 pgid。
 pub fn sys_setpgid(pid: usize, pgid: usize) -> isize {
     let target_pid = if pid == 0 {
         current_task().map(|task| task.getpid()).unwrap_or(0)
@@ -707,6 +758,8 @@ pub fn sys_setpgid(pid: usize, pgid: usize) -> isize {
     0
 }
 
+// 系统调用入口：读取进程组号。
+// 执行时 pid 为 0 取当前任务，否则查 pid 表，找到后返回任务内部保存的 pgid。
 pub fn sys_getpgid(pid: usize) -> isize {
     let target_pid = if pid == 0 {
         current_task().map(|task| task.getpid()).unwrap_or(0)
@@ -718,6 +771,8 @@ pub fn sys_getpgid(pid: usize) -> isize {
         .unwrap_or(-3)
 }
 
+// 系统调用入口：创建新会话并成为会话首进程。
+// 执行时把当前任务的 sid 和 pgid 都设成自己的 pid，并返回这个会话 id。
 pub fn sys_setsid() -> isize {
     let Some(task) = current_task() else {
         return -3;
@@ -729,6 +784,8 @@ pub fn sys_setsid() -> isize {
     pid as isize
 }
 
+// 把用户态 sigset 位图转成内核 SignalFlags。
+// 执行时按 Linux sigset 的低位编号逐个检查，把用户位图转换成内核信号标志集合。
 fn user_sigset_to_flags(raw: u64) -> SignalFlags {
     let mut flags = SignalFlags::empty();
     for sig in 1..=MAX_SIG {
@@ -741,6 +798,8 @@ fn user_sigset_to_flags(raw: u64) -> SignalFlags {
     flags
 }
 
+// 把内核 SignalFlags 转回用户态 sigset 位图。
+// 执行时逐个信号位反向转换，写给 sigprocmask 的 old_set。
 fn flags_to_user_sigset(flags: SignalFlags) -> u64 {
     let mut raw = 0u64;
     for sig in 1..=MAX_SIG {
@@ -753,6 +812,8 @@ fn flags_to_user_sigset(flags: SignalFlags) -> u64 {
     raw
 }
 
+// 系统调用入口：读取或更新当前任务信号屏蔽字。
+// 执行时先可选写回旧 mask，再按 BLOCK/UNBLOCK/SETMASK 更新；SIGKILL 和 SIGSTOP 永远不能被屏蔽。
 pub fn sys_sigprocmask(how: i32, set: *const u8, old_set: *mut u8, _sigsetsize: usize) -> isize {
     const SIG_BLOCK: i32 = 0;
     const SIG_UNBLOCK: i32 = 1;
@@ -782,14 +843,20 @@ pub fn sys_sigprocmask(how: i32, set: *const u8, old_set: *mut u8, _sigsetsize: 
     }
 }
 
+// 系统调用入口：从用户信号处理函数返回。
+// 执行时恢复进入信号处理前保存的用户上下文，让用户程序从被打断的位置继续。
 pub fn sys_sigreturn() -> isize {
     crate::task::restore_current_signal_context().unwrap_or(-1)
 }
 
+// 检查 sigaction 参数里当前不允许设置的信号。
+// 执行时拒绝修改 SIGKILL 和 SIGSTOP 的处理动作，这两个信号必须保持内核默认语义。
 fn check_sigaction_error(signal: SignalFlags, _action: usize, _old_action: usize) -> bool {
     signal == SignalFlags::SIGKILL || signal == SignalFlags::SIGSTOP
 }
 
+// 系统调用入口：设置或读取信号处理动作。
+// 执行时按 signum 定位 action 表，先可选写回旧动作，再把用户传入的新动作保存进当前任务。
 pub fn sys_sigaction(
     signum: i32,
     action: *const SignalAction,
@@ -817,6 +884,8 @@ pub fn sys_sigaction(
     }
 }
 
+// 系统调用入口：调整用户堆顶。
+// 执行时 brk_addr 为 0 只查询当前堆顶；增大时补映射，缩小时 munmap 高地址页。
 pub fn sys_brk(brk_addr: usize) -> isize {
     let task = current_task().unwrap();
     let mut inner = task.inner_exclusive_access();
@@ -857,6 +926,8 @@ pub fn sys_brk(brk_addr: usize) -> isize {
     brk_addr as isize
 }
 
+// 系统调用入口：按毫秒睡眠当前任务。
+// 执行时用当前毫秒时间算出唤醒点，在循环里检查 killed 标记并主动 yield 到时间到达。
 pub fn sys_sleep(duration: u64) -> isize {
     let wakeup_time = sys_get_time(0, 0) + duration as isize;
     loop {
@@ -875,11 +946,15 @@ pub fn sys_sleep(duration: u64) -> isize {
     0
 }
 
+// 系统调用入口：关闭模拟器。
+// 执行时直接调用 polyhal 的 shutdown 指令，正常情况下不会再返回到用户态。
 pub fn sys_shutdown() -> isize {
     polyhal::instruction::shutdown();
     0
 }
 
+// 把 mmap/mprotect 的 prot 位转成内核映射权限。
+// 执行时从 PROT_READ/WRITE/EXEC 逐位拼出 MapPermission，并总是带上用户态 U 权限。
 fn get_map_permission(prot: usize) -> crate::mm::MapPermission {
     let mut perm = crate::mm::MapPermission::U;
     if prot & PROT_READ != 0 {
@@ -894,6 +969,8 @@ fn get_map_permission(prot: usize) -> crate::mm::MapPermission {
     perm
 }
 
+// 系统调用入口：创建匿名或文件映射。
+// 执行时决定实际起始地址，MAP_FIXED 会先解除重叠区；匿名映射分配页，文件映射绑定 fd 和 offset。
 pub fn sys_mmap(
     start: usize,
     len: usize,
@@ -958,6 +1035,8 @@ pub fn sys_mmap(
     }
 }
 
+// 系统调用入口：解除一段用户映射。
+// 执行时要求起始地址页对齐且长度非零，然后调用 MemorySet::munmap 拆分或删除对应区域。
 pub fn sys_munmap(start: usize, len: usize) -> isize {
     if start % crate::config::PAGE_SIZE != 0 || len == 0 {
         return -1;
@@ -976,6 +1055,8 @@ pub fn sys_munmap(start: usize, len: usize) -> isize {
     }
 }
 
+// 系统调用入口：同步或失效文件映射页。
+// 执行时检查地址范围合法，再把起始地址、长度和 flags 交给 MemorySet::msync。
 pub fn sys_msync(start: usize, len: usize, flags: usize) -> isize {
     if (len > 0 && start as u64 + len as u64 > usize::MAX as u64)
         || start % crate::config::PAGE_SIZE != 0
@@ -988,6 +1069,8 @@ pub fn sys_msync(start: usize, len: usize, flags: usize) -> isize {
     inner.memory_set.msync(start_addr, len, flags)
 }
 
+// 系统调用入口：创建或查找 SysV 共享内存段。
+// 执行时按 key 查已有段，必要时按页对齐大小分配物理页，并把段放进全局共享内存表。
 pub fn sys_shmget(key: usize, size: usize, flags: usize) -> isize {
     const IPC_PRIVATE: usize = 0;
     const IPC_CREAT: usize = 0o1000;
@@ -1032,6 +1115,8 @@ pub fn sys_shmget(key: usize, size: usize, flags: usize) -> isize {
     }
 }
 
+// 系统调用入口：把共享内存段映射到当前地址空间。
+// 执行时根据 shmid 找到共享页数组，按 SHM_RDONLY 决定权限，再映射到指定地址或自动空洞。
 pub fn sys_shmat(shmid: usize, shmaddr: usize, shmflg: usize) -> isize {
     const SHM_RDONLY: usize = 0o10000;
     if shmid == 0 {
@@ -1059,10 +1144,14 @@ pub fn sys_shmat(shmid: usize, shmaddr: usize, shmflg: usize) -> isize {
     }
 }
 
+// 系统调用入口：分离共享内存，当前实现只做兼容返回。
+// 执行时暂不回收单个映射，只返回成功，满足只检查接口返回值的程序。
 pub fn sys_shmdt(_shmaddr: usize) -> isize {
     0
 }
 
+// 系统调用入口：共享内存控制命令的最小实现。
+// 执行时只校验 shmid 是否存在，暂不解析 cmd 或写回 shmid_ds。
 pub fn sys_shmctl(shmid: usize, _cmd: usize, _buf: *mut u8) -> isize {
     if shmid == 0 {
         return -22;
@@ -1074,6 +1163,8 @@ pub fn sys_shmctl(shmid: usize, _cmd: usize, _buf: *mut u8) -> isize {
     0
 }
 
+// 系统调用入口：写回进程用户态/内核态累计时间。
+// 执行时刷新当前任务计时，按 clock tick 写 Tms，并返回单调递增的 times tick。
 pub fn sys_times(tms_ptr: usize) -> isize {
     let task = crate::task::current_task().unwrap();
 
@@ -1096,6 +1187,8 @@ pub fn sys_times(tms_ptr: usize) -> isize {
     monotonic_user_times_tick() as isize
 }
 
+// 系统调用入口：写回 utsname 系统信息。
+// 执行时清空 utsname 结构，再填入 Linux 名称、版本和当前架构字符串。
 pub fn sys_uname(uts_ptr: usize) -> isize {
     if uts_ptr == 0 {
         return -1;
@@ -1131,6 +1224,8 @@ pub fn sys_uname(uts_ptr: usize) -> isize {
     0
 }
 
+// 系统调用入口：读取或清理内核日志缓冲区。
+// 执行时按 action 处理 open/close/clear/read/size，读取时从环形日志缓冲区拷贝到用户缓冲区。
 pub fn sys_syslog(action: usize, buf: *mut u8, len: usize) -> isize {
     match action {
         0 | 1 => 0, // open/close log
@@ -1140,7 +1235,7 @@ pub fn sys_syslog(action: usize, buf: *mut u8, len: usize) -> isize {
             0
         }
         2 | 3 | 4 => {
-            // read / read all / read+clear
+            // syslog 的读取类命令共用这条路径，区别只在是否读完后清空。
             if buf.is_null() || len == 0 {
                 return 0;
             }
@@ -1163,7 +1258,7 @@ pub fn sys_syslog(action: usize, buf: *mut u8, len: usize) -> isize {
             copy_len as isize
         }
         9 => {
-            // number of unread chars
+            // 这里只返回当前未读日志长度，不复制内容。
             let (part1, part2) = crate::logging::klog_bytes();
             (part1.len() + part2.len()) as isize
         }
@@ -1171,6 +1266,8 @@ pub fn sys_syslog(action: usize, buf: *mut u8, len: usize) -> isize {
     }
 }
 
+// 系统调用入口：按 timespec 睡眠当前任务。
+// 执行时校验 req/rem 指针和 tv_nsec，循环让出 CPU 到超时；被 kill 或未屏蔽信号打断时返回 EINTR。
 pub fn sys_nanosleep(req_ptr: usize, rem_ptr: usize) -> isize {
     let task = crate::task::current_task().unwrap();
     let inner = task.inner_exclusive_access();
@@ -1220,6 +1317,8 @@ pub fn sys_nanosleep(req_ptr: usize, rem_ptr: usize) -> isize {
     0
 }
 
+// 系统调用入口：记录线程退出时要清零/唤醒的 tid 地址。
+// 执行时把用户传入的 tid 地址保存到任务里，线程退出时会用它做 clear_child_tid。
 pub fn sys_set_tid_address(tidptr: *mut i32) -> isize {
     let task = current_task().unwrap();
     let mut inner = task.inner_exclusive_access();
@@ -1227,6 +1326,8 @@ pub fn sys_set_tid_address(tidptr: *mut i32) -> isize {
     task.getpid() as isize
 }
 
+// 系统调用入口：退出当前线程组。
+// 执行时先把 clear_child_tid 地址清零，再按进程退出路径结束当前任务。
 pub fn sys_exit_group(status: i32) -> ! {
     let tid = {
         let task = current_task().unwrap();
@@ -1240,34 +1341,46 @@ pub fn sys_exit_group(status: i32) -> ! {
     exit_current_and_run_next(status)
 }
 
+// 系统调用入口：返回真实用户 ID。
+// 执行时读取当前任务凭据里的 uid。
 pub fn sys_getuid() -> isize {
     current_task()
         .map(|t| t.inner_exclusive_access().uid as isize)
         .unwrap_or(-1)
 }
 
+// 系统调用入口：返回有效用户 ID。
+// 执行时读取当前任务凭据里的 euid。
 pub fn sys_geteuid() -> isize {
     current_task()
         .map(|t| t.inner_exclusive_access().euid as isize)
         .unwrap_or(-1)
 }
 
+// 系统调用入口：返回真实组 ID。
+// 执行时读取当前任务凭据里的 gid。
 pub fn sys_getgid() -> isize {
     current_task()
         .map(|t| t.inner_exclusive_access().gid as isize)
         .unwrap_or(-1)
 }
 
+// 系统调用入口：返回有效组 ID。
+// 执行时读取当前任务凭据里的 egid。
 pub fn sys_getegid() -> isize {
     current_task()
         .map(|t| t.inner_exclusive_access().egid as isize)
         .unwrap_or(-1)
 }
 
+// 系统调用入口：返回当前任务 ID。
+// 执行时返回当前任务的 pid；当前实现中 tid 与 pid 使用同一个编号。
 pub fn sys_gettid() -> isize {
     current_task().map(|t| t.getpid() as isize).unwrap_or(-1)
 }
 
+// 系统调用入口：设置真实和有效用户 ID。
+// 执行时 root 可同时改 uid/euid，普通用户只能在自己的 uid/euid 之间切换有效 uid。
 pub fn sys_setuid(uid: u32) -> isize {
     if let Some(task) = current_task() {
         let mut inner = task.inner_exclusive_access();
@@ -1286,6 +1399,8 @@ pub fn sys_setuid(uid: u32) -> isize {
     }
 }
 
+// 系统调用入口：设置真实和有效组 ID。
+// 执行时 root 可同时改 gid/egid，普通用户只能在自己的 gid/egid 之间切换有效组。
 pub fn sys_setgid(gid: u32) -> isize {
     if let Some(task) = current_task() {
         let mut inner = task.inner_exclusive_access();
@@ -1304,6 +1419,8 @@ pub fn sys_setgid(gid: u32) -> isize {
     }
 }
 
+// 系统调用入口：更新文件创建权限掩码，并返回旧值。
+// 执行时替换当前任务保存的 umask，并把替换前的旧值返回给用户态。
 pub fn sys_umask(mask: u32) -> isize {
     current_task()
         .map(|t| {
@@ -1315,6 +1432,8 @@ pub fn sys_umask(mask: u32) -> isize {
         .unwrap_or(-1)
 }
 
+// 系统调用入口：向用户缓冲区填入伪随机字节。
+// 执行时用当前时间做简单种子填满用户缓冲区，满足 getrandom 接口的基本可用性。
 pub fn sys_getrandom(buf: *mut u8, len: usize, _flags: usize) -> isize {
     if buf.is_null() || len == 0 {
         return -1;
@@ -1345,6 +1464,8 @@ const POLLERR: i16 = 0x008;
 const POLLHUP: i16 = 0x010;
 const POLLNVAL: i16 = 0x020;
 
+// 系统调用入口：等待 pollfd 数组上的事件或超时。
+// 执行时循环轮询网络和每个 fd 的 poll 状态；有事件就写 revents 返回，否则按 timeout 睡眠重试。
 pub fn sys_ppoll(
     fds: *mut u8,
     nfds: usize,
@@ -1423,6 +1544,8 @@ pub fn sys_ppoll(
     }
 }
 
+// 系统调用入口：mprotect 兼容实现。
+// 执行时当前不改页表权限，直接返回成功，兼容只探测接口的用户程序。
 pub fn sys_mprotect(_start: usize, _len: usize, _prot: usize) -> isize {
     0
 }
@@ -1431,6 +1554,8 @@ pub fn sys_mprotect(_start: usize, _len: usize, _prot: usize) -> isize {
 
 const MREMAP_MAYMOVE: usize = 1;
 
+// 系统调用入口：调整映射大小，必要时搬到新地址。
+// 执行时把旧区间解除映射，再按新大小重新建匿名映射；允许移动时可选择新地址或自动找空洞。
 pub fn sys_mremap(
     old_addr: usize,
     old_size: usize,
@@ -1491,6 +1616,8 @@ pub fn sys_mremap(
 
 // ---- mincore (232) ----
 
+// 系统调用入口：报告映射页是否驻留。
+// 执行时确认 vec 可写并逐页检查地址已映射，最后把每页驻留状态都写成 1。
 pub fn sys_mincore(start: usize, len: usize, vec: *mut u8) -> isize {
     if start % crate::config::PAGE_SIZE != 0 || len == 0 {
         return -22;
@@ -1498,11 +1625,11 @@ pub fn sys_mincore(start: usize, len: usize, vec: *mut u8) -> isize {
     let npages = (len + crate::config::PAGE_SIZE - 1) / crate::config::PAGE_SIZE;
     let task = current_task().unwrap();
     let inner = task.inner_exclusive_access();
-    // Validate vec pointer
+    // mincore 先检查 vec 指针能写，后面才按页填入驻留状态。
     if !inner.memory_set.valid_user_buf(vec, npages, true) {
         return -14;
     }
-    // Check that the address range is mapped
+    // 地址范围必须已经映射，否则不能报告驻留状态。
     let mut vpn = start;
     let end = start + len;
     if end < start {
@@ -1529,22 +1656,32 @@ pub fn sys_mincore(start: usize, len: usize, vec: *mut u8) -> isize {
 
 // ---- mlock/mlock2/mlockall/munlock/munlockall (228-231) ----
 
+// 系统调用入口：mlock 兼容实现。
+// 执行时不真正锁页，直接成功返回，避免用户态因为缺少内存锁能力退出。
 pub fn sys_mlock(_start: usize, _len: usize) -> isize {
     0
 }
 
+// 系统调用入口：munlock 兼容实现。
+// 执行时不维护锁页状态，作为 mlock 的对称兼容入口直接成功。
 pub fn sys_munlock(_start: usize, _len: usize) -> isize {
     0
 }
 
+// 系统调用入口：mlockall 兼容实现。
+// 执行时不遍历地址空间锁页，只返回成功表示接受该内存管理建议。
 pub fn sys_mlockall(_flags: usize) -> isize {
     0
 }
 
+// 系统调用入口：munlockall 兼容实现。
+// 执行时不需要释放锁页记录，直接返回成功。
 pub fn sys_munlockall() -> isize {
     0
 }
 
+// 系统调用入口：mlock2 兼容实现。
+// 执行时忽略 flags，不真正锁页，只做接口兼容。
 pub fn sys_mlock2(_start: usize, _len: usize, _flags: usize) -> isize {
     0
 }
@@ -1563,6 +1700,8 @@ struct RLimit {
     rlim_max: usize,
 }
 
+// 系统调用入口：读取资源限制。
+// 执行时对 NOFILE 返回 1024，其它资源暂按无限制写回。
 pub fn sys_getrlimit(resource: usize, rlim_ptr: *mut u8) -> isize {
     if rlim_ptr.is_null() || resource >= RLIM_NLIMITS {
         return -22;
@@ -1579,6 +1718,8 @@ pub fn sys_getrlimit(resource: usize, rlim_ptr: *mut u8) -> isize {
     0
 }
 
+// 系统调用入口：设置资源限制，当前主要做参数兼容。
+// 执行时只校验 resource 和指针合法性，不实际改变调度或内存限制。
 pub fn sys_setrlimit(resource: usize, rlim_ptr: *const u8) -> isize {
     if rlim_ptr.is_null() || resource >= RLIM_NLIMITS {
         return -22;
@@ -1608,6 +1749,8 @@ struct SysInfo {
     _f: [u8; 0],
 }
 
+// 系统调用入口：写回系统内存和运行时间统计。
+// 执行时校验用户缓冲区可写，然后填入固定内存容量和当前 uptime。
 pub fn sys_sysinfo(info_ptr: *mut u8) -> isize {
     if info_ptr.is_null() {
         return -14;
@@ -1652,6 +1795,8 @@ struct StackT {
     ss_size: usize,
 }
 
+// 系统调用入口：设置或读取备用信号栈。
+// 执行时先可选写回旧 altstack，再按 SS_DISABLE 或新栈大小更新当前任务的备用信号栈记录。
 pub fn sys_sigaltstack(ss: *const u8, old_ss: *mut u8) -> isize {
     let token = current_user_token();
     let task = current_task().unwrap();
@@ -1689,6 +1834,8 @@ pub fn sys_sigaltstack(ss: *const u8, old_ss: *mut u8) -> isize {
 
 // ---- sigpending / rt_sigpending (136) ----
 
+// 系统调用入口：写回当前待处理信号集合。
+// 执行时把当前任务 pending signals 转成用户 sigset 位图并写回。
 pub fn sys_rt_sigpending(set: *mut u8, _sigsize: usize) -> isize {
     if set.is_null() {
         return -14;
@@ -1703,6 +1850,8 @@ pub fn sys_rt_sigpending(set: *mut u8, _sigsize: usize) -> isize {
 
 // ---- sigsuspend / rt_sigsuspend (133) ----
 
+// 系统调用入口：临时替换信号屏蔽字并挂起等待。
+// 执行时保存旧 mask，换成用户传入的临时 mask 后睡眠；收到信号或 killed 时恢复旧 mask 并返回 EINTR。
 pub fn sys_rt_sigsuspend(mask: *const u8, _sigsize: usize) -> isize {
     let token = current_user_token();
     let task = current_task().unwrap();
@@ -1729,6 +1878,8 @@ pub fn sys_rt_sigsuspend(mask: *const u8, _sigsize: usize) -> isize {
     }
 }
 
+// 把单个 SignalFlags 转成 Linux 信号编号。
+// 执行时遍历信号编号，找到和标志位完全相同的那个编号返回。
 fn signal_number(signal: SignalFlags) -> i32 {
     for sig in 1..=MAX_SIG {
         if let Some(flag) = SignalFlags::from_bits(1u64 << sig) {
@@ -1756,6 +1907,8 @@ struct RtSignalInfo {
     _pad: [u8; 128 - 40],
 }
 
+// 给 rt_sigtimedwait 写回简化 siginfo。
+// 执行时只填 signum 和基础字段，当前不区分发送者 pid/uid。
 fn write_signal_siginfo(info_ptr: *mut u8, signum: i32) {
     if info_ptr.is_null() {
         return;
@@ -1776,6 +1929,8 @@ fn write_signal_siginfo(info_ptr: *mut u8, signum: i32) {
     };
 }
 
+// 系统调用入口：等待指定信号，可带超时时间。
+// 执行时把用户 sigset 转成 wanted 集合，循环查 pending 信号；没有信号时按 timeout 让出 CPU。
 pub fn sys_rt_sigtimedwait(
     set: *const u8,
     info: *mut u8,
@@ -1800,7 +1955,11 @@ pub fn sys_rt_sigtimedwait(
         if ts.tv_nsec >= 1_000_000_000 {
             return -22;
         }
-        Some(ts.tv_sec.saturating_mul(1_000_000_000).saturating_add(ts.tv_nsec))
+        Some(
+            ts.tv_sec
+                .saturating_mul(1_000_000_000)
+                .saturating_add(ts.tv_nsec),
+        )
     };
     let start_ns = Time::now().to_nsec() as usize;
 
@@ -1850,6 +2009,8 @@ pub fn sys_rt_sigtimedwait(
 
 // ---- clock_getres (114) ----
 
+// 系统调用入口：返回时钟分辨率。
+// 执行时向用户 timespec 写入固定 1ms 分辨率。
 pub fn sys_clock_getres(_clk_id: usize, res: *mut u8) -> isize {
     if res.is_null() {
         return -14;
@@ -1863,10 +2024,14 @@ pub fn sys_clock_getres(_clk_id: usize, res: *mut u8) -> isize {
 
 // ---- getgroups/setgroups (158/159) ----
 
+// 系统调用入口：返回补充组数量。
+// 执行时当前没有维护补充组列表，所以固定返回 0。
 pub fn sys_getgroups(_size: usize, _list: *mut u32) -> isize {
     0
 }
 
+// 系统调用入口：设置补充组，当前仅 root 兼容通过。
+// 执行时只检查 euid 是否为 root，不保存补充组内容。
 pub fn sys_setgroups(_size: usize, _list: *const u32) -> isize {
     let task = current_task().unwrap();
     let inner = task.inner_exclusive_access();
@@ -1878,6 +2043,8 @@ pub fn sys_setgroups(_size: usize, _list: *const u32) -> isize {
 
 // ---- UID/GID: getresuid(117)/getresgid(120)/setresuid(147)/setresgid(150)/setreuid(145)/setregid(143) ----
 
+// 系统调用入口：写回真实、有效和保存用户 ID。
+// 执行时把 uid、euid 和当前用 euid 代替的 saved uid 写回三个用户指针。
 pub fn sys_getresuid(ruid: *mut u32, euid: *mut u32, suid: *mut u32) -> isize {
     let token = current_user_token();
     let task = current_task().unwrap();
@@ -1888,6 +2055,8 @@ pub fn sys_getresuid(ruid: *mut u32, euid: *mut u32, suid: *mut u32) -> isize {
     0
 }
 
+// 系统调用入口：写回真实、有效和保存组 ID。
+// 执行时把 gid、egid 和当前用 egid 代替的 saved gid 写回三个用户指针。
 pub fn sys_getresgid(rgid: *mut u32, egid: *mut u32, sgid: *mut u32) -> isize {
     let token = current_user_token();
     let task = current_task().unwrap();
@@ -1898,6 +2067,8 @@ pub fn sys_getresgid(rgid: *mut u32, egid: *mut u32, sgid: *mut u32) -> isize {
     0
 }
 
+// 系统调用入口：设置真实、有效和保存用户 ID。
+// 执行时 root 可改任意值；普通用户只能把 ruid/euid/suid 设为当前 uid 或 euid，usize::MAX 表示不改。
 pub fn sys_setresuid(ruid: usize, euid: usize, suid: usize) -> isize {
     let task = current_task().unwrap();
     let mut inner = task.inner_exclusive_access();
@@ -1919,6 +2090,8 @@ pub fn sys_setresuid(ruid: usize, euid: usize, suid: usize) -> isize {
     0
 }
 
+// 系统调用入口：设置真实、有效和保存组 ID。
+// 执行时 root 可改任意值；普通用户只能把 rgid/egid/sgid 设为当前 gid 或 egid，usize::MAX 表示不改。
 pub fn sys_setresgid(rgid: usize, egid: usize, sgid: usize) -> isize {
     let task = current_task().unwrap();
     let mut inner = task.inner_exclusive_access();
@@ -1940,6 +2113,8 @@ pub fn sys_setresgid(rgid: usize, egid: usize, sgid: usize) -> isize {
     0
 }
 
+// 系统调用入口：设置真实和有效用户 ID。
+// 执行时按 setreuid 规则更新 uid/euid，usize::MAX 表示保留原值，非 root 只能切到已有身份。
 pub fn sys_setreuid(ruid: usize, euid: usize) -> isize {
     let task = current_task().unwrap();
     let mut inner = task.inner_exclusive_access();
@@ -1964,6 +2139,8 @@ pub fn sys_setreuid(ruid: usize, euid: usize) -> isize {
     0
 }
 
+// 系统调用入口：设置真实和有效组 ID。
+// 执行时按 setregid 规则更新 gid/egid，usize::MAX 表示保留原值，非 root 只能切到已有组身份。
 pub fn sys_setregid(rgid: usize, egid: usize) -> isize {
     let task = current_task().unwrap();
     let mut inner = task.inner_exclusive_access();
@@ -1990,20 +2167,28 @@ pub fn sys_setregid(rgid: usize, egid: usize) -> isize {
 
 // ---- sched_setaffinity/sched_getaffinity (122/123) ----
 
+// 系统调用入口：设置 CPU 亲和性，单核下兼容返回。
+// 执行时不保存 mask，因为当前内核只有单核调度语义，直接返回成功。
 pub fn sys_sched_setaffinity(_pid: usize, _len: usize, _mask: *const u8) -> isize {
     0
 }
 
+// 系统调用入口：读取 CPU 亲和性，单核下返回 CPU0。
+// 执行时当前没有实际写 mask，只作为兼容入口返回成功。
 pub fn sys_sched_getaffinity(_pid: usize, _len: usize, _mask: *mut u8) -> isize {
     0
 }
 
 // ---- getpriority/setpriority (140/141) ----
 
+// 系统调用入口：读取进程优先级。
+// 执行时返回固定 nice 映射值 20，表示普通优先级。
 pub fn sys_getpriority(_which: usize, _who: usize) -> isize {
     20
 }
 
+// 系统调用入口：设置进程优先级，当前兼容忽略。
+// 执行时不调整调度队列，只返回成功以兼容用户态设置优先级的尝试。
 pub fn sys_setpriority(_which: usize, _who: usize, _prio: isize) -> isize {
     0
 }
@@ -2014,6 +2199,8 @@ const FD_SETSIZE: usize = 1024;
 const FD_SET_LONGS: usize = FD_SETSIZE / 64;
 type FdSet = [u64; FD_SET_LONGS];
 
+// 判断 fdset 中某个 fd 位是否置位。
+// 执行时按 fd/64 找到对应 u64，再检查 fd%64 这一位。
 fn fd_isset(set: &FdSet, fd: usize) -> bool {
     if fd >= FD_SETSIZE {
         return false;
@@ -2021,29 +2208,39 @@ fn fd_isset(set: &FdSet, fd: usize) -> bool {
     (set[fd / 64] & (1u64 << (fd % 64))) != 0
 }
 
+// 在 fdset 中设置某个 fd 位。
+// 执行时忽略超出 FD_SETSIZE 的 fd，合法时把对应位或上 1。
 fn fd_set(set: &mut FdSet, fd: usize) {
     if fd < FD_SETSIZE {
         set[fd / 64] |= 1u64 << (fd % 64);
     }
 }
 
+// 清除 fdset 中某个 fd 位。
+// 执行时忽略超出 FD_SETSIZE 的 fd，合法时把对应位清成 0。
 fn fd_clr(set: &mut FdSet, fd: usize) {
     if fd < FD_SETSIZE {
         set[fd / 64] &= !(1u64 << (fd % 64));
     }
 }
 
+// 从用户态拷贝 fdset。
+// 执行时通过当前用户页表读取整个 FdSet，复制到内核栈上的临时集合。
 fn copy_fdset(dst: &mut FdSet, src_ptr: *const u8) {
     let token = current_user_token();
     let src: &FdSet = translated_ref(token, src_ptr as *const FdSet);
     *dst = *src;
 }
 
+// 把 fdset 写回用户态。
+// 执行时把内核计算出的 ready 集合整体写回用户提供的 fdset 地址。
 fn write_fdset(dst_ptr: *mut u8, src: &FdSet) {
     let token = current_user_token();
     *translated_refmut(token, dst_ptr as *mut FdSet) = *src;
 }
 
+// 系统调用入口：等待 fd 集合事件，并可临时替换信号屏蔽字。
+// 执行时拷入 read/write/except 三个 fdset，循环调用 File::poll，超时或有事件时把结果集合写回。
 pub fn sys_pselect6(
     nfds: usize,
     readfds: *mut u8,
@@ -2216,6 +2413,8 @@ pub fn sys_pselect6(
     }
 }
 
+// 系统调用入口：处理 futex wait/wake 的常用路径。
+// 执行时 WAIT 会先比较用户地址的当前值，匹配才阻塞；WAKE 从等待队列唤醒同地址任务。
 pub fn sys_futex(
     uaddr: *mut u32,
     futex_op: usize,
@@ -2243,6 +2442,8 @@ pub fn sys_futex(
     }
 }
 
+// 从阻塞队列唤醒等待同一 futex 地址的任务。
+// 执行时从阻塞队列挑出地址匹配的任务，最多唤醒 max_wake 个，并重新加入就绪队列。
 fn wake_futex_tasks(addr: usize, max_wake: usize) -> isize {
     let mut to_wake = Vec::new();
     {
@@ -2271,6 +2472,8 @@ fn wake_futex_tasks(addr: usize, max_wake: usize) -> isize {
     count as isize
 }
 
+// 系统调用入口：接收 madvise 建议，当前兼容忽略。
+// 执行时不改变页表或缓存策略，只把建议视为已接受。
 pub fn sys_madvise(_start: usize, _len: usize, _advice: usize) -> isize {
     0
 }
@@ -2286,6 +2489,8 @@ struct ITimerVal {
     it_value: TimeVal,
 }
 
+// 系统调用入口：读取 interval timer。
+// 执行时只支持 ITIMER_REAL，按当前时间计算剩余时间并写回 itimerval。
 pub fn sys_getitimer(which: usize, curr_value_ptr: *mut u8) -> isize {
     if which != ITIMER_REAL {
         return -22;
@@ -2335,6 +2540,8 @@ pub fn sys_getitimer(which: usize, curr_value_ptr: *mut u8) -> isize {
     0
 }
 
+// 系统调用入口：设置 interval timer。
+// 执行时可选写回旧定时器，再把新 it_value 转成到期时间，it_interval 保存为周期微秒数。
 pub fn sys_setitimer(which: usize, new_value: *const u8, old_value: *mut u8) -> isize {
     if which > ITIMER_PROF {
         return -22;
@@ -2394,6 +2601,8 @@ pub fn sys_setitimer(which: usize, new_value: *const u8, old_value: *mut u8) -> 
     0
 }
 
+// 系统调用入口：读取指定时钟的当前时间。
+// 执行时支持 realtime 和 monotonic，两者都使用单调用户时间并写成 timespec。
 pub fn sys_clock_gettime(clk_id: usize, ts: *mut u8) -> isize {
     const CLOCK_REALTIME: usize = 0;
     const CLOCK_MONOTONIC: usize = 1;
@@ -2420,10 +2629,14 @@ pub fn sys_clock_gettime(clk_id: usize, ts: *mut u8) -> isize {
     0
 }
 
+// 系统调用入口：按指定时钟睡眠，当前复用 nanosleep。
+// 执行时暂不区分 clock id 和绝对时间标志，直接转到 nanosleep 的相对睡眠实现。
 pub fn sys_clock_nanosleep(_clk_id: usize, _flags: usize, req: usize, rem: usize) -> isize {
     sys_nanosleep(req, rem)
 }
 
+// 系统调用入口：按 iovec 顺序读取到多个缓冲区。
+// 执行时逐项读取 iovec，把每段用户缓冲区交给 File::read，短读后立即停止累计。
 pub fn sys_readv(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
     use crate::mm::translated_ref;
     let token = current_user_token();
@@ -2456,6 +2669,8 @@ pub fn sys_readv(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
     total
 }
 
+// 系统调用入口：按 iovec 顺序从多个缓冲区写出。
+// 执行时逐项读取 iovec，把每段用户缓冲区交给 File::write，短写后立即停止累计。
 pub fn sys_writev(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
     use crate::mm::translated_ref;
     let token = current_user_token();
@@ -2488,6 +2703,8 @@ pub fn sys_writev(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
     total
 }
 
+// 系统调用入口：在两个 fd 之间搬运文件数据。
+// 执行时可选临时设置输入 offset，循环用 4KB 缓冲读入再写出，完成后恢复输入文件原 offset。
 pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset_ptr: *mut usize, count: usize) -> isize {
     let token = current_user_token();
     let task = current_task().unwrap();
@@ -2543,6 +2760,8 @@ pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset_ptr: *mut usize, count: 
     total
 }
 
+// 系统调用入口：写回资源使用统计。
+// 执行时刷新当前任务时间，根据 SELF/CHILDREN 选择自身或子进程累计时间，再写入 rusage。
 pub fn sys_getrusage(who: usize, usage: *mut u8) -> isize {
     const RUSAGE_SELF: usize = 0;
     const RUSAGE_CHILDREN: usize = usize::MAX;

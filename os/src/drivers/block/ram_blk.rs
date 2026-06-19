@@ -1,3 +1,4 @@
+// 这里负责操作系统的块设备驱动：实现 x86_64 本地测试用的内嵌 ramdisk 块设备。
 use core::{
     arch::global_asm,
     ptr::{slice_from_raw_parts, slice_from_raw_parts_mut},
@@ -15,6 +16,8 @@ pub struct RamDiskBlock {
 }
 
 impl BlockDevice for RamDiskBlock {
+    // 从内嵌 ramdisk 读取一个 512 字节扇区。
+    // 执行时先检查缓冲区大小和扇区范围，再从 ramdisk 对应地址复制数据到 buf。
     fn read_block(&self, sector_offset: usize, buf: &mut [u8]) {
         assert!(buf.len() == 0x200, "block size is not 0x200");
         let rlen = buf.len();
@@ -30,6 +33,8 @@ impl BlockDevice for RamDiskBlock {
         }
     }
 
+    // 写回内嵌 ramdisk 的指定扇区。
+    // 执行时先检查写入范围没有越过镜像末尾，再把 buf 复制到 ramdisk 对应地址。
     fn write_block(&self, sector_offset: usize, buf: &[u8]) {
         let wlen = buf.len();
         if (sector_offset * 0x200 + wlen) >= self.size {
@@ -40,20 +45,26 @@ impl BlockDevice for RamDiskBlock {
                 .as_mut()
                 .expect("can't deref ptr in the ramdisk")
                 .copy_from_slice(buf);
-            // let dest = (self.start as *mut [u8; 512]).add(sector_offset);
-            // dest.as_mut().unwrap().copy_from_slice(buf);
         }
     }
 
+    // ramdisk 容量就是链接进来的镜像大小。
+    // 执行时直接把构造时保存的 size 转成 u64，作为块设备容量返回。
     fn capacity_bytes(&self) -> Option<u64> {
         Some(self.size as u64)
     }
 }
 
 impl RamDiskBlock {
+    // 从链接脚本暴露的 ramdisk_start/end 构造 ramdisk 设备。
+    // 执行时读取两个链接符号的地址，计算镜像大小，确认非空后保存到 RamDiskBlock。
     pub fn new() -> Self {
         extern "C" {
+            // 链接进来的 ramdisk 起始符号。
+            // 执行时不会真正调用它，只把函数符号地址当作 ramdisk 起点使用。
             fn ramdisk_start();
+            // 链接进来的 ramdisk 结束符号。
+            // 执行时不会真正调用它，只把函数符号地址当作 ramdisk 终点使用。
             fn ramdisk_end();
         }
         info!(

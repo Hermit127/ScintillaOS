@@ -1,3 +1,4 @@
+// 这里负责操作系统的文件管理：定义文件系统模块的公共类型、File trait 和子模块导出。
 pub mod block_device_stream;
 pub mod inode;
 mod pipe;
@@ -32,6 +33,8 @@ pub struct Kstat {
 }
 
 impl Kstat {
+    // 构造一份最小可用的 stat，调用者再按具体文件类型补字段。
+    // 执行时把传入的 st_mode 写入结构体，其余字段按 Linux stat 的安全默认值初始化。
     pub const fn new(st_mode: u32) -> Self {
         Self {
             st_dev: 0,
@@ -63,32 +66,58 @@ pub const S_IFDIR: u32 = 0o040000;
 pub const S_IFREG: u32 = 0o100000;
 
 pub trait File: Send + Sync {
+    // 这个 fd 是否支持读取。
+    // 执行时由具体文件对象返回自己的读权限，不要求访问底层文件内容。
     fn readable(&self) -> bool;
+    // 这个 fd 是否支持写入。
+    // 执行时由具体文件对象返回自己的写权限，不修改任何文件状态。
     fn writable(&self) -> bool;
+    // 从当前对象读取数据，具体 offset 语义由实现决定。
+    // 执行时由具体实现决定从哪里取数据，并按约定返回实际读取字节数或错误码。
     fn read(&self, buf: &mut [u8]) -> isize;
+    // 默认的定点读取：先 seek，再走普通 read。
+    // 执行时先调用 seek 把对象位置移到 offset，再调用 read 完成读取。
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> isize {
         self.seek(offset);
         self.read(buf)
     }
+    // 向当前对象写入数据，具体 offset 语义由实现决定。
+    // 执行时由具体实现决定把数据写到哪里，并按约定返回实际写入字节数或错误码。
     fn write(&self, buf: &mut [u8]) -> isize;
+    // 默认的定点写入：先 seek，再走普通 write。
+    // 执行时先调用 seek 把对象位置移到 offset，再调用 write 完成写入。
     fn write_at(&self, offset: usize, buf: &mut [u8]) -> isize {
         self.seek(offset);
         self.write(buf)
     }
+    // 返回 Linux stat 兼容的信息。
+    // 执行时由具体实现把对象状态转换成 Kstat，供 fstat/stat 系统调用写回用户态。
     fn stat(&self) -> Kstat;
+    // 默认不是目录，目录类文件自己覆盖。
+    // 执行时默认直接返回 false，目录文件需要覆盖这个方法。
     fn is_dir(&self) -> bool {
         false
     }
+    // 默认没有稳定路径，普通 inode 会返回 VFS 路径。
+    // 执行时默认返回 None，只有能对应到 VFS 路径的文件对象才需要覆盖。
     fn path(&self) -> Option<String> {
         None
     }
+    // 默认不支持读目录项。
+    // 执行时默认返回 -1 表示不支持 getdents64，目录对象需要自己实现。
     fn getdents64(&self, _buf: &mut [u8]) -> isize {
         -1
     }
+    // 默认 seek 什么也不做，只有有 offset 的文件需要实现。
+    // 执行时默认忽略 offset，不维护位置的设备文件可以直接沿用这个实现。
     fn seek(&self, _offset: usize) {}
+    // 默认 offset 为 0，给不关心偏移的设备文件使用。
+    // 执行时默认返回 0，表示这个文件对象没有独立维护当前位置。
     fn get_offset(&self) -> usize {
         0
     }
+    // 根据读写能力拼出用户态能看到的基本 open flags。
+    // 执行时根据当前打开状态重新拼出用户态可见的 flag 位，最后返回给 fcntl 等调用。
     fn get_flags(&self) -> usize {
         let mut flags = 0usize;
         if self.readable() && self.writable() {
@@ -98,14 +127,24 @@ pub trait File: Send + Sync {
         }
         0x8000 | flags
     }
+    // 默认不允许修改打开标志。
+    // 执行时默认忽略传入 flags 并返回 false，表示这个对象不支持动态修改标志。
     fn set_flags(&self, _flags: usize) -> bool {
         false
     }
+    // 默认认为普通文件总是可读可写且无异常。
+    // 执行时直接返回可读、可写、无挂断，特殊文件或 socket 可以覆盖成真实状态。
     fn poll(&self) -> (bool, bool, bool) {
         (true, true, false)
     }
+    // fd 复制时的引用钩子，普通文件不需要额外动作。
+    // 执行时默认什么都不做，只有管道或 socket 这类需要计数的对象才覆盖。
     fn dup_ref(&self) {}
+    // fd 关闭时的引用钩子，普通文件不需要额外动作。
+    // 执行时默认什么都不做，具体对象可以在这里减少引用或唤醒等待者。
     fn close_ref(&self) {}
+    // 给上层做 downcast 用。
+    // 执行时直接把当前对象转成 Any trait 引用，方便文件描述符层做具体类型判断。
     fn as_any(&self) -> &dyn core::any::Any;
 }
 
