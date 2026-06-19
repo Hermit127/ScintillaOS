@@ -6,6 +6,7 @@ use smoltcp::socket::udp::PacketMetadata as UdpPacketMetadata;
 use smoltcp::socket::udp::Socket as UdpSocket;
 use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
 
+use crate::fs::stdio::stdout_release_if_owner;
 use crate::mm::{translated_ref, translated_refmut};
 use crate::net::socket::{SocketFile, SocketType};
 use crate::sync::UPSafeCell;
@@ -43,6 +44,7 @@ const TCP_NODELAY: usize = 1;
 const SHUT_RD: usize = 0;
 const SHUT_WR: usize = 1;
 const SHUT_RDWR: usize = 2;
+const LOCAL_TCP_BUFFER_LIMIT: usize = 256 * 1024;
 static NEXT_EPHEMERAL_PORT: AtomicU16 = AtomicU16::new(49152);
 
 #[derive(Clone)]
@@ -52,9 +54,27 @@ struct LocalUdpPacket {
     data: Vec<u8>,
 }
 
+struct LocalTcpConn {
+    client_to_server: VecDeque<u8>,
+    server_to_client: VecDeque<u8>,
+    client_endpoint: IpEndpoint,
+    server_endpoint: IpEndpoint,
+    client_closed: bool,
+    server_closed: bool,
+}
+
+struct LocalTcpListener {
+    port: u16,
+    pending: VecDeque<usize>,
+}
+
 lazy_static! {
     static ref LOCAL_UDP_QUEUE: UPSafeCell<VecDeque<LocalUdpPacket>> =
         unsafe { UPSafeCell::new(VecDeque::new()) };
+    static ref LOCAL_TCP_CONNS: UPSafeCell<Vec<Option<LocalTcpConn>>> =
+        unsafe { UPSafeCell::new(Vec::new()) };
+    static ref LOCAL_TCP_LISTENERS: UPSafeCell<Vec<LocalTcpListener>> =
+        unsafe { UPSafeCell::new(Vec::new()) };
 }
 
 fn net_ready() -> bool {
@@ -239,6 +259,17 @@ fn get_socket_local_endpoint(sockfd: usize) -> Option<IpEndpoint> {
     sock.get_local_endpoint()
 }
 
+fn get_socket_peer_endpoint(sockfd: usize) -> Option<IpEndpoint> {
+    let task = current_task()?;
+    let inner = task.inner_exclusive_access();
+    if sockfd >= inner.fd_table.len() {
+        return None;
+    }
+    let file = inner.fd_table[sockfd].as_ref()?;
+    let sock = file.as_any().downcast_ref::<SocketFile>()?;
+    sock.get_peer_endpoint()
+}
+
 fn is_local_ipv4(addr: IpAddress) -> bool {
     let IpAddress::Ipv4(ipv4) = addr;
     ipv4.0[0] == 127 || ipv4.0 == [0, 0, 0, 0] || ipv4.0 == [10, 0, 2, 15]
@@ -272,6 +303,270 @@ fn smoltcp_udp_endpoint(handle: SocketHandle) -> Option<IpEndpoint> {
         }
     })
     .flatten()
+}
+
+fn local_tcp_listener_index(port: u16) -> Option<usize> {
+    let listeners = LOCAL_TCP_LISTENERS.exclusive_access();
+    listeners.iter().position(|listener| listener.port == port)
+}
+
+fn local_tcp_endpoint(addr: IpEndpoint) -> bool {
+    is_local_ipv4(addr.addr)
+}
+
+fn set_socket_local_tcp(sockfd: usize, conn_id: usize, server_side: bool) -> bool {
+    let Some(task) = current_task() else {
+        return false;
+    };
+    let inner = task.inner_exclusive_access();
+    if sockfd >= inner.fd_table.len() {
+        return false;
+    }
+    let Some(file) = &inner.fd_table[sockfd] else {
+        return false;
+    };
+    let Some(sock) = file.as_any().downcast_ref::<SocketFile>() else {
+        return false;
+    };
+    sock.set_local_tcp(conn_id, server_side);
+    true
+}
+
+fn socket_local_tcp(sockfd: usize) -> Option<(usize, bool, bool)> {
+    let task = current_task()?;
+    let inner = task.inner_exclusive_access();
+    if sockfd >= inner.fd_table.len() {
+        return None;
+    }
+    let file = inner.fd_table[sockfd].as_ref()?;
+    let sock = file.as_any().downcast_ref::<SocketFile>()?;
+    let (conn_id, server_side) = sock.get_local_tcp()?;
+    Some((conn_id, server_side, sock.get_nonblock()))
+}
+
+pub(crate) fn local_tcp_listen(port: u16) {
+    let mut listeners = LOCAL_TCP_LISTENERS.exclusive_access();
+    if listeners.iter().all(|listener| listener.port != port) {
+        listeners.push(LocalTcpListener {
+            port,
+            pending: VecDeque::new(),
+        });
+    }
+}
+
+pub(crate) fn local_tcp_unlisten(port: u16) {
+    let mut listeners = LOCAL_TCP_LISTENERS.exclusive_access();
+    listeners.retain(|listener| listener.port != port);
+}
+
+pub(crate) fn local_tcp_pending_on(port: u16) -> bool {
+    let listeners = LOCAL_TCP_LISTENERS.exclusive_access();
+    listeners
+        .iter()
+        .find(|listener| listener.port == port)
+        .map(|listener| !listener.pending.is_empty())
+        .unwrap_or(false)
+}
+
+fn local_tcp_connect(port: u16, client_endpoint: IpEndpoint, server_endpoint: IpEndpoint) -> Option<usize> {
+    let listener_idx = local_tcp_listener_index(port)?;
+    let conn_id = {
+        let mut conns = LOCAL_TCP_CONNS.exclusive_access();
+        let conn = LocalTcpConn {
+            client_to_server: VecDeque::new(),
+            server_to_client: VecDeque::new(),
+            client_endpoint,
+            server_endpoint,
+            client_closed: false,
+            server_closed: false,
+        };
+        if let Some(idx) = conns.iter().position(|slot| slot.is_none()) {
+            conns[idx] = Some(conn);
+            idx
+        } else {
+            conns.push(Some(conn));
+            conns.len() - 1
+        }
+    };
+    let mut listeners = LOCAL_TCP_LISTENERS.exclusive_access();
+    if let Some(listener) = listeners.get_mut(listener_idx) {
+        listener.pending.push_back(conn_id);
+        Some(conn_id)
+    } else {
+        None
+    }
+}
+
+fn local_tcp_accept(port: u16) -> Option<usize> {
+    let mut listeners = LOCAL_TCP_LISTENERS.exclusive_access();
+    listeners
+        .iter_mut()
+        .find(|listener| listener.port == port)
+        .and_then(|listener| listener.pending.pop_front())
+}
+
+fn local_tcp_client_endpoint(conn_id: usize) -> Option<IpEndpoint> {
+    let conns = LOCAL_TCP_CONNS.exclusive_access();
+    conns
+        .get(conn_id)
+        .and_then(|slot| slot.as_ref())
+        .map(|conn| conn.client_endpoint)
+}
+
+fn local_tcp_server_endpoint(conn_id: usize) -> Option<IpEndpoint> {
+    let conns = LOCAL_TCP_CONNS.exclusive_access();
+    conns
+        .get(conn_id)
+        .and_then(|slot| slot.as_ref())
+        .map(|conn| conn.server_endpoint)
+}
+
+pub(crate) fn local_tcp_send(
+    conn_id: usize,
+    server_side: bool,
+    nonblock: bool,
+    data: &[u8],
+) -> isize {
+    if data.is_empty() {
+        return 0;
+    }
+    let mut offset = 0usize;
+    loop {
+        let ret = {
+            let mut conns = LOCAL_TCP_CONNS.exclusive_access();
+            let Some(Some(conn)) = conns.get_mut(conn_id) else {
+                return -32;
+            };
+            if (server_side && conn.client_closed) || (!server_side && conn.server_closed) {
+                return -32;
+            }
+            let dst = if server_side {
+                &mut conn.server_to_client
+            } else {
+                &mut conn.client_to_server
+            };
+            let room = LOCAL_TCP_BUFFER_LIMIT.saturating_sub(dst.len());
+            if room == 0 {
+                -11
+            } else {
+                let n = room.min(data.len() - offset);
+                for byte in &data[offset..offset + n] {
+                    dst.push_back(*byte);
+                }
+                n as isize
+            }
+        };
+        if ret > 0 {
+            offset += ret as usize;
+            if offset == data.len() || nonblock {
+                return offset as isize;
+            }
+        } else if nonblock {
+            return if offset > 0 { offset as isize } else { -11 };
+        } else {
+            stdout_release_if_owner();
+            suspend_current_and_run_next();
+        }
+    }
+}
+
+pub(crate) fn local_tcp_recv(
+    conn_id: usize,
+    server_side: bool,
+    nonblock: bool,
+    peek: bool,
+    buf: &mut [u8],
+) -> isize {
+    if buf.is_empty() {
+        return 0;
+    }
+    loop {
+        let ret = {
+            let mut conns = LOCAL_TCP_CONNS.exclusive_access();
+            let Some(Some(conn)) = conns.get_mut(conn_id) else {
+                return 0;
+            };
+            let (src, peer_closed) = if server_side {
+                (&mut conn.client_to_server, conn.client_closed)
+            } else {
+                (&mut conn.server_to_client, conn.server_closed)
+            };
+            let n = buf.len().min(src.len());
+            if peek {
+                for (out, byte) in buf.iter_mut().zip(src.iter()).take(n) {
+                    *out = *byte;
+                }
+            } else {
+                for out in buf.iter_mut().take(n) {
+                    *out = src.pop_front().unwrap();
+                }
+            }
+            if n > 0 {
+                n as isize
+            } else if peer_closed {
+                0
+            } else {
+                -11
+            }
+        };
+        if ret != -11 || nonblock {
+            return ret;
+        }
+        stdout_release_if_owner();
+        suspend_current_and_run_next();
+    }
+}
+
+pub(crate) fn local_tcp_close(conn_id: usize, server_side: bool) {
+    let mut conns = LOCAL_TCP_CONNS.exclusive_access();
+    let Some(Some(conn)) = conns.get_mut(conn_id) else {
+        return;
+    };
+    if server_side {
+        conn.server_closed = true;
+    } else {
+        conn.client_closed = true;
+    }
+    if conn.server_closed && conn.client_closed {
+        conns[conn_id] = None;
+    }
+}
+
+pub(crate) fn local_tcp_shutdown(conn_id: usize, server_side: bool, how: usize) -> isize {
+    match how {
+        SHUT_RD | SHUT_WR | SHUT_RDWR => {
+            local_tcp_close(conn_id, server_side);
+            0
+        }
+        _ => -22,
+    }
+}
+
+pub(crate) fn local_tcp_poll(conn_id: usize, server_side: bool) -> (bool, bool, bool) {
+    let conns = LOCAL_TCP_CONNS.exclusive_access();
+    let Some(Some(conn)) = conns.get(conn_id) else {
+        return (true, false, true);
+    };
+    let (recv, send_room, peer_closed, self_closed) = if server_side {
+        (
+            !conn.client_to_server.is_empty(),
+            conn.server_to_client.len() < LOCAL_TCP_BUFFER_LIMIT,
+            conn.client_closed,
+            conn.server_closed,
+        )
+    } else {
+        (
+            !conn.server_to_client.is_empty(),
+            conn.client_to_server.len() < LOCAL_TCP_BUFFER_LIMIT,
+            conn.server_closed,
+            conn.client_closed,
+        )
+    };
+    (
+        recv || peer_closed,
+        send_room && !peer_closed && !self_closed,
+        self_closed,
+    )
 }
 
 fn ensure_udp_local_endpoint(sockfd: usize, handle: SocketHandle, dest: IpEndpoint) -> IpEndpoint {
@@ -481,6 +776,9 @@ pub fn sys_bind(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
             endpoint.addr
         };
         set_socket_local_endpoint(sockfd, IpEndpoint::new(local_addr, port));
+        if st == SocketType::Tcp {
+            local_tcp_listen(port);
+        }
     }
     ret
 }
@@ -523,6 +821,36 @@ pub fn sys_connect(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
 
     if st != SocketType::Tcp {
         return -95;
+    }
+
+    if local_tcp_endpoint(remote) {
+        let local = source_addr_for_dest(
+            IpEndpoint::new(
+                IpAddress::Ipv4(Ipv4Address::UNSPECIFIED),
+                next_ephemeral_port(),
+            ),
+            remote,
+        );
+        let server = source_addr_for_dest(
+            IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED), port),
+            remote,
+        );
+        if let Some(conn_id) = local_tcp_connect(port, local, server) {
+            set_socket_local_tcp(sockfd, conn_id, false);
+            set_socket_local_endpoint(sockfd, local);
+            if let Some(task) = current_task() {
+                let inner = task.inner_exclusive_access();
+                if sockfd < inner.fd_table.len() {
+                    if let Some(file) = &inner.fd_table[sockfd] {
+                        if let Some(sock) = file.as_any().downcast_ref::<SocketFile>() {
+                            sock.set_peer_endpoint(remote);
+                        }
+                    }
+                }
+            }
+            return 0;
+        }
+        return -111;
     }
 
     let local = IpListenEndpoint {
@@ -599,6 +927,9 @@ pub fn sys_listen(sockfd: usize, _backlog: usize) -> isize {
     if !listening {
         return -22;
     }
+    if let Some(local) = get_socket_local_endpoint(sockfd) {
+        local_tcp_listen(local.port);
+    }
     0
 }
 
@@ -624,7 +955,40 @@ pub fn sys_accept(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
     }
     let handle = sock.get_handle();
     let nonblock = sock.get_nonblock();
+    let local_port = sock.get_local_endpoint().map(|ep| ep.port);
     drop(inner);
+
+    if let Some(port) = local_port {
+        loop {
+            if let Some(conn_id) = local_tcp_accept(port) {
+                let (new_handle, _) = match add_to_socket_set(SocketType::Tcp) {
+                    Some(v) => v,
+                    None => return -105,
+                };
+                let task = current_task().unwrap();
+                let mut inner = task.inner_exclusive_access();
+                let new_fd = inner.alloc_fd();
+                if new_fd >= inner.fd_table.len() {
+                    return -24;
+                }
+                let new_sock = Arc::new(SocketFile::new(new_handle, SocketType::Tcp, nonblock));
+                new_sock.set_local_tcp(conn_id, true);
+                if let Some(local) = local_tcp_server_endpoint(conn_id) {
+                    new_sock.set_local_endpoint(local);
+                }
+                if let Some(peer) = local_tcp_client_endpoint(conn_id) {
+                    new_sock.set_peer_endpoint(peer);
+                }
+                inner.fd_table[new_fd] = Some(new_sock);
+                return new_fd as isize;
+            }
+            if nonblock {
+                return -11;
+            }
+            stdout_release_if_owner();
+            suspend_current_and_run_next();
+        }
+    }
 
     crate::net::net_poll();
 
@@ -762,7 +1126,13 @@ pub fn sys_sendto(
     let data = unsafe { core::slice::from_raw_parts(buf, len) };
 
     match st {
-        SocketType::Tcp => tcp_send(handle, dontwait, data),
+        SocketType::Tcp => {
+            if let Some((conn_id, server_side, _)) = socket_local_tcp(sockfd) {
+                local_tcp_send(conn_id, server_side, dontwait, data)
+            } else {
+                tcp_send(handle, dontwait, data)
+            }
+        }
         SocketType::Udp => {
             let (ip, port) = match parse_sockaddr_in(dest_addr) {
                 Some(v) => v,
@@ -802,7 +1172,13 @@ pub fn sys_recvfrom(
     let recv_buf = unsafe { core::slice::from_raw_parts_mut(buf, len) };
 
     let result = match st {
-        SocketType::Tcp => tcp_recv(handle, dontwait, recv_buf),
+        SocketType::Tcp => {
+            if let Some((conn_id, server_side, _)) = socket_local_tcp(sockfd) {
+                local_tcp_recv(conn_id, server_side, dontwait, peek, recv_buf)
+            } else {
+                tcp_recv(handle, dontwait, recv_buf)
+            }
+        }
         SocketType::Udp => loop {
             if let Some(ret) = try_recv_local_udp(sockfd, handle, recv_buf, src_addr, addrlen, peek)
             {
@@ -865,7 +1241,13 @@ pub fn sys_sendmsg(sockfd: usize, msg: *const u8, flags: usize) -> isize {
     let copied = copy_from_iov(&mut buf, iov, iovcnt);
 
     match st {
-        SocketType::Tcp => tcp_send(handle, dontwait, &buf[..copied]),
+        SocketType::Tcp => {
+            if let Some((conn_id, server_side, _)) = socket_local_tcp(sockfd) {
+                local_tcp_send(conn_id, server_side, dontwait, &buf[..copied])
+            } else {
+                tcp_send(handle, dontwait, &buf[..copied])
+            }
+        }
         SocketType::Udp => {
             let dest = if !msghdr.msg_name.is_null() && msghdr.msg_namelen as usize >= 8 {
                 match parse_sockaddr_in(msghdr.msg_name) {
@@ -913,7 +1295,13 @@ pub fn sys_recvmsg(sockfd: usize, msg: *mut u8, flags: usize) -> isize {
     let mut buf = alloc::vec![0u8; total.min(SOCKET_BUFFER_SIZE)];
 
     let result = match st {
-        SocketType::Tcp => tcp_recv(handle, dontwait, &mut buf),
+        SocketType::Tcp => {
+            if let Some((conn_id, server_side, _)) = socket_local_tcp(sockfd) {
+                local_tcp_recv(conn_id, server_side, dontwait, peek, &mut buf)
+            } else {
+                tcp_recv(handle, dontwait, &mut buf)
+            }
+        }
         SocketType::Udp => udp_recv(handle, dontwait, &mut buf),
     };
 
@@ -1097,6 +1485,10 @@ pub fn sys_sock_shutdown(sockfd: usize, how: usize) -> isize {
         return -95;
     }
 
+    if let Some((conn_id, server_side, _)) = socket_local_tcp(sockfd) {
+        return local_tcp_shutdown(conn_id, server_side, how);
+    }
+
     crate::net::with_net_iface(|iface| {
         let sock: &mut TcpSocket = iface.sockets.get_mut(handle);
         match how {
@@ -1128,7 +1520,8 @@ pub fn sys_getpeername(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isi
             let sock: &TcpSocket = iface.sockets.get(handle);
             sock.remote_endpoint()
         })
-        .flatten(),
+        .flatten()
+        .or_else(|| get_socket_peer_endpoint(sockfd)),
         SocketType::Udp => crate::net::with_net_iface(|iface| {
             let sock: &UdpSocket = iface.sockets.get(handle);
             sock.endpoint()

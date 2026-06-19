@@ -1513,6 +1513,8 @@ pub fn sys_ppoll(
         drop(task);
 
         if ready > 0 {
+            stdout_release_if_owner();
+            suspend_current_and_run_next();
             return ready as isize;
         }
 
@@ -2350,6 +2352,8 @@ pub fn sys_pselect6(
             if !exceptfds.is_null() {
                 write_fdset(exceptfds, &efds);
             }
+            stdout_release_if_owner();
+            suspend_current_and_run_next();
             return ready as isize;
         }
 
@@ -2590,6 +2594,9 @@ pub fn sys_readv(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
         let file = inner.fd_table[fd].as_ref().unwrap().clone();
         drop(inner);
         let n = file.read(buf);
+        if n < 0 {
+            return if total > 0 { total } else { n };
+        }
         total += n as isize;
         if (n as usize) < iov.iov_len {
             break;
@@ -2622,6 +2629,9 @@ pub fn sys_writev(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
         let file = inner.fd_table[fd].as_ref().unwrap().clone();
         drop(inner);
         let n = file.write(buf);
+        if n < 0 {
+            return if total > 0 { total } else { n };
+        }
         total += n as isize;
         if (n as usize) < iov.iov_len {
             break;

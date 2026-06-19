@@ -19,6 +19,7 @@ pub struct SocketFile {
     pub nonblock: AtomicBool,
     pub peer_endpoint: UPSafeCell<Option<IpEndpoint>>,
     pub local_endpoint: UPSafeCell<Option<IpEndpoint>>,
+    pub local_tcp: UPSafeCell<Option<(usize, bool)>>,
     pub was_listening: AtomicBool,
 }
 
@@ -30,6 +31,7 @@ impl SocketFile {
             nonblock: AtomicBool::new(nonblock),
             peer_endpoint: unsafe { UPSafeCell::new(None) },
             local_endpoint: unsafe { UPSafeCell::new(None) },
+            local_tcp: unsafe { UPSafeCell::new(None) },
             was_listening: AtomicBool::new(false),
         }
     }
@@ -61,6 +63,14 @@ impl SocketFile {
     pub fn set_local_endpoint(&self, ep: IpEndpoint) {
         *self.local_endpoint.exclusive_access() = Some(ep);
     }
+
+    pub fn get_local_tcp(&self) -> Option<(usize, bool)> {
+        *self.local_tcp.exclusive_access()
+    }
+
+    pub fn set_local_tcp(&self, conn_id: usize, server_side: bool) {
+        *self.local_tcp.exclusive_access() = Some((conn_id, server_side));
+    }
 }
 
 impl File for SocketFile {
@@ -73,6 +83,15 @@ impl File for SocketFile {
     }
 
     fn read(&self, buf: &mut [u8]) -> isize {
+        if let Some((conn_id, server_side)) = self.get_local_tcp() {
+            return super::syscall::local_tcp_recv(
+                conn_id,
+                server_side,
+                self.get_nonblock(),
+                false,
+                buf,
+            );
+        }
         let nonblock = self.get_nonblock();
         let handle = self.get_handle();
         match self.socket_type {
@@ -82,6 +101,9 @@ impl File for SocketFile {
     }
 
     fn write(&self, buf: &mut [u8]) -> isize {
+        if let Some((conn_id, server_side)) = self.get_local_tcp() {
+            return super::syscall::local_tcp_send(conn_id, server_side, self.get_nonblock(), buf);
+        }
         let nonblock = self.get_nonblock();
         let handle = self.get_handle();
         let data: &[u8] = buf;
@@ -113,6 +135,16 @@ impl File for SocketFile {
     }
 
     fn poll(&self) -> (bool, bool, bool) {
+        if let Some((conn_id, server_side)) = self.get_local_tcp() {
+            return super::syscall::local_tcp_poll(conn_id, server_side);
+        }
+        if self.was_listening.load(Ordering::Relaxed) {
+            if let Some(local) = self.get_local_endpoint() {
+                if super::syscall::local_tcp_pending_on(local.port) {
+                    return (true, true, false);
+                }
+            }
+        }
         #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
         {
             use smoltcp::socket::tcp::Socket as TcpSocket;
@@ -140,6 +172,17 @@ impl File for SocketFile {
         #[cfg(not(any(target_arch = "riscv64", target_arch = "aarch64")))]
         {
             (false, false, false)
+        }
+    }
+
+    fn close_ref(&self) {
+        if let Some((conn_id, server_side)) = self.get_local_tcp() {
+            super::syscall::local_tcp_close(conn_id, server_side);
+        }
+        if self.was_listening.load(Ordering::Relaxed) {
+            if let Some(local) = self.get_local_endpoint() {
+                super::syscall::local_tcp_unlisten(local.port);
+            }
         }
     }
 
