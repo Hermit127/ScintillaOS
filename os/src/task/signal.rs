@@ -1,3 +1,4 @@
+// 这里负责操作系统的信号管理：定义内核内部使用的信号位图和致命信号检查。
 use bitflags::*;
 
 pub const MAX_SIG: usize = 63;
@@ -42,6 +43,8 @@ bitflags! {
 }
 
 impl SignalFlags {
+    // 检查当前待处理信号里有没有会导致进程异常退出的信号。
+    // 执行时按优先顺序检查常见致命信号，命中后返回对应退出码和调试说明。
     pub fn check_error(&self) -> Option<(i32, &'static str)> {
         if self.contains(Self::SIGINT) {
             Some((-2, "Killed, SIGINT=2"))
@@ -56,7 +59,6 @@ impl SignalFlags {
         } else if self.contains(Self::SIGSEGV) {
             Some((-11, "Segmentation Fault, SIGSEGV=11"))
         } else {
-            //println!("[K] signalflags check_error  {:?}", self);
             None
         }
     }

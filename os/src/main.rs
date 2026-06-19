@@ -2,6 +2,7 @@
 #![no_main]
 #![feature(alloc_error_handler)]
 
+// 这里负责操作系统的启动入口：初始化内存、文件系统、网络、任务和 trap 分发。
 use crate::{
     syscall::syscall,
     task::{
@@ -38,31 +39,29 @@ mod task;
 
 pub struct ArchInterfaceImpl;
 
-/// kernel interrupt
+// 用户态 trap 统一入口：处理系统调用、缺页、定时器和信号收尾。
 #[polyhal::arch_interrupt]
+// 执行时先保存用户浮点和时间，再按 trap 类型分发处理，最后统一处理信号并记录返回用户态前的时间。
 fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
     if let Some(task) = crate::task::current_task() {
         task.save_user_float_state();
     }
-    //user time accounting
+    // trap 进入内核后先把上一段用户态运行时间记到账上。
     if let Some(task) = crate::task::current_task() {
         task.record_time_user_to_kernel();
     }
-    // trace!("trap_type @ {:x?} {:#x?}", trap_type, ctx);
     match trap_type {
         Breakpoint => return,
         SysCall => {
-            // jump to next instruction anyway
+            // 系统调用返回后要跳过 ecall 指令，避免回到用户态后重复触发。
             ctx.syscall_ok();
             let args = ctx.args();
-            // get system call return value
-            // info!("syscall: {}", ctx[TrapFrameArgs::SYSCALL]);
 
             let result = syscall(
                 ctx[TrapFrameArgs::SYSCALL],
                 [args[0], args[1], args[2], args[3], args[4], args[5]],
             );
-            // cx is changed during sys_exec, so we have to call it again
+            // sys_exec 可能替换 trap 上下文，所以这里最后统一写回返回值。
             ctx[TrapFrameArgs::RET] = result as usize;
         }
         StorePageFault(bad_addr) => {
@@ -122,22 +121,23 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             warn!("unsuspended trap type: {:?}", trap_type);
         }
     }
-    // handle signals (handle the sent signal)
-    // println!("[K] trap_handler:: handle_signals");
+    // trap 收尾阶段处理待递送信号，必要时改写用户态返回现场。
     handle_signals();
 
-    // check error signals (if error then exit)
+    // fatal 信号在这里统一转成进程退出，避免回到用户态继续执行坏现场。
     if let Some((errno, msg)) = check_signals_error_of_current() {
         println!("[kernel] {}", msg);
         exit_current_and_run_next(errno);
     }
 
-    // kernel time accounting
+    // 回用户态前把这一段内核执行时间记到账上。
     if let Some(task) = crate::task::current_task() {
         task.record_time_kernel_to_user();
     }
 }
 
+// 检查当前任务的 interval timer，到期就投递 SIGALRM。
+// 执行时读取当前任务的 itimer_expire，到期后插入 SIGALRM，并按 interval 决定重装还是关闭定时器。
 fn check_itimer() {
     let Some(task) = current_task() else { return };
     let Some(mut inner) = task.try_inner_exclusive_access() else {
@@ -157,6 +157,8 @@ fn check_itimer() {
     }
 }
 
+// 内核主入口，只让 hart0 完成初始化并进入任务调度。
+// 执行时只允许 hart0 继续，随后初始化堆、日志、物理页、文件系统、网络和首个用户任务。
 fn main(hartid: usize) {
     trace!("ch7 main: hartid: {}", hartid);
     if hartid != 0 {
@@ -166,8 +168,6 @@ fn main(hartid: usize) {
     mm::init_heap();
     logging::init(option_env!("LOG"));
     println!("init logging");
-    // polyhal::init_interrupt(); done in polyhal::CPU::rust_main()
-
     polyhal::common::init(&PageAllocImpl);
     get_mem_areas().for_each(|(start, size)| {
         println!("init memory region {:#x} - {:#x}", start, start + size);
@@ -227,10 +227,16 @@ core::arch::global_asm!(
 
 #[cfg(target_arch = "loongarch64")]
 #[no_mangle]
+// LoongArch 的临时 Rust 入口，先补齐早期初始化再跳进通用 main。
+// 执行时先清零 bss，再初始化 DTB、percpu、FPU、polyhal 构造器和平台信息，最后进入通用 main。
 extern "C" fn loongarch64_rust_tmp_main(hart_id: usize) -> ! {
     unsafe {
         extern "C" {
+            // bss 段起始符号。
+            // 执行时不会真正调用它，只把符号地址当作 bss 清零起点。
             fn _sbss();
+            // bss 段结束符号。
+            // 执行时不会真正调用它，只把符号地址当作 bss 清零终点。
             fn _ebss();
         }
         core::ptr::write_bytes(_sbss as *mut u8, 0, _ebss as usize - _sbss as usize);
@@ -252,11 +258,15 @@ pub struct PageAllocImpl;
 
 impl PageAlloc for PageAllocImpl {
     #[inline]
+    // 给 polyhal 分配一页物理内存。
+    // 执行时调用内核持久页帧分配器，成功后把 PhysAddr 返回给 polyhal。
     fn alloc(&self) -> PhysAddr {
         mm::frame_alloc_persist().expect("can't find memory page")
     }
 
     #[inline]
+    // 把 polyhal 归还的物理页交回帧分配器。
+    // 执行时把 polyhal 给回来的物理地址直接交给 frame_dealloc。
     fn dealloc(&self, paddr: PhysAddr) {
         mm::frame_dealloc(paddr)
     }

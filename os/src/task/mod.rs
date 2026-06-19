@@ -1,3 +1,4 @@
+// 这里负责操作系统的进程管理和调度：汇总任务模块，并实现任务阻塞、唤醒、退出和信号递送的高层逻辑。
 mod action;
 mod fp;
 mod manager;
@@ -45,7 +46,7 @@ pub struct SleepTask {
 }
 
 lazy_static! {
-    // public sleep queue for timer interrupt handler to access
+    // 定时器中断会扫描这个睡眠队列。
     pub static ref SLEEP_QUEUE: UPSafeCell<Vec<SleepTask>> = unsafe {
         UPSafeCell::new_named(Vec::new(), "SleepQueue")
     };
@@ -57,31 +58,32 @@ pub static ref WAITPID_QUEUE: UPSafeCell<Vec<Arc<TaskControlBlock>>> = unsafe {
     };
 }
 
+// 当前任务主动让出 CPU，状态改回 Ready 后重新入队。
+// 执行时先记录当前任务状态和等待原因，再切回调度器，等条件满足后继续运行。
 pub fn suspend_current_and_run_next() {
-    //trace!("os::task::suspend_current_and_run_next");
-    // There must be an application running.
     let task = current_task().unwrap();
 
-    //added for kernel time accounting
+    // 任务离开 CPU 前先记录时间，后面重新调度回来再补恢复时间。
     task.record_time_suspend();
-    // ---- access current TCB exclusively
+    // 修改任务状态和上下文指针需要独占访问 TCB。
     let mut task_inner = task.inner_exclusive_access();
     let task_cx_ptr = &mut task_inner.task_cx as *mut KContext;
-    // Change status to Ready
+    // 主动让出 CPU 的任务仍然可运行，所以放回 Ready 队列。
     task_inner.task_status = TaskStatus::Ready;
     drop(task_inner);
-    // ---- release current PCB
 
-    // push back to ready queue BEFORE clearing processor
+    // 先入队再清空 processor.current，避免调度窗口里丢失当前任务。
     add_task(task.clone());
-    // now safe to clear processor (window from here to schedule is minimal)
+    // 当前 CPU 不再持有这个任务，后续从 idle 上下文重新选任务。
     take_current_task();
-    // jump to scheduling cycle
+    // 切到 idle 调度循环，等再次选中该任务时从这里继续。
     schedule(task_cx_ptr);
-    //added fot reset time accounting
+    // 任务重新运行后重置计时起点，避免把睡眠时间算进内核态。
     task.record_time_resume();
 }
 
+// 当前任务进入普通阻塞态，不重新放回就绪队列。
+// 执行时先记录当前任务状态和等待原因，再切回调度器，等条件满足后继续运行。
 pub fn sleep_current_and_run_next() {
     crate::fs::stdio::stdout_release_if_owner();
     let task = current_task().unwrap();
@@ -95,6 +97,8 @@ pub fn sleep_current_and_run_next() {
     task.record_time_resume();
 }
 
+// 当前任务按给定原因阻塞，并挂到统一阻塞队列里。
+// 执行时先记录当前任务状态和等待原因，再切回调度器，等条件满足后继续运行。
 pub fn block_current_and_run_next(block_reason: BlockReason) {
     static mut C: u64 = 0;
     crate::fs::stdio::stdout_release_if_owner();
@@ -115,6 +119,8 @@ pub fn block_current_and_run_next(block_reason: BlockReason) {
     task.record_time_resume();
 }
 
+// 唤醒所有等 poll/select 结果的任务。
+// 执行时先从等待队列里找满足条件的任务，再把它们改回 Ready，最后交给调度器运行。
 pub fn wake_poll_wait_tasks() {
     let mut to_wake = Vec::new();
     {
@@ -141,14 +147,20 @@ pub fn wake_poll_wait_tasks() {
     }
 }
 
+// 唤醒等待指定管道可读的任务。
+// 执行时先从等待队列里找满足条件的任务，再把它们改回 Ready，最后交给调度器运行。
 pub fn wake_pipe_read_tasks(pipe_id: usize) {
     wake_pipe_tasks(pipe_id, true);
 }
 
+// 唤醒等待指定管道可写的任务。
+// 执行时先从等待队列里找满足条件的任务，再把它们改回 Ready，最后交给调度器运行。
 pub fn wake_pipe_write_tasks(pipe_id: usize) {
     wake_pipe_tasks(pipe_id, false);
 }
 
+// 从阻塞队列里挑出同一根管道对应方向的等待者。
+// 执行时先从等待队列里找满足条件的任务，再把它们改回 Ready，最后交给调度器运行。
 fn wake_pipe_tasks(pipe_id: usize, read_waiters: bool) {
     let mut to_wake = Vec::new();
     {
@@ -179,6 +191,8 @@ fn wake_pipe_tasks(pipe_id: usize, read_waiters: bool) {
     }
 }
 
+// 把一个阻塞任务移出等待队列并放回就绪队列。
+// 执行时先从等待队列里找满足条件的任务，再把它们改回 Ready，最后交给调度器运行。
 pub fn wake_blocked_task(task: &Arc<TaskControlBlock>) {
     let pid = task.getpid();
     let removed = remove_task_from_block_queues(pid);
@@ -192,6 +206,8 @@ pub fn wake_blocked_task(task: &Arc<TaskControlBlock>) {
     }
 }
 
+// 子进程退出时给父进程投递 SIGCHLD，并唤醒可能阻塞的父进程。
+// 执行时先读取或更新任务信号状态，再决定是否改写用户上下文或唤醒任务。
 fn notify_parent_sigchld(parent: &Arc<TaskControlBlock>) {
     let should_wake = {
         let mut inner = parent.inner_exclusive_access();
@@ -207,6 +223,8 @@ fn notify_parent_sigchld(parent: &Arc<TaskControlBlock>) {
     }
 }
 
+// 从所有阻塞队列里移除指定 pid，返回是否真的删到了。
+// 执行时先记录当前任务状态和等待原因，再切回调度器，等条件满足后继续运行。
 fn remove_task_from_block_queues(pid: usize) -> bool {
     let mut removed = false;
     {
@@ -236,6 +254,8 @@ fn remove_task_from_block_queues(pid: usize) -> bool {
     removed
 }
 
+// 强制结束指定任务，清理资源并把孤儿子进程交给 initproc。
+// 执行时从阻塞队列和 pid 表移除目标，标记 Zombie，释放地址空间/fd，并唤醒等待它的父进程。
 pub fn force_exit_task(task: &Arc<TaskControlBlock>, exit_code: i32) {
     let pid = task.getpid();
     remove_task_from_block_queues(pid);
@@ -280,11 +300,12 @@ pub fn force_exit_task(task: &Arc<TaskControlBlock>, exit_code: i32) {
 
 pub const IDLE_PID: usize = 0;
 
-/// Exit the current 'Running' task and run the next task in task list.
+// 退出当前正在运行的任务，并切回调度循环。
+// 执行时把当前任务标记为 Zombie，清理资源，转交孤儿子进程，最后切回 idle 调度循环且不再返回。
 pub fn exit_current_and_run_next(exit_code: i32) -> ! {
     crate::fs::stdio::stdout_release_if_owner();
     trace!("os::task::exit_current_and_run_next");
-    // take from Processor
+    // 退出只能发生在当前运行任务上，先从 processor 拿到它。
     let task = current_task().unwrap();
 
     let pid = task.getpid();
@@ -296,26 +317,25 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
         shutdown();
     }
 
-    // remove from pid2task
+    // 退出后不能再通过 pid 查到这个 TCB。
     remove_from_pid2task(task.getpid());
     let (parent, orphan_children) = {
-        // **** access current TCB exclusively
+        // 退出路径要修改状态、子进程和资源表，因此需要独占 TCB。
         let mut inner = task.inner_exclusive_access();
-        // Change status to Zombie
+        // 标成 Zombie 后父进程 wait 才能回收退出码。
         inner.task_status = TaskStatus::Zombie;
-        // Record exit code
+        // exit_code 保存在 TCB 里，等待父进程 waitpid/write back。
         inner.exit_code = exit_code;
         let parent = inner.parent.as_ref().and_then(|w| w.upgrade());
         let orphan_children = core::mem::take(&mut inner.children);
-        // deallocate user space
+        // 用户地址空间不再运行，可以立即回收数据页。
         inner.memory_set.recycle_data_pages();
-        // drop file descriptors
+        // 关闭 fd 表会递减文件、管道和 socket 的引用计数。
         inner.clear_fd_table();
         (parent, orphan_children)
     };
-    // **** release current PCB before touching parent/initproc
 
-    // wake parent waiting in waitpid
+    // 父进程可能正在 waitpid 队列里睡眠，子进程退出后要把它叫醒。
     if let Some(parent) = parent {
         notify_parent_sigchld(&parent);
         let mut queue = WAITPID_QUEUE.exclusive_access();
@@ -329,7 +349,7 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
         }
     }
 
-    // ++++++ access initproc TCB exclusively
+    // 孤儿子进程交给 initproc 接管，保持进程树可回收。
     if !orphan_children.is_empty() {
         let mut initproc_inner = INITPROC.inner_exclusive_access();
         for child in orphan_children.iter() {
@@ -337,10 +357,8 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
             initproc_inner.children.push(child.clone());
         }
     }
-    // ++++++ release parent PCB
-    // drop task manually to maintain rc correctly
     drop(task);
-    // we do not have to save task context
+    // 当前任务不会再回来运行，直接切到 idle 调度循环。
     take_current_task();
     loop {
         let mut unused = KContext::blank();
@@ -361,11 +379,15 @@ static EMBEDDED_INITPROC: &[u8] =
 static EMBEDDED_INITPROC: &[u8] =
     include_bytes!("../../../target/loongarch64-unknown-none/release/initproc");
 
+// 把内嵌的 initproc 加入任务队列。
+// 执行时克隆全局 INITPROC 引用并加入就绪队列，启动第一个用户进程。
 pub fn add_initproc() {
     trace!("os::task::add_initproc");
     add_task(INITPROC.clone());
 }
 
+// 检查当前任务是否有需要立即报错退出的信号。
+// 执行时读取当前任务 pending 信号，并交给 SignalFlags::check_error 判断是否有致命信号。
 pub fn check_signals_error_of_current() -> Option<(i32, &'static str)> {
     trace!("os::task::check_signals_error_of_current");
     let task = current_task()?;
@@ -373,6 +395,8 @@ pub fn check_signals_error_of_current() -> Option<(i32, &'static str)> {
     task_inner.signals.check_error()
 }
 
+// 给当前任务挂上一个待处理信号。
+// 执行时尝试取得当前任务 inner，把信号位加入 pending 集合。
 pub fn current_add_signal(signal: SignalFlags) {
     trace!("os::task::current_add_signal");
     let task = match current_task() {
@@ -389,6 +413,8 @@ pub fn current_add_signal(signal: SignalFlags) {
     // );
 }
 
+// 处理内核自己接管的信号，比如 kill/stop/cont。
+// 执行时直接修改 frozen/killed 等任务状态，并从 pending 集合移除已经处理的内核信号。
 fn call_kernel_signal_handler(signal: SignalFlags) {
     trace!("os::task::call_kernel_signal_handler");
     let task = current_task().unwrap();
@@ -418,6 +444,8 @@ fn call_kernel_signal_handler(signal: SignalFlags) {
     }
 }
 
+// 准备跳到用户注册的信号处理函数，并保存原 trap 上下文。
+// 执行时保存原 trap frame 和信号 mask，把用户 PC 改到 handler，返回地址改到 sigreturn trampoline。
 fn call_user_signal_handler(sig: usize, signal: SignalFlags) {
     trace!("os::task::call_user_signal_handler");
     let task = current_task().unwrap();
@@ -449,10 +477,10 @@ fn call_user_signal_handler(sig: usize, signal: SignalFlags) {
             SIGNAL_RETURN_TRAMPOLINE
         };
 
-        // put args (a0)
+        // 用户处理函数按照 ABI 从 a0 接收信号编号。
         trap_ctx[TrapFrameArgs::ARG0] = sig;
     } else {
-        // default action: fatal signals kill the process, others are ignored
+        // 没注册用户处理函数时，fatal 信号直接杀进程，其它信号忽略。
         let fatal = signal.intersects(
             SignalFlags::SIGSEGV
                 | SignalFlags::SIGABRT
@@ -484,6 +512,8 @@ fn call_user_signal_handler(sig: usize, signal: SignalFlags) {
     }
 }
 
+// 用户态 signal handler 返回时恢复之前保存的 trap 上下文。
+// 执行时恢复 signal mask 和备份 trap frame，并把原系统调用返回值交回 sigreturn。
 pub fn restore_current_signal_context() -> Option<isize> {
     let task = current_task()?;
     let mut inner = task.inner_exclusive_access();
@@ -498,6 +528,8 @@ pub fn restore_current_signal_context() -> Option<isize> {
     Some(ret)
 }
 
+// 扫描当前任务的待处理信号，选择一个可以递送的信号处理。
+// 执行时按信号编号遍历 pending 集合，跳过被 mask 的信号，内核信号直接处理，用户信号改写 trap 上下文。
 fn check_pending_signals() {
     trace!("os::task::check_pending_signals");
     let task = match current_task() {
@@ -543,6 +575,8 @@ fn check_pending_signals() {
     }
 }
 
+// trap 返回用户态前统一处理信号、冻结和被杀状态。
+// 执行时反复递送可处理信号；若任务被杀就退出，若被冻结就让出 CPU 等 SIGCONT。
 pub fn handle_signals() {
     trace!("os::task::handle_signals");
     loop {
@@ -588,12 +622,16 @@ pub fn handle_signals() {
     }
 }
 
+// 把任务加入睡眠队列，等定时器到点唤醒。
+// 执行时先记录当前任务状态和等待原因，再切回调度器，等条件满足后继续运行。
 pub fn add_sleep_task(wakeup_time: usize, task: Arc<TaskControlBlock>) {
     SLEEP_QUEUE
         .exclusive_access()
         .push(SleepTask { wakeup_time, task });
 }
 
+// 定时器里扫描睡眠队列，把到期任务放回就绪队列。
+// 执行时先从等待队列里找满足条件的任务，再把它们改回 Ready，最后交给调度器运行。
 pub fn check_and_wake_up_tasks() {
     let now = polyhal::time::Time::now().to_nsec() as usize;
     let mut queue = SLEEP_QUEUE.exclusive_access();
@@ -603,7 +641,7 @@ pub fn check_and_wake_up_tasks() {
         if queue[i].wakeup_time <= now {
             let sleep_task = queue.remove(i);
 
-            //wake up the task by changing its status to Ready and adding it back to the scheduler
+            // 睡眠时间到后把任务改回 Ready，再放回调度队列。
             let mut inner = sleep_task.task.inner_exclusive_access();
             inner.task_status = TaskStatus::Ready;
             drop(inner);

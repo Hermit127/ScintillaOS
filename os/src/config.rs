@@ -1,3 +1,4 @@
+// 这里负责操作系统的基础配置：集中放内核和用户空间共用的基础配置常量。
 #[allow(unused)]
 
 pub const USER_STACK_SIZE: usize = 4096 * 256;

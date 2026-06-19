@@ -1,3 +1,4 @@
+// 这里负责操作系统的文件管理：把块设备包装成 lwext4 可以读写和 seek 的流接口。
 use crate::drivers::BlockDevice;
 use alloc::sync::Arc;
 use lwext4_rust::Ext4BlockWrapper;
@@ -17,6 +18,8 @@ pub struct BlockDeviceStreamOp;
 impl KernelDevOp for BlockDeviceStreamOp {
     type DevType = BlockDeviceStream;
 
+    // 把 lwext4 的写请求落到块设备上，非扇区对齐时先读改写。
+    // 执行时先计算当前位置对应的扇区和扇区内偏移；对齐写直接分块写，非对齐写先读整扇区再覆盖对应字节。
     fn write(dev: &mut Self::DevType, buf: &[u8]) -> Result<usize, i32> {
         if buf.is_empty() {
             return Ok(0);
@@ -58,6 +61,8 @@ impl KernelDevOp for BlockDeviceStreamOp {
         Ok(buf.len())
     }
 
+    // 从块设备读取数据，遇到非扇区对齐的范围就用临时缓冲拼出来。
+    // 执行时按当前位置计算扇区范围；对齐读直接读进用户缓冲，非对齐读先读整扇区再拷贝需要的片段。
     fn read(dev: &mut Self::DevType, buf: &mut [u8]) -> Result<usize, i32> {
         if buf.is_empty() {
             return Ok(0);
@@ -70,10 +75,8 @@ impl KernelDevOp for BlockDeviceStreamOp {
             let mut read = 0;
             while read < buf.len() {
                 let chunk = (buf.len() - read).min(MAX_BULK_IO_SIZE);
-                dev.inner.read_block(
-                    sector + read / SECTOR_SIZE,
-                    &mut buf[read..read + chunk],
-                );
+                dev.inner
+                    .read_block(sector + read / SECTOR_SIZE, &mut buf[read..read + chunk]);
                 read += chunk;
             }
             dev.pos = pos + buf.len();
@@ -94,6 +97,8 @@ impl KernelDevOp for BlockDeviceStreamOp {
         Ok(buf.len())
     }
 
+    // 按 C 风格的 whence 调整当前位置，供 lwext4 随机访问镜像。
+    // 执行时按 SEEK_SET/SEEK_CUR/SEEK_END 计算新位置，拒绝负偏移，成功后更新流里的 pos。
     fn seek(dev: &mut Self::DevType, off: i64, whence: i32) -> Result<i64, i32> {
         let new_pos = match whence {
             0 => off as i64,
@@ -108,6 +113,8 @@ impl KernelDevOp for BlockDeviceStreamOp {
         Ok(dev.pos as i64)
     }
 
+    // 块设备本身没有额外缓存，这里只给 lwext4 一个成功答复。
+    // 执行时不访问设备，只返回 0 表示 flush 已完成，真正缓存刷新由底层块设备或 ext4 负责。
     fn flush(_dev: &mut Self::DevType) -> Result<usize, i32> {
         Ok(0)
     }

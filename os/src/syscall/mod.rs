@@ -1,3 +1,4 @@
+// 这里负责操作系统的系统调用接口：定义系统调用号，并把 trap 传来的 syscall 分发到具体模块。
 const SYSCALL_DUP: usize = 23;
 const SYSCALL_DUP3: usize = 24;
 const SYSCALL_FCNTL: usize = 25;
@@ -132,8 +133,8 @@ mod fs;
 mod process;
 
 use crate::net::syscall::{
-    sys_accept, sys_accept4, sys_bind, sys_connect, sys_getpeername, sys_getsockname, sys_getsockopt,
-    sys_listen, sys_recvfrom, sys_recvmsg, sys_sendmsg, sys_sendto, sys_setsockopt,
+    sys_accept, sys_accept4, sys_bind, sys_connect, sys_getpeername, sys_getsockname,
+    sys_getsockopt, sys_listen, sys_recvfrom, sys_recvmsg, sys_sendmsg, sys_sendto, sys_setsockopt,
     sys_sock_shutdown, sys_socket,
 };
 use crate::task::SignalAction;
@@ -154,6 +155,8 @@ pub static LAST_SYSCALL_RET: AtomicUsize = AtomicUsize::new(0);
 #[no_mangle]
 pub static LAST_SYSCALL_PID: AtomicUsize = AtomicUsize::new(0);
 
+// 系统调用总分发入口，按 Linux syscall 号把参数转到具体实现。
+// 执行时先特殊处理关机号，再记录最近一次 syscall 的编号、参数和 pid，随后 match 到具体模块并保存返回值。
 pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     if syscall_id == SYSCALL_SHUTDOWN {
         return sys_shutdown();
@@ -166,7 +169,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     LAST_SYSCALL_ARG1.store(args[1], Ordering::Relaxed);
     LAST_SYSCALL_ARG2.store(args[2], Ordering::Relaxed);
     LAST_SYSCALL_PID.store(current_pid, Ordering::Relaxed);
-    // Avoid formatting on the syscall hot path; lmbench is very sensitive to this.
+    // 系统调用分发是 lmbench 热路径，这里只记录原始编号和参数，不做格式化打印。
     let ret = match syscall_id {
         SYSCALL_DUP => sys_dup(args[0]),
         SYSCALL_DUP3 => sys_dup3(args[0], args[1], args[2]),
@@ -295,7 +298,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         ),
         SYSCALL_BRK => sys_brk(args[0]),
         SYSCALL_SLEEP => sys_sleep(args[0] as u64),
-        // keep x86_64 dup2 syscall number for compatibility
+        // 保留 x86_64 dup2 号是为了兼容已有用户程序和测试二进制。
         SYSCALL_DUP2 => sys_dup2(args[0], args[1]),
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4] as i32, args[5]),
         SYSCALL_MUNMAP => sys_munmap(args[0], args[1]),

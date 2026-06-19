@@ -1,3 +1,4 @@
+// 这里负责操作系统的系统调用接口和文件管理：实现文件描述符、路径、挂载、stat 和同步相关系统调用。
 use crate::fs::vfs::{vfs_resolve_path, vfs_resolve_with_fallback, Dentry, VfsSuperBlock};
 use crate::fs::{
     make_pipe, mkdir_at, open_file_at, rename_at, symlink_at, unlink_at, DevNull, DevZero, File,
@@ -17,6 +18,8 @@ const FILE_TIME_NOW_GUARD_SEC: i64 = 5;
 
 static TMPFILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+// 根据 dirfd 找到相对路径解析的起点目录。
+// 执行时 AT_FDCWD 取当前 cwd；普通 fd 要确认它是目录 fd，再尽量从 OSInode 取 dentry，最后才按路径回查。
 fn resolve_base_dir(dirfd: isize) -> Option<Arc<Dentry>> {
     let task = current_task()?;
     if dirfd == AT_FDCWD {
@@ -46,6 +49,8 @@ fn resolve_base_dir(dirfd: isize) -> Option<Arc<Dentry>> {
     vfs_resolve_path(&cwd, &path)
 }
 
+// 系统调用入口：从用户缓冲区写数据到 fd。
+// 执行时检查 fd、目录写入和写权限，再校验用户缓冲区可读，放掉任务锁后调用 File::write。
 pub fn sys_write(fd: usize, buf: *mut u8, len: usize) -> isize {
     let token = current_user_token();
     let task = current_task().unwrap();
@@ -71,6 +76,8 @@ pub fn sys_write(fd: usize, buf: *mut u8, len: usize) -> isize {
     }
 }
 
+// 系统调用入口：从 fd 读取数据到用户缓冲区。
+// 执行时检查 fd、目录读取和读权限，再校验用户缓冲区可写，最后把 File::read 结果返回给用户态。
 pub fn sys_read(fd: usize, buf: *mut u8, len: usize) -> isize {
     let token = current_user_token();
     let task = current_task().unwrap();
@@ -97,13 +104,17 @@ pub fn sys_read(fd: usize, buf: *mut u8, len: usize) -> isize {
     }
 }
 
+// 系统调用入口：旧 open，内部转到 openat。
+// 执行时固定使用 AT_FDCWD，并把旧接口的参数转交给 openat 统一处理。
 pub fn sys_open(path: *const u8, flags: u32) -> isize {
     sys_openat(AT_FDCWD, path, flags, 0)
 }
 
+// 系统调用入口：按 dirfd 和 flags 打开文件或特殊设备。
+// 执行时先校验路径指针，再优先处理 /proc、/dev 和 O_TMPFILE；普通文件按 VFS 解析后分配 fd。
 pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> isize {
     let task = current_task().unwrap();
-    // Validate path before reading
+    // 先校验用户传入的 path 至少第一页可读，避免 translated_str 直接访问非法地址。
     {
         let inner = task.inner_exclusive_access();
         let end_of_page =
@@ -116,7 +127,7 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> isize
     let token = current_user_token();
     let path = translated_str(token, path);
 
-    // proc filesystem intercept
+    // /proc 是内核伪文件，不走 ext4，先在这里拦截成对应的 File 对象。
     if let Some(file) = open_proc(&path) {
         let mut inner = task.inner_exclusive_access();
         let fd = inner.alloc_fd();
@@ -127,6 +138,7 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> isize
         return fd as isize;
     }
 
+    // /dev 下这几个常用字符设备由内核手写实现，不走普通 inode 打开流程。
     if path == "/dev/urandom" || path == "/dev/random" {
         let mut inner = task.inner_exclusive_access();
         let fd = inner.alloc_fd();
@@ -161,6 +173,7 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> isize
         return sys_open_tmpfile(dirfd, path.as_str(), mode);
     }
 
+    // 普通路径先做语义检查，把目录、独占创建和不存在等 errno 区分出来。
     let open_flags = OpenFlags::from_raw(flags);
     let base_dir = resolve_base_dir(dirfd);
     let Some(base) = base_dir.clone() else {
@@ -180,6 +193,7 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> isize
     } else if !open_flags.create_requested() {
         return -2;
     }
+    // 真正创建或打开交给 inode 层；成功后分配 fd 并挂入当前任务 fd 表。
     let inode = open_file_at(base_dir, path.as_str(), open_flags, mode as u32);
 
     if let Some(inode) = inode {
@@ -195,7 +209,10 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> isize
     }
 }
 
+// 处理 O_TMPFILE，创建匿名临时文件并直接返回 fd。
+// 执行时确认传入路径是目录，然后用 pid 和递增计数生成隐藏文件名，创建成功后包装成可读写 inode fd。
 fn sys_open_tmpfile(dirfd: isize, path: &str, mode: u32) -> isize {
+    // O_TMPFILE 传入的是目录路径，临时文件名由内核生成，避免和用户文件冲突。
     let base = match resolve_base_dir(dirfd) {
         Some(base) => base,
         None => return -2,
@@ -231,6 +248,8 @@ fn sys_open_tmpfile(dirfd: isize, path: &str, mode: u32) -> isize {
     -17
 }
 
+// 打开几个手写的 /proc 伪文件。
+// 执行时按固定路径匹配 /proc 目录、mounts、meminfo、rtc 和 /proc/<pid>/stat，命中就返回对应伪文件对象。
 fn open_proc(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
     use crate::fs::proc::{
         DevRtcFile, ProcDirFile, ProcMeminfoFile, ProcMountsFile, ProcPidStatFile,
@@ -258,6 +277,8 @@ fn open_proc(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
     None
 }
 
+// 返回内置特殊设备的 stat。
+// 执行时按 /dev/null、zero、random、urandom、rtc 填充字符设备类型和 rdev，非内置设备返回 None。
 fn special_device_stat(path: &str) -> Option<Kstat> {
     let mut st = match path {
         "/dev/null" => Kstat::new(crate::fs::S_IFCHR | 0o666),
@@ -277,6 +298,8 @@ fn special_device_stat(path: &str) -> Option<Kstat> {
     Some(st)
 }
 
+// 判断路径是否落在我们手写支持的特殊设备上。
+// 执行时只判断路径前缀，避免把 /dev/null/xxx 这类路径继续当普通目录解析。
 fn special_device_as_parent(path: &str) -> bool {
     path.starts_with("/dev/null/")
         || path.starts_with("/dev/zero/")
@@ -286,10 +309,14 @@ fn special_device_as_parent(path: &str) -> bool {
         || path.starts_with("/dev/misc/rtc/")
 }
 
+// 系统调用入口：旧 mkdir，内部转 mkdirat。
+// 执行时固定用 AT_FDCWD 作为起点，把旧接口统一交给 mkdirat。
 pub fn sys_mkdir(path: *const u8, mode: u32) -> isize {
     sys_mkdirat(AT_FDCWD, path, mode)
 }
 
+// 系统调用入口：创建目录。
+// 执行时读取用户路径、解析 dirfd 起点，然后调用 inode 层创建目录，失败按当前兼容逻辑返回 -1。
 pub fn sys_mkdirat(dirfd: isize, path: *const u8, _mode: u32) -> isize {
     if path.is_null() {
         return -1;
@@ -307,12 +334,16 @@ pub fn sys_mkdirat(dirfd: isize, path: *const u8, _mode: u32) -> isize {
     }
 }
 
+// 系统调用入口：旧 unlink，内部转 unlinkat。
+// 执行时把旧 unlink 当作不带 AT_REMOVEDIR 的 unlinkat 处理。
 pub fn sys_unlink(path: *const u8) -> isize {
     sys_unlinkat(AT_FDCWD, path, 0)
 }
 
 const AT_REMOVEDIR: u32 = 0x200;
 
+// 系统调用入口：删除文件或目录。
+// 执行时检查 flags 和路径指针，区分删除目录还是普通文件，再交给 inode 层 unlink。
 pub fn sys_unlinkat(dirfd: isize, path: *const u8, flags: u32) -> isize {
     if path.is_null() {
         return -14;
@@ -321,10 +352,11 @@ pub fn sys_unlinkat(dirfd: isize, path: *const u8, flags: u32) -> isize {
     if flags != 0 && !is_dir {
         return -22;
     }
-    // Validate path before reading
+    // 读取路径前先检查用户指针，避免删除路径时踩到非法用户地址。
     let task = current_task().unwrap();
     let inner = task.inner_exclusive_access();
-    let end_of_page = ((path as usize) + crate::config::PAGE_SIZE) & !(crate::config::PAGE_SIZE - 1);
+    let end_of_page =
+        ((path as usize) + crate::config::PAGE_SIZE) & !(crate::config::PAGE_SIZE - 1);
     let first_page_len = 4096.min(end_of_page - (path as usize));
     if !inner.memory_set.valid_user_buf(path, first_page_len, false) {
         return -14;
@@ -352,12 +384,14 @@ pub fn sys_unlinkat(dirfd: isize, path: *const u8, flags: u32) -> isize {
     }
 }
 
+// 系统调用入口：切换当前工作目录。
+// 执行时校验路径指针和长度，解析到目录 dentry 后，把当前任务的 cwd 更新为该目录。
 pub fn sys_chdir(path: *const u8) -> isize {
     if path.is_null() {
         return -14;
     }
     let token = current_user_token();
-    // Validate user path before reading — only check first page
+    // chdir 读取路径前只检查当前页，后续 translated_str 再按字符串结束位置读取。
     let task = current_task().unwrap();
     let inner = task.inner_exclusive_access();
     let max_len = 4096;
@@ -384,6 +418,8 @@ pub fn sys_chdir(path: *const u8) -> isize {
     0
 }
 
+// 系统调用入口：切换当前任务的根目录。
+// 执行时解析目标目录，成功后同时更新 root 和 cwd，让后续路径显示和解析都以新根为准。
 pub fn sys_chroot(path: *const u8) -> isize {
     if path.is_null() {
         return -14;
@@ -416,6 +452,8 @@ pub fn sys_chroot(path: *const u8) -> isize {
     0
 }
 
+// 系统调用入口：把当前工作目录写回用户缓冲区。
+// 执行时按 chroot 视角修剪真实 cwd 路径，确认用户缓冲区足够大后写入以 '\0' 结尾的字符串。
 pub fn sys_getcwd(buf: *mut u8, size: usize) -> isize {
     let task = current_task().unwrap();
     let cwd_path = {
@@ -459,6 +497,8 @@ pub fn sys_getcwd(buf: *mut u8, size: usize) -> isize {
     need as isize
 }
 
+// 系统调用入口：更新文件访问时间和修改时间。
+// 执行时支持按 fd 或路径定位 dentry，检查属主/写权限，再按 UTIME_NOW/OMIT 更新 atime、mtime 和 ctime 缓存。
 pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const u8, _flags: usize) -> isize {
     const UTIME_NOW: i64 = (1i64 << 30) - 1;
     const UTIME_OMIT: i64 = (1i64 << 30) - 2;
@@ -563,7 +603,7 @@ pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const u8, _flags: us
         };
 
         if !ch {
-            return 0; // both UTIME_OMIT → ctime unchanged
+            return 0; // 忽略
         }
         (at, mt, true)
     };
@@ -601,10 +641,14 @@ pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const u8, _flags: us
     0
 }
 
+// 系统调用入口：按真实权限检查文件可访问性。
+// 执行时兼容旧 faccessat，实际交给 faccessat2 的实现处理。
 pub fn sys_faccessat(dirfd: isize, path: *const u8, mode: usize, _flags: usize) -> isize {
     sys_faccessat2(dirfd, path, mode, 0)
 }
 
+// 系统调用入口：faccessat2，支持 AT_EACCESS 等 flags。
+// 执行时解析路径和符号链接策略，F_OK 只查存在性，R/W/X 则按当前有效 uid/gid 与 inode 权限位判断。
 pub fn sys_faccessat2(dirfd: isize, path: *const u8, mode: usize, flags: usize) -> isize {
     const F_OK: usize = 0;
     const R_OK: usize = 4;
@@ -706,6 +750,8 @@ pub fn sys_faccessat2(dirfd: isize, path: *const u8, mode: usize, flags: usize) 
     }
 }
 
+// 系统调用入口：按路径修改权限位。
+// 执行时解析目标路径，非 root 必须是文件属主，成功后写 mode 并刷新 ctime。
 pub fn sys_fchmodat(dirfd: isize, path: *const u8, mode: u32) -> isize {
     let token = current_user_token();
     let path_str = translated_str(token, path);
@@ -745,6 +791,8 @@ pub fn sys_fchmodat(dirfd: isize, path: *const u8, mode: u32) -> isize {
     0
 }
 
+// 从 fd 对象里取出底层 dentry。
+// 执行时检查 fd 表项并确认它是 OSInode，只有真实文件 fd 才能取到 dentry。
 fn resolve_fd_dentry(fd: usize) -> Option<Arc<Dentry>> {
     let task = current_task()?;
     let inner = task.inner_exclusive_access();
@@ -756,6 +804,8 @@ fn resolve_fd_dentry(fd: usize) -> Option<Arc<Dentry>> {
     Some(inode.get_dentry().clone())
 }
 
+// 系统调用入口：按 fd 修改权限位。
+// 执行时从 fd 找 dentry，非 root 要求属主匹配，成功后更新 mode 和 ctime。
 pub fn sys_fchmod(fd: usize, mode: u32) -> isize {
     let dentry = match resolve_fd_dentry(fd) {
         Some(d) => d,
@@ -789,6 +839,8 @@ pub fn sys_fchmod(fd: usize, mode: u32) -> isize {
     0
 }
 
+// 系统调用入口：按路径修改属主和属组。
+// 执行时解析路径并要求有效 uid 为 root，然后写入 owner/group 并更新 ctime。
 pub fn sys_fchownat(dirfd: isize, path: *const u8, owner: u32, group: u32, _flags: u32) -> isize {
     let token = current_user_token();
     let path_str = translated_str(token, path);
@@ -822,6 +874,8 @@ pub fn sys_fchownat(dirfd: isize, path: *const u8, owner: u32, group: u32, _flag
     0
 }
 
+// 系统调用入口：按 fd 修改属主和属组。
+// 执行时从 fd 找到真实 inode，只有 root 可以修改 uid/gid，成功后刷新 ctime。
 pub fn sys_fchown(fd: usize, owner: u32, group: u32) -> isize {
     let dentry = match resolve_fd_dentry(fd) {
         Some(d) => d,
@@ -849,6 +903,8 @@ pub fn sys_fchown(fd: usize, owner: u32, group: u32) -> isize {
     0
 }
 
+// 系统调用入口：处理 fd 复制、FD_CLOEXEC、O_NONBLOCK 等 fcntl 命令。
+// 执行时先校验 fd，再按 cmd 分派：复制 fd、读写 cloexec/flags，文件锁命令只记录兼容用的锁类型。
 pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
     const F_DUPFD: usize = 0;
     const F_GETFD: usize = 1;
@@ -923,9 +979,9 @@ pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
                 -9
             }
         }
-        // File locking stubs (both 32-bit: 5/6/7 and 64-bit: 12/13/14)
+        // 文件锁
         5 | 12 => {
-            // F_GETLK
+            // 取锁
             let token = inner.get_user_token();
             let cur_type = inner.fd_table[fd]
                 .as_ref()
@@ -949,7 +1005,7 @@ pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             return 0;
         }
         6 | 7 | 13 | 14 => {
-            // F_SETLK / F_SETLKW
+            // 设锁
             if let Some(inode) = inner.fd_table[fd]
                 .as_ref()
                 .and_then(|f| f.as_any().downcast_ref::<crate::fs::inode::OSInode>())
@@ -959,12 +1015,12 @@ pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             0
         }
         2 | 15 => {
-            // F_UNLCK
+            // 解锁
             if let Some(inode) = inner.fd_table[fd]
                 .as_ref()
                 .and_then(|f| f.as_any().downcast_ref::<crate::fs::inode::OSInode>())
             {
-                inode.set_lock_type(2); // F_UNLCK
+                inode.set_lock_type(2); // 解锁
             }
             0
         }
@@ -993,15 +1049,19 @@ struct Winsize {
     ws_ypixel: u16,
 }
 
+// 判断 fd 是否是标准终端类 fd。
+// 执行时只把 stdin/stdout 当作终端，满足常见 shell 和测试程序的 ioctl 探测。
 fn is_terminal_fd(fd: usize) -> bool {
-    fd == 0 || fd == 1 // stdin/stdout
+    fd == 0 || fd == 1 // 标准流
 }
 
+// 系统调用入口：处理终端、窗口大小和少量 socket ioctl。
+// 执行时先处理 RTC_RD_TIME；终端 ioctl 返回固定 termios 和 80x24 窗口，其它请求按 ENOTTY 处理。
 pub fn sys_ioctl(fd: usize, request: usize, arg: usize) -> isize {
     let token = current_user_token();
     let request = request & 0xffffffff;
 
-    // RTC ioctl
+    // RTC
     const RTC_RD_TIME: usize = 0x80247009;
     if request == RTC_RD_TIME {
         if fd >= 1024 {
@@ -1105,6 +1165,8 @@ pub fn sys_ioctl(fd: usize, request: usize, arg: usize) -> isize {
     }
 }
 
+// 系统调用入口：关闭 fd。
+// 执行时从当前任务 fd 表移除对应对象，并触发 File::close_ref 做引用计数和资源清理。
 pub fn sys_close(fd: usize) -> isize {
     let task = current_task().unwrap();
     let mut inner = task.inner_exclusive_access();
@@ -1114,10 +1176,14 @@ pub fn sys_close(fd: usize) -> isize {
     -9
 }
 
+// 系统调用入口：旧 pipe，内部转 pipe2。
+// 执行时把旧 pipe 视为不带额外 flags 的 pipe2。
 pub fn sys_pipe(pipe: *mut usize) -> isize {
     sys_pipe2(pipe, 0)
 }
 
+// 系统调用入口：创建匿名管道并返回两个 fd。
+// 执行时创建读端和写端 File，分配两个 fd，设置可选 CLOEXEC，再把 fd 数组写回用户态。
 pub fn sys_pipe2(pipe: *mut usize, flags: usize) -> isize {
     const O_NONBLOCK: usize = 0x800;
     const O_CLOEXEC: usize = 0x80000;
@@ -1152,6 +1218,8 @@ pub fn sys_pipe2(pipe: *mut usize, flags: usize) -> isize {
     0
 }
 
+// 系统调用入口：复制 fd 到最小可用槽位。
+// 执行时确认旧 fd 有效，递增文件对象引用计数，并放到 fd 表里第一个空槽。
 pub fn sys_dup(fd: usize) -> isize {
     let task = current_task().unwrap();
     let mut inner = task.inner_exclusive_access();
@@ -1171,10 +1239,14 @@ pub fn sys_dup(fd: usize) -> isize {
     new_fd as isize
 }
 
+// 系统调用入口：dup2 兼容入口。
+// 执行时转到 dup3，flags 固定为 0，保持旧接口语义。
 pub fn sys_dup2(fd: usize, new_fd: usize) -> isize {
     sys_dup3(fd, new_fd, 0)
 }
 
+// 系统调用入口：复制 fd 到指定编号，并处理 CLOEXEC。
+// 执行时扩展 fd 表到 new_fd，先关闭目标槽位，再把旧文件对象引用放过去并设置 close-on-exec。
 pub fn sys_dup3(fd: usize, new_fd: usize, flags: usize) -> isize {
     const O_CLOEXEC: usize = 0x80000;
     const MAX_FD: usize = 1024;
@@ -1206,6 +1278,8 @@ pub fn sys_dup3(fd: usize, new_fd: usize, flags: usize) -> isize {
     new_fd as isize
 }
 
+// 系统调用入口：调整 fd 当前读写偏移。
+// 执行时按 SEEK_SET/CUR/END 计算新偏移，拒绝负偏移，最后调用 File::seek 更新对象内部 offset。
 pub fn sys_lseek(fd: usize, offset: i64, whence: i32) -> isize {
     const SEEK_SET: i32 = 0;
     const SEEK_CUR: i32 = 1;
@@ -1243,6 +1317,8 @@ pub fn sys_lseek(fd: usize, offset: i64, whence: i32) -> isize {
     new_off as isize
 }
 
+// 系统调用入口：重命名文件或目录。
+// 执行时分别解析旧路径和新路径的 dirfd 起点，然后交给 inode 层 rename_at 完成跨目录移动。
 pub fn sys_renameat2(
     olddirfd: isize,
     oldpath: *const u8,
@@ -1274,6 +1350,8 @@ pub fn sys_renameat2(
     }
 }
 
+// 系统调用入口：创建符号链接。
+// 执行时读取目标字符串和链接路径，解析 newdirfd 起点后创建保存 target 内容的符号链接文件。
 pub fn sys_symlinkat(target: *const u8, newdirfd: isize, linkpath: *const u8) -> isize {
     if target.is_null() || linkpath.is_null() {
         return -14; // EFAULT
@@ -1295,6 +1373,8 @@ pub fn sys_symlinkat(target: *const u8, newdirfd: isize, linkpath: *const u8) ->
     }
 }
 
+// 系统调用入口：读取符号链接目标。
+// 执行时解析路径但不跟随链接，确认 inode 是 symlink 后读取链接内容并截断写入用户缓冲区。
 pub fn sys_readlinkat(dirfd: isize, path: *const u8, buf: *mut u8, bufsiz: usize) -> isize {
     if buf.is_null() || bufsiz == 0 {
         return -22; // EINVAL
@@ -1339,6 +1419,8 @@ pub fn sys_readlinkat(dirfd: isize, path: *const u8, buf: *mut u8, bufsiz: usize
     len as isize
 }
 
+// 系统调用入口：按路径写回 stat 信息。
+// 执行时支持 AT_EMPTY_PATH 和 AT_SYMLINK_NOFOLLOW，特殊设备直接填 stat，普通路径通过 OSInode::stat 生成。
 pub fn sys_fstatat(dirfd: isize, path: *const u8, stat_buf: *mut u8, flags: usize) -> isize {
     const AT_EMPTY_PATH: usize = 0x1000;
     const AT_SYMLINK_NOFOLLOW: usize = 0x100;
@@ -1361,9 +1443,13 @@ pub fn sys_fstatat(dirfd: isize, path: *const u8, stat_buf: *mut u8, flags: usiz
         return 0;
     }
 
-    // Special device files
-    if path_str == "/dev/null" || path_str == "/dev/zero" || path_str == "/dev/null/invalid"
-        || path_str == "/dev/urandom" || path_str == "/dev/random" || path_str == "/dev/rtc"
+    // 对手写支持的字符设备直接返回 stat，不需要走 VFS 路径解析。
+    if path_str == "/dev/null"
+        || path_str == "/dev/zero"
+        || path_str == "/dev/null/invalid"
+        || path_str == "/dev/urandom"
+        || path_str == "/dev/random"
+        || path_str == "/dev/rtc"
         || path_str == "/dev/misc/rtc"
     {
         let st = Kstat::new(crate::fs::S_IFCHR);
@@ -1394,6 +1480,8 @@ pub fn sys_fstatat(dirfd: isize, path: *const u8, stat_buf: *mut u8, flags: usiz
     0
 }
 
+// 系统调用入口：写回 statx 兼容结构。
+// 执行时按 Linux statx 布局写兼容字段，路径和 fd 两种形式都转成 Kstat 再统一转换。
 pub fn sys_statx(
     dirfd: isize,
     path: *const u8,
@@ -1423,11 +1511,12 @@ pub fn sys_statx(
         return 0;
     }
 
-    // Validate path pointer
+    // statx 的路径指针可能为空；非空时先校验一小段用户地址。
     if !path.is_null() {
         let task = current_task().unwrap();
         let inner = task.inner_exclusive_access();
-        let end_of_page = ((path as usize) + crate::config::PAGE_SIZE) & !(crate::config::PAGE_SIZE - 1);
+        let end_of_page =
+            ((path as usize) + crate::config::PAGE_SIZE) & !(crate::config::PAGE_SIZE - 1);
         let first_page_len = 256.min(end_of_page - (path as usize));
         if !inner.memory_set.valid_user_buf(path, first_page_len, false) {
             return -14;
@@ -1444,9 +1533,13 @@ pub fn sys_statx(
         return 0;
     }
 
-    // Special device files
-    if path_str == "/dev/null" || path_str == "/dev/zero" || path_str == "/dev/null/invalid"
-        || path_str == "/dev/urandom" || path_str == "/dev/random" || path_str == "/dev/rtc"
+    // 对手写支持的字符设备直接填 statx，保持和 fstatat 行为一致。
+    if path_str == "/dev/null"
+        || path_str == "/dev/zero"
+        || path_str == "/dev/null/invalid"
+        || path_str == "/dev/urandom"
+        || path_str == "/dev/random"
+        || path_str == "/dev/rtc"
         || path_str == "/dev/misc/rtc"
     {
         let st = Kstat::new(crate::fs::S_IFCHR);
@@ -1457,7 +1550,7 @@ pub fn sys_statx(
         return -36;
     }
 
-    // Resolve dirfd manually to get proper error codes
+    // 手动解析 dirfd，便于按 Linux 习惯返回更准确的错误码。
     let base = if dirfd == AT_FDCWD {
         let task = current_task().unwrap();
         let inner = task.inner_exclusive_access();
@@ -1500,7 +1593,10 @@ pub fn sys_statx(
     let st = inode.stat();
     let task = current_task().unwrap();
     let inner = task.inner_exclusive_access();
-    if !inner.memory_set.valid_user_buf(statx_buf, core::mem::size_of::<Statx>(), true) {
+    if !inner
+        .memory_set
+        .valid_user_buf(statx_buf, core::mem::size_of::<Statx>(), true)
+    {
         return -14;
     }
     drop(inner);
@@ -1508,18 +1604,24 @@ pub fn sys_statx(
     0
 }
 
+// 把 Kstat 转写成 Linux statx 布局。
+// 执行时把 Kstat 的大小、时间、权限和设备号字段逐项搬到用户 statx 结构里。
 fn write_statx(buf: *mut u8, st: &Kstat, mask: u32) {
+    // 从设备号里取 major。
+    // 执行时按 Linux dev_t 编码规则拆出主设备号。
     fn dev_major(dev: u64) -> u32 {
         (((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff)) as u32
     }
 
+    // 从设备号里取 minor。
+    // 执行时按 Linux dev_t 编码规则拆出次设备号。
     fn dev_minor(dev: u64) -> u32 {
         ((dev & 0xff) | ((dev >> 12) & !0xff)) as u32
     }
 
     let token = current_user_token();
     let statx = translated_refmut(token, buf as *mut Statx);
-    statx.stx_mask = mask & 0x7ff; // STATX_BASIC_STATS
+    statx.stx_mask = mask & 0x7ff; // 基础项
     statx.stx_blksize = st.st_blksize;
     statx.stx_attributes = 0;
     statx.stx_nlink = st.st_nlink;
@@ -1580,6 +1682,8 @@ struct Statx {
     stx_dev_minor: u32,
 }
 
+// 系统调用入口：按 fd 写回 stat 信息。
+// 执行时从 fd 表取出 File 对象，调用它的 stat，再把 Kstat 写回用户缓冲区。
 pub fn sys_fstat(fd: usize, stat_buf: *mut u8) -> isize {
     let task = current_task().unwrap();
     let token = current_user_token();
@@ -1601,6 +1705,8 @@ pub fn sys_fstat(fd: usize, stat_buf: *mut u8) -> isize {
     }
 }
 
+// 系统调用入口：读取目录项到用户缓冲区。
+// 执行时取出目录 fd，对用户缓冲区做地址翻译，再让 File::getdents64 生成 dirent64 数据。
 pub fn sys_getdents64(fd: usize, dirp: *mut u8, len: usize) -> isize {
     if len == 0 {
         return 0;
@@ -1630,6 +1736,8 @@ use crate::drivers::block::VirtIOBlock;
 use crate::drivers::{BLOCK_DEVICE, ROOT_BLOCK_DEVICE};
 use crate::fs::vfs::{vfs_mount, vfs_umount};
 
+// 系统调用入口：把块设备文件系统挂到目标目录。
+// 执行时解析 target 和 fstype，选择对应 virtio 块设备，创建新的 ext4 超级块并挂到目标目录。
 pub fn sys_mount(
     _source: *const u8,
     target: *const u8,
@@ -1702,6 +1810,8 @@ pub fn sys_mount(
     }
 }
 
+// 系统调用入口：卸载指定挂载点。
+// 执行时解析目标路径，在挂载表里找到挂载点后移除记录，并调用超级块 force_umount 释放 lwext4 状态。
 pub fn sys_umount2(target: *const u8, _flags: usize) -> isize {
     let token = current_user_token();
     let target_path = translated_str(token, target);
@@ -1746,10 +1856,14 @@ struct StatFs {
 
 const EXT4_SUPER_MAGIC: i64 = 0xEF53;
 
+// 判断公历闰年，给 statfs 生成 fsid 时使用。
+// 执行时按四年一闰、百年不闰、四百年再闰的规则返回布尔值。
 fn is_leap(year: i32) -> bool {
     (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
 }
 
+// 根据 dentry 所属文件系统填充 statfs。
+// 执行时从超级块读取块数和 inode 数，把 ext4 统计信息填进 Linux statfs 结构。
 fn fill_statfs_from_dentry(dentry: &Arc<Dentry>, buf: &mut StatFs) {
     let stats = dentry.super_block.get_fs_stats();
     let block_size = stats.block_size as i64;
@@ -1773,6 +1887,8 @@ fn fill_statfs_from_dentry(dentry: &Arc<Dentry>, buf: &mut StatFs) {
     };
 }
 
+// 系统调用入口：按路径写回文件系统统计。
+// 执行时解析路径到 dentry，再把该 dentry 所属超级块的统计信息写回用户 statfs。
 pub fn sys_statfs(path: *const u8, buf: *mut u8) -> isize {
     let token = current_user_token();
     let path = translated_str(token, path);
@@ -1790,6 +1906,8 @@ pub fn sys_statfs(path: *const u8, buf: *mut u8) -> isize {
     0
 }
 
+// 系统调用入口：从指定偏移读取，不改变 fd 当前 offset。
+// 执行时检查 fd 和读权限，把用户缓冲区翻译出来后调用 File::read_at，文件当前 offset 不移动。
 pub fn sys_pread64(fd: usize, buf: *mut u8, len: usize, offset: usize) -> isize {
     let token = current_user_token();
     let task = current_task().unwrap();
@@ -1806,6 +1924,8 @@ pub fn sys_pread64(fd: usize, buf: *mut u8, len: usize, offset: usize) -> isize 
     file.read_at(offset, user_buf)
 }
 
+// 系统调用入口：从指定偏移写入，不改变 fd 当前 offset。
+// 执行时检查 fd 和写权限，把用户缓冲区翻译出来后调用 File::write_at，文件当前 offset 不移动。
 pub fn sys_pwrite64(fd: usize, buf: *mut u8, len: usize, offset: usize) -> isize {
     let token = current_user_token();
     let task = current_task().unwrap();
@@ -1822,6 +1942,8 @@ pub fn sys_pwrite64(fd: usize, buf: *mut u8, len: usize, offset: usize) -> isize
     file.write_at(offset, user_buf)
 }
 
+// 系统调用入口：按 iovec 从指定偏移读取。
+// 执行时先校验 iovec 数组，再逐项校验目标缓冲区可写，并按 read_at 累加偏移读取。
 pub fn sys_preadv(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> isize {
     use crate::mm::translated_ref;
     const IOV_MAX: usize = 1024;
@@ -1886,6 +2008,8 @@ pub fn sys_preadv(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> is
     total
 }
 
+// 系统调用入口：按 iovec 从指定偏移写入。
+// 执行时逐项读取用户 iovec，确认每段源缓冲区可读，再按 write_at 累加偏移写入文件。
 pub fn sys_pwritev(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> isize {
     use crate::mm::translated_ref;
     const IOV_MAX: usize = 1024;
@@ -1895,7 +2019,7 @@ pub fn sys_pwritev(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> i
     let token = current_user_token();
     let task = current_task().unwrap();
     let inner = task.inner_exclusive_access();
-    // Validate iov array
+    // pwritev 先校验 iovec 数组本身，再逐个读取用户缓冲区内容。
     if !inner
         .memory_set
         .valid_user_buf(iov, iovcnt * core::mem::size_of::<IoVec>(), false)
@@ -1951,6 +2075,8 @@ pub fn sys_pwritev(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> i
     total
 }
 
+// 系统调用入口：preadv2 兼容入口。
+// 执行时暂时忽略 flags，复用 preadv 的偏移读取逻辑。
 pub fn sys_preadv2(
     fd: usize,
     iov: *const u8,
@@ -1961,6 +2087,8 @@ pub fn sys_preadv2(
     sys_preadv(fd, iov, iovcnt, offset)
 }
 
+// 系统调用入口：pwritev2 兼容入口。
+// 执行时暂时忽略 flags，复用 pwritev 的偏移写入逻辑。
 pub fn sys_pwritev2(
     fd: usize,
     iov: *const u8,
@@ -1971,6 +2099,8 @@ pub fn sys_pwritev2(
     sys_pwritev(fd, iov, iovcnt, offset)
 }
 
+// 刷新指定 fd 对应的文件系统缓存。
+// 执行时确认 fd 是 OSInode，取出它的 dentry 后调用超级块 fsync，失败按 EIO 返回。
 fn sync_fd(fd: usize) -> isize {
     let task = current_task().unwrap();
     let inner = task.inner_exclusive_access();
@@ -1991,14 +2121,20 @@ fn sync_fd(fd: usize) -> isize {
     }
 }
 
+// 系统调用入口：fsync 指定 fd。
+// 执行时复用 sync_fd，把该文件相关的 ext4 缓存刷到底层块设备。
 pub fn sys_fsync(fd: usize) -> isize {
     sync_fd(fd)
 }
 
+// 系统调用入口：fdatasync，当前和 fsync 同步处理。
+// 执行时当前不区分数据和元数据，直接走和 fsync 相同的同步路径。
 pub fn sys_fdatasync(fd: usize) -> isize {
     sync_fd(fd)
 }
 
+// 系统调用入口：同步根文件系统缓存。
+// 执行时调用根超级块 sync_all，把整个根文件系统的脏数据刷出。
 pub fn sys_sync() -> isize {
     let rc = crate::fs::vfs::ROOT_SB.sync_all();
     if rc == 0 {
@@ -2008,10 +2144,14 @@ pub fn sys_sync() -> isize {
     }
 }
 
+// 系统调用入口：同步 fd 所在文件系统。
+// 执行时当前按 fd 粒度同步处理，复用 sync_fd。
 pub fn sys_syncfs(fd: usize) -> isize {
     sync_fd(fd)
 }
 
+// 系统调用入口：预分配或打洞文件空间的兼容实现。
+// 执行时只支持普通扩展文件大小；KEEP_SIZE 视为成功，其它复杂模式返回 ENOSYS。
 pub fn sys_fallocate(fd: usize, mode: usize, offset: usize, len: usize) -> isize {
     const FALLOC_FL_KEEP_SIZE: usize = 0x01;
     if fd >= 1024 || len == 0 {
@@ -2026,6 +2166,8 @@ pub fn sys_fallocate(fd: usize, mode: usize, offset: usize, len: usize) -> isize
     crate::syscall::fs::sys_ftruncate(fd, (offset + len) as u64)
 }
 
+// 系统调用入口：接收文件访问建议，当前主要做参数检查。
+// 执行时只校验 advice 枚举范围，内核暂不根据访问模式调整缓存策略。
 pub fn sys_fadvise64(fd: usize, offset: usize, len: usize, advice: usize) -> isize {
     const POSIX_FADV_NORMAL: usize = 0;
     const POSIX_FADV_RANDOM: usize = 1;
@@ -2039,6 +2181,8 @@ pub fn sys_fadvise64(fd: usize, offset: usize, len: usize, advice: usize) -> isi
     0
 }
 
+// 系统调用入口：按 fd 写回文件系统统计。
+// 执行时要求 fd 对应真实 inode，再按它所在超级块填充 statfs。
 pub fn sys_fstatfs(fd: usize, buf: *mut u8) -> isize {
     let token = current_user_token();
     let task = current_task().unwrap();
@@ -2064,6 +2208,8 @@ pub fn sys_fstatfs(fd: usize, buf: *mut u8) -> isize {
     }
 }
 
+// 系统调用入口：按 fd 截断文件。
+// 执行时从 fd 找到 inode dentry，调用超级块 truncate_file，并同步更新 OSInode 的缓存大小。
 pub fn sys_ftruncate(fd: usize, length: u64) -> isize {
     let task = current_task().unwrap();
     let inner = task.inner_exclusive_access();
@@ -2095,20 +2241,25 @@ pub fn sys_ftruncate(fd: usize, length: u64) -> isize {
 
 // ---- flock (32) ----
 
+// 系统调用入口：flock 兼容实现。
+// 执行时暂不维护 BSD flock 状态，直接返回成功以兼容只探测锁接口的程序。
 pub fn sys_flock(_fd: usize, _op: usize) -> isize {
     0
 }
 
 // ---- mknodat (33) ----
 
+// 系统调用入口：创建普通文件或少量特殊节点。
+// 执行时校验路径并确认目标不存在，然后按普通文件创建；当前不真正区分设备节点类型。
 pub fn sys_mknodat(dirfd: isize, path: *const u8, mode: u32, _dev: usize) -> isize {
     if path.is_null() {
         return -14;
     }
-    // Validate path before reading
+    // mknodat 读取路径前先校验用户地址，避免 translated_str 访问非法指针。
     let task = current_task().unwrap();
     let inner = task.inner_exclusive_access();
-    let end_of_page = ((path as usize) + crate::config::PAGE_SIZE) & !(crate::config::PAGE_SIZE - 1);
+    let end_of_page =
+        ((path as usize) + crate::config::PAGE_SIZE) & !(crate::config::PAGE_SIZE - 1);
     let first_page_len = 256.min(end_of_page - (path as usize));
     if !inner.memory_set.valid_user_buf(path, first_page_len, false) {
         return -14;
@@ -2126,7 +2277,7 @@ pub fn sys_mknodat(dirfd: isize, path: *const u8, mode: u32, _dev: usize) -> isi
         Some(b) => b,
         None => return -2,
     };
-    // Check if already exists
+    // 目标已经存在时按 EEXIST 返回，不覆盖已有节点。
     if crate::fs::vfs::vfs_resolve_path(&base, &path_str).is_some() {
         return -17;
     }
@@ -2142,12 +2293,16 @@ pub fn sys_mknodat(dirfd: isize, path: *const u8, mode: u32, _dev: usize) -> isi
 
 // ---- readahead (213) ----
 
+// 系统调用入口：readahead 兼容实现。
+// 执行时不主动预读，只返回成功，让用户态把它当作性能提示而不是硬性操作。
 pub fn sys_readahead(_fd: usize, _offset: usize, _count: usize) -> isize {
     0
 }
 
 // ---- copy_file_range (285) ----
 
+// 系统调用入口：在两个 fd 之间复制一段文件内容。
+// 执行时可选设置输入/输出偏移，然后用 4KB 临时缓冲循环读写，直到达到 len 或一端停止。
 pub fn sys_copy_file_range(
     fd_in: usize,
     off_in: *mut usize,
@@ -2194,6 +2349,8 @@ pub fn sys_copy_file_range(
 
 // ---- memfd_create (279) ----
 
+// 系统调用入口：memfd_create 兼容实现，返回匿名临时文件 fd。
+// 执行时分配一个 fd 并挂上 DevNull 作为占位匿名文件，满足只需要 fd 的兼容场景。
 pub fn sys_memfd_create(_name: *const u8, _flags: usize) -> isize {
     let task = current_task().unwrap();
     let mut inner = task.inner_exclusive_access();
@@ -2207,6 +2364,8 @@ pub fn sys_memfd_create(_name: *const u8, _flags: usize) -> isize {
 
 // ---- close_range (436) ----
 
+// 系统调用入口：批量关闭 fd 范围。
+// 执行时把 last 截到当前 fd 表范围内，逐个调用 close_fd 释放对应文件引用。
 pub fn sys_close_range(first: usize, last: usize, _flags: usize) -> isize {
     let task = current_task().unwrap();
     let mut inner = task.inner_exclusive_access();
@@ -2219,6 +2378,8 @@ pub fn sys_close_range(first: usize, last: usize, _flags: usize) -> isize {
 
 // ---- socketpair (199) ----
 
+// 系统调用入口：socketpair 兼容实现。
+// 执行时暂时直接返回成功；当前测试只需要接口存在，还没有创建成对 socket。
 pub fn sys_socketpair(_domain: usize, _typ: usize, _protocol: usize, _sv: *mut usize) -> isize {
     0
 }
