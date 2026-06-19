@@ -175,6 +175,16 @@ impl File for SocketFile {
                 super::syscall::local_tcp_unlisten(local.port);
             }
         }
+
+        let handle = self.get_handle();
+        #[cfg(any(
+            target_arch = "riscv64",
+            target_arch = "aarch64",
+            target_arch = "loongarch64"
+        ))]
+        crate::net::with_net_iface(|iface| {
+            iface.sockets.remove(handle);
+        });
     }
 
     fn poll(&self) -> (bool, bool, bool) {

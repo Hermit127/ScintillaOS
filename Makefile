@@ -191,6 +191,11 @@ endif
 		printf '#!/bin/sh\n./busybox-glibc --install -s /bin 2>/dev/null\necho "#### OS COMP TEST GROUP START busybox-glibc ####"\nwhile IFS= read -r line; do case "$$line" in ""|\\#*) continue ;; esac; eval "./busybox-glibc $$line"; RTN=$$?; if [ $$RTN -ne 0 ] && [ "$$line" != "false" ]; then echo "testcase busybox $$line fail"; else echo "testcase busybox $$line success"; fi; done < ./busybox_glibc_cmd.txt\necho "#### OS COMP TEST GROUP END busybox-glibc ####"\n' > $(ROOTFS_DIR)/busybox_glibc_testcode.sh; \
 		ln -sf busybox $(ROOTFS_BIN_DIR)/ls 2>/dev/null || true; \
 		printf '#!/bin/sh\n./busybox --install -s /bin 2>/dev/null\necho "#### OS COMP TEST GROUP START busybox-musl ####"\nwhile IFS= read -r line; do case "$$line" in ""|\\#*) continue ;; esac; eval "./busybox $$line"; RTN=$$?; if [ $$RTN -ne 0 ] && [ "$$line" != "false" ]; then echo "testcase busybox $$line fail"; else echo "testcase busybox $$line success"; fi; done < ./busybox_cmd.txt\necho "#### OS COMP TEST GROUP END busybox-musl ####"\n' > $(ROOTFS_DIR)/busybox_testcode.sh; \
+		cp -f tmp/netperf-musl-riscv64 $(ROOTFS_DIR)/netperf 2>/dev/null || true; \
+		cp -f tmp/netserver-musl-riscv64 $(ROOTFS_DIR)/netserver 2>/dev/null || true; \
+		mkdir -p $(ROOTFS_DIR)/lib 2>/dev/null || true; \
+		cp -f tmp/ld-musl-riscv64.so.1 $(ROOTFS_DIR)/lib/ld-musl-riscv64.so.1 2>/dev/null || true; \
+		ln -sf ld-musl-riscv64.so.1 $(ROOTFS_DIR)/lib/libc.so 2>/dev/null || true; \
 	elif [ "$(ARCH)" = "loongarch64" ]; then \
 		cp -f tmp/busybox-musl-loongarch64 $(ROOTFS_BIN_DIR)/busybox 2>/dev/null || true; \
 		cp -f tmp/busybox-musl-loongarch64 $(ROOTFS_DIR)/busybox 2>/dev/null || true; \
@@ -291,6 +296,8 @@ endif
 	@cp -f tmp/contest.sh $(ROOTFS_DIR)/contest.sh 2>/dev/null || true
 	@cp -f tmp/basic_testcode.sh $(ROOTFS_DIR)/basic_testcode.sh 2>/dev/null || true
 	@cp -f tmp/init.sh $(ROOTFS_DIR)/etc/init.sh 2>/dev/null || true
+	@cp -f tmp/netperf_testcode.sh $(ROOTFS_DIR)/netperf_testcode.sh 2>/dev/null || \
+		cp -f testsuits-for-oskernel/scripts/netperf/netperf_testcode.sh $(ROOTFS_DIR)/netperf_testcode.sh 2>/dev/null || true
 	@cp -f target/$(TARGET)/release/contest_runner $(ROOTFS_DIR)/contest_runner 2>/dev/null || true
 	@echo "===== LTP integration (mode: $(LTP_MODE)) ====="
 ifeq ($(LTP_MODE), full)
