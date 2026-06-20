@@ -183,6 +183,7 @@ impl VfsSuperBlock {
             let file_type = mode & 0o170000;
             let is_link = file_type == 0o120000;
             let is_dir_mode = file_type == 0o040000;
+            let is_regular_mode = file_type == 0 || file_type == 0o100000;
 
             let (inode_num, size, is_dir) = if is_dir_mode {
                 let mut dir: ext4_dir = unsafe { core::mem::zeroed() };
@@ -200,6 +201,9 @@ impl VfsSuperBlock {
                 } else {
                     return None;
                 }
+            } else if !is_regular_mode && raw_rc == EOK as i32 {
+                let size = ((raw_inode.size_hi as u64) << 32) | raw_inode.size_lo as u64;
+                (raw_ino, size, false)
             } else {
                 let mut file: ext4_file = unsafe { core::mem::zeroed() };
                 let c_path_file = CString::new(fs_path).ok()?;

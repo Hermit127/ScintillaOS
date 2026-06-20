@@ -368,7 +368,11 @@ pub(crate) fn local_tcp_pending_on(port: u16) -> bool {
         .unwrap_or(false)
 }
 
-fn local_tcp_connect(port: u16, client_endpoint: IpEndpoint, server_endpoint: IpEndpoint) -> Option<usize> {
+fn local_tcp_connect(
+    port: u16,
+    client_endpoint: IpEndpoint,
+    server_endpoint: IpEndpoint,
+) -> Option<usize> {
     let listener_idx = local_tcp_listener_index(port)?;
     let conn_id = {
         let mut conns = LOCAL_TCP_CONNS.exclusive_access();

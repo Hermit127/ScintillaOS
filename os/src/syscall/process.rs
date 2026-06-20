@@ -716,6 +716,9 @@ fn signal_task(task: &Arc<TaskControlBlock>, signum: i32) {
         force_exit_task(task, -9);
         return;
     }
+    if signum < 0 || signum as usize > MAX_SIG {
+        return;
+    }
     let flag = SignalFlags::from_bits(1u32 << signum as usize).unwrap();
     {
         let mut task_ref = task.inner_exclusive_access();
@@ -760,7 +763,8 @@ fn signal_task(task: &Arc<TaskControlBlock>, signum: i32) {
 }
 
 pub fn sys_kill(pid: isize, signum: i32) -> isize {
-    if signum < 0 || signum as usize > MAX_SIG {
+    const MAX_USER_SIG: usize = 64;
+    if signum < 0 || signum as usize > MAX_USER_SIG {
         return -22; // EINVAL
     }
     let targets: Vec<Arc<TaskControlBlock>> = if pid > 0 {
@@ -795,6 +799,9 @@ pub fn sys_kill(pid: isize, signum: i32) -> isize {
         return 0;
     }
     if signum == 0 {
+        return 0;
+    }
+    if signum as usize > MAX_SIG {
         return 0;
     }
     for task in targets {
@@ -905,11 +912,18 @@ pub fn sys_sigaction(
     action: *const SignalAction,
     old_action: *mut SignalAction,
 ) -> isize {
+    const MAX_USER_SIG: usize = 64;
     let token = current_user_token();
     let task = current_task().unwrap();
     let mut inner = task.inner_exclusive_access();
-    if signum as usize > MAX_SIG {
+    if signum <= 0 || signum as usize > MAX_USER_SIG {
         return -1;
+    }
+    if signum as usize > MAX_SIG {
+        if !old_action.is_null() {
+            *translated_refmut(token, old_action) = SignalAction::default();
+        }
+        return 0;
     }
     if let Some(flag) = SignalFlags::from_bits(1 << signum) {
         if check_sigaction_error(flag, action as usize, old_action as usize) {
@@ -1034,6 +1048,23 @@ pub fn sys_mmap(
         let end_addr = polyhal::VirtAddr::from(real_start + len);
         if (flags & MAP_FIXED) != 0 && inner.memory_set.is_overlap(start_addr, end_addr) {
             inner.memory_set.munmap(start_addr, end_addr);
+        }
+        if (flags & MAP_SHARED) != 0 {
+            let aligned_len =
+                (len + crate::config::PAGE_SIZE - 1) & !(crate::config::PAGE_SIZE - 1);
+            let pages = aligned_len / crate::config::PAGE_SIZE;
+            let Some(frames) = frames_alloc(pages) else {
+                return -12;
+            };
+            return match inner.memory_set.insert_shared_frames(
+                start_addr,
+                aligned_len,
+                &frames,
+                permission,
+            ) {
+                Some(addr) => addr.raw() as isize,
+                None => -12,
+            };
         }
         if !inner
             .memory_set
@@ -1536,8 +1567,20 @@ pub fn sys_ppoll(
     }
 }
 
-pub fn sys_mprotect(_start: usize, _len: usize, _prot: usize) -> isize {
-    0
+pub fn sys_mprotect(start: usize, len: usize, prot: usize) -> isize {
+    if start % crate::config::PAGE_SIZE != 0 {
+        return -22;
+    }
+    if prot & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
+        return -22;
+    }
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    inner.memory_set.mprotect(
+        polyhal::VirtAddr::from(start),
+        len,
+        get_map_permission(prot),
+    )
 }
 
 // ---- mremap (216) ----

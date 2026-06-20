@@ -791,6 +791,112 @@ impl MemorySet {
         0
     }
 
+    pub fn mprotect(
+        &mut self,
+        start_addr: polyhal::VirtAddr,
+        len: usize,
+        permission: MapPermission,
+    ) -> isize {
+        if len == 0 {
+            return 0;
+        }
+        let end_addr = polyhal::VirtAddr::from(start_addr.raw().saturating_add(len)).ceil();
+
+        let mut cursor = start_addr;
+        while cursor < end_addr {
+            let Some(area) = self.areas.iter().find(|area| {
+                area.vaddr_range.get_start() <= cursor && cursor < area.vaddr_range.get_end()
+            }) else {
+                return -12;
+            };
+            if permission.contains(MapPermission::W)
+                && area.file.as_ref().is_some_and(|file| !file.writable())
+            {
+                return -13;
+            }
+            cursor = area.vaddr_range.get_end().min(end_addr);
+        }
+
+        let mut i = 0;
+        while i < self.areas.len() {
+            let area_start = self.areas[i].vaddr_range.get_start();
+            let area_end = self.areas[i].vaddr_range.get_end();
+            if area_start >= end_addr || area_end <= start_addr {
+                i += 1;
+                continue;
+            }
+
+            let protect_start = start_addr.max(area_start);
+            let protect_end = end_addr.min(area_end);
+
+            if protect_start > area_start {
+                let mut right = MapArea::from_another(&self.areas[i]);
+                right.vaddr_range = VAddrRange::new(protect_start, area_end);
+                let right_keys: alloc::vec::Vec<VirtAddr> = self.areas[i]
+                    .data_frames
+                    .range(protect_start..area_end)
+                    .map(|(&k, _)| k)
+                    .collect();
+                for key in right_keys {
+                    if let Some(frame) = self.areas[i].data_frames.remove(&key) {
+                        right.data_frames.insert(key, frame);
+                    }
+                    if self.areas[i].dirty.remove(&key) {
+                        right.dirty.insert(key);
+                    }
+                }
+                self.areas[i].vaddr_range = VAddrRange::new(area_start, protect_start);
+                self.areas.insert(i + 1, right);
+                i += 1;
+                continue;
+            }
+
+            if protect_end < area_end {
+                let mut right = MapArea::from_another(&self.areas[i]);
+                right.vaddr_range = VAddrRange::new(protect_end, area_end);
+                let right_keys: alloc::vec::Vec<VirtAddr> = self.areas[i]
+                    .data_frames
+                    .range(protect_end..area_end)
+                    .map(|(&k, _)| k)
+                    .collect();
+                for key in right_keys {
+                    if let Some(frame) = self.areas[i].data_frames.remove(&key) {
+                        right.data_frames.insert(key, frame);
+                    }
+                    if self.areas[i].dirty.remove(&key) {
+                        right.dirty.insert(key);
+                    }
+                }
+                self.areas[i].vaddr_range = VAddrRange::new(area_start, protect_end);
+                self.areas.insert(i + 1, right);
+            }
+
+            self.areas[i].set_perm(permission);
+            let vpns: alloc::vec::Vec<VirtAddr> =
+                self.areas[i].data_frames.keys().copied().collect();
+            for vpn in vpns {
+                let Some(frame) = self.areas[i].data_frames.get(&vpn) else {
+                    continue;
+                };
+                if self
+                    .page_table
+                    .translate(vpn)
+                    .is_some_and(|(_, flags)| flags.contains(MappingFlags::P))
+                {
+                    self.page_table.unmap_page(vpn);
+                    self.page_table.map_page(
+                        vpn,
+                        frame.paddr,
+                        permission.into(),
+                        MappingSize::Page4KB,
+                    );
+                }
+            }
+            i += 1;
+        }
+        0
+    }
+
     pub fn max_end_vaddr(&self) -> polyhal::VirtAddr {
         self.areas
             .iter()

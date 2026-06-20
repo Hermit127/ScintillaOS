@@ -424,15 +424,13 @@ fn should_run_script(script: &str) -> bool {
         || script.starts_with("libctest_")
 }
 
-fn should_run_script_in_dir(dir: &str, script: &str) -> bool {
-    if script.starts_with("libctest_") && is_glibc_dir(dir) {
-        return false;
-    }
+fn should_run_script_in_dir(_dir: &str, _script: &str) -> bool {
     true
 }
 
 fn should_skip_script_path(path: &str) -> bool {
-    path.contains("/glibc/libctest_")
+    let _ = path;
+    false
 }
 
 fn script_budget(script: &str) -> &'static str {
@@ -451,9 +449,18 @@ fn script_budget(script: &str) -> &'static str {
     } else if script.starts_with("libctest_") {
         "600"
     } else if is_embedded_ltp(script) {
-        "900"
+        "7200"
     } else {
         "90"
+    }
+}
+
+fn libctest_label_for_dir(dir: &str) -> &'static str {
+    let root = dir.trim_end_matches('\0').trim_end_matches('/');
+    if root.ends_with("/glibc") {
+        "libctest-glibc"
+    } else {
+        "libctest-musl"
     }
 }
 
@@ -478,11 +485,6 @@ fn dir_flavor_priority(dir: &str) -> u8 {
     } else {
         2
     }
-}
-
-fn is_glibc_dir(dir: &str) -> bool {
-    let dir = dir.trim_end_matches('\0').trim_end_matches('/');
-    dir.ends_with("/glibc") || dir.contains("/glibc/")
 }
 
 struct TestScript {
@@ -671,6 +673,87 @@ fn run_script(dir: &str, script: &str) {
     }
 }
 
+fn run_libctest(dir: &str) {
+    let (chroot_root, chroot_cwd) = chroot_root_and_cwd(dir);
+    let label = libctest_label_for_dir(dir);
+    let mut command = String::from("echo \"#### OS COMP TEST GROUP START ");
+    command.push_str(label);
+    command.push_str(" ####\"; ");
+    command.push_str("for s in run-dynamic.sh run-static.sh; do ");
+    command.push_str("if [ -f $s ]; then ");
+    command.push_str("while read r o e c x; do ");
+    command.push_str("if [ -n \"$c\" ]; then ./runtest.exe -t 2 -w \"$e\" \"$c\"; fi; ");
+    command.push_str("done < $s; ");
+    command.push_str("fi; ");
+    command.push_str("done; ");
+    command.push_str("echo \"#### OS COMP TEST GROUP END ");
+    command.push_str(label);
+    command.push_str(" ####\"\0");
+    let args: [*const u8; 4] = [
+        b"sh\0".as_ptr(),
+        b"-c\0".as_ptr(),
+        command.as_ptr(),
+        core::ptr::null(),
+    ];
+    let envs: [*const u8; 6] = [
+        b"PATH=/bin:/usr/bin:.\0".as_ptr(),
+        b"LD_LIBRARY_PATH=/lib:/lib64:.\0".as_ptr(),
+        b"HOME=/\0".as_ptr(),
+        b"TMPDIR=/tmp\0".as_ptr(),
+        b"ENOUGH=50000\0".as_ptr(),
+        core::ptr::null(),
+    ];
+    let pid = fork();
+    if pid == 0 {
+        setsid();
+        let chroot_arg = chroot_root.clone() + "\0";
+        let chdir_arg = chroot_cwd.clone() + "\0";
+        if chroot(&chroot_arg) != 0 {
+            exit(126);
+        }
+        if user_lib::chdir(&chdir_arg) != 0 {
+            exit(126);
+        }
+        execve("/busybox\0", &args, &envs);
+        exit(127);
+    } else if pid > 0 {
+        let mut ec = 0;
+        let budget_ms = script_budget("libctest_testcode.sh")
+            .parse::<isize>()
+            .unwrap_or(600)
+            * 1000;
+        let start = get_time();
+        loop {
+            let r = waitpid_nb(pid as usize, &mut ec);
+            if r == pid {
+                println!(
+                    "[initproc] [DONE] {}libctest_testcode.sh exit {}",
+                    dir.trim_end_matches('\0'),
+                    ec
+                );
+                kill_pgrp(pid as usize, 9);
+                reap_zombies();
+                break;
+            }
+            if get_time() - start > budget_ms {
+                println!(
+                    "[initproc] [TIMEOUT] {}libctest_testcode.sh after {}ms",
+                    dir.trim_end_matches('\0'),
+                    budget_ms
+                );
+                kill_pgrp(pid as usize, 9);
+                kill(pid as usize, 9);
+                waitpid(pid as usize, &mut ec);
+                reap_zombies();
+                println!("#### OS COMP TEST GROUP END {} ####", label);
+                break;
+            }
+            reap_zombies();
+            sleep(20);
+        }
+    }
+}
+
 fn run_embedded_basic(script: &str) {
     let (path, label) = if script == EMBEDDED_BASIC_MUSL {
         ("/bin/contest_runner_musl\0", "basic-musl")
@@ -755,6 +838,10 @@ fn wait_embedded_ltp_child(pid: isize, dir: &str) {
             kill(pid as usize, 9);
             waitpid(pid as usize, &mut ec);
             reap_zombies();
+            println!(
+                "#### OS COMP TEST GROUP END {} ####",
+                ltp_label_for_dir(dir)
+            );
             break;
         }
         reap_zombies();
@@ -772,7 +859,7 @@ fn run_embedded_ltp_shell(dir: &str) {
     command.push_str("; do f=ltp/testcases/bin/$t; if [ -f $f ]; then ");
     command.push_str("echo RUN LTP CASE $t; ret=/tmp/ltp_ret_$t; rm -f $ret; ");
     command.push_str("($f; echo $? > $ret) & p=$!; i=0; r=124; ");
-    command.push_str("while [ $i -lt 30 ]; do if [ -f $ret ]; then r=$(cat $ret); break; fi; ");
+    command.push_str("while [ $i -lt 6 ]; do if [ -f $ret ]; then r=$(cat $ret); break; fi; ");
     command.push_str("sleep 1; i=$(expr $i + 1); done; ");
     command.push_str("if [ ! -f $ret ]; then kill -9 $p; wait $p; else wait $p; fi; rm -f $ret; ");
     command.push_str("echo FINISH LTP CASE $t : $r; ");
@@ -922,6 +1009,10 @@ fn run_collected_scripts(mut scripts: Vec<TestScript>) -> bool {
         }
         setup_runtime_for_dir(&item.dir, &item.script);
         println!("[initproc] [RUN] {}", path);
+        if item.script.starts_with("libctest_") {
+            run_libctest(&item.dir);
+            continue;
+        }
         run_script(&item.dir, &item.script);
     }
     true

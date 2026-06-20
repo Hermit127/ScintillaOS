@@ -2,7 +2,7 @@ use super::vfs::{
     dentry_parent, vfs_create, vfs_resolve_parent_and_name, vfs_resolve_path,
     vfs_resolve_with_fallback, Dentry, DirEntry,
 };
-use super::{File, Kstat, S_IFDIR, S_IFREG};
+use super::{File, Kstat, S_IFDIR, S_IFIFO, S_IFREG};
 use crate::sync::UPSafeCell;
 use alloc::collections::BTreeMap;
 use alloc::ffi::CString;
@@ -26,6 +26,23 @@ struct CachedTimes {
 lazy_static! {
     static ref PATH_TIME_CACHE: UPSafeCell<BTreeMap<String, CachedTimes>> =
         unsafe { UPSafeCell::new(BTreeMap::new()) };
+    static ref PATH_SPECIAL_MODE_CACHE: UPSafeCell<BTreeMap<String, u32>> =
+        unsafe { UPSafeCell::new(BTreeMap::new()) };
+}
+
+pub fn record_special_path_mode(fs_path: &str, mode_type: u32) {
+    if mode_type == S_IFIFO {
+        PATH_SPECIAL_MODE_CACHE
+            .exclusive_access()
+            .insert(String::from(fs_path), mode_type);
+    }
+}
+
+fn path_special_mode(fs_path: &str) -> Option<u32> {
+    PATH_SPECIAL_MODE_CACHE
+        .exclusive_access()
+        .get(fs_path)
+        .copied()
 }
 
 pub fn update_path_cached_times(
@@ -215,6 +232,8 @@ impl OSInode {
             Some(info) => {
                 let file_type = if self.dentry.is_dir || info.is_dir {
                     S_IFDIR
+                } else if let Some(mode_type) = path_special_mode(&self.dentry.fs_path) {
+                    mode_type
                 } else {
                     info.mode & 0o170000
                 };

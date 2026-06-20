@@ -207,6 +207,31 @@ pub mod syscall {
     ) -> isize {
         -38
     }
+    pub(crate) fn local_tcp_send(
+        _conn_id: usize,
+        _server_side: bool,
+        _nonblock: bool,
+        _data: &[u8],
+    ) -> isize {
+        -38
+    }
+    pub(crate) fn local_tcp_recv(
+        _conn_id: usize,
+        _server_side: bool,
+        _nonblock: bool,
+        _peek: bool,
+        _buf: &mut [u8],
+    ) -> isize {
+        -38
+    }
+    pub(crate) fn local_tcp_close(_conn_id: usize, _server_side: bool) {}
+    pub(crate) fn local_tcp_unlisten(_port: u16) {}
+    pub(crate) fn local_tcp_pending_on(_port: u16) -> bool {
+        false
+    }
+    pub(crate) fn local_tcp_poll(_conn_id: usize, _server_side: bool) -> (bool, bool, bool) {
+        (false, false, true)
+    }
 }
 
 #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]

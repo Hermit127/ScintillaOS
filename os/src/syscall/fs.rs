@@ -288,7 +288,7 @@ fn sys_open_tmpfile(dirfd: isize, path: &str, mode: u32) -> isize {
 
 fn open_proc(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
     use crate::fs::proc::{
-        DevRtcFile, ProcDirFile, ProcMeminfoFile, ProcMountsFile, ProcPidStatFile,
+        DevRtcFile, ProcDirFile, ProcMeminfoFile, ProcMountsFile, ProcPidStatFile, ProcStaticFile,
     };
     if path == "/proc" {
         return Some(Arc::new(ProcDirFile::new()));
@@ -298,6 +298,9 @@ fn open_proc(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
     }
     if path == "/proc/meminfo" {
         return Some(Arc::new(ProcMeminfoFile::new()));
+    }
+    if path == "/proc/sys/kernel/pid_max" {
+        return Some(Arc::new(ProcStaticFile::new("4194304\n")));
     }
     if path == "/dev/rtc" || path == "/dev/misc/rtc" {
         return Some(Arc::new(DevRtcFile));
@@ -347,18 +350,41 @@ pub fn sys_mkdir(path: *const u8, mode: u32) -> isize {
 
 pub fn sys_mkdirat(dirfd: isize, path: *const u8, _mode: u32) -> isize {
     if path.is_null() {
-        return -1;
+        return -14; // EFAULT
     }
     let token = current_user_token();
     let path = translated_str(token, path);
-    let base_dir = match resolve_base_dir(dirfd) {
-        Some(base) => base,
-        None => return -2,
+    let base_dir = if path.starts_with('/') {
+        current_task()
+            .map(|task| task.inner_exclusive_access().root.clone())
+            .unwrap_or_else(|| crate::fs::vfs::ROOT_DENTRY.clone())
+    } else if dirfd == AT_FDCWD {
+        current_task().unwrap().inner_exclusive_access().cwd.clone()
+    } else if dirfd < 0 {
+        return -9; // EBADF
+    } else {
+        let task = current_task().unwrap();
+        let inner = task.inner_exclusive_access();
+        let fd = dirfd as usize;
+        if fd >= inner.fd_table.len() {
+            return -9; // EBADF
+        }
+        let Some(file) = &inner.fd_table[fd] else {
+            return -9; // EBADF
+        };
+        if !file.is_dir() {
+            return -20; // ENOTDIR
+        }
+        if let Some(inode) = file.as_any().downcast_ref::<crate::fs::inode::OSInode>() {
+            inode.get_dentry().clone()
+        } else {
+            return -20; // ENOTDIR
+        }
     };
     if mkdir_at(Some(base_dir), path.as_str()) {
         0
     } else {
-        -1
+        -2 // ENOENT
     }
 }
 
@@ -1144,8 +1170,11 @@ pub fn sys_pipe(pipe: *mut usize) -> isize {
 pub fn sys_pipe2(pipe: *mut usize, flags: usize) -> isize {
     const O_NONBLOCK: usize = 0x800;
     const O_CLOEXEC: usize = 0x80000;
-    if pipe.is_null() || flags & !(O_NONBLOCK | O_CLOEXEC) != 0 {
-        return -1;
+    if pipe.is_null() {
+        return -14; // EFAULT
+    }
+    if flags & !(O_NONBLOCK | O_CLOEXEC) != 0 {
+        return -22; // EINVAL
     }
     let task = current_task().unwrap();
     let token = current_user_token();
@@ -1245,7 +1274,7 @@ pub fn sys_lseek(fd: usize, offset: i64, whence: i32) -> isize {
     let file = file.clone();
     drop(inner);
     let mode_type = file.stat().st_mode & 0o170000;
-    if mode_type != 0o100000 && mode_type != 0o040000 {
+    if mode_type != 0o100000 {
         return -29; // ESPIPE
     }
 
@@ -1573,14 +1602,24 @@ struct Statx {
 }
 
 pub fn sys_fstat(fd: usize, stat_buf: *mut u8) -> isize {
+    if stat_buf.is_null() {
+        return -14; // EFAULT
+    }
     let task = current_task().unwrap();
     let token = current_user_token();
+    {
+        let inner = task.inner_exclusive_access();
+        if !inner.memory_set.valid_user_buf(
+            stat_buf as *const u8,
+            core::mem::size_of::<Kstat>(),
+            true,
+        ) {
+            return -14; // EFAULT
+        }
+    }
     let inner = task.inner_exclusive_access();
     if fd >= inner.fd_table.len() {
-        return -1;
-    }
-    if stat_buf.is_null() {
-        return -1;
+        return -9; // EBADF
     }
     if let Some(file) = &inner.fd_table[fd] {
         let file = file.clone();
@@ -1589,7 +1628,7 @@ pub fn sys_fstat(fd: usize, stat_buf: *mut u8) -> isize {
         *translated_refmut(token, stat_buf as *mut Kstat) = st;
         0
     } else {
-        -1
+        -9 // EBADF
     }
 }
 
@@ -2105,8 +2144,13 @@ pub fn sys_mknodat(dirfd: isize, path: *const u8, mode: u32, _dev: usize) -> isi
         None => return -2,
     };
     let create_mode = if mode == 0 { 0o666 } else { mode };
-    crate::fs::vfs::vfs_create(&parent, &name, false, create_mode);
-    0
+    let mode_type = create_mode & 0o170000;
+    if let Some(dentry) = crate::fs::vfs::vfs_create(&parent, &name, false, create_mode) {
+        crate::fs::inode::record_special_path_mode(&dentry.fs_path, mode_type);
+        0
+    } else {
+        -17
+    }
 }
 
 // ---- readahead (213) ----

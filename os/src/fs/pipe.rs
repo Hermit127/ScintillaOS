@@ -265,6 +265,9 @@ impl File for Pipe {
     fn stat(&self) -> Kstat {
         Kstat::new(S_IFIFO)
     }
+    fn set_flags(&self, _flags: usize) -> bool {
+        true
+    }
     fn dup_ref(&self) {
         let mut ring_buffer = self.buffer.exclusive_access();
         if self.readable {
