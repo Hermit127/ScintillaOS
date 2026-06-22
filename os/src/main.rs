@@ -6,7 +6,8 @@ use crate::{
     syscall::syscall,
     task::{
         check_and_wake_up_tasks, check_signals_error_of_current, current_add_signal, current_task,
-        exit_current_and_run_next, handle_signals, suspend_current_and_run_next, SignalFlags,
+        exit_current_and_run_next, force_exit_task_group, handle_signals,
+        suspend_current_and_run_next, SignalFlags,
     },
 };
 // use polyhal::api::ArchInterface;
@@ -37,6 +38,29 @@ mod syscall;
 mod task;
 
 pub struct ArchInterfaceImpl;
+
+fn sync_shared_vm_after_page_fault(
+    task: &alloc::sync::Arc<task::TaskControlBlock>,
+    vaddr: polyhal::VirtAddr,
+) {
+    let snapshot = {
+        let inner = task.inner_exclusive_access();
+        if !inner.memory_set.is_shared() {
+            return;
+        }
+        let vpn = vaddr.floor();
+        let Some(frame) = inner.memory_set.clone_frame_metadata(vpn) else {
+            return;
+        };
+        (task.getpid(), inner.tgid, vpn, frame)
+    };
+    crate::syscall::process::sync_thread_group_vm_frame(
+        snapshot.0,
+        snapshot.1,
+        snapshot.2,
+        &snapshot.3,
+    );
+}
 
 /// kernel interrupt
 #[polyhal::arch_interrupt]
@@ -69,9 +93,17 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             let vaddr = polyhal::VirtAddr::from(bad_addr);
             let task = crate::task::current_task().unwrap();
             let mut inner = task.inner_exclusive_access();
-            if !inner.memory_set.handle_page_fault(vaddr, true) {
+            let fault_result = inner.memory_set.handle_page_fault(vaddr, true);
+            if fault_result.is_none() {
                 drop(inner);
                 current_add_signal(SignalFlags::SIGSEGV);
+            } else {
+                let should_sync =
+                    fault_result == Some(crate::mm::PageFaultResult::SharedMetadataChanged);
+                drop(inner);
+                if should_sync {
+                    sync_shared_vm_after_page_fault(&task, vaddr);
+                }
             }
         }
         InstructionPageFault(bad_addr)
@@ -88,18 +120,34 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             let vaddr = polyhal::VirtAddr::from(bad_addr);
             let task = crate::task::current_task().unwrap();
             let mut inner = task.inner_exclusive_access();
-            if !inner.memory_set.handle_page_fault(vaddr, false) {
+            let fault_result = inner.memory_set.handle_page_fault(vaddr, false);
+            if fault_result.is_none() {
                 drop(inner);
-                exit_current_and_run_next(-11);
+                current_add_signal(SignalFlags::SIGSEGV);
+            } else {
+                let should_sync =
+                    fault_result == Some(crate::mm::PageFaultResult::SharedMetadataChanged);
+                drop(inner);
+                if should_sync {
+                    sync_shared_vm_after_page_fault(&task, vaddr);
+                }
             }
         }
         InstructionPageFault(bad_addr) => {
             let vaddr = polyhal::VirtAddr::from(bad_addr);
             let task = crate::task::current_task().unwrap();
             let mut inner = task.inner_exclusive_access();
-            if !inner.memory_set.handle_page_fault(vaddr, false) {
+            let fault_result = inner.memory_set.handle_page_fault(vaddr, false);
+            if fault_result.is_none() {
                 drop(inner);
                 current_add_signal(SignalFlags::SIGSEGV);
+            } else {
+                let should_sync =
+                    fault_result == Some(crate::mm::PageFaultResult::SharedMetadataChanged);
+                drop(inner);
+                if should_sync {
+                    sync_shared_vm_after_page_fault(&task, vaddr);
+                }
             }
         }
         IllegalInstruction(_) => {
@@ -129,6 +177,9 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
     // check error signals (if error then exit)
     if let Some((errno, msg)) = check_signals_error_of_current() {
         println!("[kernel] {}", msg);
+        if let Some(task) = current_task() {
+            force_exit_task_group(&task, errno);
+        }
         exit_current_and_run_next(errno);
     }
 

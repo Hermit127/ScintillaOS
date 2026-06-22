@@ -156,14 +156,23 @@ impl File for DevNull {
     }
 }
 
-pub struct DevZero;
+pub struct DevZero {
+    readable: bool,
+    writable: bool,
+}
+
+impl DevZero {
+    pub fn new(readable: bool, writable: bool) -> Self {
+        Self { readable, writable }
+    }
+}
 
 impl File for DevZero {
     fn readable(&self) -> bool {
-        true
+        self.readable
     }
     fn writable(&self) -> bool {
-        true
+        self.writable
     }
     fn read(&self, buf: &mut [u8]) -> isize {
         for b in buf.iter_mut() {

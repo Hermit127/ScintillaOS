@@ -34,3 +34,18 @@ impl Default for SignalActions {
         }
     }
 }
+
+impl SignalActions {
+    pub fn reset_for_exec(&mut self) {
+        for action in self.table.iter_mut() {
+            if action.handler == 1 {
+                *action = SignalAction {
+                    handler: 1,
+                    ..SignalAction::default()
+                };
+            } else if action.handler != 0 {
+                *action = SignalAction::default();
+            }
+        }
+    }
+}

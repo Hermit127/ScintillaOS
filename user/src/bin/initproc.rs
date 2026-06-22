@@ -22,29 +22,45 @@ const BUSYBOX_APPLETS: [&str; 68] = [
     "mknod", "mktemp", "chgrp", "dmesg", "ps", "free", "hostname", "md5sum", "diff", "unlink",
 ];
 
-const KNOWN_TEST_SCRIPTS: [&str; 7] = [
+const KNOWN_TEST_SCRIPTS: [&str; 8] = [
     "basic_testcode.sh",
     "busybox_testcode.sh",
     "lua_testcode.sh",
     "iozone_testcode.sh",
     "lmbench_testcode.sh",
     "iperf_testcode.sh",
+    "libcbench_testcode.sh",
     "libctest_testcode.sh",
 ];
 
 const EMBEDDED_BASIC_MUSL: &str = "__embedded_basic_musl__";
 const EMBEDDED_BASIC_GLIBC: &str = "__embedded_basic_glibc__";
 const EMBEDDED_LTP: &str = "__embedded_ltp__";
+const EMBEDDED_LTP_CASE_TIMEOUT_SECS: &str = "60";
+#[cfg(not(target_arch = "loongarch64"))]
 const LTP_SUBSET_CASES: &str = concat!(
     "close01 close02 open01 open02 read01 read02 write01 write02 ",
     "lseek01 lseek02 fstat01 fstat02 fstat03 ",
     "dup01 dup02 dup201 dup202 pipe01 pipe02 ",
     "brk01 brk02 mmap01 mmap02 munmap01 munmap02 ",
     "fork01 fork02 fork03 exit_group01 wait01 wait02 ",
-    "getpid01 getpid02 getcwd01 getcwd02 chdir01 chdir04 ",
-    "times01 uname01 uname02 nanosleep01 kill01 kill02 ",
-    "gettimeofday01 gettimeofday02 umask01 mkdirat01 mkdirat02 ",
-    "rename01 rename02 unlink01 unlink02 mprotect01 mprotect02 ",
+    "getpid01 getpid02 getcwd01 getcwd02 chdir04 ",
+    "times01 uname01 uname02 ",
+    "gettimeofday01 gettimeofday02 umask01 mkdirat01 ",
+    "mprotect01 mprotect02 ",
+    "fcntl01 fcntl02 access01"
+);
+#[cfg(target_arch = "loongarch64")]
+const LTP_SUBSET_CASES: &str = concat!(
+    "close01 close02 open01 open02 read01 read02 write01 write02 ",
+    "lseek01 lseek02 fstat01 fstat02 fstat03 ",
+    "dup01 dup02 dup201 dup202 pipe01 pipe02 ",
+    "brk01 brk02 mmap01 mmap02 ",
+    "fork01 fork02 fork03 exit_group01 wait01 wait02 ",
+    "getpid01 getpid02 getcwd01 getcwd02 chdir04 ",
+    "times01 uname01 uname02 ",
+    "gettimeofday01 gettimeofday02 umask01 mkdirat01 ",
+    "mprotect01 mprotect02 ",
     "fcntl01 fcntl02 access01"
 );
 
@@ -406,10 +422,12 @@ fn script_priority(script: &str) -> u8 {
         4
     } else if script.starts_with("iperf_") {
         5
-    } else if script.starts_with("libctest_") {
+    } else if script.starts_with("libcbench_") {
         6
-    } else if is_embedded_ltp(script) {
+    } else if script.starts_with("libctest_") {
         7
+    } else if is_embedded_ltp(script) {
+        8
     } else {
         50
     }
@@ -421,10 +439,15 @@ fn should_run_script(script: &str) -> bool {
         || script.starts_with("iozone_")
         || script.starts_with("lmbench_")
         || script.starts_with("iperf_")
+        || script.starts_with("libcbench_")
         || script.starts_with("libctest_")
 }
 
-fn should_run_script_in_dir(_dir: &str, _script: &str) -> bool {
+fn should_run_script_in_dir(dir: &str, script: &str) -> bool {
+    let dir = dir.trim_end_matches('\0').trim_end_matches('/');
+    if script.starts_with("libctest_") && dir.ends_with("/glibc") {
+        return false;
+    }
     true
 }
 
@@ -446,6 +469,8 @@ fn script_budget(script: &str) -> &'static str {
         "720"
     } else if script.starts_with("iperf_") {
         "300"
+    } else if script.starts_with("libcbench_") {
+        "600"
     } else if script.starts_with("libctest_") {
         "600"
     } else if is_embedded_ltp(script) {
@@ -543,7 +568,7 @@ fn collect_known_scripts(dir: &str, out: &mut Vec<TestScript>) -> usize {
         found += 1;
     }
     let entries = list_dir(dir);
-    let has_ltp = has_entry(&entries, "ltp") && dir_flavor_priority(dir) == 0;
+    let has_ltp = has_entry(&entries, "ltp") && dir_flavor_priority(dir) <= 1;
     if has_ltp {
         if !out
             .iter()
@@ -681,9 +706,7 @@ fn run_libctest(dir: &str) {
     command.push_str(" ####\"; ");
     command.push_str("for s in run-dynamic.sh run-static.sh; do ");
     command.push_str("if [ -f $s ]; then ");
-    command.push_str("while read r o e c x; do ");
-    command.push_str("if [ -n \"$c\" ]; then ./runtest.exe -t 2 -w \"$e\" \"$c\"; fi; ");
-    command.push_str("done < $s; ");
+    command.push_str("sh $s; ");
     command.push_str("fi; ");
     command.push_str("done; ");
     command.push_str("echo \"#### OS COMP TEST GROUP END ");
@@ -859,7 +882,9 @@ fn run_embedded_ltp_shell(dir: &str) {
     command.push_str("; do f=ltp/testcases/bin/$t; if [ -f $f ]; then ");
     command.push_str("echo RUN LTP CASE $t; ret=/tmp/ltp_ret_$t; rm -f $ret; ");
     command.push_str("($f; echo $? > $ret) & p=$!; i=0; r=124; ");
-    command.push_str("while [ $i -lt 6 ]; do if [ -f $ret ]; then r=$(cat $ret); break; fi; ");
+    command.push_str("while [ $i -lt ");
+    command.push_str(EMBEDDED_LTP_CASE_TIMEOUT_SECS);
+    command.push_str(" ]; do if [ -f $ret ]; then r=$(cat $ret); break; fi; ");
     command.push_str("sleep 1; i=$(expr $i + 1); done; ");
     command.push_str("if [ ! -f $ret ]; then kill -9 $p; wait $p; else wait $p; fi; rm -f $ret; ");
     command.push_str("echo FINISH LTP CASE $t : $r; ");

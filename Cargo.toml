@@ -1,3 +1,8 @@
 [workspace]
 resolver = "2"
 members = ["os", "user"]
+
+[patch.crates-io]
+polyhal = { path = "vendor/polyhal" }
+polyhal-boot = { path = "vendor/polyhal-boot" }
+polyhal-trap = { path = "vendor/polyhal-trap" }

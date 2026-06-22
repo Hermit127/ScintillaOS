@@ -1,4 +1,8 @@
-#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+#[cfg(any(
+    target_arch = "riscv64",
+    target_arch = "aarch64",
+    target_arch = "loongarch64"
+))]
 mod imp {
     use core::sync::atomic::{AtomicBool, Ordering};
     use smoltcp::iface::{Config, Interface, SocketSet};
@@ -74,10 +78,18 @@ mod imp {
 
 pub mod socket;
 
-#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+#[cfg(any(
+    target_arch = "riscv64",
+    target_arch = "aarch64",
+    target_arch = "loongarch64"
+))]
 pub mod syscall;
 
-#[cfg(not(any(target_arch = "riscv64", target_arch = "aarch64")))]
+#[cfg(not(any(
+    target_arch = "riscv64",
+    target_arch = "aarch64",
+    target_arch = "loongarch64"
+)))]
 pub mod syscall {
     use alloc::sync::Arc;
 
@@ -234,7 +246,11 @@ pub mod syscall {
     }
 }
 
-#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+#[cfg(any(
+    target_arch = "riscv64",
+    target_arch = "aarch64",
+    target_arch = "loongarch64"
+))]
 use imp::NetworkState;
 #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
 use imp::NET_IFACE;
@@ -351,6 +367,81 @@ pub fn with_net_iface_tcp_connect(
     }
 }
 
+#[cfg(target_arch = "loongarch64")]
+pub fn net_device_present() -> bool {
+    false
+}
+
+#[cfg(target_arch = "loongarch64")]
+pub fn net_available() -> bool {
+    false
+}
+
+#[cfg(target_arch = "loongarch64")]
+pub fn net_available_fast() -> bool {
+    false
+}
+
+#[cfg(target_arch = "loongarch64")]
+pub fn with_net_iface<F, R>(_f: F) -> Option<R>
+where
+    F: FnOnce(&mut NetworkState) -> R,
+{
+    None
+}
+
+#[cfg(target_arch = "loongarch64")]
+pub fn with_net_iface_tcp_connect(
+    _handle: smoltcp::iface::SocketHandle,
+    _remote: smoltcp::wire::IpEndpoint,
+    _local: smoltcp::wire::IpListenEndpoint,
+) -> isize {
+    -97
+}
+
+#[cfg(not(any(
+    target_arch = "riscv64",
+    target_arch = "aarch64",
+    target_arch = "loongarch64"
+)))]
+pub fn net_available() -> bool {
+    false
+}
+
+#[cfg(not(any(
+    target_arch = "riscv64",
+    target_arch = "aarch64",
+    target_arch = "loongarch64"
+)))]
+pub fn net_available_fast() -> bool {
+    false
+}
+
+#[cfg(not(any(
+    target_arch = "riscv64",
+    target_arch = "aarch64",
+    target_arch = "loongarch64"
+)))]
+pub fn with_net_iface<F, R>(_f: F) -> Option<R>
+where
+    F: FnOnce(&mut ()) -> R,
+{
+    None
+}
+
+#[cfg(not(any(
+    target_arch = "riscv64",
+    target_arch = "aarch64",
+    target_arch = "loongarch64"
+)))]
+pub fn with_net_iface_tcp_connect(
+    _handle: smoltcp::iface::SocketHandle,
+    _remote: smoltcp::wire::IpEndpoint,
+    _local: smoltcp::wire::IpListenEndpoint,
+) -> isize {
+    -97
+}
+
 #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
 pub fn wake_net_blocked_tasks() {
     use crate::task::{add_priority_task, add_task, BlockReason, TaskStatus, NET_BLOCK_QUEUE};
@@ -429,5 +520,12 @@ pub fn wake_net_blocked_tasks() {
     }
 }
 
-#[cfg(not(any(target_arch = "riscv64", target_arch = "aarch64")))]
+#[cfg(target_arch = "loongarch64")]
+pub fn wake_net_blocked_tasks() {}
+
+#[cfg(not(any(
+    target_arch = "riscv64",
+    target_arch = "aarch64",
+    target_arch = "loongarch64"
+)))]
 pub fn wake_net_blocked_tasks() {}

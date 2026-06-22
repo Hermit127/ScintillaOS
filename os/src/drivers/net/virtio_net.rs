@@ -11,9 +11,6 @@ use polyhal::PhysAddr;
 use virtio_drivers::device::net::VirtIONet;
 use virtio_drivers::transport::mmio::MmioTransport;
 
-#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
-const VIRTIO2: usize = 0x10003000;
-
 #[cfg(target_arch = "aarch64")]
 const VIRTIO2: usize = 0xa00_0300;
 
@@ -39,15 +36,43 @@ pub struct VirtIONetAdapter {
 
 impl VirtIONetAdapter {
     pub fn new() -> Option<Self> {
-        let ptr = PhysAddr::new(VIRTIO2).get_mut_ptr();
-        println!("[net] probing VirtIO at {:#x}", VIRTIO2);
-        let transport = match unsafe { MmioTransport::new(NonNull::new_unchecked(ptr)) } {
-            Ok(t) => t,
-            Err(e) => {
-                println!("[net] MmioTransport::new failed: {:?}", e);
-                return None;
+        #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
+        const BASES: &[usize] = &[
+            0x1000_1000,
+            0x1000_2000,
+            0x1000_3000,
+            0x1000_4000,
+            0x1000_5000,
+            0x1000_6000,
+            0x1000_7000,
+            0x1000_8000,
+        ];
+        #[cfg(target_arch = "aarch64")]
+        const BASES: &[usize] = &[VIRTIO2];
+
+        let mut transport = None;
+        for &base in BASES {
+            let ptr = PhysAddr::new(base).get_mut_ptr();
+            let device_id =
+                unsafe { core::ptr::read_volatile((ptr as usize + 0x08) as *const u32) };
+            println!(
+                "[net] probing VirtIO at {:#x}: device_id={}",
+                base, device_id
+            );
+            if device_id != 1 {
+                continue;
             }
-        };
+            match unsafe { MmioTransport::new(NonNull::new_unchecked(ptr)) } {
+                Ok(t) => {
+                    transport = Some(t);
+                    break;
+                }
+                Err(e) => {
+                    println!("[net] MmioTransport::new at {:#x} failed: {:?}", base, e);
+                }
+            }
+        }
+        let transport = transport?;
         let net = match VirtIONet::new(transport, NET_BUF_SIZE) {
             Ok(n) => n,
             Err(e) => {

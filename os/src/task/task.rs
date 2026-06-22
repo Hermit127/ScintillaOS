@@ -84,6 +84,7 @@ pub struct TaskControlBlockInner {
     // if the task is frozen by a signal
     pub frozen: bool,
     pub trap_ctx_backup: Option<TrapFrame>,
+    pub signal_ucontext: Option<usize>,
     // record the stack
     pub heap_bottom: usize,
     pub program_brk: usize,
@@ -97,6 +98,8 @@ pub struct TaskControlBlockInner {
     pub itimer_expire: u64,
     pub itimer_interval_us: u64,
     pub child_tid: usize,
+    pub robust_list_head: usize,
+    pub robust_list_len: usize,
     pub alt_stack: usize,
     pub alt_stack_size: usize,
     pub alt_stack_flags: u32,
@@ -164,9 +167,12 @@ impl TaskControlBlockInner {
 fn task_entry() {
     trace!("os::task::task_entry");
     loop {
-        let task = current_task().unwrap();
-        task.restore_user_float_state();
-        let trap_cx = task.inner.exclusive_access().get_trap_cx() as *mut TrapFrame;
+        let trap_cx = {
+            let task = current_task().unwrap();
+            task.restore_user_float_state();
+            let trap_cx = task.inner.exclusive_access().get_trap_cx() as *mut TrapFrame;
+            trap_cx
+        };
         let ctx_mut = unsafe { trap_cx.as_mut().unwrap() };
         run_user_task(ctx_mut);
     }
@@ -274,6 +280,7 @@ impl TaskControlBlock {
                         killed: false,
                         frozen: false,
                         trap_ctx_backup: None,
+                        signal_ucontext: None,
                         kernel_stack: kstack,
                         // added
                         heap_bottom,
@@ -288,6 +295,8 @@ impl TaskControlBlock {
                         itimer_expire: 0,
                         itimer_interval_us: 0,
                         child_tid: 0,
+                        robust_list_head: 0,
+                        robust_list_len: 0,
                         alt_stack: 0,
                         alt_stack_size: 0,
                         alt_stack_flags: 0,
@@ -543,6 +552,11 @@ impl TaskControlBlock {
 
         let mut inner = self.inner_exclusive_access();
         inner.close_cloexec_fds();
+        inner.signal_actions.reset_for_exec();
+        inner.handling_sig = -1;
+        inner.signal_mask_backup = None;
+        inner.trap_ctx_backup = None;
+        inner.signal_ucontext = None;
         inner.memory_set = memory_set;
         inner.heap_bottom = heap_bottom;
         inner.program_brk = heap_bottom;
@@ -591,7 +605,7 @@ impl TaskControlBlock {
             rlimit_nofile_max,
             cwd,
             root,
-            tid_ptr,
+            _tid_ptr,
             _parent_tgid,
             pgid,
             sid,
@@ -665,7 +679,7 @@ impl TaskControlBlock {
                         rlimit_nofile_max,
                         cwd,
                         root,
-                        tid_ptr,
+                        tid_ptr: 0,
                         tgid: pid_value,
                         pgid,
                         sid,
@@ -682,6 +696,7 @@ impl TaskControlBlock {
                         killed: false,
                         frozen: false,
                         trap_ctx_backup: None,
+                        signal_ucontext: None,
                         kernel_stack: kstack,
                         heap_bottom,
                         program_brk,
@@ -695,6 +710,8 @@ impl TaskControlBlock {
                         itimer_expire: 0,
                         itimer_interval_us: 0,
                         child_tid: 0,
+                        robust_list_head: 0,
+                        robust_list_len: 0,
                         alt_stack: 0,
                         alt_stack_size: 0,
                         alt_stack_flags: 0,
@@ -706,6 +723,145 @@ impl TaskControlBlock {
             },
         });
         // add child to parent's children list
+        {
+            let mut parent_inner = self.inner_exclusive_access();
+            parent_inner.children.push(task_control_block.clone());
+        }
+        Some(task_control_block)
+    }
+    pub fn clone_shared_vm(self: &Arc<TaskControlBlock>) -> Option<Arc<TaskControlBlock>> {
+        trace!("os::task::TaskControlBlock::clone_shared_vm");
+        let (
+            memory_set,
+            trap_cx_clone,
+            base_size,
+            fd_table,
+            fd_cloexec,
+            rlimit_nofile,
+            rlimit_nofile_max,
+            cwd,
+            root,
+            _tid_ptr,
+            pgid,
+            sid,
+            uid,
+            euid,
+            gid,
+            egid,
+            umask,
+            signal_mask,
+            signal_actions,
+            heap_bottom,
+            program_brk,
+            fp_state,
+        ) = {
+            let mut parent_inner = self.inner_exclusive_access();
+            if !parent_inner.memory_set.prepare_shared_writable_pages() {
+                return None;
+            }
+            parent_inner.memory_set.mark_shared();
+            let memory_set = MemorySet::from_shared(&parent_inner.memory_set);
+            (
+                memory_set,
+                parent_inner.trap_cx.clone(),
+                parent_inner.base_size,
+                parent_inner
+                    .fd_table
+                    .iter()
+                    .map(|f| {
+                        f.as_ref().map(|x| {
+                            x.dup_ref();
+                            x.clone()
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+                parent_inner.fd_cloexec.clone(),
+                parent_inner.rlimit_nofile,
+                parent_inner.rlimit_nofile_max,
+                parent_inner.cwd.clone(),
+                parent_inner.root.clone(),
+                parent_inner.tid_ptr,
+                parent_inner.pgid,
+                parent_inner.sid,
+                parent_inner.uid,
+                parent_inner.euid,
+                parent_inner.gid,
+                parent_inner.egid,
+                parent_inner.umask,
+                parent_inner.signal_mask,
+                parent_inner.signal_actions.clone(),
+                parent_inner.heap_bottom,
+                parent_inner.program_brk,
+                parent_inner.fp_state,
+            )
+        };
+
+        let pid_handle = pid_alloc();
+        let pid_value = pid_handle.0;
+        let kstack = KernelStack::new();
+        let task_control_block = Arc::new(TaskControlBlock {
+            pid: pid_handle,
+            inner: unsafe {
+                UPSafeCell::new_named(
+                    TaskControlBlockInner {
+                        trap_cx: trap_cx_clone,
+                        fp_state,
+                        base_size,
+                        task_cx: blank_kcontext(kstack.get_position().1),
+                        task_status: TaskStatus::Ready,
+                        memory_set,
+                        parent: Some(Arc::downgrade(self)),
+                        children: Vec::new(),
+                        exit_code: 0,
+                        fd_table,
+                        fd_cloexec,
+                        rlimit_nofile,
+                        rlimit_nofile_max,
+                        cwd,
+                        root,
+                        tid_ptr: 0,
+                        tgid: pid_value,
+                        pgid,
+                        sid,
+                        uid,
+                        euid,
+                        gid,
+                        egid,
+                        umask,
+                        signals: SignalFlags::empty(),
+                        signal_mask,
+                        signal_mask_backup: None,
+                        handling_sig: -1,
+                        signal_actions,
+                        killed: false,
+                        frozen: false,
+                        trap_ctx_backup: None,
+                        signal_ucontext: None,
+                        kernel_stack: kstack,
+                        heap_bottom,
+                        program_brk,
+                        sleeping: None,
+                        utime: 0,
+                        stime: 0,
+                        cutime: 0,
+                        cstime: 0,
+                        last_time: polyhal::time::Time::now().to_nsec() as usize,
+                        block_reason: None,
+                        itimer_expire: 0,
+                        itimer_interval_us: 0,
+                        child_tid: 0,
+                        robust_list_head: 0,
+                        robust_list_len: 0,
+                        alt_stack: 0,
+                        alt_stack_size: 0,
+                        alt_stack_flags: 0,
+                        in_syscall: false,
+                        exit_signal: 0,
+                    },
+                    "TaskInner",
+                )
+            },
+        });
         {
             let mut parent_inner = self.inner_exclusive_access();
             parent_inner.children.push(task_control_block.clone());

@@ -38,6 +38,8 @@ const SYSCALL_CLOCK_NANOSLEEP: usize = 115;
 const SYSCALL_SYSLOG: usize = 116;
 const SYSCALL_YIELD: usize = 124;
 const SYSCALL_KILL: usize = 129;
+const SYSCALL_TKILL: usize = 130;
+const SYSCALL_TGKILL: usize = 131;
 const SYSCALL_SIGACTION: usize = 134;
 const SYSCALL_SIGPROCMASK: usize = 135;
 const SYSCALL_RT_SIGTIMEDWAIT: usize = 137;
@@ -75,6 +77,7 @@ const SYSCALL_GETPGID: usize = 155;
 const SYSCALL_SETSID: usize = 157;
 const SYSCALL_MADVISE: usize = 233;
 const SYSCALL_SET_ROBUST_LIST: usize = 99;
+const SYSCALL_GET_ROBUST_LIST: usize = 100;
 const SYSCALL_GETRANDOM: usize = 278;
 const SYSCALL_PSELECT6: usize = 72;
 const SYSCALL_PPOLL: usize = 73;
@@ -137,7 +140,7 @@ const SYSCALL_EXIT_GROUP: usize = 94;
 const SYSCALL_WAITID: usize = 95;
 
 mod fs;
-mod process;
+pub(crate) mod process;
 
 use crate::net::syscall::{
     sys_accept, sys_bind, sys_connect, sys_getpeername, sys_getsockname, sys_getsockopt,
@@ -249,10 +252,13 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_YIELD => sys_yield(),
         SYSCALL_SYSLOG => sys_syslog(args[0], args[1] as *mut u8, args[2]),
         SYSCALL_KILL => sys_kill(args[0] as isize, args[1] as i32),
+        SYSCALL_TKILL => sys_tkill(args[0], args[1] as i32),
+        SYSCALL_TGKILL => sys_tgkill(args[0], args[1], args[2] as i32),
         SYSCALL_SIGACTION => sys_sigaction(
             args[0] as i32,
             args[1] as *const SignalAction,
             args[2] as *mut SignalAction,
+            args[3],
         ),
         SYSCALL_SIGPROCMASK => sys_sigprocmask(
             args[0] as i32,
@@ -298,7 +304,16 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETGROUPS => sys_getgroups(args[0], args[1] as *mut u32),
         SYSCALL_SETGROUPS => sys_setgroups(args[0], args[1] as *const u32),
         SYSCALL_SET_TID_ADDRESS => sys_set_tid_address(args[0] as *mut i32),
-        SYSCALL_CLONE => sys_clone(args[0], args[1], args[2], args[3], args[4]),
+        SYSCALL_CLONE => {
+            #[cfg(target_arch = "loongarch64")]
+            {
+                sys_clone(args[0], args[1], args[2], args[4], args[3])
+            }
+            #[cfg(not(target_arch = "loongarch64"))]
+            {
+                sys_clone(args[0], args[1], args[2], args[3], args[4])
+            }
+        }
         SYSCALL_FORK => sys_fork(),
         SYSCALL_EXEC => sys_exec(
             args[0] as *const u8,
@@ -377,7 +392,10 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_RECVMSG => sys_recvmsg(args[0], args[1] as *mut u8, args[2]),
         SYSCALL_MPROTECT => sys_mprotect(args[0], args[1], args[2]),
         // Tier 4 stubs
-        SYSCALL_SET_ROBUST_LIST => 0,
+        SYSCALL_SET_ROBUST_LIST => sys_set_robust_list(args[0], args[1]),
+        SYSCALL_GET_ROBUST_LIST => {
+            sys_get_robust_list(args[0], args[1] as *mut usize, args[2] as *mut usize)
+        }
         SYSCALL_GETRANDOM => sys_getrandom(args[0] as *mut u8, args[1], args[2]),
         SYSCALL_PSELECT6 => sys_pselect6(
             args[0],

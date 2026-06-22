@@ -17,7 +17,7 @@ use crate::task::{
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU16, Ordering};
+use core::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 use lazy_static::*;
 
 const SOCKET_BUFFER_SIZE: usize = 65536;
@@ -46,6 +46,7 @@ const SHUT_WR: usize = 1;
 const SHUT_RDWR: usize = 2;
 const LOCAL_TCP_BUFFER_LIMIT: usize = 256 * 1024;
 static NEXT_EPHEMERAL_PORT: AtomicU16 = AtomicU16::new(49152);
+static NEXT_DUMMY_HANDLE: AtomicUsize = AtomicUsize::new(1_000_000);
 
 #[derive(Clone)]
 struct LocalUdpPacket {
@@ -79,6 +80,30 @@ lazy_static! {
 
 fn net_ready() -> bool {
     crate::net::net_available_fast()
+}
+
+fn dummy_socket_handle() -> SocketHandle {
+    unsafe { core::mem::transmute(NEXT_DUMMY_HANDLE.fetch_add(1, Ordering::Relaxed)) }
+}
+
+fn create_socket_fd(st: SocketType, nonblock: bool, cloexec: bool) -> isize {
+    let handle = if net_ready() {
+        match add_to_socket_set(st) {
+            Some((handle, _)) => handle,
+            None => return -105,
+        }
+    } else {
+        dummy_socket_handle()
+    };
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    let fd = inner.alloc_fd();
+    if fd >= inner.fd_table.len() {
+        return -24;
+    }
+    inner.fd_table[fd] = Some(Arc::new(SocketFile::new(handle, st, nonblock)));
+    inner.fd_cloexec[fd] = cloexec;
+    fd as isize
 }
 
 fn alloc_null_socket_fd(cloexec: bool) -> isize {
@@ -697,31 +722,10 @@ pub fn sys_socket(domain: usize, type_: usize, _protocol: usize) -> isize {
     let nonblock = (type_ & SOCK_NONBLOCK) != 0;
     let cloexec = (type_ & SOCK_CLOEXEC) != 0;
 
-    if !net_ready() {
-        return alloc_null_socket_fd(cloexec);
-    }
-
-    let task = current_task().unwrap();
-    let mut inner = task.inner_exclusive_access();
-
-    let (handle, st) = match add_to_socket_set(st) {
-        Some(v) => v,
-        None => return -105,
-    };
-
-    let fd = inner.alloc_fd();
-    if fd >= inner.fd_table.len() {
-        return -24;
-    }
-    inner.fd_table[fd] = Some(Arc::new(SocketFile::new(handle, st, nonblock)));
-    inner.fd_cloexec[fd] = cloexec;
-    fd as isize
+    create_socket_fd(st, nonblock, cloexec)
 }
 
 pub fn sys_bind(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
-    if !net_ready() {
-        return -97;
-    }
     if addr.is_null() || addrlen < 8 {
         return -14;
     }
@@ -743,6 +747,19 @@ pub fn sys_bind(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
         IpAddress::from(Ipv4Address::from_bytes(&ip.to_be_bytes())),
         port,
     );
+
+    if !net_ready() {
+        let local_addr = if ip == 0 {
+            IpAddress::Ipv4(Ipv4Address::UNSPECIFIED)
+        } else {
+            endpoint.addr
+        };
+        set_socket_local_endpoint(sockfd, IpEndpoint::new(local_addr, port));
+        if st == SocketType::Tcp {
+            local_tcp_listen(port);
+        }
+        return 0;
+    }
 
     let ret = crate::net::with_net_iface(|iface| match st {
         SocketType::Tcp => {
@@ -788,9 +805,6 @@ pub fn sys_bind(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
 }
 
 pub fn sys_connect(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
-    if !net_ready() {
-        return -97;
-    }
     if addr.is_null() || addrlen < 8 {
         return -14;
     }
@@ -857,6 +871,10 @@ pub fn sys_connect(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
         return -111;
     }
 
+    if !net_ready() {
+        return -97;
+    }
+
     let local = IpListenEndpoint {
         addr: None,
         port: 32768 + ((sockfd as u16).wrapping_mul(7919) % 32767), // non-zero ephemeral port
@@ -898,9 +916,6 @@ pub fn sys_connect(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
 }
 
 pub fn sys_listen(sockfd: usize, _backlog: usize) -> isize {
-    if !net_ready() {
-        return -97;
-    }
     let (handle, st, _nonblock) = match sock_lookup(sockfd) {
         Some(v) => v,
         None => return -9,
@@ -922,6 +937,14 @@ pub fn sys_listen(sockfd: usize, _backlog: usize) -> isize {
         }
     }
 
+    if !net_ready() {
+        if let Some(local) = get_socket_local_endpoint(sockfd) {
+            local_tcp_listen(local.port);
+            return 0;
+        }
+        return -22;
+    }
+
     let listening = crate::net::with_net_iface(|iface| {
         let sock: &TcpSocket = iface.sockets.get(handle);
         sock.is_listening()
@@ -938,9 +961,6 @@ pub fn sys_listen(sockfd: usize, _backlog: usize) -> isize {
 }
 
 pub fn sys_accept(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
-    if !net_ready() {
-        return -97;
-    }
     let task = current_task().unwrap();
     let inner = task.inner_exclusive_access();
 
@@ -965,9 +985,13 @@ pub fn sys_accept(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
     if let Some(port) = local_port {
         loop {
             if let Some(conn_id) = local_tcp_accept(port) {
-                let (new_handle, _) = match add_to_socket_set(SocketType::Tcp) {
-                    Some(v) => v,
-                    None => return -105,
+                let new_handle = if net_ready() {
+                    match add_to_socket_set(SocketType::Tcp) {
+                        Some((handle, _)) => handle,
+                        None => return -105,
+                    }
+                } else {
+                    dummy_socket_handle()
                 };
                 let task = current_task().unwrap();
                 let mut inner = task.inner_exclusive_access();
@@ -992,6 +1016,10 @@ pub fn sys_accept(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
             stdout_release_if_owner();
             suspend_current_and_run_next();
         }
+    }
+
+    if !net_ready() {
+        return -22;
     }
 
     crate::net::net_poll();
@@ -1111,9 +1139,6 @@ pub fn sys_sendto(
     dest_addr: *const u8,
     addrlen: usize,
 ) -> isize {
-    if !net_ready() {
-        return -97;
-    }
     let (handle, st, nonblock) = match sock_lookup(sockfd) {
         Some(v) => v,
         None => return -9,
@@ -1162,9 +1187,6 @@ pub fn sys_recvfrom(
     src_addr: *mut u8,
     addrlen: *mut usize,
 ) -> isize {
-    if !net_ready() {
-        return -97;
-    }
     let (handle, st, nonblock) = match sock_lookup(sockfd) {
         Some(v) => v,
         None => return -9,
@@ -1348,9 +1370,6 @@ pub fn sys_setsockopt(
     optval: *const u8,
     optlen: usize,
 ) -> isize {
-    if !net_ready() {
-        return -97;
-    }
     let (handle, st, _nonblock) = match sock_lookup(sockfd) {
         Some(v) => v,
         None => return -9,
@@ -1370,14 +1389,18 @@ pub fn sys_setsockopt(
                         } else {
                             false
                         };
-                        crate::net::with_net_iface(|iface| {
-                            let sock: &mut TcpSocket = iface.sockets.get_mut(handle);
-                            if val {
-                                sock.set_keep_alive(Some(smoltcp::time::Duration::from_secs(7200)));
-                            } else {
-                                sock.set_keep_alive(None);
-                            }
-                        });
+                        if net_ready() {
+                            crate::net::with_net_iface(|iface| {
+                                let sock: &mut TcpSocket = iface.sockets.get_mut(handle);
+                                if val {
+                                    sock.set_keep_alive(Some(smoltcp::time::Duration::from_secs(
+                                        7200,
+                                    )));
+                                } else {
+                                    sock.set_keep_alive(None);
+                                }
+                            });
+                        }
                     }
                     0
                 }
@@ -1396,10 +1419,12 @@ pub fn sys_setsockopt(
                 } else {
                     false
                 };
-                crate::net::with_net_iface(|iface| {
-                    let sock: &mut TcpSocket = iface.sockets.get_mut(handle);
-                    sock.set_nagle_enabled(!val);
-                });
+                if net_ready() {
+                    crate::net::with_net_iface(|iface| {
+                        let sock: &mut TcpSocket = iface.sockets.get_mut(handle);
+                        sock.set_nagle_enabled(!val);
+                    });
+                }
                 0
             }
             _ => 0,
@@ -1415,9 +1440,6 @@ pub fn sys_getsockopt(
     optval: *mut u8,
     optlen: *mut usize,
 ) -> isize {
-    if !net_ready() {
-        return -97;
-    }
     if optval.is_null() || optlen.is_null() {
         return -14;
     }
@@ -1477,9 +1499,6 @@ pub fn sys_getsockopt(
 }
 
 pub fn sys_sock_shutdown(sockfd: usize, how: usize) -> isize {
-    if !net_ready() {
-        return -97;
-    }
     let (handle, st, _nonblock) = match sock_lookup(sockfd) {
         Some(v) => v,
         None => return -9,
@@ -1491,6 +1510,10 @@ pub fn sys_sock_shutdown(sockfd: usize, how: usize) -> isize {
 
     if let Some((conn_id, server_side, _)) = socket_local_tcp(sockfd) {
         return local_tcp_shutdown(conn_id, server_side, how);
+    }
+
+    if !net_ready() {
+        return -97;
     }
 
     crate::net::with_net_iface(|iface| {
@@ -1507,9 +1530,6 @@ pub fn sys_sock_shutdown(sockfd: usize, how: usize) -> isize {
 }
 
 pub fn sys_getpeername(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
-    if !net_ready() {
-        return -97;
-    }
     if addr.is_null() || addrlen.is_null() {
         return -14;
     }
@@ -1535,7 +1555,8 @@ pub fn sys_getpeername(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isi
                 ep.addr.unwrap_or(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED)),
                 ep.port,
             )
-        }),
+        })
+        .or_else(|| get_socket_peer_endpoint(sockfd)),
     };
 
     match peer {
@@ -1555,9 +1576,6 @@ pub fn sys_getpeername(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isi
 }
 
 pub fn sys_getsockname(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
-    if !net_ready() {
-        return -97;
-    }
     if addr.is_null() || addrlen.is_null() {
         return -14;
     }

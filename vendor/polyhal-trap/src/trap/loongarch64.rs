@@ -216,7 +216,8 @@ fn loongarch64_trap_handler(tf: &mut TrapFrame) -> TrapType {
             TrapType::StorePageFault(badv::read().vaddr())
         }
         Trap::Exception(Exception::PageNonExecutableFault)
-        | Trap::Exception(Exception::FetchPageFault) => {
+        | Trap::Exception(Exception::FetchPageFault)
+        | Trap::Exception(Exception::FetchInstructionAddressError) => {
             TrapType::InstructionPageFault(badv::read().vaddr())
         }
         Trap::Exception(Exception::TLBRFill)
@@ -225,7 +226,8 @@ fn loongarch64_trap_handler(tf: &mut TrapFrame) -> TrapType {
         }
         // Load Fault
         Trap::Exception(Exception::LoadPageFault)
-        | Trap::Exception(Exception::PageNonReadableFault) => {
+        | Trap::Exception(Exception::PageNonReadableFault)
+        | Trap::Exception(Exception::MemoryAccessAddressError) => {
             TrapType::LoadPageFault(badv::read().vaddr())
         }
         Trap::MachineError(_) => todo!(),
