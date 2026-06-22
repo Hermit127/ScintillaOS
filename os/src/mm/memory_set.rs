@@ -13,6 +13,7 @@ use xmas_elf::header::Type as ElfType;
 pub struct MemorySet {
     page_table: Arc<PageTableWrapper>,
     areas: Vec<MapArea>,
+    shared_page_table: bool,
 }
 
 pub struct LoadedElf {
@@ -28,6 +29,12 @@ pub struct LoadedElf {
     pub interp_path: Option<alloc::string::String>,
     pub interp_base: usize,
     pub program_entry: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PageFaultResult {
+    Handled,
+    SharedMetadataChanged,
 }
 
 pub fn get_elf_interp(elf_data: &[u8]) -> Option<String> {
@@ -132,10 +139,48 @@ impl MemorySet {
         Self {
             page_table: Arc::new(PageTableWrapper::alloc()),
             areas: Vec::new(),
+            shared_page_table: false,
         }
     }
     pub fn token(&self) -> PageTable {
         self.page_table.0
+    }
+    pub fn mark_shared(&mut self) {
+        self.shared_page_table = true;
+    }
+
+    pub fn is_shared(&self) -> bool {
+        self.shared_page_table
+    }
+
+    pub fn shared_metadata_snapshot(&self) -> Vec<MapArea> {
+        self.areas.iter().map(MapArea::from_another).collect()
+    }
+
+    pub fn replace_shared_metadata(&mut self, areas: &[MapArea]) {
+        let old_areas = core::mem::take(&mut self.areas);
+        self.areas = areas
+            .iter()
+            .map(|incoming| {
+                let mut area = MapArea::from_another(incoming);
+                for (&vpn, frame) in incoming.data_frames.iter() {
+                    area.data_frames.insert(vpn, frame.shared_clone());
+                }
+                area
+            })
+            .collect();
+        for old in old_areas.iter() {
+            for (&vpn, frame) in old.data_frames.iter() {
+                if let Some(area) = self.areas.iter_mut().find(|area| {
+                    area.vaddr_range.get_start() <= vpn && vpn < area.vaddr_range.get_end()
+                }) {
+                    area.data_frames
+                        .entry(vpn)
+                        .or_insert_with(|| frame.shared_clone());
+                }
+            }
+        }
+        self.shared_page_table = true;
     }
     pub fn push(&mut self, mut map_area: MapArea, data: Option<&[u8]>, page_off: usize) -> bool {
         if map_area.map(&self.page_table).is_err() {
@@ -474,18 +519,42 @@ impl MemorySet {
         for area in user_space.areas.iter() {
             let mut new_area = MapArea::from_another(area);
             for (&vpn, frame) in area.data_frames.iter() {
-                let new_frame = frame.shared_clone();
+                #[cfg(target_arch = "loongarch64")]
+                let child_perm = area.map_perm;
+                #[cfg(not(target_arch = "loongarch64"))]
                 let mut child_perm = area.map_perm;
-                if !area.shared && child_perm.contains(MapPermission::W) {
-                    child_perm.remove(MapPermission::W);
-                    user_space.page_table.unmap_page(vpn);
-                    user_space.page_table.map_page(
-                        vpn,
-                        frame.paddr,
-                        child_perm.into(),
-                        MappingSize::Page4KB,
-                    );
-                }
+
+                #[cfg(target_arch = "loongarch64")]
+                let new_frame = if area.shared {
+                    frame.shared_clone()
+                } else {
+                    let new_frame = frame_alloc()?;
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            frame.paddr.get_ptr::<u8>(),
+                            new_frame.paddr.get_mut_ptr(),
+                            PAGE_SIZE,
+                        );
+                    }
+                    new_frame
+                };
+
+                #[cfg(not(target_arch = "loongarch64"))]
+                let new_frame = {
+                    let new_frame = frame.shared_clone();
+                    if !area.shared && child_perm.contains(MapPermission::W) {
+                        child_perm.remove(MapPermission::W);
+                        user_space.page_table.unmap_page(vpn);
+                        user_space.page_table.map_page(
+                            vpn,
+                            frame.paddr,
+                            child_perm.into(),
+                            MappingSize::Page4KB,
+                        );
+                    }
+                    new_frame
+                };
+
                 memory_set.page_table.map_page(
                     vpn,
                     new_frame.paddr,
@@ -499,7 +568,49 @@ impl MemorySet {
         Some(memory_set)
     }
 
-    pub fn handle_page_fault(&mut self, vaddr: polyhal::VirtAddr, write_fault: bool) -> bool {
+    pub fn prepare_shared_writable_pages(&mut self) -> bool {
+        let page_table = self.page_table.clone();
+        for area in self.areas.iter_mut() {
+            if !area.map_perm.contains(MapPermission::W) {
+                continue;
+            }
+            let vpns: alloc::vec::Vec<VirtAddr> = area.data_frames.keys().copied().collect();
+            for vpn in vpns {
+                let Some(old) = area.data_frames.get(&vpn) else {
+                    continue;
+                };
+                let Some((paddr, flags)) = page_table.translate(vpn) else {
+                    continue;
+                };
+                if old.is_shared() && !flags.contains(MappingFlags::W) {
+                    let f = match frame_alloc() {
+                        Some(f) => f,
+                        None => return false,
+                    };
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            paddr.get_ptr::<u8>(),
+                            f.paddr.get_mut_ptr(),
+                            PAGE_SIZE,
+                        );
+                    }
+                    page_table.unmap_page(vpn);
+                    page_table.map_page(vpn, f.paddr, area.map_perm.into(), MappingSize::Page4KB);
+                    area.data_frames.insert(vpn, f);
+                } else if !flags.contains(MappingFlags::W) {
+                    page_table.unmap_page(vpn);
+                    page_table.map_page(vpn, old.paddr, area.map_perm.into(), MappingSize::Page4KB);
+                }
+            }
+        }
+        true
+    }
+
+    pub fn handle_page_fault(
+        &mut self,
+        vaddr: polyhal::VirtAddr,
+        write_fault: bool,
+    ) -> Option<PageFaultResult> {
         let vpn = vaddr.floor();
         let area = match self
             .areas
@@ -507,13 +618,54 @@ impl MemorySet {
             .find(|a| a.vaddr_range.get_start() <= vpn && vpn < a.vaddr_range.get_end())
         {
             Some(a) => a,
-            None => return false,
+            None => return None,
         };
+        if write_fault && !area.map_perm.contains(MapPermission::W) {
+            return None;
+        }
+        if self.shared_page_table {
+            if let Some((paddr, flags)) = self
+                .page_table
+                .translate(vpn)
+                .filter(|(_, flags)| flags.contains(MappingFlags::P))
+            {
+                if write_fault && !flags.contains(MappingFlags::W) {
+                    let f = match frame_alloc() {
+                        Some(f) => f,
+                        None => return None,
+                    };
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            paddr.get_ptr::<u8>(),
+                            f.paddr.get_mut_ptr(),
+                            PAGE_SIZE,
+                        );
+                    }
+                    self.page_table.unmap_page(vpn);
+                    self.page_table.map_page(
+                        vpn,
+                        f.paddr,
+                        area.map_perm.into(),
+                        MappingSize::Page4KB,
+                    );
+                    area.data_frames.insert(vpn, f);
+                    return Some(PageFaultResult::SharedMetadataChanged);
+                }
+                self.page_table.unmap_page(vpn);
+                self.page_table.map_page(
+                    vpn,
+                    paddr.into(),
+                    area.map_perm.into(),
+                    MappingSize::Page4KB,
+                );
+                return Some(PageFaultResult::Handled);
+            }
+        }
         let in_frames = area.data_frames.contains_key(&vpn);
         if !in_frames {
             let f = match frame_alloc() {
                 Some(f) => f,
-                None => return false,
+                None => return None,
             };
             if let Some(ref file) = area.file {
                 let off = area.file_offset + (vpn.raw() - area.vaddr_range.get_start().raw());
@@ -523,36 +675,51 @@ impl MemorySet {
             self.page_table
                 .map_page(vpn, f.paddr, area.map_perm.into(), MappingSize::Page4KB);
             area.data_frames.insert(vpn, f);
-            return true;
+            return Some(if self.shared_page_table {
+                PageFaultResult::SharedMetadataChanged
+            } else {
+                PageFaultResult::Handled
+            });
         }
-        // Write fault on read-only area → SIGSEGV
-        if write_fault && !area.map_perm.contains(MapPermission::W) {
-            return false;
+        if self.shared_page_table {
+            let old = match area.data_frames.get(&vpn) {
+                Some(f) => f,
+                None => return None,
+            };
+            self.page_table.unmap_page(vpn);
+            self.page_table
+                .map_page(vpn, old.paddr, area.map_perm.into(), MappingSize::Page4KB);
+            return Some(PageFaultResult::Handled);
         }
         // Read fault on already-mapped read-only page — re-establish PTE
         if !write_fault && !area.map_perm.contains(MapPermission::W) {
             let paddr = match area.data_frames.get(&vpn) {
                 Some(f) => f.paddr,
-                None => return false,
+                None => return None,
             };
             self.page_table.unmap_page(vpn);
             self.page_table
                 .map_page(vpn, paddr, area.map_perm.into(), MappingSize::Page4KB);
-            return true;
+            return Some(PageFaultResult::Handled);
         }
         // COW or permission upgrade for writable pages
-        let (paddr, _) = match self.page_table.translate(vpn) {
+        let (paddr, flags) = match self.page_table.translate(vpn) {
             Some(x) => x,
-            None => return false,
+            None => return None,
         };
         let old = match area.data_frames.get(&vpn) {
             Some(f) => f,
-            None => return false,
+            None => return None,
         };
+        if !flags.contains(MappingFlags::P) {
+            self.page_table
+                .map_page(vpn, old.paddr, area.map_perm.into(), MappingSize::Page4KB);
+            return Some(PageFaultResult::Handled);
+        }
         if old.is_shared() {
             let f = match frame_alloc() {
                 Some(f) => f,
-                None => return false,
+                None => return None,
             };
             unsafe {
                 core::ptr::copy_nonoverlapping(
@@ -570,12 +737,18 @@ impl MemorySet {
             self.page_table
                 .map_page(vpn, old.paddr, area.map_perm.into(), MappingSize::Page4KB);
         }
-        true
+        Some(PageFaultResult::Handled)
     }
+
     pub fn from_shared(user_space: &MemorySet) -> MemorySet {
+        let mut areas = Vec::new();
+        for area in user_space.areas.iter() {
+            areas.push(MapArea::from_another(area));
+        }
         MemorySet {
             page_table: user_space.page_table.clone(),
-            areas: Vec::new(),
+            areas,
+            shared_page_table: true,
         }
     }
     pub fn activate(&self) {
@@ -585,6 +758,80 @@ impl MemorySet {
         self.page_table
             .translate(vaddr)
             .map(|(pa, flags)| (pa.into(), flags))
+    }
+    pub fn clone_frame_metadata(&self, vpn: VirtAddr) -> Option<FrameTracker> {
+        self.areas
+            .iter()
+            .find(|area| area.vaddr_range.get_start() <= vpn && vpn < area.vaddr_range.get_end())
+            .and_then(|area| area.data_frames.get(&vpn))
+            .map(FrameTracker::shared_clone)
+    }
+    pub fn replace_frame_metadata(&mut self, vpn: VirtAddr, frame: &FrameTracker) {
+        if let Some(area) = self
+            .areas
+            .iter_mut()
+            .find(|area| area.vaddr_range.get_start() <= vpn && vpn < area.vaddr_range.get_end())
+        {
+            area.data_frames.insert(vpn, frame.shared_clone());
+        }
+    }
+    pub fn frame_metadata_range(
+        &self,
+        start: VirtAddr,
+        end: VirtAddr,
+    ) -> Vec<(VirtAddr, FrameTracker)> {
+        let start = start.floor();
+        let end = end.ceil();
+        let mut frames = Vec::new();
+        for area in self.areas.iter() {
+            if area.vaddr_range.get_start() >= end || area.vaddr_range.get_end() <= start {
+                continue;
+            }
+            for (&vpn, frame) in area.data_frames.range(start..end) {
+                frames.push((vpn, frame.shared_clone()));
+            }
+        }
+        frames
+    }
+
+    pub fn area_metadata_range(&self, start: VirtAddr, end: VirtAddr) -> Vec<MapArea> {
+        let start = start.floor();
+        let end = end.ceil();
+        let mut areas = Vec::new();
+        for area in self.areas.iter() {
+            let area_start = area.vaddr_range.get_start();
+            let area_end = area.vaddr_range.get_end();
+            if area_start >= end || area_end <= start {
+                continue;
+            }
+            let range_start = start.max(area_start);
+            let range_end = end.min(area_end);
+            let mut metadata = MapArea::from_another(area);
+            metadata.vaddr_range = VAddrRange::new(range_start, range_end);
+            for (&vpn, frame) in area.data_frames.range(range_start..range_end) {
+                metadata.data_frames.insert(vpn, frame.shared_clone());
+            }
+            for &vpn in area.dirty.range(range_start..range_end) {
+                metadata.dirty.insert(vpn);
+            }
+            areas.push(metadata);
+        }
+        areas
+    }
+
+    pub fn insert_shared_metadata_areas(&mut self, areas: &[MapArea]) {
+        for incoming in areas {
+            let start = incoming.vaddr_range.get_start();
+            let end = incoming.vaddr_range.get_end();
+            self.munmap_metadata_only(start, end);
+            let mut area = MapArea::from_another(incoming);
+            for (&vpn, frame) in incoming.data_frames.iter() {
+                area.data_frames.insert(vpn, frame.shared_clone());
+            }
+            area.dirty = incoming.dirty.clone();
+            self.merge_or_push_metadata_area(area);
+        }
+        self.shared_page_table = true;
     }
     pub fn valid_user_buf(&self, ptr: *const u8, len: usize, need_write: bool) -> bool {
         if len == 0 {
@@ -630,6 +877,10 @@ impl MemorySet {
         true
     }
     pub fn recycle_data_pages(&mut self) {
+        if self.shared_page_table {
+            self.areas.clear();
+            return;
+        }
         for area in self.areas.iter_mut() {
             area.unmap(&self.page_table);
         }
@@ -703,6 +954,48 @@ impl MemorySet {
         true
     }
 
+    pub fn insert_lazy_area(
+        &mut self,
+        start_addr: polyhal::VirtAddr,
+        end_addr: polyhal::VirtAddr,
+        permission: MapPermission,
+    ) -> bool {
+        let start_addr = start_addr.floor();
+        let end_addr = end_addr.ceil();
+        if start_addr >= end_addr || self.is_overlap(start_addr, end_addr) {
+            return false;
+        }
+        let area = MapArea::new(start_addr, end_addr, MapType::Framed, permission);
+        self.merge_or_push_metadata_area(area);
+        true
+    }
+
+    fn merge_or_push_metadata_area(&mut self, mut area: MapArea) {
+        if !area.is_empty_metadata_mapping() {
+            self.areas.push(area);
+            return;
+        }
+
+        let mut start = area.vaddr_range.get_start();
+        let mut end = area.vaddr_range.get_end();
+        let mut i = 0;
+        while i < self.areas.len() {
+            if self.areas[i].can_merge_empty_metadata_mapping(&area) {
+                let area_start = self.areas[i].vaddr_range.get_start();
+                let area_end = self.areas[i].vaddr_range.get_end();
+                if area_end == start || end == area_start {
+                    start = start.min(area_start);
+                    end = end.max(area_end);
+                    self.areas.remove(i);
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        area.vaddr_range = VAddrRange::new(start, end);
+        self.areas.push(area);
+    }
+
     pub fn insert_file_area(
         &mut self,
         start_addr: polyhal::VirtAddr,
@@ -761,6 +1054,23 @@ impl MemorySet {
         }
         self.areas.push(area);
         Some(start_addr)
+    }
+
+    pub fn insert_shared_file_frames(
+        &mut self,
+        start_addr: polyhal::VirtAddr,
+        len: usize,
+        frames: &[FrameTracker],
+        permission: MapPermission,
+        file: alloc::sync::Arc<dyn crate::fs::File>,
+        file_offset: usize,
+    ) -> Option<polyhal::VirtAddr> {
+        let addr = self.insert_shared_frames(start_addr, len, frames, permission)?;
+        if let Some(area) = self.areas.last_mut() {
+            area.file = Some(file);
+            area.file_offset = file_offset;
+        }
+        Some(addr)
     }
 
     pub fn msync(&mut self, start_addr: polyhal::VirtAddr, len: usize, flags: usize) -> isize {
@@ -920,13 +1230,12 @@ impl MemorySet {
                 let unmap_start = start_vaddr.max(area_start);
                 let unmap_end = end_vaddr.min(area_end);
 
-                let vaddrs: alloc::vec::Vec<VirtAddr> = self.areas[i]
+                let frame_keys: alloc::vec::Vec<VirtAddr> = self.areas[i]
                     .data_frames
                     .range(unmap_start..unmap_end)
                     .map(|(&k, _)| k)
                     .collect();
-
-                for vaddr in &vaddrs {
+                for vaddr in &frame_keys {
                     if self
                         .page_table
                         .translate(*vaddr)
@@ -935,8 +1244,17 @@ impl MemorySet {
                         self.page_table.unmap_page(*vaddr);
                     }
                 }
-                for vaddr in &vaddrs {
+                for vaddr in &frame_keys {
                     self.areas[i].data_frames.remove(vaddr);
+                    self.areas[i].dirty.remove(vaddr);
+                }
+                let dirty_keys: alloc::vec::Vec<VirtAddr> = self.areas[i]
+                    .dirty
+                    .range(unmap_start..unmap_end)
+                    .copied()
+                    .collect();
+                for vaddr in dirty_keys {
+                    self.areas[i].dirty.remove(&vaddr);
                 }
                 unmapped_any = true;
 
@@ -972,6 +1290,80 @@ impl MemorySet {
 
         unmapped_any
     }
+
+    pub fn munmap_metadata_only(
+        &mut self,
+        start_addr: polyhal::VirtAddr,
+        end_addr: polyhal::VirtAddr,
+    ) -> bool {
+        let start_vaddr = start_addr.floor();
+        let end_vaddr = end_addr.ceil();
+
+        let mut unmapped_any = false;
+        let mut i = 0;
+
+        while i < self.areas.len() {
+            let area_start = self.areas[i].vaddr_range.get_start();
+            let area_end = self.areas[i].vaddr_range.get_end();
+
+            if area_start < end_vaddr && area_end > start_vaddr {
+                let unmap_start = start_vaddr.max(area_start);
+                let unmap_end = end_vaddr.min(area_end);
+
+                let frame_keys: alloc::vec::Vec<VirtAddr> = self.areas[i]
+                    .data_frames
+                    .range(unmap_start..unmap_end)
+                    .map(|(&k, _)| k)
+                    .collect();
+                for vaddr in &frame_keys {
+                    self.areas[i].data_frames.remove(vaddr);
+                    self.areas[i].dirty.remove(vaddr);
+                }
+                let dirty_keys: alloc::vec::Vec<VirtAddr> =
+                    self.areas[i].dirty.range(unmap_start..unmap_end).copied().collect();
+                for vaddr in dirty_keys {
+                    self.areas[i].dirty.remove(&vaddr);
+                }
+                unmapped_any = true;
+
+                if unmap_start <= area_start && unmap_end >= area_end {
+                    self.areas.remove(i);
+                } else if unmap_start <= area_start {
+                    self.areas[i].vaddr_range = VAddrRange::new(unmap_end, area_end);
+                    i += 1;
+                } else if unmap_end >= area_end {
+                    self.areas[i].vaddr_range = VAddrRange::new(area_start, unmap_start);
+                    i += 1;
+                } else {
+                    let mut right = MapArea::from_another(&self.areas[i]);
+                    right.vaddr_range = VAddrRange::new(unmap_end, area_end);
+                    let right_keys: alloc::vec::Vec<VirtAddr> = self.areas[i]
+                        .data_frames
+                        .range(unmap_end..area_end)
+                        .map(|(&k, _)| k)
+                        .collect();
+                    for key in right_keys {
+                        if let Some(frame) = self.areas[i].data_frames.remove(&key) {
+                            right.data_frames.insert(key, frame);
+                        }
+                    }
+                    let right_dirty: alloc::vec::Vec<VirtAddr> =
+                        self.areas[i].dirty.range(unmap_end..area_end).copied().collect();
+                    for key in right_dirty {
+                        self.areas[i].dirty.remove(&key);
+                        right.dirty.insert(key);
+                    }
+                    self.areas[i].vaddr_range = VAddrRange::new(area_start, unmap_start);
+                    self.areas.insert(i + 1, right);
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+        }
+
+        unmapped_any
+    }
 }
 
 pub struct MapArea {
@@ -989,6 +1381,20 @@ impl MapArea {
     pub fn set_perm(&mut self, perm: MapPermission) {
         self.map_perm = perm;
     }
+
+    fn is_empty_metadata_mapping(&self) -> bool {
+        self.file.is_none() && self.data_frames.is_empty() && self.dirty.is_empty()
+    }
+
+    fn can_merge_empty_metadata_mapping(&self, other: &MapArea) -> bool {
+        self.is_empty_metadata_mapping()
+            && other.is_empty_metadata_mapping()
+            && self.map_type == other.map_type
+            && self.map_perm == other.map_perm
+            && self.shared == other.shared
+            && self.file_offset == other.file_offset
+    }
+
     pub fn new(
         start_va: VirtAddr,
         end_va: VirtAddr,
@@ -1021,6 +1427,25 @@ impl MapArea {
             file_offset: another.file_offset,
             shared: another.shared,
             dirty: alloc::collections::BTreeSet::new(),
+        }
+    }
+    pub fn clone_shared_metadata(another: &MapArea) -> Self {
+        Self {
+            vaddr_range: VAddrRange::new(
+                another.vaddr_range.get_start(),
+                another.vaddr_range.get_end(),
+            ),
+            data_frames: another
+                .data_frames
+                .iter()
+                .map(|(&vpn, frame)| (vpn, frame.shared_clone()))
+                .collect(),
+            map_type: another.map_type,
+            map_perm: another.map_perm,
+            file: another.file.clone(),
+            file_offset: another.file_offset,
+            shared: another.shared,
+            dirty: another.dirty.clone(),
         }
     }
     pub fn map(&mut self, page_table: &Arc<PageTableWrapper>) -> Result<(), ()> {
@@ -1131,7 +1556,7 @@ bitflags! {
 impl Into<MappingFlags> for MapPermission {
     fn into(self) -> MappingFlags {
         let mut flags = MappingFlags::empty();
-        if self.contains(MapPermission::R) {
+        if self.contains(MapPermission::R) || self.contains(MapPermission::W) {
             flags |= MappingFlags::R;
         }
         if self.contains(MapPermission::W) {

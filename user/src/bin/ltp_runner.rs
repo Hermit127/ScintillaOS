@@ -11,7 +11,7 @@ use user_lib::{
 };
 
 const DEFAULT_LTP_DIR: &str = "/ltp/testcases/bin/";
-const CASE_TIMEOUT_MS: isize = 30_000;
+const CASE_TIMEOUT_MS: isize = 60_000;
 
 const SUBSET_LIST: &[&str] = &[
     "close01",

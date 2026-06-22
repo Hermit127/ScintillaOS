@@ -5,8 +5,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::task::{
-    block_current_and_run_next, current_task, wake_pipe_read_tasks, wake_pipe_write_tasks,
-    wake_poll_wait_tasks, BlockReason,
+    block_current_and_run_next, current_add_signal, current_task, wake_pipe_read_tasks,
+    wake_pipe_write_tasks, wake_poll_wait_tasks, BlockReason, SignalFlags,
 };
 
 use crate::fs::stdio::stdout_release_if_owner;
@@ -230,6 +230,7 @@ impl File for Pipe {
                 )
             };
             if read_end_closed {
+                current_add_signal(SignalFlags::SIGPIPE);
                 return -32;
             }
             if loop_write == 0 {

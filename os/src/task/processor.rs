@@ -1,7 +1,7 @@
 use core::cell::LazyCell;
 
 use super::TaskControlBlock;
-use super::{fetch_task, TaskStatus};
+use super::{fetch_task, reap_exited_tasks, TaskStatus};
 use crate::sync::UPSafeCell;
 use alloc::sync::Arc;
 use lazy_static::*;
@@ -39,6 +39,7 @@ lazy_static! {
 pub fn run_tasks() {
     trace!("os::task::processor::run_tasks");
     loop {
+        reap_exited_tasks();
         let mut processor = PROCESSOR.exclusive_access();
         if let Some(task) = fetch_task() {
             let idle_task_cx_ptr = processor.get_idle_task_cx_ptr();

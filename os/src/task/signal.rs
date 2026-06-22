@@ -1,9 +1,9 @@
 use bitflags::*;
 
-pub const MAX_SIG: usize = 31;
+pub const MAX_SIG: usize = 34;
 
 bitflags! {
-    pub struct SignalFlags: u32 {
+    pub struct SignalFlags: u64 {
         const SIGDEF = 1; // Default signal handling
         const SIGHUP = 1 << 1;
         const SIGINT = 1 << 2;
@@ -36,6 +36,9 @@ bitflags! {
         const SIGIO = 1 << 29;
         const SIGPWR = 1 << 30;
         const SIGSYS = 1 << 31;
+        const SIGRTMIN = 1 << 32;
+        const SIGCANCEL = 1 << 33;
+        const SIGSYNCCALL = 1 << 34;
     }
 }
 

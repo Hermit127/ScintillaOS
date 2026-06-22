@@ -145,7 +145,11 @@ impl File for SocketFile {
                 }
             }
         }
-        #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+        #[cfg(any(
+            target_arch = "riscv64",
+            target_arch = "aarch64",
+            target_arch = "loongarch64"
+        ))]
         {
             use smoltcp::socket::tcp::Socket as TcpSocket;
             use smoltcp::socket::udp::Socket as UdpSocket;
@@ -169,7 +173,11 @@ impl File for SocketFile {
             })
             .unwrap_or((false, false, false))
         }
-        #[cfg(not(any(target_arch = "riscv64", target_arch = "aarch64")))]
+        #[cfg(not(any(
+            target_arch = "riscv64",
+            target_arch = "aarch64",
+            target_arch = "loongarch64"
+        )))]
         {
             (false, false, false)
         }

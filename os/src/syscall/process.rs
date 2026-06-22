@@ -2,16 +2,17 @@ use crate::fs::stdio::stdout_release_if_owner;
 use crate::fs::{open_file, open_file_at, File, OpenFlags};
 use crate::mm::{
     frames_alloc, get_elf_interp_file, translated_byte_buffer, translated_ref, translated_refmut,
-    translated_str, FrameTracker, MapPermission,
+    translated_str, FrameTracker, MapArea, MapPermission,
 };
 use crate::sync::UPSafeCell;
 use crate::task::{
-    add_task, blank_kcontext, block_current_and_run_next, current_task, current_user_token,
-    exit_current_and_run_next, force_exit_task, force_exit_task_group, pid2task, pid_alloc,
-    sleep_current_and_run_next, suspend_current_and_run_next, wake_blocked_task, BlockReason,
-    KernelStack, SignalAction, SignalFlags, TaskControlBlock, TaskControlBlockInner, TaskStatus,
-    MAX_SIG, PID2TCB,
+    add_priority_task, add_task, blank_kcontext, block_current_and_run_next, current_task,
+    current_user_token, exit_current_and_run_next, force_exit_task, force_exit_task_group,
+    pid2task, pid_alloc, sleep_current_and_run_next, suspend_current_and_run_next,
+    wake_blocked_task, BlockReason, KernelStack, SignalAction, SignalFlags, TaskControlBlock,
+    TaskControlBlockInner, TaskStatus, MAX_SIG, PID2TCB,
 };
+use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -29,9 +30,20 @@ struct ShmSegment {
     frames: Vec<FrameTracker>,
 }
 
+struct SharedFileMapping {
+    path: String,
+    offset: usize,
+    len: usize,
+    frames: Vec<FrameTracker>,
+}
+
 lazy_static! {
     static ref SHM_SEGMENTS: UPSafeCell<Vec<Option<ShmSegment>>> =
         unsafe { UPSafeCell::new(Vec::new()) };
+    static ref SHARED_FILE_MAPPINGS: UPSafeCell<Vec<SharedFileMapping>> =
+        unsafe { UPSafeCell::new(Vec::new()) };
+    static ref FUTEX_WAITERS: UPSafeCell<BTreeMap<usize, Vec<Arc<TaskControlBlock>>>> =
+        unsafe { UPSafeCell::new(BTreeMap::new()) };
 }
 
 static LAST_USER_TIME_US: AtomicU64 = AtomicU64::new(0);
@@ -41,6 +53,228 @@ const USER_CLOCK_TICK_US: u64 = 10_000;
 const USER_CLOCK_TICK_NS: usize = USER_CLOCK_TICK_US as usize * 1_000;
 const NSEC_PER_SEC: usize = 1_000_000_000;
 const NSEC_PER_USEC: usize = 1_000;
+
+fn page_align_up(len: usize) -> Option<usize> {
+    len.checked_add(crate::config::PAGE_SIZE - 1)
+        .map(|n| n & !(crate::config::PAGE_SIZE - 1))
+}
+
+fn fill_shared_file_frames(
+    file: &Arc<dyn File>,
+    offset: usize,
+    frames: &[FrameTracker],
+    base_page: usize,
+) {
+    for (idx, frame) in frames.iter().enumerate() {
+        let page = frame.paddr.slice_mut_with_len(crate::config::PAGE_SIZE);
+        let file_off = offset + (base_page + idx) * crate::config::PAGE_SIZE;
+        let _ = file.read_at(file_off, page);
+    }
+}
+
+fn shared_file_mapping_frames(
+    file: Arc<dyn File>,
+    offset: usize,
+    len: usize,
+) -> Option<Vec<FrameTracker>> {
+    let path = file.path()?;
+    let len = page_align_up(len)?;
+    let pages = len / crate::config::PAGE_SIZE;
+    if pages == 0 {
+        return None;
+    }
+
+    let mut mappings = SHARED_FILE_MAPPINGS.exclusive_access();
+    if let Some(mapping) = mappings
+        .iter_mut()
+        .find(|mapping| mapping.path == path && mapping.offset == offset)
+    {
+        if mapping.len < len {
+            let old_pages = mapping.frames.len();
+            let extra_pages = pages.saturating_sub(old_pages);
+            if extra_pages > 0 {
+                let mut extra = frames_alloc(extra_pages)?;
+                fill_shared_file_frames(&file, offset, &extra, old_pages);
+                mapping.frames.append(&mut extra);
+            }
+            mapping.len = len;
+        }
+        return Some(
+            mapping
+                .frames
+                .iter()
+                .take(pages)
+                .map(|frame| frame.shared_clone())
+                .collect(),
+        );
+    }
+
+    let frames = frames_alloc(pages)?;
+    fill_shared_file_frames(&file, offset, &frames, 0);
+    let result = frames.iter().map(|frame| frame.shared_clone()).collect();
+    mappings.push(SharedFileMapping {
+        path,
+        offset,
+        len,
+        frames,
+    });
+    Some(result)
+}
+
+pub(crate) fn sync_thread_group_vm_metadata(
+    owner_pid: usize,
+    tgid: usize,
+    program_brk: usize,
+    areas: &[MapArea],
+) {
+    let tasks: Vec<Arc<TaskControlBlock>> = PID2TCB.exclusive_access().values().cloned().collect();
+    for task in tasks {
+        if task.getpid() == owner_pid {
+            continue;
+        }
+        let Some(mut inner) = task.try_inner_exclusive_access() else {
+            continue;
+        };
+        if inner.tgid != tgid {
+            continue;
+        }
+        inner.program_brk = program_brk;
+        inner.memory_set.replace_shared_metadata(areas);
+    }
+}
+
+pub(crate) fn sync_thread_group_vm_frame(
+    owner_pid: usize,
+    tgid: usize,
+    vpn: polyhal::VirtAddr,
+    frame: &FrameTracker,
+) {
+    let tasks: Vec<Arc<TaskControlBlock>> = PID2TCB.exclusive_access().values().cloned().collect();
+    for task in tasks {
+        if task.getpid() == owner_pid {
+            continue;
+        }
+        let Some(mut inner) = task.try_inner_exclusive_access() else {
+            continue;
+        };
+        if inner.tgid != tgid {
+            continue;
+        }
+        inner.memory_set.replace_frame_metadata(vpn, frame);
+    }
+}
+
+fn sync_thread_group_vm_frames(
+    owner_pid: usize,
+    tgid: usize,
+    frames: &[(polyhal::VirtAddr, FrameTracker)],
+) {
+    if frames.is_empty() {
+        return;
+    }
+    let tasks: Vec<Arc<TaskControlBlock>> = PID2TCB.exclusive_access().values().cloned().collect();
+    for task in tasks {
+        if task.getpid() == owner_pid {
+            continue;
+        }
+        let Some(mut inner) = task.try_inner_exclusive_access() else {
+            continue;
+        };
+        if inner.tgid != tgid {
+            continue;
+        }
+        for (vpn, frame) in frames.iter() {
+            inner.memory_set.replace_frame_metadata(*vpn, frame);
+        }
+    }
+}
+
+fn sync_thread_group_vm_area_metadata(owner_pid: usize, tgid: usize, areas: &[MapArea]) {
+    if areas.is_empty() {
+        return;
+    }
+    let tasks: Vec<Arc<TaskControlBlock>> = PID2TCB.exclusive_access().values().cloned().collect();
+    for task in tasks {
+        if task.getpid() == owner_pid {
+            continue;
+        }
+        let Some(mut inner) = task.try_inner_exclusive_access() else {
+            continue;
+        };
+        if inner.tgid != tgid {
+            continue;
+        }
+        inner.memory_set.insert_shared_metadata_areas(areas);
+    }
+}
+
+fn sync_thread_group_vm_unmap_metadata(
+    owner_pid: usize,
+    tgid: usize,
+    start: polyhal::VirtAddr,
+    end: polyhal::VirtAddr,
+) {
+    let tasks: Vec<Arc<TaskControlBlock>> = PID2TCB.exclusive_access().values().cloned().collect();
+    for task in tasks {
+        if task.getpid() == owner_pid {
+            continue;
+        }
+        let Some(mut inner) = task.try_inner_exclusive_access() else {
+            continue;
+        };
+        if inner.tgid != tgid {
+            continue;
+        }
+        inner.memory_set.munmap_metadata_only(start, end);
+    }
+}
+
+fn thread_group_has_peer(owner_pid: usize, tgid: usize) -> bool {
+    let tasks: Vec<Arc<TaskControlBlock>> = PID2TCB.exclusive_access().values().cloned().collect();
+    tasks.into_iter().any(|task| {
+        if task.getpid() == owner_pid {
+            return false;
+        }
+        let Some(inner) = task.try_inner_exclusive_access() else {
+            return false;
+        };
+        inner.tgid == tgid && inner.task_status != TaskStatus::Zombie
+    })
+}
+
+fn shared_vm_sync_snapshot(
+    inner: &TaskControlBlockInner,
+) -> Option<(usize, usize, Vec<MapArea>)> {
+    if inner.memory_set.is_shared() {
+        Some((
+            inner.tgid,
+            inner.program_brk,
+            inner.memory_set.shared_metadata_snapshot(),
+        ))
+    } else {
+        None
+    }
+}
+
+fn sync_thread_group_vm_snapshot(owner_pid: usize, snapshot: Option<(usize, usize, Vec<MapArea>)>) {
+    if let Some((tgid, program_brk, areas)) = snapshot {
+        if thread_group_has_peer(owner_pid, tgid) {
+            sync_thread_group_vm_metadata(owner_pid, tgid, program_brk, &areas);
+        }
+    }
+}
+
+fn sync_thread_group_vm_snapshot_and_frames(
+    owner_pid: usize,
+    snapshot: Option<(usize, usize, Vec<MapArea>)>,
+    frames: &[(polyhal::VirtAddr, FrameTracker)],
+) {
+    let tgid = snapshot.as_ref().map(|(tgid, _, _)| *tgid);
+    sync_thread_group_vm_snapshot(owner_pid, snapshot);
+    if let Some(tgid) = tgid {
+        sync_thread_group_vm_frames(owner_pid, tgid, frames);
+    }
+}
 
 fn monotonic_user_time_us() -> u64 {
     let hw_us = (Time::now().to_nsec() / 1000) as u64;
@@ -208,20 +442,216 @@ struct RUsage {
     ru_nivcsw: isize,
 }
 
+const ROBUST_LIST_LEN: usize = 3 * core::mem::size_of::<usize>();
+const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
+const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
+const FUTEX_WAITERS_BIT: u32 = 0x8000_0000;
+const ROBUST_LIST_LIMIT: usize = 2048;
+const MUSL_KILLLOCK_OFFSET_FROM_ROBUST_HEAD: usize = 0x28;
+const MUSL_LOCKED_NO_WAITERS: u32 = 0x8000_0001;
+
+fn user_usize(inner: &TaskControlBlockInner, addr: usize) -> Option<usize> {
+    if addr == 0
+        || !inner
+            .memory_set
+            .valid_user_buf(addr as *const u8, core::mem::size_of::<usize>(), false)
+    {
+        return None;
+    }
+    Some(*translated_ref(
+        inner.memory_set.token(),
+        addr as *const usize,
+    ))
+}
+
+fn user_u32(inner: &TaskControlBlockInner, addr: usize) -> Option<u32> {
+    if addr == 0
+        || !inner
+            .memory_set
+            .valid_user_buf(addr as *const u8, core::mem::size_of::<u32>(), false)
+    {
+        return None;
+    }
+    Some(*translated_ref(inner.memory_set.token(), addr as *const u32))
+}
+
+fn set_user_u32(inner: &TaskControlBlockInner, addr: usize, value: u32) -> bool {
+    if addr == 0
+        || !inner
+            .memory_set
+            .valid_user_buf(addr as *const u8, core::mem::size_of::<u32>(), true)
+    {
+        return false;
+    }
+    *translated_refmut(inner.memory_set.token(), addr as *mut u32) = value;
+    true
+}
+
+fn futex_keys_for_addr(inner: &TaskControlBlockInner, addr: usize, shared: bool) -> Vec<usize> {
+    let mut keys = Vec::new();
+    keys.push(addr);
+    if shared {
+        if let Some((paddr, _)) = inner.memory_set.translate(polyhal::VirtAddr::from(addr)) {
+            let key = paddr.raw();
+            if key != addr {
+                keys.push(key);
+            }
+        }
+    }
+    keys
+}
+
+fn wake_futex_keys(keys: &[usize]) {
+    for &key in keys {
+        let _ = futex_wake_key(key, 1);
+    }
+}
+
+fn clear_stale_musl_killlock(inner: &TaskControlBlockInner, robust_head: usize) {
+    // musl keeps killlock next to robust_list; clear its stale fast-path state before exit cleanup.
+    let addr = robust_head + MUSL_KILLLOCK_OFFSET_FROM_ROBUST_HEAD;
+    if user_u32(inner, addr) == Some(MUSL_LOCKED_NO_WAITERS) {
+        let _ = set_user_u32(inner, addr, 0);
+    }
+}
+
+fn futex_owner_gone(owner: u32) -> bool {
+    if owner == 0 || owner == FUTEX_TID_MASK {
+        return false;
+    }
+    match pid2task(owner as usize) {
+        Some(task) => task
+            .try_inner_borrow()
+            .map(|inner| inner.task_status == TaskStatus::Zombie)
+            .unwrap_or(true),
+        None => true,
+    }
+}
+
+fn mark_futex_owner_died(uaddr: *mut u32, shared: bool, key: usize) -> bool {
+    if !shared {
+        return false;
+    }
+    let Some(task) = current_task() else {
+        return false;
+    };
+    let mut wake_keys = Vec::new();
+    {
+        let inner = task.inner_exclusive_access();
+        if !inner.memory_set.valid_user_buf(
+            uaddr as *const u8,
+            core::mem::size_of::<u32>(),
+            true,
+        ) {
+            return false;
+        }
+        let word = *translated_ref(inner.memory_set.token(), uaddr);
+        if word & FUTEX_OWNER_DIED != 0 {
+            return false;
+        }
+        let owner = word & FUTEX_TID_MASK;
+        if !futex_owner_gone(owner) {
+            return false;
+        }
+        let new = (word & FUTEX_WAITERS_BIT) | FUTEX_OWNER_DIED;
+        *translated_refmut(inner.memory_set.token(), uaddr) = new;
+        wake_keys.push(key);
+        for wake_key in futex_keys_for_addr(&inner, uaddr as usize, shared) {
+            if !wake_keys.contains(&wake_key) {
+                wake_keys.push(wake_key);
+            }
+        }
+    }
+    wake_futex_keys(&wake_keys);
+    true
+}
+
+fn process_robust_node(
+    inner: &TaskControlBlockInner,
+    node: usize,
+    futex_offset: isize,
+    tid: u32,
+    wake_keys: &mut Vec<usize>,
+) {
+    let futex_addr = node.wrapping_add_signed(futex_offset);
+    let Some(old) = user_u32(inner, futex_addr) else {
+        return;
+    };
+    if old & FUTEX_TID_MASK != tid {
+        return;
+    }
+    let new = (old & FUTEX_WAITERS_BIT) | FUTEX_OWNER_DIED;
+    if set_user_u32(inner, futex_addr, new) {
+        wake_keys.extend(futex_keys_for_addr(inner, futex_addr, true));
+    }
+}
+
+fn process_current_robust_list(clear_after: bool) {
+    let Some(task) = current_task() else {
+        return;
+    };
+    let tid = task.getpid() as u32;
+    let mut wake_keys = Vec::new();
+    {
+        let mut inner = task.inner_exclusive_access();
+        let head = inner.robust_list_head;
+        if head == 0 || inner.robust_list_len != ROBUST_LIST_LEN {
+            return;
+        }
+        let Some(offset_raw) = user_usize(&inner, head + core::mem::size_of::<usize>()) else {
+            if clear_after {
+                inner.robust_list_head = 0;
+                inner.robust_list_len = 0;
+            }
+            return;
+        };
+        let futex_offset = offset_raw as isize;
+        let pending = user_usize(&inner, head + 2 * core::mem::size_of::<usize>()).unwrap_or(0);
+        let mut node = user_usize(&inner, head).unwrap_or(0);
+        let mut seen = 0usize;
+        while node != 0 && node != head && seen < ROBUST_LIST_LIMIT {
+            let next = user_usize(&inner, node).unwrap_or(0);
+            process_robust_node(&inner, node, futex_offset, tid, &mut wake_keys);
+            node = next;
+            seen += 1;
+        }
+        if pending != 0 && pending != head {
+            process_robust_node(&inner, pending, futex_offset, tid, &mut wake_keys);
+        }
+        if clear_after {
+            inner.robust_list_head = 0;
+            inner.robust_list_len = 0;
+        }
+    }
+    wake_futex_keys(&wake_keys);
+}
+
 fn clear_current_tid_ptr() {
     let Some(task) = current_task() else {
         return;
     };
-    let tid = {
+    let (tid, wake_keys) = {
         let inner = task.inner_exclusive_access();
-        inner.tid_ptr
+        let tid = inner.tid_ptr;
+        if tid == 0
+            || !inner
+                .memory_set
+                .valid_user_buf(tid as *const u8, core::mem::size_of::<i32>(), true)
+        {
+            return;
+        }
+        *translated_refmut(inner.memory_set.token(), tid as *mut i32) = 0;
+        (tid, futex_keys_for_addr(&inner, tid, true))
     };
-    if tid != 0 {
-        *translated_refmut(current_user_token(), tid as *mut i32) = 0;
+    let mut keys = wake_keys;
+    if !keys.contains(&tid) {
+        keys.push(tid);
     }
+    wake_futex_keys(&keys);
 }
 
 pub fn sys_exit(exit_code: i32) -> ! {
+    process_current_robust_list(false);
     clear_current_tid_ptr();
     exit_current_and_run_next(exit_code)
 }
@@ -310,8 +740,16 @@ pub fn sys_clone(flags: usize, stack: usize, ptid: usize, tls: usize, ctid: usiz
         inner.tgid
     };
     let is_thread = flags & CLONE_THREAD != 0;
-    let Some(new_task) = current_task.fork() else {
-        return -12;
+    let new_task = if flags & CLONE_VM != 0 {
+        let Some(new_task) = current_task.clone_shared_vm() else {
+            return -12;
+        };
+        new_task
+    } else {
+        let Some(new_task) = current_task.fork() else {
+            return -12;
+        };
+        new_task
     };
     let new_pid = new_task.pid.0;
 
@@ -719,7 +1157,7 @@ fn signal_task(task: &Arc<TaskControlBlock>, signum: i32) {
     if signum < 0 || signum as usize > MAX_SIG {
         return;
     }
-    let flag = SignalFlags::from_bits(1u32 << signum as usize).unwrap();
+    let flag = SignalFlags::from_bits(1u64 << signum as usize).unwrap();
     {
         let mut task_ref = task.inner_exclusive_access();
         if task_ref.signals.contains(flag) {
@@ -810,6 +1248,40 @@ pub fn sys_kill(pid: isize, signum: i32) -> isize {
     0
 }
 
+pub fn sys_tkill(tid: usize, signum: i32) -> isize {
+    const MAX_USER_SIG: usize = 64;
+    if signum < 0 || signum as usize > MAX_USER_SIG {
+        return -22;
+    }
+    let Some(task) = pid2task(tid) else {
+        return -3;
+    };
+    if signum == 0 || signum as usize > MAX_SIG {
+        return 0;
+    }
+    signal_task(&task, signum);
+    0
+}
+
+pub fn sys_tgkill(tgid: usize, tid: usize, signum: i32) -> isize {
+    const MAX_USER_SIG: usize = 64;
+    if signum < 0 || signum as usize > MAX_USER_SIG {
+        return -22;
+    }
+    let Some(task) = pid2task(tid) else {
+        return -3;
+    };
+    let task_tgid = task.inner_exclusive_access().tgid;
+    if tgid != 0 && task_tgid != tgid {
+        return -3;
+    }
+    if signum == 0 || signum as usize > MAX_SIG {
+        return 0;
+    }
+    signal_task(&task, signum);
+    0
+}
+
 pub fn sys_setpgid(pid: usize, pgid: usize) -> isize {
     let target_pid = if pid == 0 {
         current_task().map(|task| task.getpid()).unwrap_or(0)
@@ -850,7 +1322,7 @@ fn user_sigset_to_flags(raw: u64) -> SignalFlags {
     let mut flags = SignalFlags::empty();
     for sig in 1..=MAX_SIG {
         if (raw & (1u64 << (sig - 1))) != 0 {
-            if let Some(flag) = SignalFlags::from_bits(1u32 << sig) {
+            if let Some(flag) = SignalFlags::from_bits(1u64 << sig) {
                 flags.insert(flag);
             }
         }
@@ -861,7 +1333,7 @@ fn user_sigset_to_flags(raw: u64) -> SignalFlags {
 fn flags_to_user_sigset(flags: SignalFlags) -> u64 {
     let mut raw = 0u64;
     for sig in 1..=MAX_SIG {
-        if let Some(flag) = SignalFlags::from_bits(1u32 << sig) {
+        if let Some(flag) = SignalFlags::from_bits(1u64 << sig) {
             if flags.contains(flag) {
                 raw |= 1u64 << (sig - 1);
             }
@@ -911,13 +1383,17 @@ pub fn sys_sigaction(
     signum: i32,
     action: *const SignalAction,
     old_action: *mut SignalAction,
+    sigsetsize: usize,
 ) -> isize {
     const MAX_USER_SIG: usize = 64;
     let token = current_user_token();
     let task = current_task().unwrap();
     let mut inner = task.inner_exclusive_access();
+    if sigsetsize != 0 && sigsetsize != 8 {
+        return -22;
+    }
     if signum <= 0 || signum as usize > MAX_USER_SIG {
-        return -1;
+        return -22;
     }
     if signum as usize > MAX_SIG {
         if !old_action.is_null() {
@@ -925,15 +1401,34 @@ pub fn sys_sigaction(
         }
         return 0;
     }
-    if let Some(flag) = SignalFlags::from_bits(1 << signum) {
+    if let Some(flag) = SignalFlags::from_bits(1u64 << signum) {
         if check_sigaction_error(flag, action as usize, old_action as usize) {
-            return -1;
+            return -22;
         }
         if !old_action.is_null() {
             *translated_refmut(token, old_action) = inner.signal_actions.table[signum as usize];
         }
         if !action.is_null() {
-            inner.signal_actions.table[signum as usize] = *translated_ref(token, action);
+            let new_action = *translated_ref(token, action);
+            let tgid = inner.tgid;
+            inner.signal_actions.table[signum as usize] = new_action;
+            drop(inner);
+            let tasks: Vec<Arc<TaskControlBlock>> = PID2TCB
+                .exclusive_access()
+                .values()
+                .filter(|task| {
+                    task.try_inner_borrow()
+                        .map(|inner| inner.tgid == tgid)
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect();
+            for task in tasks {
+                if let Some(mut task_inner) = task.try_inner_exclusive_access() {
+                    task_inner.signal_actions.table[signum as usize] = new_action;
+                }
+            }
+            return 0;
         }
         0
     } else {
@@ -943,6 +1438,7 @@ pub fn sys_sigaction(
 
 pub fn sys_brk(brk_addr: usize) -> isize {
     let task = current_task().unwrap();
+    let pid = task.getpid();
     let mut inner = task.inner_exclusive_access();
 
     if brk_addr == 0 {
@@ -958,6 +1454,7 @@ pub fn sys_brk(brk_addr: usize) -> isize {
 
     let old_brk_page = (old_brk + crate::config::PAGE_SIZE - 1) / crate::config::PAGE_SIZE;
     let new_brk_page = (brk_addr + crate::config::PAGE_SIZE - 1) / crate::config::PAGE_SIZE;
+    let mut new_frame_range = None;
 
     if new_brk_page > old_brk_page {
         let start_va = polyhal::VirtAddr::new(old_brk_page * crate::config::PAGE_SIZE);
@@ -972,12 +1469,34 @@ pub fn sys_brk(brk_addr: usize) -> isize {
         if !inner.memory_set.push(map_area, None, 0) {
             return -1; // ENOMEM
         }
+        new_frame_range = Some((start_va, end_va));
     } else if new_brk_page < old_brk_page {
         let shrink_start = polyhal::VirtAddr::new(new_brk_page * crate::config::PAGE_SIZE);
         let shrink_end = polyhal::VirtAddr::new(old_brk_page * crate::config::PAGE_SIZE);
         inner.memory_set.munmap(shrink_start, shrink_end);
     }
     inner.program_brk = brk_addr;
+    let tgid = inner.tgid;
+    let may_sync = inner.memory_set.is_shared();
+    let snapshot = if may_sync {
+        Some(inner.memory_set.shared_metadata_snapshot())
+    } else {
+        None
+    };
+    let frames = if may_sync {
+        new_frame_range
+            .map(|(start, end)| inner.memory_set.frame_metadata_range(start, end))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    drop(inner);
+    if let Some(snapshot) = snapshot {
+        if thread_group_has_peer(pid, tgid) {
+            sync_thread_group_vm_metadata(pid, tgid, brk_addr, &snapshot);
+            sync_thread_group_vm_frames(pid, tgid, &frames);
+        }
+    }
     brk_addr as isize
 }
 
@@ -1031,7 +1550,25 @@ pub fn sys_mmap(
     }
 
     let task = crate::task::current_task().unwrap();
+    let pid = task.getpid();
     let mut inner = task.inner_exclusive_access();
+    macro_rules! sync_and_return {
+        ($value:expr, $frame_start:expr, $frame_end:expr) => {{
+            let ret = $value;
+            let tgid = inner.tgid;
+            let may_sync = ret >= 0 && inner.memory_set.is_shared();
+            let areas = if may_sync {
+                inner.memory_set.area_metadata_range($frame_start, $frame_end)
+            } else {
+                Vec::new()
+            };
+            drop(inner);
+            if may_sync && thread_group_has_peer(pid, tgid) {
+                sync_thread_group_vm_area_metadata(pid, tgid, &areas);
+            }
+            return ret;
+        }};
+    }
 
     let permission = get_map_permission(prot);
 
@@ -1056,7 +1593,7 @@ pub fn sys_mmap(
             let Some(frames) = frames_alloc(pages) else {
                 return -12;
             };
-            return match inner.memory_set.insert_shared_frames(
+            sync_and_return!(match inner.memory_set.insert_shared_frames(
                 start_addr,
                 aligned_len,
                 &frames,
@@ -1064,7 +1601,16 @@ pub fn sys_mmap(
             ) {
                 Some(addr) => addr.raw() as isize,
                 None => -12,
-            };
+            }, start_addr, polyhal::VirtAddr::from(start_addr.raw() + aligned_len));
+        }
+        if prot == PROT_NONE {
+            if !inner
+                .memory_set
+                .insert_lazy_area(start_addr, end_addr, permission)
+            {
+                return -12;
+            }
+            sync_and_return!(real_start as isize, start_addr, end_addr);
         }
         if !inner
             .memory_set
@@ -1072,7 +1618,7 @@ pub fn sys_mmap(
         {
             return -12;
         }
-        return real_start as isize;
+        sync_and_return!(real_start as isize, start_addr, end_addr);
     } else {
         let start_addr = polyhal::VirtAddr::from(real_start);
         let end_addr = polyhal::VirtAddr::from(real_start + len);
@@ -1085,11 +1631,54 @@ pub fn sys_mmap(
         }
 
         if let Some(file) = inner.fd_table[fd as usize].clone() {
+            if (flags & MAP_SHARED) != 0 {
+                if offset % crate::config::PAGE_SIZE != 0 {
+                    return -22;
+                }
+                let Some(aligned_len) = page_align_up(len) else {
+                    return -12;
+                };
+                if permission.contains(MapPermission::W) && !file.writable() {
+                    return -13;
+                }
+                if file.as_any().is::<crate::fs::DevZero>() {
+                    let pages = aligned_len / crate::config::PAGE_SIZE;
+                    let Some(frames) = frames_alloc(pages) else {
+                        return -12;
+                    };
+                    sync_and_return!(match inner.memory_set.insert_shared_file_frames(
+                        start_addr,
+                        aligned_len,
+                        &frames,
+                        permission,
+                        file,
+                        offset,
+                    ) {
+                        Some(addr) => addr.raw() as isize,
+                        None => -12,
+                    }, start_addr, polyhal::VirtAddr::from(start_addr.raw() + aligned_len));
+                }
+                let Some(frames) = shared_file_mapping_frames(file.clone(), offset, aligned_len)
+                else {
+                    return -12;
+                };
+                sync_and_return!(match inner.memory_set.insert_shared_file_frames(
+                    start_addr,
+                    aligned_len,
+                    &frames,
+                    permission,
+                    file,
+                    offset,
+                ) {
+                    Some(addr) => addr.raw() as isize,
+                    None => -12,
+                }, start_addr, polyhal::VirtAddr::from(start_addr.raw() + aligned_len));
+            }
             let ok = inner
                 .memory_set
                 .insert_file_area(start_addr, end_addr, permission, file, offset);
             if ok {
-                return real_start as isize;
+                sync_and_return!(real_start as isize, start_addr, end_addr);
             } else {
                 return -1;
             }
@@ -1105,12 +1694,19 @@ pub fn sys_munmap(start: usize, len: usize) -> isize {
     }
 
     let task = crate::task::current_task().unwrap();
+    let pid = task.getpid();
     let mut inner = task.inner_exclusive_access();
 
     let start_addr = polyhal::VirtAddr::from(start);
     let end_addr = polyhal::VirtAddr::from(start + len);
 
     if inner.memory_set.munmap(start_addr, end_addr) {
+        let tgid = inner.tgid;
+        let may_sync = inner.memory_set.is_shared();
+        drop(inner);
+        if may_sync && thread_group_has_peer(pid, tgid) {
+            sync_thread_group_vm_unmap_metadata(pid, tgid, start_addr, end_addr);
+        }
         0
     } else {
         -1
@@ -1239,11 +1835,19 @@ pub fn sys_times(tms_ptr: usize) -> isize {
 
 pub fn sys_uname(uts_ptr: usize) -> isize {
     if uts_ptr == 0 {
-        return -1;
+        return -14;
     }
 
     let task = crate::task::current_task().unwrap();
-    let token = task.inner_exclusive_access().get_user_token();
+    let inner = task.inner_exclusive_access();
+    if !inner
+        .memory_set
+        .valid_user_buf(uts_ptr as *const u8, core::mem::size_of::<UtsName>(), true)
+    {
+        return -14;
+    }
+    let token = inner.get_user_token();
+    drop(inner);
     let uts = crate::mm::translated_refmut(token, uts_ptr as *mut UtsName);
 
     *uts = UtsName {
@@ -1370,14 +1974,9 @@ pub fn sys_set_tid_address(tidptr: *mut i32) -> isize {
 
 pub fn sys_exit_group(status: i32) -> ! {
     let task = current_task().unwrap();
+    process_current_robust_list(false);
+    clear_current_tid_ptr();
     force_exit_task_group(&task, status);
-    let tid = {
-        let inner = task.inner_exclusive_access();
-        inner.tid_ptr
-    };
-    if tid != 0 {
-        *translated_refmut(current_user_token(), tid as *mut i32) = 0;
-    }
 
     exit_current_and_run_next(status)
 }
@@ -1575,12 +2174,19 @@ pub fn sys_mprotect(start: usize, len: usize, prot: usize) -> isize {
         return -22;
     }
     let task = current_task().unwrap();
+    let pid = task.getpid();
     let mut inner = task.inner_exclusive_access();
-    inner.memory_set.mprotect(
+    let ret = inner.memory_set.mprotect(
         polyhal::VirtAddr::from(start),
         len,
         get_map_permission(prot),
-    )
+    );
+    if ret == 0 {
+        let snapshot = shared_vm_sync_snapshot(&inner);
+        drop(inner);
+        sync_thread_group_vm_snapshot(pid, snapshot);
+    }
+    ret
 }
 
 // ---- mremap (216) ----
@@ -1935,7 +2541,7 @@ pub fn sys_rt_sigsuspend(mask: *const u8, _sigsize: usize) -> isize {
 
 fn signal_number(signal: SignalFlags) -> i32 {
     for sig in 1..=MAX_SIG {
-        if let Some(flag) = SignalFlags::from_bits(1u32 << sig) {
+        if let Some(flag) = SignalFlags::from_bits(1u64 << sig) {
             if flag == signal {
                 return sig as i32;
             }
@@ -2022,7 +2628,7 @@ pub fn sys_rt_sigtimedwait(
             let pending = inner.signals & wanted;
             let mut selected = None;
             for sig in 1..=MAX_SIG {
-                if let Some(flag) = SignalFlags::from_bits(1u32 << sig) {
+                if let Some(flag) = SignalFlags::from_bits(1u64 << sig) {
                     if pending.contains(flag) {
                         inner.signals.remove(flag);
                         selected = Some(flag);
@@ -2437,30 +3043,364 @@ pub fn sys_futex(
     uaddr: *mut u32,
     futex_op: usize,
     val: usize,
-    _val2: usize,
-    _uaddr2: *mut u32,
-    _val3: usize,
+    val2: usize,
+    uaddr2: *mut u32,
+    val3: usize,
 ) -> isize {
+    if uaddr.is_null() {
+        return -14;
+    }
     let token = current_user_token();
     let cur = *translated_ref(token, uaddr);
-    let op = futex_op & 0x0F;
+    let op = futex_op & 0x7F;
+    let shared = futex_op & 128 == 0;
+    let key = {
+        let task = current_task().unwrap();
+        let inner = task.inner_exclusive_access();
+        futex_keys_for_addr(&inner, uaddr as usize, shared)
+            .last()
+            .copied()
+            .unwrap_or(uaddr as usize)
+    };
     match op {
-        0 | 9 => {
-            if cur == val as u32 {
-                stdout_release_if_owner();
-                suspend_current_and_run_next();
-                0
-            } else {
-                -11
+        0 => {
+            if cur != val as u32 {
+                return -11;
+            }
+            if mark_futex_owner_died(uaddr, shared, key) {
+                return 0;
+            }
+            match futex_wait_current(key, futex_relative_timeout_ns(val2)) {
+                FutexWaitResult::Woken => 0,
+                FutexWaitResult::TimedOut => {
+                    if mark_futex_owner_died(uaddr, shared, key) {
+                        0
+                    } else {
+                        -110
+                    }
+                }
+                FutexWaitResult::Interrupted => -4,
             }
         }
-        1 | 10 => 0,
+        9 => {
+            if cur != val as u32 {
+                return -11;
+            }
+            if mark_futex_owner_died(uaddr, shared, key) {
+                return 0;
+            }
+            match futex_wait_current(key, futex_absolute_timeout_ns(val2)) {
+                FutexWaitResult::Woken => 0,
+                FutexWaitResult::TimedOut => {
+                    if mark_futex_owner_died(uaddr, shared, key) {
+                        0
+                    } else {
+                        -110
+                    }
+                }
+                FutexWaitResult::Interrupted => -4,
+            }
+        }
+        1 | 10 => futex_wake_key(key, val),
+        3 => {
+            if uaddr2.is_null() {
+                return -14;
+            }
+            let new_key = {
+                let task = current_task().unwrap();
+                let inner = task.inner_exclusive_access();
+                futex_keys_for_addr(&inner, uaddr2 as usize, shared)
+                    .last()
+                    .copied()
+                    .unwrap_or(uaddr2 as usize)
+            };
+            futex_requeue_key(key, new_key, val, val2)
+        }
+        4 => {
+            if uaddr2.is_null() {
+                return -14;
+            }
+            if cur != val3 as u32 {
+                return -11;
+            }
+            let new_key = {
+                let task = current_task().unwrap();
+                let inner = task.inner_exclusive_access();
+                futex_keys_for_addr(&inner, uaddr2 as usize, shared)
+                    .last()
+                    .copied()
+                    .unwrap_or(uaddr2 as usize)
+            };
+            futex_requeue_key(key, new_key, val, val2)
+        }
         6..=8 | 11..=13 => 0,
         _ => -38,
     }
 }
 
+enum FutexWaitResult {
+    Woken,
+    TimedOut,
+    Interrupted,
+}
+
+fn futex_relative_timeout_ns(timeout_ptr: usize) -> Option<usize> {
+    if timeout_ptr == 0 {
+        return None;
+    }
+    let token = current_user_token();
+    let ts = *translated_ref(token, timeout_ptr as *const crate::task::TimeSpec);
+    if ts.tv_nsec >= 1_000_000_000 {
+        return Some(polyhal::time::Time::now().to_nsec() as usize);
+    }
+    let duration = ts
+        .tv_sec
+        .saturating_mul(1_000_000_000)
+        .saturating_add(ts.tv_nsec);
+    Some((polyhal::time::Time::now().to_nsec() as usize).saturating_add(duration))
+}
+
+fn futex_absolute_timeout_ns(timeout_ptr: usize) -> Option<usize> {
+    if timeout_ptr == 0 {
+        return None;
+    }
+    let token = current_user_token();
+    let ts = *translated_ref(token, timeout_ptr as *const crate::task::TimeSpec);
+    if ts.tv_nsec >= 1_000_000_000 {
+        return Some(polyhal::time::Time::now().to_nsec() as usize);
+    }
+    Some(
+        ts.tv_sec
+            .saturating_mul(1_000_000_000)
+            .saturating_add(ts.tv_nsec),
+    )
+}
+
+pub(crate) fn remove_futex_waiter(pid: usize) -> bool {
+    let mut removed = false;
+    let mut waiters = FUTEX_WAITERS.exclusive_access();
+    waiters.retain(|_, queue| {
+        let old_len = queue.len();
+        queue.retain(|task| task.getpid() != pid);
+        if queue.len() != old_len {
+            removed = true;
+        }
+        !queue.is_empty()
+    });
+    removed
+}
+
+fn futex_wake_key(key: usize, count: usize) -> isize {
+    if count == 0 {
+        return 0;
+    }
+    let mut waiters = FUTEX_WAITERS.exclusive_access();
+    let Some(queue) = waiters.get_mut(&key) else {
+        return 0;
+    };
+    let mut wake_tasks = Vec::new();
+    while wake_tasks.len() < count && !queue.is_empty() {
+        let task = queue.remove(0);
+        let is_zombie = task
+            .try_inner_borrow()
+            .map(|inner| inner.task_status == TaskStatus::Zombie)
+            .unwrap_or(true);
+        if !is_zombie {
+            wake_tasks.push(task);
+        }
+    }
+    if queue.is_empty() {
+        waiters.remove(&key);
+    }
+    drop(waiters);
+    let mut woke = 0isize;
+    for task in wake_tasks {
+        let mut inner = task.inner_exclusive_access();
+        if inner.task_status != TaskStatus::Zombie {
+            inner.task_status = TaskStatus::Ready;
+            inner.block_reason = None;
+            drop(inner);
+            add_priority_task(task);
+            woke += 1;
+        }
+    }
+    woke
+}
+
+fn futex_requeue_key(
+    old_key: usize,
+    new_key: usize,
+    wake_count: usize,
+    requeue_count: usize,
+) -> isize {
+    let mut waiters = FUTEX_WAITERS.exclusive_access();
+    let Some(queue) = waiters.get_mut(&old_key) else {
+        return 0;
+    };
+    let mut wake_tasks = Vec::new();
+    while wake_tasks.len() < wake_count && !queue.is_empty() {
+        let task = queue.remove(0);
+        let is_zombie = task
+            .try_inner_borrow()
+            .map(|inner| inner.task_status == TaskStatus::Zombie)
+            .unwrap_or(true);
+        if !is_zombie {
+            wake_tasks.push(task);
+        }
+    }
+    let mut moved_tasks = Vec::new();
+    while moved_tasks.len() < requeue_count && !queue.is_empty() {
+        let task = queue.remove(0);
+        let is_zombie = task
+            .try_inner_borrow()
+            .map(|inner| inner.task_status == TaskStatus::Zombie)
+            .unwrap_or(true);
+        if !is_zombie {
+            moved_tasks.push(task);
+        }
+    }
+    if queue.is_empty() {
+        waiters.remove(&old_key);
+    }
+    let moved = moved_tasks.len();
+    if moved > 0 {
+        waiters
+            .entry(new_key)
+            .or_insert_with(Vec::new)
+            .extend(moved_tasks);
+    }
+    drop(waiters);
+
+    let mut woke = 0isize;
+    for task in wake_tasks {
+        let mut inner = task.inner_exclusive_access();
+        if inner.task_status != TaskStatus::Zombie {
+            inner.task_status = TaskStatus::Ready;
+            inner.block_reason = None;
+            drop(inner);
+            add_priority_task(task);
+            woke += 1;
+        }
+    }
+    woke + moved as isize
+}
+
+fn futex_wait_current(key: usize, deadline_ns: Option<usize>) -> FutexWaitResult {
+    if let Some(deadline) = deadline_ns {
+        if polyhal::time::Time::now().to_nsec() as usize >= deadline {
+            return FutexWaitResult::TimedOut;
+        }
+    }
+    stdout_release_if_owner();
+    let task = current_task().unwrap();
+    let pid = task.getpid();
+    task.record_time_suspend();
+    let mut inner = task.inner_exclusive_access();
+    inner.task_status = TaskStatus::Blocked;
+    let task_cx_ptr = &mut inner.task_cx as *mut _;
+    drop(inner);
+    crate::task::take_current_task();
+    {
+        let mut waiters = FUTEX_WAITERS.exclusive_access();
+        let queue = waiters.entry(key).or_insert_with(Vec::new);
+        queue.retain(|queued| queued.getpid() != pid);
+        queue.push(task.clone());
+    }
+    if let Some(deadline) = deadline_ns {
+        crate::task::add_sleep_task(deadline, task.clone());
+    }
+    crate::task::schedule(task_cx_ptr);
+    task.record_time_resume();
+    let mut still_waiting = false;
+    {
+        let mut waiters = FUTEX_WAITERS.exclusive_access();
+        if let Some(queue) = waiters.get_mut(&key) {
+            let old_len = queue.len();
+            queue.retain(|queued| queued.getpid() != pid);
+            still_waiting = queue.len() != old_len;
+            if queue.is_empty() {
+                waiters.remove(&key);
+            }
+        }
+    }
+    if deadline_ns.is_some() {
+        crate::task::SLEEP_QUEUE
+            .exclusive_access()
+            .retain(|sleep_task| sleep_task.task.getpid() != pid);
+    }
+    let inner = task.inner_exclusive_access();
+    let interrupted =
+        inner.killed || (!inner.signals.is_empty() && !inner.signal_mask.contains(inner.signals));
+    drop(inner);
+    if interrupted {
+        FutexWaitResult::Interrupted
+    } else if still_waiting && deadline_ns.is_some() {
+        FutexWaitResult::TimedOut
+    } else {
+        FutexWaitResult::Woken
+    }
+}
+
 pub fn sys_madvise(_start: usize, _len: usize, _advice: usize) -> isize {
+    0
+}
+
+pub fn sys_set_robust_list(head: usize, len: usize) -> isize {
+    if len != ROBUST_LIST_LEN {
+        return -22;
+    }
+    if head == 0 {
+        process_current_robust_list(true);
+        return 0;
+    }
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    if !inner
+        .memory_set
+        .valid_user_buf(head as *const u8, ROBUST_LIST_LEN, false)
+    {
+        return -14;
+    }
+    clear_stale_musl_killlock(&inner, head);
+    inner.robust_list_head = head;
+    inner.robust_list_len = len;
+    0
+}
+
+pub fn sys_get_robust_list(pid: usize, head_ptr: *mut usize, len_ptr: *mut usize) -> isize {
+    if head_ptr.is_null() || len_ptr.is_null() {
+        return -14;
+    }
+    let current = current_task().unwrap();
+    {
+        let inner = current.inner_exclusive_access();
+        if !inner.memory_set.valid_user_buf(
+            head_ptr as *const u8,
+            core::mem::size_of::<usize>(),
+            true,
+        ) || !inner.memory_set.valid_user_buf(
+            len_ptr as *const u8,
+            core::mem::size_of::<usize>(),
+            true,
+        ) {
+            return -14;
+        }
+    }
+    let target = if pid == 0 || pid == current.getpid() {
+        current
+    } else {
+        match pid2task(pid) {
+            Some(task) => task,
+            None => return -3,
+        }
+    };
+    let (head, len) = {
+        let inner = target.inner_exclusive_access();
+        (inner.robust_list_head, inner.robust_list_len)
+    };
+    let token = current_user_token();
+    *translated_refmut(token, head_ptr) = head;
+    *translated_refmut(token, len_ptr) = if len == 0 { ROBUST_LIST_LEN } else { len };
     0
 }
 

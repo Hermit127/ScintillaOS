@@ -7,6 +7,7 @@ mod signal;
 #[allow(clippy::module_inception)]
 mod task;
 
+use crate::mm::{translated_ref, translated_refmut};
 use crate::sync::UPSafeCell;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -20,6 +21,17 @@ use polyhal::kcontext::KContext;
 use polyhal_trap::trapframe::TrapFrameArgs;
 
 pub const SIGNAL_RETURN_TRAMPOLINE: usize = 0x7ffeff000;
+const SA_SIGINFO: usize = 4;
+const SIGINFO_SIZE: usize = 128;
+const UCONTEXT_SIZE: usize = 512;
+const UCONTEXT_SIGMASK_OFFSET: usize = 40;
+
+#[cfg(target_arch = "riscv64")]
+const UCONTEXT_PC_OFFSET: usize = 176;
+#[cfg(target_arch = "loongarch64")]
+const UCONTEXT_PC_OFFSET: usize = 176;
+#[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
+const UCONTEXT_PC_OFFSET: usize = 0;
 
 pub use action::{SignalAction, SignalActions};
 pub use fp::UserFloatState;
@@ -56,6 +68,17 @@ lazy_static! {
 pub static ref WAITPID_QUEUE: UPSafeCell<Vec<Arc<TaskControlBlock>>> = unsafe {
         UPSafeCell::new_named(Vec::new(), "WaitpidQueue")
     };
+    static ref EXITED_TASKS: UPSafeCell<Vec<Arc<TaskControlBlock>>> = unsafe {
+        UPSafeCell::new_named(Vec::new(), "ExitedTasks")
+    };
+}
+
+fn defer_drop_task(task: Arc<TaskControlBlock>) {
+    EXITED_TASKS.exclusive_access().push(task);
+}
+
+pub(super) fn reap_exited_tasks() {
+    EXITED_TASKS.exclusive_access().clear();
 }
 
 pub fn suspend_current_and_run_next() {
@@ -210,6 +233,9 @@ fn notify_parent_sigchld(parent: &Arc<TaskControlBlock>) {
 
 fn remove_task_from_block_queues(pid: usize) -> bool {
     let mut removed = false;
+    if crate::syscall::process::remove_futex_waiter(pid) {
+        removed = true;
+    }
     {
         let mut queue = NET_BLOCK_QUEUE.exclusive_access();
         let old_len = queue.len();
@@ -413,10 +439,10 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
         }
     }
     // ++++++ release parent PCB
-    // drop task manually to maintain rc correctly
+    if let Some(current) = take_current_task() {
+        defer_drop_task(current);
+    }
     drop(task);
-    // we do not have to save task context
-    take_current_task();
     loop {
         let mut unused = KContext::blank();
         schedule(&mut unused as *mut _);
@@ -505,7 +531,6 @@ fn call_user_signal_handler(sig: usize, signal: SignalFlags) {
     }
     if handler != 0 {
         let action = task_inner.signal_actions.table[sig];
-
         // handle flag
         let old_mask = task_inner.signal_mask;
         task_inner.signals ^= signal;
@@ -516,13 +541,26 @@ fn call_user_signal_handler(sig: usize, signal: SignalFlags) {
         // backup trapframe
         let trap_ctx = task_inner.get_trap_cx();
         task_inner.trap_ctx_backup = Some(trap_ctx.clone());
+        task_inner.signal_ucontext = None;
+        if action.flags & SA_SIGINFO != 0 {
+            let token = task_inner.get_user_token();
+            let frame_base = write_signal_frame(
+                token,
+                trap_ctx[TrapFrameArgs::SP],
+                sig,
+                old_mask,
+                trap_ctx[TrapFrameArgs::SEPC],
+            );
+            let siginfo_addr = frame_base;
+            let ucontext_addr = frame_base + SIGINFO_SIZE;
+            task_inner.signal_ucontext = Some(ucontext_addr);
+            trap_ctx[TrapFrameArgs::SP] = frame_base;
+            trap_ctx[TrapFrameArgs::ARG1] = siginfo_addr;
+            trap_ctx[TrapFrameArgs::ARG2] = ucontext_addr;
+        }
         // modify trapframe
         trap_ctx[TrapFrameArgs::SEPC] = handler;
-        trap_ctx[TrapFrameArgs::RA] = if action.restorer != 0 {
-            action.restorer
-        } else {
-            SIGNAL_RETURN_TRAMPOLINE
-        };
+        trap_ctx[TrapFrameArgs::RA] = SIGNAL_RETURN_TRAMPOLINE;
 
         // put args (a0)
         trap_ctx[TrapFrameArgs::ARG0] = sig;
@@ -559,15 +597,75 @@ fn call_user_signal_handler(sig: usize, signal: SignalFlags) {
     }
 }
 
+fn flags_to_user_sigset(flags: SignalFlags) -> u64 {
+    let mut raw = 0u64;
+    for sig in 1..=MAX_SIG {
+        if let Some(flag) = SignalFlags::from_bits(1u64 << sig) {
+            if flags.contains(flag) {
+                raw |= 1u64 << (sig - 1);
+            }
+        }
+    }
+    raw
+}
+
+fn user_sigset_to_flags(raw: u64) -> SignalFlags {
+    let mut flags = SignalFlags::empty();
+    for sig in 1..=MAX_SIG {
+        if raw & (1u64 << (sig - 1)) != 0 {
+            if let Some(flag) = SignalFlags::from_bits(1u64 << sig) {
+                flags.insert(flag);
+            }
+        }
+    }
+    flags
+}
+
+fn write_signal_frame(
+    token: polyhal::pagetable::PageTable,
+    sp: usize,
+    sig: usize,
+    old_mask: SignalFlags,
+    interrupted_pc: usize,
+) -> usize {
+    let frame_size = SIGINFO_SIZE + UCONTEXT_SIZE;
+    let frame_base = sp.saturating_sub(frame_size) & !15;
+    for i in 0..frame_size {
+        *translated_refmut(token, (frame_base + i) as *mut u8) = 0;
+    }
+    *translated_refmut(token, frame_base as *mut i32) = sig as i32;
+    let ucontext_addr = frame_base + SIGINFO_SIZE;
+    *translated_refmut(token, (ucontext_addr + UCONTEXT_SIGMASK_OFFSET) as *mut u64) =
+        flags_to_user_sigset(old_mask);
+    *translated_refmut(token, (ucontext_addr + UCONTEXT_PC_OFFSET) as *mut usize) = interrupted_pc;
+    frame_base
+}
+
 pub fn restore_current_signal_context() -> Option<isize> {
     let task = current_task()?;
     let mut inner = task.inner_exclusive_access();
     inner.handling_sig = -1;
-    if let Some(mask) = inner.signal_mask_backup.take() {
+    let backup_mask = inner.signal_mask_backup.take();
+    let signal_ucontext = inner.signal_ucontext.take();
+    if let Some(ucontext_addr) = signal_ucontext {
+        let token = inner.get_user_token();
+        let raw_mask = *translated_ref(
+            token,
+            (ucontext_addr + UCONTEXT_SIGMASK_OFFSET) as *const u64,
+        );
+        inner.signal_mask = user_sigset_to_flags(raw_mask);
+    } else if let Some(mask) = backup_mask {
         inner.signal_mask = mask;
     }
-    let backup = inner.trap_ctx_backup.take()?;
+    let mut backup = inner.trap_ctx_backup.take()?;
     let ret = backup[TrapFrameArgs::RET] as isize;
+    if let Some(ucontext_addr) = signal_ucontext {
+        let token = inner.get_user_token();
+        let pc = *translated_ref(token, (ucontext_addr + UCONTEXT_PC_OFFSET) as *const usize);
+        if pc != 0 {
+            backup[TrapFrameArgs::SEPC] = pc;
+        }
+    }
     let trap_ctx = inner.get_trap_cx();
     *trap_ctx = backup;
     Some(ret)
@@ -580,7 +678,7 @@ fn check_pending_signals() {
         None => return,
     };
     for sig in 0..(MAX_SIG + 1) {
-        let signal = SignalFlags::from_bits(1 << sig).unwrap();
+        let signal = SignalFlags::from_bits(1u64 << sig).unwrap();
         let (masked, kernel_signal) = {
             let Some(mut task_inner) = task.try_inner_exclusive_access() else {
                 return;
