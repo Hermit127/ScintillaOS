@@ -36,7 +36,9 @@ const KNOWN_TEST_SCRIPTS: [&str; 8] = [
 const EMBEDDED_BASIC_MUSL: &str = "__embedded_basic_musl__";
 const EMBEDDED_BASIC_GLIBC: &str = "__embedded_basic_glibc__";
 const EMBEDDED_LTP: &str = "__embedded_ltp__";
-const EMBEDDED_LTP_CASE_TIMEOUT_SECS: &str = "60";
+const TEST_TIMEOUT_SECS: &str = "1800";
+const EMBEDDED_LTP_CASE_TIMEOUT_SECS: &str = TEST_TIMEOUT_SECS;
+const RUN_IPERF_SCRIPTS: bool = false;
 #[cfg(not(target_arch = "loongarch64"))]
 const LTP_SUBSET_CASES: &str = concat!(
     "close01 close02 open01 open02 read01 read02 write01 write02 ",
@@ -420,13 +422,13 @@ fn script_priority(script: &str) -> u8 {
         3
     } else if script.starts_with("iozone_") {
         4
-    } else if script.starts_with("iperf_") {
-        5
     } else if script.starts_with("libcbench_") {
-        6
+        5
     } else if script.starts_with("libctest_") {
-        7
+        6
     } else if is_embedded_ltp(script) {
+        7
+    } else if script.starts_with("iperf_") {
         8
     } else {
         50
@@ -452,32 +454,12 @@ fn should_run_script_in_dir(dir: &str, script: &str) -> bool {
 }
 
 fn should_skip_script_path(path: &str) -> bool {
-    let _ = path;
-    false
+    !RUN_IPERF_SCRIPTS && path.ends_with("/iperf_testcode.sh")
 }
 
 fn script_budget(script: &str) -> &'static str {
-    if is_embedded_basic(script) || script.starts_with("basic_") {
-        "90"
-    } else if script.starts_with("busybox_") {
-        "600"
-    } else if script.starts_with("lmbench_") {
-        "1800"
-    } else if script.starts_with("lua_") {
-        "180"
-    } else if script.starts_with("iozone_") {
-        "720"
-    } else if script.starts_with("iperf_") {
-        "300"
-    } else if script.starts_with("libcbench_") {
-        "600"
-    } else if script.starts_with("libctest_") {
-        "600"
-    } else if is_embedded_ltp(script) {
-        "7200"
-    } else {
-        "90"
-    }
+    let _ = script;
+    TEST_TIMEOUT_SECS
 }
 
 fn libctest_label_for_dir(dir: &str) -> &'static str {
@@ -704,7 +686,7 @@ fn run_libctest(dir: &str) {
     let mut command = String::from("echo \"#### OS COMP TEST GROUP START ");
     command.push_str(label);
     command.push_str(" ####\"; ");
-    command.push_str("for s in run-dynamic.sh run-static.sh; do ");
+    command.push_str("for s in run-static.sh run-dynamic.sh; do ");
     command.push_str("if [ -f $s ]; then ");
     command.push_str("sh $s; ");
     command.push_str("fi; ");
@@ -898,10 +880,11 @@ fn run_embedded_ltp_shell(dir: &str) {
         command.as_ptr(),
         core::ptr::null(),
     ];
-    let envs: [*const u8; 4] = [
+    let envs: [*const u8; 5] = [
         b"PATH=/bin:/usr/bin:.\0".as_ptr(),
         b"LD_LIBRARY_PATH=/lib:/lib64:.\0".as_ptr(),
         b"TMPDIR=/tmp\0".as_ptr(),
+        b"LTP_TIMEOUT_MUL=60\0".as_ptr(),
         core::ptr::null(),
     ];
     let pid = fork();

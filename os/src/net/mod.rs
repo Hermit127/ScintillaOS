@@ -4,7 +4,7 @@
     target_arch = "loongarch64"
 ))]
 mod imp {
-    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::sync::atomic::AtomicBool;
     use smoltcp::iface::{Config, Interface, SocketSet};
     use smoltcp::socket::dhcpv4::Socket as DhcpSocket;
     use smoltcp::time::Instant;
@@ -444,7 +444,7 @@ pub fn with_net_iface_tcp_connect(
 
 #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
 pub fn wake_net_blocked_tasks() {
-    use crate::task::{add_priority_task, add_task, BlockReason, TaskStatus, NET_BLOCK_QUEUE};
+    use crate::task::{add_priority_task, BlockReason, TaskStatus, NET_BLOCK_QUEUE};
     use smoltcp::iface::SocketHandle;
     use smoltcp::socket::tcp::Socket as TcpSocket;
     use smoltcp::socket::udp::Socket as UdpSocket;
@@ -477,11 +477,32 @@ pub fn wake_net_blocked_tasks() {
                     }
                     Some(BlockReason::TcpAccept(h)) => {
                         let handle: SocketHandle = unsafe { core::mem::transmute(*h) };
-                        with_net_iface(|iface| {
-                            let sock: &TcpSocket = iface.sockets.get(handle);
-                            sock.is_active() && !sock.is_listening()
-                        })
-                        .unwrap_or(true)
+                        let local_pending = inner.fd_table.iter().any(|file| {
+                            let Some(file) = file else {
+                                return false;
+                            };
+                            let Some(sock) =
+                                file.as_any().downcast_ref::<crate::net::socket::SocketFile>()
+                            else {
+                                return false;
+                            };
+                            if sock.socket_type != crate::net::socket::SocketType::Tcp {
+                                return false;
+                            }
+                            let sock_handle: usize = unsafe { core::mem::transmute(sock.get_handle()) };
+                            if sock_handle != *h {
+                                return false;
+                            }
+                            sock.get_local_endpoint()
+                                .map(|ep| crate::net::syscall::local_tcp_pending_on(ep.port))
+                                .unwrap_or(false)
+                        });
+                        local_pending
+                            || with_net_iface(|iface| {
+                                let sock: &TcpSocket = iface.sockets.get(handle);
+                                sock.is_active() && !sock.is_listening()
+                            })
+                            .unwrap_or(true)
                     }
                     Some(BlockReason::TcpConnect(h)) => {
                         let handle: SocketHandle = unsafe { core::mem::transmute(*h) };
@@ -516,7 +537,13 @@ pub fn wake_net_blocked_tasks() {
     }
     if !to_wake.is_empty() {}
     for task in &to_wake {
-        add_task(task.clone());
+        let mut inner = task.inner_exclusive_access();
+        if inner.task_status != TaskStatus::Zombie {
+            inner.task_status = TaskStatus::Ready;
+            inner.block_reason = None;
+            drop(inner);
+            add_priority_task(task.clone());
+        }
     }
 }
 

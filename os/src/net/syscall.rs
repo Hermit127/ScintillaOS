@@ -6,13 +6,14 @@ use smoltcp::socket::udp::PacketMetadata as UdpPacketMetadata;
 use smoltcp::socket::udp::Socket as UdpSocket;
 use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
 
+use crate::fs::File;
 use crate::fs::stdio::stdout_release_if_owner;
 use crate::mm::{translated_ref, translated_refmut};
 use crate::net::socket::{SocketFile, SocketType};
 use crate::sync::UPSafeCell;
 use crate::task::{
     add_task, block_current_and_run_next, current_task, current_user_token,
-    suspend_current_and_run_next, BlockReason, TaskStatus, NET_BLOCK_QUEUE,
+    suspend_current_and_run_next, BlockReason, TaskStatus, NET_BLOCK_QUEUE, PID2TCB,
 };
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
@@ -47,6 +48,42 @@ const SHUT_RDWR: usize = 2;
 const LOCAL_TCP_BUFFER_LIMIT: usize = 256 * 1024;
 static NEXT_EPHEMERAL_PORT: AtomicU16 = AtomicU16::new(49152);
 static NEXT_DUMMY_HANDLE: AtomicUsize = AtomicUsize::new(1_000_000);
+static LOCAL_UDP_DEBUG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static LOCAL_UDP_DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+static LOCAL_UDP_BIG_RECV_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn log_local_udp_event(tag: &str, src: IpEndpoint, dst_port: u16, len: usize) {
+    let idx = LOCAL_UDP_DEBUG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if idx < 16 {
+        println!(
+            "[udp-local] {} src={:?} dst_port={} len={}",
+            tag, src, dst_port, len
+        );
+    }
+}
+
+fn log_local_udp_drop(src: IpEndpoint, dst_port: u16, len: usize) {
+    let idx = LOCAL_UDP_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+    if idx < 8 {
+        println!(
+            "[udp-local] drop src={:?} dst_port={} len={}",
+            src, dst_port, len
+        );
+    }
+}
+
+fn log_local_udp_big_recv(tag: &str, src: IpEndpoint, dst_port: u16, len: usize) {
+    if len < 100 {
+        return;
+    }
+    let idx = LOCAL_UDP_BIG_RECV_COUNT.fetch_add(1, Ordering::Relaxed);
+    if idx < 16 {
+        println!(
+            "[udp-local] {} src={:?} dst_port={} len={}",
+            tag, src, dst_port, len
+        );
+    }
+}
 
 #[derive(Clone)]
 struct LocalUdpPacket {
@@ -101,8 +138,12 @@ fn create_socket_fd(st: SocketType, nonblock: bool, cloexec: bool) -> isize {
     if fd >= inner.fd_table.len() {
         return -24;
     }
-    inner.fd_table[fd] = Some(Arc::new(SocketFile::new(handle, st, nonblock)));
+    let file: Arc<dyn File + Send + Sync> = Arc::new(SocketFile::new(handle, st, nonblock));
+    inner.fd_table[fd] = Some(file.clone());
     inner.fd_cloexec[fd] = cloexec;
+    let tgid = inner.tgid;
+    drop(inner);
+    install_fd_for_thread_group(task.getpid(), tgid, fd, file, cloexec);
     fd as isize
 }
 
@@ -116,6 +157,37 @@ fn alloc_null_socket_fd(cloexec: bool) -> isize {
     inner.fd_table[fd] = Some(Arc::new(crate::fs::NullSocket));
     inner.fd_cloexec[fd] = cloexec;
     fd as isize
+}
+
+fn install_fd_for_thread_group(
+    owner_pid: usize,
+    tgid: usize,
+    fd: usize,
+    file: Arc<dyn File + Send + Sync>,
+    cloexec: bool,
+) {
+    let tasks: Vec<_> = PID2TCB
+        .exclusive_access()
+        .values()
+        .filter(|task| task.getpid() != owner_pid)
+        .filter(|task| {
+            task.try_inner_borrow()
+                .map(|inner| inner.tgid == tgid)
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+    for task in tasks {
+        if let Some(mut inner) = task.try_inner_exclusive_access() {
+            while inner.fd_table.len() <= fd {
+                inner.fd_table.push(None);
+                inner.fd_cloexec.push(false);
+            }
+            file.dup_ref();
+            inner.fd_table[fd] = Some(file.clone());
+            inner.fd_cloexec[fd] = cloexec;
+        }
+    }
 }
 
 fn next_ephemeral_port() -> u16 {
@@ -300,6 +372,10 @@ fn is_local_ipv4(addr: IpAddress) -> bool {
     ipv4.0[0] == 127 || ipv4.0 == [0, 0, 0, 0] || ipv4.0 == [10, 0, 2, 15]
 }
 
+pub(crate) fn is_local_endpoint(endpoint: IpEndpoint) -> bool {
+    is_local_ipv4(endpoint.addr)
+}
+
 fn source_addr_for_dest(local: IpEndpoint, dest: IpEndpoint) -> IpEndpoint {
     let IpAddress::Ipv4(local_ip) = local.addr;
     if local_ip.0 != [0, 0, 0, 0] {
@@ -391,6 +467,11 @@ pub(crate) fn local_tcp_pending_on(port: u16) -> bool {
         .find(|listener| listener.port == port)
         .map(|listener| !listener.pending.is_empty())
         .unwrap_or(false)
+}
+
+pub(crate) fn local_udp_pending_on(port: u16) -> bool {
+    let queue = LOCAL_UDP_QUEUE.exclusive_access();
+    queue.iter().any(|packet| packet.dst_port == port)
 }
 
 fn local_tcp_connect(
@@ -613,8 +694,54 @@ fn ensure_udp_local_endpoint(sockfd: usize, handle: SocketHandle, dest: IpEndpoi
         let sock: &mut UdpSocket = iface.sockets.get_mut(handle);
         let _ = sock.bind(IpListenEndpoint { addr: None, port });
     });
-    set_socket_local_endpoint(sockfd, local);
-    source_addr_for_dest(local, dest)
+    let src = source_addr_for_dest(local, dest);
+    set_socket_local_endpoint(sockfd, src);
+    src
+}
+
+fn ensure_udp_socket_local_endpoint(
+    sock: &SocketFile,
+    handle: SocketHandle,
+    dest: IpEndpoint,
+) -> IpEndpoint {
+    if let Some(local) = sock.get_local_endpoint() {
+        return source_addr_for_dest(local, dest);
+    }
+    if let Some(local) = smoltcp_udp_endpoint(handle) {
+        sock.set_local_endpoint(local);
+        return source_addr_for_dest(local, dest);
+    }
+
+    let port = next_ephemeral_port();
+    let local = IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED), port);
+    if net_ready() {
+        crate::net::with_net_iface(|iface| {
+            let sock: &mut UdpSocket = iface.sockets.get_mut(handle);
+            let _ = sock.bind(IpListenEndpoint { addr: None, port });
+        });
+    }
+    let src = source_addr_for_dest(local, dest);
+    sock.set_local_endpoint(src);
+    src
+}
+
+fn enqueue_local_udp(src: IpEndpoint, data: &[u8], dest: IpEndpoint) -> isize {
+    {
+        let mut queue = LOCAL_UDP_QUEUE.exclusive_access();
+        if queue.len() >= 256 {
+            log_local_udp_drop(src, dest.port, data.len());
+            return data.len() as isize;
+        }
+        log_local_udp_event("enqueue", src, dest.port, data.len());
+        queue.push_back(LocalUdpPacket {
+            dst_port: dest.port,
+            src,
+            data: data.to_vec(),
+        });
+    }
+    wake_local_udp_receivers();
+    crate::task::wake_poll_wait_tasks();
+    data.len() as isize
 }
 
 fn wake_local_udp_receivers() {
@@ -653,25 +780,34 @@ fn try_send_local_udp(
         return None;
     }
     let src = ensure_udp_local_endpoint(sockfd, handle, dest);
-    {
-        let mut queue = LOCAL_UDP_QUEUE.exclusive_access();
-        if queue.len() >= 256 {
-            return Some(-11);
-        }
-        queue.push_back(LocalUdpPacket {
-            dst_port: dest.port,
-            src,
-            data: data.to_vec(),
-        });
+    Some(enqueue_local_udp(src, data, dest))
+}
+
+pub(crate) fn try_write_local_udp(
+    sock: &SocketFile,
+    handle: SocketHandle,
+    data: &[u8],
+    dest: IpEndpoint,
+) -> Option<isize> {
+    if !is_local_ipv4(dest.addr) {
+        return None;
     }
-    wake_local_udp_receivers();
-    Some(data.len() as isize)
+    let src = ensure_udp_socket_local_endpoint(sock, handle, dest);
+    Some(enqueue_local_udp(src, data, dest))
 }
 
 fn local_recv_endpoint(sockfd: usize, handle: SocketHandle) -> Option<IpEndpoint> {
     get_socket_local_endpoint(sockfd).or_else(|| {
         let ep = smoltcp_udp_endpoint(handle)?;
         set_socket_local_endpoint(sockfd, ep);
+        Some(ep)
+    })
+}
+
+fn local_recv_endpoint_socket(sock: &SocketFile, handle: SocketHandle) -> Option<IpEndpoint> {
+    sock.get_local_endpoint().or_else(|| {
+        let ep = smoltcp_udp_endpoint(handle)?;
+        sock.set_local_endpoint(ep);
         Some(ep)
     })
 }
@@ -696,6 +832,8 @@ fn try_recv_local_udp(
     };
     let n = packet.data.len().min(buf.len());
     buf[..n].copy_from_slice(&packet.data[..n]);
+    log_local_udp_event("recv_fd", packet.src, local.port, n);
+    log_local_udp_big_recv("recv_fd_big", packet.src, local.port, n);
     drop(queue);
 
     if !src_addr.is_null() && !addrlen.is_null() {
@@ -706,6 +844,66 @@ fn try_recv_local_udp(
     }
 
     Some(n as isize)
+}
+
+fn try_recv_local_udp_socket(
+    sock: &SocketFile,
+    handle: SocketHandle,
+    buf: &mut [u8],
+    peek: bool,
+) -> Option<isize> {
+    let local = local_recv_endpoint_socket(sock, handle)?;
+    let mut queue = LOCAL_UDP_QUEUE.exclusive_access();
+    let pos = queue
+        .iter()
+        .position(|packet| packet.dst_port == local.port)?;
+    let packet = if peek {
+        queue[pos].clone()
+    } else {
+        queue.remove(pos)?
+    };
+    let n = packet.data.len().min(buf.len());
+    buf[..n].copy_from_slice(&packet.data[..n]);
+    log_local_udp_event("recv_sock", packet.src, local.port, n);
+    log_local_udp_big_recv("recv_sock_big", packet.src, local.port, n);
+    Some(n as isize)
+}
+
+pub(crate) fn udp_read_socket(
+    sock: &SocketFile,
+    handle: SocketHandle,
+    nonblock: bool,
+    buf: &mut [u8],
+) -> isize {
+    if let Some(ret) = try_recv_local_udp_socket(sock, handle, buf, false) {
+        return ret;
+    }
+    if nonblock {
+        return udp_recv(handle, true, buf);
+    }
+
+    loop {
+        crate::net::net_poll();
+        crate::net::net_poll();
+        crate::net::net_poll();
+        if let Some(ret) = try_recv_local_udp_socket(sock, handle, buf, false) {
+            return ret;
+        }
+        let result = crate::net::with_net_iface(|iface| {
+            let sock: &mut UdpSocket = iface.sockets.get_mut(handle);
+            match sock.recv_slice(buf) {
+                Ok((n, _)) => Some(n as isize),
+                Err(_) => None,
+            }
+        })
+        .flatten();
+        match result {
+            Some(n) => return n,
+            None => block_current_and_run_next(BlockReason::UdpRecv(unsafe {
+                core::mem::transmute(handle)
+            })),
+        }
+    }
 }
 
 pub fn sys_socket(domain: usize, type_: usize, _protocol: usize) -> isize {
@@ -1007,7 +1205,12 @@ pub fn sys_accept(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
                 if let Some(peer) = local_tcp_client_endpoint(conn_id) {
                     new_sock.set_peer_endpoint(peer);
                 }
-                inner.fd_table[new_fd] = Some(new_sock);
+                let file: Arc<dyn File + Send + Sync> = new_sock.clone();
+                inner.fd_table[new_fd] = Some(file.clone());
+                let tgid = inner.tgid;
+                let cloexec = inner.fd_cloexec.get(new_fd).copied().unwrap_or(false);
+                drop(inner);
+                install_fd_for_thread_group(task.getpid(), tgid, new_fd, file, cloexec);
                 return new_fd as isize;
             }
             if nonblock {
@@ -1103,10 +1306,14 @@ pub fn sys_accept(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
     if new_fd >= inner.fd_table.len() {
         return -24;
     }
-    inner.fd_table[new_fd] = Some(Arc::new(SocketFile::new(handle, SocketType::Tcp, nonblock)));
+    let file: Arc<dyn File + Send + Sync> = Arc::new(SocketFile::new(handle, SocketType::Tcp, nonblock));
+    inner.fd_table[new_fd] = Some(file.clone());
+    let tgid = inner.tgid;
+    let cloexec = inner.fd_cloexec.get(new_fd).copied().unwrap_or(false);
 
     // Release inner lock before writing peer address (avoids holding lock during net_poll)
     drop(inner);
+    install_fd_for_thread_group(task.getpid(), tgid, new_fd, file, cloexec);
 
     // Ensure any pending data from client is delivered to the accepted socket
     crate::net::net_poll();
@@ -1210,7 +1417,11 @@ pub fn sys_recvfrom(
             {
                 return ret;
             }
-            let ret = udp_recv(handle, true, recv_buf);
+            let ret = if net_ready() {
+                udp_recv(handle, true, recv_buf)
+            } else {
+                -11
+            };
             if ret != -11 || dontwait {
                 break ret;
             }
@@ -1242,9 +1453,6 @@ pub fn sys_recvfrom(
 }
 
 pub fn sys_sendmsg(sockfd: usize, msg: *const u8, flags: usize) -> isize {
-    if !net_ready() {
-        return -97;
-    }
     let token = current_user_token();
     let msghdr: &Msghdr = translated_ref(token, msg as *const Msghdr);
 
@@ -1290,15 +1498,15 @@ pub fn sys_sendmsg(sockfd: usize, msg: *const u8, flags: usize) -> isize {
                 Some(d) => d,
                 None => return -89,
             };
+            if let Some(ret) = try_send_local_udp(sockfd, handle, &buf[..copied], dest) {
+                return ret;
+            }
             udp_send(handle, &buf[..copied], dest)
         }
     }
 }
 
 pub fn sys_recvmsg(sockfd: usize, msg: *mut u8, flags: usize) -> isize {
-    if !net_ready() {
-        return -97;
-    }
     let token = current_user_token();
     let msghdr: &Msghdr = translated_ref(token, msg as *const Msghdr);
 
@@ -1328,7 +1536,29 @@ pub fn sys_recvmsg(sockfd: usize, msg: *mut u8, flags: usize) -> isize {
                 tcp_recv(handle, dontwait, &mut buf)
             }
         }
-        SocketType::Udp => udp_recv(handle, dontwait, &mut buf),
+        SocketType::Udp => loop {
+            if let Some(ret) = try_recv_local_udp(
+                sockfd,
+                handle,
+                &mut buf,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                peek,
+            ) {
+                break ret;
+            }
+            let ret = if net_ready() {
+                udp_recv(handle, true, &mut buf)
+            } else {
+                -11
+            };
+            if ret != -11 || dontwait {
+                break ret;
+            }
+            block_current_and_run_next(BlockReason::UdpRecv(unsafe {
+                core::mem::transmute(handle)
+            }));
+        },
     };
 
     if result > 0 {
@@ -1546,17 +1776,18 @@ pub fn sys_getpeername(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isi
         })
         .flatten()
         .or_else(|| get_socket_peer_endpoint(sockfd)),
-        SocketType::Udp => crate::net::with_net_iface(|iface| {
-            let sock: &UdpSocket = iface.sockets.get(handle);
-            sock.endpoint()
-        })
-        .map(|ep| {
-            IpEndpoint::new(
-                ep.addr.unwrap_or(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED)),
-                ep.port,
-            )
-        })
-        .or_else(|| get_socket_peer_endpoint(sockfd)),
+        SocketType::Udp => get_socket_peer_endpoint(sockfd).or_else(|| {
+            crate::net::with_net_iface(|iface| {
+                let sock: &UdpSocket = iface.sockets.get(handle);
+                sock.endpoint()
+            })
+            .map(|ep| {
+                IpEndpoint::new(
+                    ep.addr.unwrap_or(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED)),
+                    ep.port,
+                )
+            })
+        }),
     };
 
     match peer {

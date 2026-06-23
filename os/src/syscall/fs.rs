@@ -536,6 +536,9 @@ pub fn sys_unlinkat(dirfd: isize, path: *const u8, flags: u32) -> isize {
         return 0;
     }
     if unlink_at(Some(base_dir.clone()), path.as_str(), is_dir) {
+        if !is_dir {
+            crate::syscall::process::remove_shared_file_mappings(&path);
+        }
         0
     } else if let Some(dentry) = vfs_resolve_with_fallback(&base_dir, path.as_str()) {
         if dentry.is_dir && !is_dir {

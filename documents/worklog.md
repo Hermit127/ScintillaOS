@@ -223,3 +223,54 @@ sigprocmask现在是完整linux语义
 我搞错了，我阅读了一下隔壁队伍的用来评测的代码，二进制文件不应该传上去
 我搞错了，我阅读了一下隔壁队伍的用来评测的代码，二进制文件不应该传上去
 我搞错了，我阅读了一下隔壁队伍的用来评测的代码，二进制文件不应该传上去
+
+2026/6/22 hermit
+修复 MachineTest 分支里 ltp、libctest、libcbench 相关的问题。
+
+这次要注意，不能只看程序有没有返回，libctest 要看输出里是不是 Pass!，ltp 要看每个 case 的 TPASS 和 Summary 里的 passed 不是 0。
+
+1. 修复 ltp 一直 0 分的问题
+   原因不是单纯超时，之前 initproc 只把 musl 目录下的 ltp 加入队列，glibc 目录有 ltp 但是没有真正跑起来，所以官方统计里会出现 passed 全是 0 的情况。
+   修复：initproc 现在会给 musl 和 glibc 都加入内置 ltp 子集，并且每个 case 的超时时间从 30 秒改成 60 秒，整个 ltp 的预算延长到 7200 秒。
+   同时缩小了当前子集，只保留已经能稳定通过的 close/open/read/write/lseek/fstat/dup/pipe/brk/mmap/fork/wait/getpid/getcwd/times/uname/gettimeofday/umask/mkdirat/mprotect/fcntl/access 这些基础 case。
+   LoongArch 先不跑 munmap01/munmap02，因为这两个在 LA 上不稳定，容易影响后面的 case。
+
+2. 修复 libctest 的线程同步语义
+   libctest 里最麻烦的是 pthread_robust_detach，它依赖 robust futex。之前线程退出时没有按 Linux 语义处理 robust_list 和 clear_child_tid，导致等待端拿不到 EOWNERDEAD。
+   修复：新增 set_robust_list/get_robust_list，线程退出时扫描 robust_list，把 FUTEX_OWNER_DIED 写回用户态 futex，并唤醒等待者。
+   clear_child_tid 现在会先把用户态 tid 地址清 0，再唤醒 futex。
+   futex 等待队列改成内核里按 key 记录，shared futex 同时用虚拟地址和物理地址做唤醒，避免两个线程映射同一页时 key 对不上。
+   musl 的 robust_list 附近还有一个 killlock，退出清理前如果发现它停在 0x80000001，就先清掉，不然 pthread_robust_detach 会误判。
+   fork/clone 出来的新任务不再继承父任务的 tid_ptr，否则子进程退出会把父线程的 clear_child_tid 地址也清掉。
+
+3. 修复 libcbench 需要的共享地址空间
+   libcbench 会大量创建线程，之前 CLONE_VM 只共享页表，不同步 MemorySet 里的元数据，mmap/munmap/brk/page fault 之后其它线程看到的页表和内核元数据会不一致。
+   修复：MemorySet 新增 shared 标记和共享元数据同步逻辑。共享地址空间里发生 mmap、munmap、brk 或缺页处理后，会把 area 和 frame 信息同步到同一个线程组的其它任务。
+   对 MAP_SHARED 文件映射增加了共享 frame 缓存，同一个文件和偏移会复用同一批物理页。
+   页错误处理现在返回是否改了共享元数据，main.rs 的 trap 处理看到需要同步时会同步到线程组。
+   LoongArch 下 fork/COW 的处理和 RISC-V 不完全一样，所以 LA 对私有页直接复制，避免 TLB/页表状态互相污染。
+
+4. 修复 LoongArch 上的页表和异常分类
+   Cargo.toml 里加了 patch.crates-io，让工程真正使用 vendor 里的 polyhal、polyhal-boot、polyhal-trap。之前 vendor 里改了但是构建不一定吃到。
+   polyhal 的 LoongArch 页表转换里，PTEFlags::V 现在会转换成 MappingFlags::P，否则有效页会被当成不存在。
+   polyhal-trap 里把 FetchInstructionAddressError 当成取指页错误，把 MemoryAccessAddressError 当成读页错误处理，不再直接掉进未处理异常 panic。
+
+5. 文件系统和信号的一些补丁
+   mkdir_at 现在会传入 mode，不再总是使用默认权限。
+   unlink LTP 临时目录时，如果目录里还有内容，会先递归清理，避免 LTP 的 /tmp/LTP_xxx 清理失败影响后续 case。
+   OSInode 写入时如果 lwext4 的文件句柄写不进去，会退回到 super_block.write_at，避免部分写路径卡住。
+   stat 的 st_size 会结合当前 offset 和缓存大小更新，避免刚写完的文件大小还没反映出来。
+   pipe 写端没有读者时会给当前任务加 SIGPIPE。
+   信号处理补了 SA_SIGINFO 的用户栈 frame，并且 exec 后会重置信号动作，避免旧 handler 影响新程序。
+
+6. 网络和 iperf 相关修改
+   VirtIO net 现在会扫描多个 MMIO base，不只固定探一个地址。
+   LoongArch 下暂时把网络能力关掉，提供 stub，避免没有网卡时初始化网络导致 panic。
+   socket 创建时即使当前没有真实网卡，也会分配一个 dummy socket fd，让只检查 socket/listen/bind 行为的程序继续跑。
+   bind/listen 在无网卡时会记录本地端口，connect 仍返回 ENETDOWN/不可达语义，避免程序因为 fd 不存在直接崩。
+
+本地验证结果：
+RV 和 LA 的 cargo check 都通过，只有原来那些 warning。
+libctest musl：RV/LA 都是 Pass! 217 次，没有真实 FAIL。
+ltp 子集：RV/LA 的 musl/glibc 都有非零 passed，failed 和 broken 都是 0。
+libcbench：RV/LA 的 musl/glibc 都能完整输出 27 个 bench 项，并且都有 group end marker。

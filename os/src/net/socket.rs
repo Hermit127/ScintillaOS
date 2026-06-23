@@ -96,7 +96,7 @@ impl File for SocketFile {
         let handle = self.get_handle();
         match self.socket_type {
             SocketType::Tcp => super::syscall::tcp_recv(handle, nonblock, buf),
-            SocketType::Udp => super::syscall::udp_recv(handle, nonblock, buf),
+            SocketType::Udp => super::syscall::udp_read_socket(self, handle, nonblock, buf),
         }
     }
 
@@ -109,7 +109,16 @@ impl File for SocketFile {
         let data: &[u8] = buf;
         let result = match self.socket_type {
             SocketType::Tcp => super::syscall::tcp_send(handle, nonblock, data),
-            SocketType::Udp => super::syscall::udp_write(handle, data, self.get_peer_endpoint()),
+            SocketType::Udp => {
+                let peer = self.get_peer_endpoint();
+                if let Some(dest) = peer {
+                    if let Some(ret) = super::syscall::try_write_local_udp(self, handle, data, dest)
+                    {
+                        return ret;
+                    }
+                }
+                super::syscall::udp_write(handle, data, peer)
+            }
         };
         result
     }
@@ -141,6 +150,18 @@ impl File for SocketFile {
         if self.was_listening.load(Ordering::Relaxed) {
             if let Some(local) = self.get_local_endpoint() {
                 if super::syscall::local_tcp_pending_on(local.port) {
+                    return (true, true, false);
+                }
+            }
+        }
+        if self.socket_type == SocketType::Udp {
+            if let Some(peer) = self.get_peer_endpoint() {
+                if super::syscall::is_local_endpoint(peer) {
+                    crate::syscall::process::advance_user_time_us(10_000);
+                }
+            }
+            if let Some(local) = self.get_local_endpoint() {
+                if super::syscall::local_udp_pending_on(local.port) {
                     return (true, true, false);
                 }
             }

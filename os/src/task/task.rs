@@ -187,6 +187,7 @@ pub fn blank_kcontext(ksp: usize) -> KContext {
 }
 
 impl TaskControlBlock {
+    #[track_caller]
     pub fn inner_exclusive_access(&self) -> RefMut<'_, TaskControlBlockInner> {
         self.inner.exclusive_access()
     }
@@ -196,6 +197,7 @@ impl TaskControlBlock {
             inner: unsafe { UPSafeCell::new(inner) },
         }
     }
+    #[track_caller]
     pub fn try_inner_exclusive_access(&self) -> Option<RefMut<'_, TaskControlBlockInner>> {
         match self.inner.try_borrow_mut() {
             Some(g) => Some(g),

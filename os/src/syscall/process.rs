@@ -37,6 +37,8 @@ struct SharedFileMapping {
     frames: Vec<FrameTracker>,
 }
 
+const SHARED_FILE_MAPPING_CACHE_MAX_PAGES: usize = 4096;
+
 lazy_static! {
     static ref SHM_SEGMENTS: UPSafeCell<Vec<Option<ShmSegment>>> =
         unsafe { UPSafeCell::new(Vec::new()) };
@@ -60,7 +62,7 @@ fn page_align_up(len: usize) -> Option<usize> {
 }
 
 fn fill_shared_file_frames(
-    file: &Arc<dyn File>,
+    file: &dyn File,
     offset: usize,
     frames: &[FrameTracker],
     base_page: usize,
@@ -70,6 +72,29 @@ fn fill_shared_file_frames(
         let file_off = offset + (base_page + idx) * crate::config::PAGE_SIZE;
         let _ = file.read_at(file_off, page);
     }
+}
+
+fn shared_file_mapping_cache_pages(mappings: &[SharedFileMapping]) -> usize {
+    mappings.iter().map(|mapping| mapping.frames.len()).sum()
+}
+
+fn trim_shared_file_mapping_cache(mappings: &mut Vec<SharedFileMapping>, reserve_pages: usize) {
+    while !mappings.is_empty()
+        && shared_file_mapping_cache_pages(mappings).saturating_add(reserve_pages)
+            > SHARED_FILE_MAPPING_CACHE_MAX_PAGES
+    {
+        mappings.remove(0);
+    }
+}
+
+fn load_shared_file_frames_uncached(
+    file: &dyn File,
+    offset: usize,
+    pages: usize,
+) -> Option<Vec<FrameTracker>> {
+    let frames = frames_alloc(pages)?;
+    fill_shared_file_frames(file, offset, &frames, 0);
+    Some(frames)
 }
 
 fn shared_file_mapping_frames(
@@ -83,34 +108,48 @@ fn shared_file_mapping_frames(
     if pages == 0 {
         return None;
     }
+    if pages > SHARED_FILE_MAPPING_CACHE_MAX_PAGES {
+        return load_shared_file_frames_uncached(file.as_ref(), offset, pages);
+    }
 
     let mut mappings = SHARED_FILE_MAPPINGS.exclusive_access();
-    if let Some(mapping) = mappings
-        .iter_mut()
-        .find(|mapping| mapping.path == path && mapping.offset == offset)
+    if let Some(idx) = mappings
+        .iter()
+        .position(|mapping| mapping.path == path && mapping.offset == offset)
     {
-        if mapping.len < len {
-            let old_pages = mapping.frames.len();
+        let old_pages = mappings[idx].frames.len();
+        if mappings[idx].len < len {
+            let total_without_current =
+                shared_file_mapping_cache_pages(&mappings).saturating_sub(old_pages);
+            if total_without_current.saturating_add(pages) > SHARED_FILE_MAPPING_CACHE_MAX_PAGES {
+                mappings.remove(idx);
+                drop(mappings);
+                return load_shared_file_frames_uncached(file.as_ref(), offset, pages);
+            }
             let extra_pages = pages.saturating_sub(old_pages);
             if extra_pages > 0 {
                 let mut extra = frames_alloc(extra_pages)?;
-                fill_shared_file_frames(&file, offset, &extra, old_pages);
-                mapping.frames.append(&mut extra);
+                fill_shared_file_frames(file.as_ref(), offset, &extra, old_pages);
+                mappings[idx].frames.append(&mut extra);
             }
-            mapping.len = len;
+            mappings[idx].len = len;
         }
-        return Some(
-            mapping
-                .frames
-                .iter()
-                .take(pages)
-                .map(|frame| frame.shared_clone())
-                .collect(),
-        );
+        let result = mappings[idx]
+            .frames
+            .iter()
+            .take(pages)
+            .map(|frame| frame.shared_clone())
+            .collect();
+        if idx + 1 != mappings.len() {
+            let mapping = mappings.remove(idx);
+            mappings.push(mapping);
+        }
+        return Some(result);
     }
 
+    trim_shared_file_mapping_cache(&mut mappings, pages);
     let frames = frames_alloc(pages)?;
-    fill_shared_file_frames(&file, offset, &frames, 0);
+    fill_shared_file_frames(file.as_ref(), offset, &frames, 0);
     let result = frames.iter().map(|frame| frame.shared_clone()).collect();
     mappings.push(SharedFileMapping {
         path,
@@ -119,6 +158,12 @@ fn shared_file_mapping_frames(
         frames,
     });
     Some(result)
+}
+
+pub(crate) fn remove_shared_file_mappings(path: &str) {
+    SHARED_FILE_MAPPINGS
+        .exclusive_access()
+        .retain(|mapping| mapping.path != path);
 }
 
 pub(crate) fn sync_thread_group_vm_metadata(
@@ -290,6 +335,22 @@ fn monotonic_user_time_us() -> u64 {
     }
 }
 
+pub(crate) fn advance_user_time_us(delta: u64) {
+    if delta == 0 {
+        return;
+    }
+    loop {
+        let last = LAST_USER_TIME_US.load(Ordering::Relaxed);
+        let next = last.saturating_add(delta);
+        if LAST_USER_TIME_US
+            .compare_exchange(last, next, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            return;
+        }
+    }
+}
+
 fn monotonic_user_times_tick() -> u64 {
     let hw_tick = monotonic_user_time_us() / USER_CLOCK_TICK_US;
     loop {
@@ -450,41 +511,59 @@ const ROBUST_LIST_LIMIT: usize = 2048;
 const MUSL_KILLLOCK_OFFSET_FROM_ROBUST_HEAD: usize = 0x28;
 const MUSL_LOCKED_NO_WAITERS: u32 = 0x8000_0001;
 
-fn user_usize(inner: &TaskControlBlockInner, addr: usize) -> Option<usize> {
-    if addr == 0
-        || !inner
+fn user_usize(task: &Arc<TaskControlBlock>, addr: usize) -> Option<usize> {
+    if addr == 0 {
+        return None;
+    }
+    let token = {
+        let inner = task.inner_exclusive_access();
+        if !inner
             .memory_set
             .valid_user_buf(addr as *const u8, core::mem::size_of::<usize>(), false)
-    {
-        return None;
-    }
-    Some(*translated_ref(
-        inner.memory_set.token(),
-        addr as *const usize,
-    ))
+        {
+            return None;
+        }
+        inner.memory_set.token()
+    };
+    Some(*translated_ref(token, addr as *const usize))
 }
 
-fn user_u32(inner: &TaskControlBlockInner, addr: usize) -> Option<u32> {
-    if addr == 0
-        || !inner
+fn user_u32(task: &Arc<TaskControlBlock>, addr: usize) -> Option<u32> {
+    if addr == 0 {
+        return None;
+    }
+    let token = {
+        let inner = task.inner_exclusive_access();
+        if !inner
             .memory_set
             .valid_user_buf(addr as *const u8, core::mem::size_of::<u32>(), false)
-    {
-        return None;
-    }
-    Some(*translated_ref(inner.memory_set.token(), addr as *const u32))
+        {
+            return None;
+        }
+        inner.memory_set.token()
+    };
+    Some(*translated_ref(token, addr as *const u32))
 }
 
-fn set_user_u32(inner: &TaskControlBlockInner, addr: usize, value: u32) -> bool {
-    if addr == 0
-        || !inner
+fn set_user_u32(task: &Arc<TaskControlBlock>, addr: usize, value: u32) -> Option<Vec<usize>> {
+    if addr == 0 {
+        return None;
+    }
+    let (token, keys) = {
+        let inner = task.inner_exclusive_access();
+        if !inner
             .memory_set
             .valid_user_buf(addr as *const u8, core::mem::size_of::<u32>(), true)
-    {
-        return false;
-    }
-    *translated_refmut(inner.memory_set.token(), addr as *mut u32) = value;
-    true
+        {
+            return None;
+        }
+        (
+            inner.memory_set.token(),
+            futex_keys_for_addr(&inner, addr, true),
+        )
+    };
+    *translated_refmut(token, addr as *mut u32) = value;
+    Some(keys)
 }
 
 fn futex_keys_for_addr(inner: &TaskControlBlockInner, addr: usize, shared: bool) -> Vec<usize> {
@@ -507,11 +586,11 @@ fn wake_futex_keys(keys: &[usize]) {
     }
 }
 
-fn clear_stale_musl_killlock(inner: &TaskControlBlockInner, robust_head: usize) {
+fn clear_stale_musl_killlock(task: &Arc<TaskControlBlock>, robust_head: usize) {
     // musl keeps killlock next to robust_list; clear its stale fast-path state before exit cleanup.
     let addr = robust_head + MUSL_KILLLOCK_OFFSET_FROM_ROBUST_HEAD;
-    if user_u32(inner, addr) == Some(MUSL_LOCKED_NO_WAITERS) {
-        let _ = set_user_u32(inner, addr, 0);
+    if user_u32(task, addr) == Some(MUSL_LOCKED_NO_WAITERS) {
+        let _ = set_user_u32(task, addr, 0);
     }
 }
 
@@ -535,8 +614,7 @@ fn mark_futex_owner_died(uaddr: *mut u32, shared: bool, key: usize) -> bool {
     let Some(task) = current_task() else {
         return false;
     };
-    let mut wake_keys = Vec::new();
-    {
+    let token = {
         let inner = task.inner_exclusive_access();
         if !inner.memory_set.valid_user_buf(
             uaddr as *const u8,
@@ -545,44 +623,53 @@ fn mark_futex_owner_died(uaddr: *mut u32, shared: bool, key: usize) -> bool {
         ) {
             return false;
         }
-        let word = *translated_ref(inner.memory_set.token(), uaddr);
-        if word & FUTEX_OWNER_DIED != 0 {
+        inner.memory_set.token()
+    };
+    let word = *translated_ref(token, uaddr);
+    if word & FUTEX_OWNER_DIED != 0 {
+        return false;
+    }
+    let owner = word & FUTEX_TID_MASK;
+    if !futex_owner_gone(owner) {
+        return false;
+    }
+    let new = (word & FUTEX_WAITERS_BIT) | FUTEX_OWNER_DIED;
+    let mut wake_keys = {
+        let inner = task.inner_exclusive_access();
+        if !inner.memory_set.valid_user_buf(
+            uaddr as *const u8,
+            core::mem::size_of::<u32>(),
+            true,
+        ) {
             return false;
         }
-        let owner = word & FUTEX_TID_MASK;
-        if !futex_owner_gone(owner) {
-            return false;
-        }
-        let new = (word & FUTEX_WAITERS_BIT) | FUTEX_OWNER_DIED;
-        *translated_refmut(inner.memory_set.token(), uaddr) = new;
+        futex_keys_for_addr(&inner, uaddr as usize, shared)
+    };
+    *translated_refmut(token, uaddr) = new;
+    if !wake_keys.contains(&key) {
         wake_keys.push(key);
-        for wake_key in futex_keys_for_addr(&inner, uaddr as usize, shared) {
-            if !wake_keys.contains(&wake_key) {
-                wake_keys.push(wake_key);
-            }
-        }
     }
     wake_futex_keys(&wake_keys);
     true
 }
 
 fn process_robust_node(
-    inner: &TaskControlBlockInner,
+    task: &Arc<TaskControlBlock>,
     node: usize,
     futex_offset: isize,
     tid: u32,
     wake_keys: &mut Vec<usize>,
 ) {
     let futex_addr = node.wrapping_add_signed(futex_offset);
-    let Some(old) = user_u32(inner, futex_addr) else {
+    let Some(old) = user_u32(task, futex_addr) else {
         return;
     };
     if old & FUTEX_TID_MASK != tid {
         return;
     }
     let new = (old & FUTEX_WAITERS_BIT) | FUTEX_OWNER_DIED;
-    if set_user_u32(inner, futex_addr, new) {
-        wake_keys.extend(futex_keys_for_addr(inner, futex_addr, true));
+    if let Some(keys) = set_user_u32(task, futex_addr, new) {
+        wake_keys.extend(keys);
     }
 }
 
@@ -592,36 +679,39 @@ fn process_current_robust_list(clear_after: bool) {
     };
     let tid = task.getpid() as u32;
     let mut wake_keys = Vec::new();
-    {
-        let mut inner = task.inner_exclusive_access();
+    let head = {
+        let inner = task.inner_exclusive_access();
         let head = inner.robust_list_head;
         if head == 0 || inner.robust_list_len != ROBUST_LIST_LEN {
             return;
         }
-        let Some(offset_raw) = user_usize(&inner, head + core::mem::size_of::<usize>()) else {
-            if clear_after {
-                inner.robust_list_head = 0;
-                inner.robust_list_len = 0;
-            }
-            return;
-        };
-        let futex_offset = offset_raw as isize;
-        let pending = user_usize(&inner, head + 2 * core::mem::size_of::<usize>()).unwrap_or(0);
-        let mut node = user_usize(&inner, head).unwrap_or(0);
-        let mut seen = 0usize;
-        while node != 0 && node != head && seen < ROBUST_LIST_LIMIT {
-            let next = user_usize(&inner, node).unwrap_or(0);
-            process_robust_node(&inner, node, futex_offset, tid, &mut wake_keys);
-            node = next;
-            seen += 1;
-        }
-        if pending != 0 && pending != head {
-            process_robust_node(&inner, pending, futex_offset, tid, &mut wake_keys);
-        }
+        head
+    };
+    let Some(offset_raw) = user_usize(&task, head + core::mem::size_of::<usize>()) else {
         if clear_after {
+            let mut inner = task.inner_exclusive_access();
             inner.robust_list_head = 0;
             inner.robust_list_len = 0;
         }
+        return;
+    };
+    let futex_offset = offset_raw as isize;
+    let pending = user_usize(&task, head + 2 * core::mem::size_of::<usize>()).unwrap_or(0);
+    let mut node = user_usize(&task, head).unwrap_or(0);
+    let mut seen = 0usize;
+    while node != 0 && node != head && seen < ROBUST_LIST_LIMIT {
+        let next = user_usize(&task, node).unwrap_or(0);
+        process_robust_node(&task, node, futex_offset, tid, &mut wake_keys);
+        node = next;
+        seen += 1;
+    }
+    if pending != 0 && pending != head {
+        process_robust_node(&task, pending, futex_offset, tid, &mut wake_keys);
+    }
+    if clear_after {
+        let mut inner = task.inner_exclusive_access();
+        inner.robust_list_head = 0;
+        inner.robust_list_len = 0;
     }
     wake_futex_keys(&wake_keys);
 }
@@ -630,7 +720,7 @@ fn clear_current_tid_ptr() {
     let Some(task) = current_task() else {
         return;
     };
-    let (tid, wake_keys) = {
+    let (tid, token, wake_keys) = {
         let inner = task.inner_exclusive_access();
         let tid = inner.tid_ptr;
         if tid == 0
@@ -640,9 +730,13 @@ fn clear_current_tid_ptr() {
         {
             return;
         }
-        *translated_refmut(inner.memory_set.token(), tid as *mut i32) = 0;
-        (tid, futex_keys_for_addr(&inner, tid, true))
+        (
+            tid,
+            inner.memory_set.token(),
+            futex_keys_for_addr(&inner, tid, true),
+        )
     };
+    *translated_refmut(token, tid as *mut i32) = 0;
     let mut keys = wake_keys;
     if !keys.contains(&tid) {
         keys.push(tid);
@@ -989,6 +1083,7 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: usize) -> isize
                 let found_pid = child.getpid();
                 let child_inner = child.inner_exclusive_access();
                 let exit_code = child_inner.exit_code;
+                let exit_signal = child_inner.exit_signal;
                 inner.cutime = inner
                     .cutime
                     .saturating_add(child_inner.utime)
@@ -997,17 +1092,14 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: usize) -> isize
                     .cstime
                     .saturating_add(child_inner.stime)
                     .saturating_add(child_inner.cstime);
-                (found_pid, exit_code, inner.memory_set.token())
+                (found_pid, exit_code, exit_signal, inner.memory_set.token())
             })
         };
 
-        if let Some((found_pid, exit_code, token)) = zombie {
+        if let Some((found_pid, exit_code, exit_signal, token)) = zombie {
             if !exit_code_ptr.is_null() {
-                if exit_code < 0 {
-                    *translated_refmut(token, exit_code_ptr) = -exit_code;
-                } else {
-                    *translated_refmut(token, exit_code_ptr) = (exit_code << 8) as i32;
-                }
+                *translated_refmut(token, exit_code_ptr) =
+                    wait_status_from_exit(exit_code, exit_signal);
             }
             return found_pid as isize;
         }
@@ -1023,6 +1115,24 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: usize) -> isize
         drop(task);
         crate::task::sleep_current_and_run_next();
         // Loop back to check again
+    }
+}
+
+fn wait_status_from_exit(exit_code: i32, exit_signal: i32) -> i32 {
+    if let Some(signal) = wait_signal_from_exit(exit_code, exit_signal) {
+        signal
+    } else {
+        ((exit_code as u8) as i32) << 8
+    }
+}
+
+fn wait_signal_from_exit(exit_code: i32, exit_signal: i32) -> Option<i32> {
+    if exit_signal < 0 {
+        Some(-exit_signal)
+    } else if (-(MAX_SIG as i32)..0).contains(&exit_code) {
+        Some(-exit_code)
+    } else {
+        None
     }
 }
 
@@ -1042,17 +1152,17 @@ struct WaitSigInfo {
     _pad: [u8; 128 - 40],
 }
 
-fn write_wait_siginfo(info_ptr: *mut u8, pid: i32, exit_code: i32) {
+fn write_wait_siginfo(info_ptr: *mut u8, pid: i32, exit_code: i32, exit_signal: i32) {
     if info_ptr.is_null() {
         return;
     }
     const SIGCHLD: i32 = 17;
     const CLD_EXITED: i32 = 1;
     const CLD_KILLED: i32 = 2;
-    let (code, status) = if exit_code < 0 {
-        (CLD_KILLED, -exit_code)
+    let (code, status) = if let Some(signal) = wait_signal_from_exit(exit_code, exit_signal) {
+        (CLD_KILLED, signal)
     } else {
-        (CLD_EXITED, exit_code)
+        (CLD_EXITED, (exit_code as u8) as i32)
     };
     let token = current_user_token();
     *translated_refmut(token, info_ptr as *mut WaitSigInfo) = WaitSigInfo {
@@ -1115,9 +1225,10 @@ pub fn sys_waitid(
 
         if let Some(child) = zombie {
             let found_pid = child.getpid();
-            let exit_code = {
+            let (exit_code, exit_signal) = {
                 let child_inner = child.inner_exclusive_access();
                 let exit_code = child_inner.exit_code;
+                let exit_signal = child_inner.exit_signal;
                 let mut parent_inner = task.inner_exclusive_access();
                 parent_inner.cutime = parent_inner
                     .cutime
@@ -1127,14 +1238,14 @@ pub fn sys_waitid(
                     .cstime
                     .saturating_add(child_inner.stime)
                     .saturating_add(child_inner.cstime);
-                exit_code
+                (exit_code, exit_signal)
             };
-            write_wait_siginfo(info_ptr, found_pid as i32, exit_code);
+            write_wait_siginfo(info_ptr, found_pid as i32, exit_code, exit_signal);
             return 0;
         }
 
         if options & WNOHANG != 0 {
-            write_wait_siginfo(info_ptr, 0, 0);
+            write_wait_siginfo(info_ptr, 0, 0, 0);
             return 0;
         }
         let mut queue = crate::task::WAITPID_QUEUE.exclusive_access();
@@ -1644,6 +1755,25 @@ pub fn sys_mmap(
                 if file.as_any().is::<crate::fs::DevZero>() {
                     let pages = aligned_len / crate::config::PAGE_SIZE;
                     let Some(frames) = frames_alloc(pages) else {
+                        return -12;
+                    };
+                    sync_and_return!(match inner.memory_set.insert_shared_file_frames(
+                        start_addr,
+                        aligned_len,
+                        &frames,
+                        permission,
+                        file,
+                        offset,
+                    ) {
+                        Some(addr) => addr.raw() as isize,
+                        None => -12,
+                    }, start_addr, polyhal::VirtAddr::from(start_addr.raw() + aligned_len));
+                }
+                if permission.contains(MapPermission::W) {
+                    let pages = aligned_len / crate::config::PAGE_SIZE;
+                    let Some(frames) =
+                        load_shared_file_frames_uncached(file.as_ref(), offset, pages)
+                    else {
                         return -12;
                     };
                     sync_and_return!(match inner.memory_set.insert_shared_file_frames(
@@ -3354,14 +3484,17 @@ pub fn sys_set_robust_list(head: usize, len: usize) -> isize {
         return 0;
     }
     let task = current_task().unwrap();
-    let mut inner = task.inner_exclusive_access();
-    if !inner
-        .memory_set
-        .valid_user_buf(head as *const u8, ROBUST_LIST_LEN, false)
     {
-        return -14;
+        let inner = task.inner_exclusive_access();
+        if !inner
+            .memory_set
+            .valid_user_buf(head as *const u8, ROBUST_LIST_LEN, false)
+        {
+            return -14;
+        }
     }
-    clear_stale_musl_killlock(&inner, head);
+    clear_stale_musl_killlock(&task, head);
+    let mut inner = task.inner_exclusive_access();
     inner.robust_list_head = head;
     inner.robust_list_len = len;
     0
