@@ -6,7 +6,6 @@ use super::{File, Kstat, S_IFDIR, S_IFIFO, S_IFREG};
 use crate::sync::UPSafeCell;
 use alloc::collections::BTreeMap;
 use alloc::ffi::CString;
-use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -249,6 +248,9 @@ impl OSInode {
                 st.st_blksize = EXT4_BLOCK_SIZE;
                 st.st_blocks = info.blocks_count;
                 st.st_nlink = info.links_count.max(1);
+                if file_type == S_IFDIR {
+                    st.st_nlink = st.st_nlink.max(2);
+                }
                 st.st_atime_sec = info.atime as i64;
                 st.st_mtime_sec = info.mtime as i64;
                 st.st_ctime_sec = info.ctime as i64;
@@ -277,6 +279,8 @@ impl OSInode {
             let inner = self.inner.exclusive_access();
             st.st_size = st.st_size.max(inner.offset as i64);
             st.st_blocks = ((st.st_size.max(0) as u64) + 511) / 512;
+        } else {
+            st.st_nlink = st.st_nlink.max(2);
         }
         if !self.dentry.is_dir {
             self.inner.exclusive_access().cached_stat = Some(st);
@@ -550,17 +554,11 @@ pub fn unlink_at(base: Option<Arc<Dentry>>, path: &str, is_dir: bool) -> bool {
     root_make_accessible(&parent, 0o777);
     root_make_accessible(&dentry, 0o777);
 
-    if is_dir && dentry.path.contains("/tmp/LTP_") {
-        remove_ltp_tmpdir_contents(&dentry);
-    }
-
     let ok = if is_dir {
         dentry.super_block.unlink_dir(&dentry.fs_path)
     } else {
         dentry.super_block.unlink_file(&dentry.fs_path)
     };
-
-    let ok = ok || (is_dir && dentry.path.contains("/tmp/LTP_"));
 
     if ok {
         let mut children = parent.children.exclusive_access();
@@ -569,33 +567,6 @@ pub fn unlink_at(base: Option<Arc<Dentry>>, path: &str, is_dir: bool) -> bool {
         }
     }
     ok
-}
-
-fn remove_ltp_tmpdir_contents(dir: &Arc<Dentry>) {
-    let entries = dir.super_block.dir_get_entries(&dir.fs_path);
-    for entry in entries {
-        let name = entry.get_name();
-        if name == "." || name == ".." {
-            continue;
-        }
-        let child_path = if dir.fs_path == "/" {
-            format!("/{}", name)
-        } else {
-            format!("{}/{}", dir.fs_path, name)
-        };
-        let Some(info) = dir.super_block.get_inode_info(&child_path) else {
-            continue;
-        };
-        if info.is_dir {
-            if let Some(child) = vfs_resolve_path(dir, &name) {
-                remove_ltp_tmpdir_contents(&child);
-            }
-            dir.super_block.unlink_dir(&child_path);
-        } else {
-            dir.super_block.unlink_file(&child_path);
-        }
-    }
-    *dir.children.exclusive_access() = None;
 }
 
 // ==================== File Trait for OSInode ====================

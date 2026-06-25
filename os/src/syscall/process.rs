@@ -1097,6 +1097,7 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: usize) -> isize
         };
 
         if let Some((found_pid, exit_code, exit_signal, token)) = zombie {
+            crate::task::reap_exited_task(found_pid);
             if !exit_code_ptr.is_null() {
                 *translated_refmut(token, exit_code_ptr) =
                     wait_status_from_exit(exit_code, exit_signal);

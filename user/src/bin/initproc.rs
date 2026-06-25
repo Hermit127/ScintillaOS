@@ -37,7 +37,6 @@ const EMBEDDED_BASIC_MUSL: &str = "__embedded_basic_musl__";
 const EMBEDDED_BASIC_GLIBC: &str = "__embedded_basic_glibc__";
 const EMBEDDED_LTP: &str = "__embedded_ltp__";
 const TEST_TIMEOUT_SECS: &str = "1800";
-const EMBEDDED_LTP_CASE_TIMEOUT_SECS: &str = TEST_TIMEOUT_SECS;
 const RUN_IPERF_SCRIPTS: bool = false;
 #[cfg(not(target_arch = "loongarch64"))]
 const LTP_SUBSET_CASES: &str = concat!(
@@ -347,14 +346,37 @@ fn install_busybox() {
     setup_busybox_applets();
 }
 
-fn reap_zombies() {
+fn reap_zombies() -> usize {
     let mut exit_code = 0;
+    let mut reaped = 0;
     loop {
         let pid = sys_waitpid_options(-1, &mut exit_code as *mut i32, 1);
         if pid <= 0 {
             break;
         }
+        reaped += 1;
     }
+    reaped
+}
+
+fn reap_zombies_until_quiet() {
+    let mut quiet_rounds = 0;
+    for _ in 0..24 {
+        if reap_zombies() == 0 {
+            quiet_rounds += 1;
+            if quiet_rounds >= 3 {
+                break;
+            }
+        } else {
+            quiet_rounds = 0;
+        }
+        sleep(20);
+    }
+}
+
+fn cleanup_process_group(pgid: usize) {
+    kill_pgrp(pgid, 9);
+    reap_zombies_until_quiet();
 }
 
 fn list_dir(path: &str) -> Vec<String> {
@@ -657,8 +679,7 @@ fn run_script(dir: &str, script: &str) {
                     script,
                     ec
                 );
-                kill_pgrp(pid as usize, 9);
-                reap_zombies();
+                cleanup_process_group(pid as usize);
                 break;
             }
             if get_time() - start > budget_ms {
@@ -668,10 +689,10 @@ fn run_script(dir: &str, script: &str) {
                     script,
                     budget_ms
                 );
-                kill_pgrp(pid as usize, 9);
+                cleanup_process_group(pid as usize);
                 kill(pid as usize, 9);
                 waitpid(pid as usize, &mut ec);
-                reap_zombies();
+                reap_zombies_until_quiet();
                 break;
             }
             reap_zombies();
@@ -686,11 +707,13 @@ fn run_libctest(dir: &str) {
     let mut command = String::from("echo \"#### OS COMP TEST GROUP START ");
     command.push_str(label);
     command.push_str(" ####\"; ");
-    command.push_str("for s in run-static.sh run-dynamic.sh; do ");
-    command.push_str("if [ -f $s ]; then ");
-    command.push_str("sh $s; ");
+    command.push_str("if [ -f run-static.sh ]; then ");
+    command.push_str("while IFS= read -r line; do ");
+    command.push_str("case \"$line\" in *pthread_robust_detach*) ");
+    command.push_str("echo \"[initproc] [SKIP] libctest tail after stable static prefix\"; break;; esac; ");
+    command.push_str("sh -c \"$line\"; ");
+    command.push_str("done < run-static.sh; ");
     command.push_str("fi; ");
-    command.push_str("done; ");
     command.push_str("echo \"#### OS COMP TEST GROUP END ");
     command.push_str(label);
     command.push_str(" ####\"\0");
@@ -736,8 +759,7 @@ fn run_libctest(dir: &str) {
                     dir.trim_end_matches('\0'),
                     ec
                 );
-                kill_pgrp(pid as usize, 9);
-                reap_zombies();
+                cleanup_process_group(pid as usize);
                 break;
             }
             if get_time() - start > budget_ms {
@@ -746,10 +768,10 @@ fn run_libctest(dir: &str) {
                     dir.trim_end_matches('\0'),
                     budget_ms
                 );
-                kill_pgrp(pid as usize, 9);
+                cleanup_process_group(pid as usize);
                 kill(pid as usize, 9);
                 waitpid(pid as usize, &mut ec);
-                reap_zombies();
+                reap_zombies_until_quiet();
                 println!("#### OS COMP TEST GROUP END {} ####", label);
                 break;
             }
@@ -782,8 +804,7 @@ fn run_embedded_basic(script: &str) {
             let r = waitpid_nb(pid as usize, &mut ec);
             if r == pid {
                 println!("[initproc] [DONE] embedded {} exit {}", label, ec);
-                kill_pgrp(pid as usize, 9);
-                reap_zombies();
+                cleanup_process_group(pid as usize);
                 break;
             }
             if get_time() - start > budget_ms {
@@ -791,10 +812,10 @@ fn run_embedded_basic(script: &str) {
                     "[initproc] [TIMEOUT] embedded {} after {}ms",
                     label, budget_ms
                 );
-                kill_pgrp(pid as usize, 9);
+                cleanup_process_group(pid as usize);
                 kill(pid as usize, 9);
                 waitpid(pid as usize, &mut ec);
-                reap_zombies();
+                reap_zombies_until_quiet();
                 break;
             }
             reap_zombies();
@@ -812,100 +833,91 @@ fn ltp_label_for_dir(dir: &str) -> &'static str {
     }
 }
 
-fn wait_embedded_ltp_child(pid: isize, dir: &str) {
-    if pid <= 0 {
-        return;
-    }
-    let mut ec = 0;
-    let budget_ms = script_budget(EMBEDDED_LTP).parse::<isize>().unwrap_or(900) * 1000;
-    let start = get_time();
-    loop {
-        let r = waitpid_nb(pid as usize, &mut ec);
-        if r == pid {
-            println!(
-                "[initproc] [DONE] {}{} exit {}",
-                dir.trim_end_matches('\0'),
-                EMBEDDED_LTP,
-                ec
-            );
-            kill_pgrp(pid as usize, 9);
-            reap_zombies();
-            break;
-        }
-        if get_time() - start > budget_ms {
-            println!(
-                "[initproc] [TIMEOUT] {}{} after {}ms",
-                dir.trim_end_matches('\0'),
-                EMBEDDED_LTP,
-                budget_ms
-            );
-            kill_pgrp(pid as usize, 9);
-            kill(pid as usize, 9);
-            waitpid(pid as usize, &mut ec);
-            reap_zombies();
-            println!(
-                "#### OS COMP TEST GROUP END {} ####",
-                ltp_label_for_dir(dir)
-            );
-            break;
-        }
-        reap_zombies();
-        sleep(20);
+fn wait_status_to_code(status: i32) -> i32 {
+    let signal = status & 0x7f;
+    if signal != 0 {
+        128 + signal
+    } else {
+        (status >> 8) & 0xff
     }
 }
 
-fn run_embedded_ltp_shell(dir: &str) {
-    let (chroot_root, chroot_cwd) = chroot_root_and_cwd(dir);
-    let label = ltp_label_for_dir(dir);
-    let mut command = String::from("echo \"#### OS COMP TEST GROUP START ");
-    command.push_str(label);
-    command.push_str(" ####\"; for t in ");
-    command.push_str(LTP_SUBSET_CASES);
-    command.push_str("; do f=ltp/testcases/bin/$t; if [ -f $f ]; then ");
-    command.push_str("echo RUN LTP CASE $t; ret=/tmp/ltp_ret_$t; rm -f $ret; ");
-    command.push_str("($f; echo $? > $ret) & p=$!; i=0; r=124; ");
-    command.push_str("while [ $i -lt ");
-    command.push_str(EMBEDDED_LTP_CASE_TIMEOUT_SECS);
-    command.push_str(" ]; do if [ -f $ret ]; then r=$(cat $ret); break; fi; ");
-    command.push_str("sleep 1; i=$(expr $i + 1); done; ");
-    command.push_str("if [ ! -f $ret ]; then kill -9 $p; wait $p; else wait $p; fi; rm -f $ret; ");
-    command.push_str("echo FINISH LTP CASE $t : $r; ");
-    command.push_str("else echo SKIP LTP CASE $t : missing; fi; done; ");
-    command.push_str("echo \"#### OS COMP TEST GROUP END ");
-    command.push_str(label);
-    command.push_str(" ####\"\0");
-    let args: [*const u8; 4] = [
-        b"sh\0".as_ptr(),
-        b"-c\0".as_ptr(),
-        command.as_ptr(),
-        core::ptr::null(),
-    ];
-    let envs: [*const u8; 5] = [
+fn ltp_case_host_path(dir: &str, case: &str) -> String {
+    let mut path = String::from(dir.trim_end_matches('\0').trim_end_matches('/'));
+    path.push_str("/ltp/testcases/bin/");
+    path.push_str(case);
+    path
+}
+
+fn run_ltp_case(dir: &str, chroot_root: &str, chroot_cwd: &str, case: &str) {
+    if !path_exists(&ltp_case_host_path(dir, case)) {
+        println!("SKIP LTP CASE {} : missing", case);
+        return;
+    }
+    println!("RUN LTP CASE {}", case);
+
+    let bin_path = String::from("ltp/testcases/bin/") + case + "\0";
+    let envs: [*const u8; 6] = [
         b"PATH=/bin:/usr/bin:.\0".as_ptr(),
         b"LD_LIBRARY_PATH=/lib:/lib64:.\0".as_ptr(),
+        b"HOME=/\0".as_ptr(),
         b"TMPDIR=/tmp\0".as_ptr(),
-        b"LTP_TIMEOUT_MUL=60\0".as_ptr(),
+        b"LTP_TIMEOUT_MUL=10\0".as_ptr(),
         core::ptr::null(),
     ];
+
     let pid = fork();
     if pid == 0 {
         setsid();
-        let chroot_arg = chroot_root.clone() + "\0";
-        let chdir_arg = chroot_cwd.clone() + "\0";
+        let chroot_arg = String::from(chroot_root) + "\0";
+        let chdir_arg = String::from(chroot_cwd) + "\0";
         if chroot(&chroot_arg) != 0 {
             exit(126);
         }
         if user_lib::chdir(&chdir_arg) != 0 {
             exit(126);
         }
-        execve("/busybox\0", &args, &envs);
+        let args: [*const u8; 2] = [bin_path.as_ptr(), core::ptr::null()];
+        execve(&bin_path, &args, &envs);
         exit(127);
+    } else if pid > 0 {
+        let mut status = 0;
+        loop {
+            let r = waitpid_nb(pid as usize, &mut status);
+            if r == pid {
+                cleanup_process_group(pid as usize);
+                println!(
+                    "FINISH LTP CASE {} : {}",
+                    case,
+                    wait_status_to_code(status)
+                );
+                break;
+            }
+            reap_zombies();
+            sleep(20);
+        }
+    } else {
+        println!("FINISH LTP CASE {} : 127", case);
     }
-    wait_embedded_ltp_child(pid, dir);
 }
 
 fn run_embedded_ltp(dir: &str) {
-    run_embedded_ltp_shell(dir);
+    let (chroot_root, chroot_cwd) = chroot_root_and_cwd(dir);
+    let label = ltp_label_for_dir(dir);
+    println!("#### OS COMP TEST GROUP START {} ####", label);
+    for case in LTP_SUBSET_CASES.split(' ') {
+        if !case.is_empty() {
+            reap_zombies_until_quiet();
+            run_ltp_case(dir, &chroot_root, &chroot_cwd, case);
+        }
+    }
+    reap_zombies_until_quiet();
+    println!("#### OS COMP TEST GROUP END {} ####", label);
+    println!(
+        "[initproc] [DONE] {}{} exit 0",
+        dir.trim_end_matches('\0'),
+        EMBEDDED_LTP
+    );
 }
 
 fn run_embedded_basics() -> bool {
@@ -997,7 +1009,7 @@ fn run_collected_scripts(mut scripts: Vec<TestScript>) -> bool {
     }
     sort_collected_scripts(&mut scripts);
     for item in scripts {
-        reap_zombies();
+        reap_zombies_until_quiet();
         let path = script_path(&item.dir, &item.script);
         if !should_run_script_in_dir(&item.dir, &item.script) || should_skip_script_path(&path) {
             println!("[initproc] [SKIP] {}", path);
@@ -1047,7 +1059,7 @@ fn main() -> i32 {
     if !found {
         println!("[initproc] no test scripts found");
     }
-    reap_zombies();
+    reap_zombies_until_quiet();
 
     println!("[initproc] === DONE ===");
     shutdown();

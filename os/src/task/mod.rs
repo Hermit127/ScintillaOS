@@ -81,6 +81,12 @@ pub(super) fn reap_exited_tasks() {
     EXITED_TASKS.exclusive_access().clear();
 }
 
+pub fn reap_exited_task(pid: usize) {
+    EXITED_TASKS
+        .exclusive_access()
+        .retain(|task| task.getpid() != pid);
+}
+
 pub fn suspend_current_and_run_next() {
     //trace!("os::task::suspend_current_and_run_next");
     // There must be an application running.
@@ -217,18 +223,11 @@ pub fn wake_blocked_task(task: &Arc<TaskControlBlock>) {
 }
 
 fn notify_parent_sigchld(parent: &Arc<TaskControlBlock>) {
-    let should_wake = {
+    {
         let mut inner = parent.inner_exclusive_access();
-        if inner.signal_mask.contains(SignalFlags::SIGCHLD) {
-            inner.signals.insert(SignalFlags::SIGCHLD);
-            true
-        } else {
-            false
-        }
-    };
-    if should_wake {
-        wake_blocked_task(parent);
+        inner.signals.insert(SignalFlags::SIGCHLD);
     }
+    wake_blocked_task(parent);
 }
 
 fn remove_task_from_block_queues(pid: usize) -> bool {
