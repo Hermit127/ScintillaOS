@@ -15,7 +15,9 @@ const SYSCALL_UNLINKAT: usize = 35;
 const SYSCALL_SYMLINKAT: usize = 36;
 const SYSCALL_LINKAT: usize = 37;
 const SYSCALL_FTRUNCATE: usize = 46;
+const SYSCALL_FALLOCATE: usize = 47;
 const SYSCALL_CHDIR: usize = 49;
+const SYSCALL_FCHDIR: usize = 50;
 const SYSCALL_CHROOT: usize = 51;
 const SYSCALL_OPENAT: usize = 56;
 const SYSCALL_CLOSE: usize = 57;
@@ -56,8 +58,10 @@ const SYSCALL_GETEUID: usize = 175;
 const SYSCALL_GETGID: usize = 176;
 const SYSCALL_GETEGID: usize = 177;
 const SYSCALL_GETTID: usize = 178;
-const SYSCALL_GETRESUID: usize = 117;
-const SYSCALL_GETRESGID: usize = 120;
+const SYSCALL_GETRESUID: usize = 148;
+const SYSCALL_GETRESGID: usize = 150;
+const SYSCALL_GETRLIMIT: usize = 163;
+const SYSCALL_SETRLIMIT: usize = 164;
 const SYSCALL_GETRUSAGE: usize = 165;
 const SYSCALL_UMASK: usize = 166;
 const SYSCALL_SETREGID: usize = 143;
@@ -65,7 +69,7 @@ const SYSCALL_SETGID: usize = 144;
 const SYSCALL_SETREUID: usize = 145;
 const SYSCALL_SETUID: usize = 146;
 const SYSCALL_SETRESUID: usize = 147;
-const SYSCALL_SETRESGID: usize = 150;
+const SYSCALL_SETRESGID: usize = 149;
 const SYSCALL_GETGROUPS: usize = 158;
 const SYSCALL_SETGROUPS: usize = 159;
 const SYSCALL_BRK: usize = 214;
@@ -74,11 +78,13 @@ const SYSCALL_READV: usize = 65;
 const SYSCALL_MPROTECT: usize = 226;
 const SYSCALL_SETPGID: usize = 154;
 const SYSCALL_GETPGID: usize = 155;
+const SYSCALL_GETSID: usize = 156;
 const SYSCALL_SETSID: usize = 157;
 const SYSCALL_MADVISE: usize = 233;
 const SYSCALL_SET_ROBUST_LIST: usize = 99;
 const SYSCALL_GET_ROBUST_LIST: usize = 100;
 const SYSCALL_GETRANDOM: usize = 278;
+const SYSCALL_COPY_FILE_RANGE: usize = 285;
 const SYSCALL_PSELECT6: usize = 72;
 const SYSCALL_PPOLL: usize = 73;
 const SYSCALL_STATFS: usize = 43;
@@ -86,6 +92,9 @@ const SYSCALL_FSTATFS: usize = 44;
 const SYSCALL_PRCTL: usize = 167;
 const SYSCALL_PRLIMIT64: usize = 261;
 const SYSCALL_SYSINFO: usize = 179;
+const SYSCALL_SETPRIORITY: usize = 140;
+const SYSCALL_GETPRIORITY: usize = 141;
+const SYSCALL_SCHED_SETAFFINITY: usize = 122;
 const SYSCALL_SCHED_GETAFFINITY: usize = 123;
 const SYSCALL_EPOLL_CREATE1: usize = 20;
 const SYSCALL_STATX: usize = 291;
@@ -96,6 +105,7 @@ const SYSCALL_CLONE: usize = 220;
 const SYSCALL_FORK: usize = 401;
 const SYSCALL_EXEC: usize = 221;
 const SYSCALL_MMAP: usize = 222;
+const SYSCALL_FADVISE64: usize = 223;
 const SYSCALL_MSYNC: usize = 227;
 const SYSCALL_WAITPID: usize = 260;
 
@@ -107,6 +117,7 @@ const SYSCALL_SYNC: usize = 81;
 const SYSCALL_FSYNC: usize = 82;
 const SYSCALL_FDATASYNC: usize = 83;
 const SYSCALL_SLEEP: usize = 300;
+const SYSCALL_SYNCFS: usize = 267;
 
 const SYSCALL_MOUNT: usize = 40;
 const SYSCALL_UMOUNT2: usize = 39;
@@ -115,6 +126,8 @@ const SYSCALL_UTIMENSAT: usize = 88;
 
 const SYSCALL_RENAMEAT2: usize = 276;
 
+const SYSCALL_FLOCK: usize = 32;
+const SYSCALL_READAHEAD: usize = 213;
 const SYSCALL_SOCKET: usize = 198;
 const SYSCALL_SHMGET: usize = 194;
 const SYSCALL_SHMCTL: usize = 195;
@@ -134,6 +147,7 @@ const SYSCALL_SOCK_SHUTDOWN: usize = 210;
 const SYSCALL_SHUTDOWN: usize = 403;
 const SYSCALL_SENDMSG: usize = 211;
 const SYSCALL_RECVMSG: usize = 212;
+const SYSCALL_CLOSE_RANGE: usize = 436;
 
 const SYSCALL_SET_TID_ADDRESS: usize = 96;
 const SYSCALL_EXIT_GROUP: usize = 94;
@@ -182,6 +196,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_DUP => sys_dup(args[0]),
         SYSCALL_DUP3 => sys_dup3(args[0], args[1], args[2]),
         SYSCALL_FCNTL => sys_fcntl(args[0], args[1], args[2]),
+        SYSCALL_FLOCK => sys_flock(args[0], args[1]),
         SYSCALL_FACCESSAT => {
             sys_faccessat(args[0] as isize, args[1] as *const u8, args[2], args[3])
         }
@@ -218,7 +233,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3] as *const u8,
             args[4] as u32,
         ),
+        SYSCALL_FALLOCATE => sys_fallocate(args[0], args[1], args[2], args[3]),
         SYSCALL_CHDIR => sys_chdir(args[0] as *const u8),
+        SYSCALL_FCHDIR => sys_fchdir(args[0]),
         SYSCALL_CHROOT => sys_chroot(args[0] as *const u8),
         SYSCALL_OPENAT => sys_openat(
             args[0] as isize,
@@ -239,6 +256,15 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_PREADV => sys_preadv(args[0], args[1] as *const u8, args[2], args[3]),
         SYSCALL_PWRITEV => sys_pwritev(args[0], args[1] as *const u8, args[2], args[3]),
         SYSCALL_SENDFILE => sys_sendfile(args[0], args[1], args[2] as *mut usize, args[3]),
+        SYSCALL_READAHEAD => sys_readahead(args[0], args[1], args[2]),
+        SYSCALL_COPY_FILE_RANGE => sys_copy_file_range(
+            args[0],
+            args[1] as *mut usize,
+            args[2],
+            args[3] as *mut usize,
+            args[4],
+            args[5],
+        ),
         SYSCALL_FUTEX => sys_futex(
             args[0] as *mut u32,
             args[1],
@@ -331,6 +357,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         //added
         SYSCALL_FSTAT => sys_fstat(args[0], args[1] as *mut u8),
         SYSCALL_SYNC => sys_sync(),
+        SYSCALL_SYNCFS => sys_syncfs(args[0]),
         SYSCALL_FSYNC => sys_fsync(args[0]),
         SYSCALL_FDATASYNC => sys_fdatasync(args[0]),
         SYSCALL_FSTATAT => sys_fstatat(
@@ -350,6 +377,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4] as i32, args[5]),
         SYSCALL_MUNMAP => sys_munmap(args[0], args[1]),
         SYSCALL_MSYNC => sys_msync(args[0], args[1], args[2]),
+        SYSCALL_FADVISE64 => sys_fadvise64(args[0], args[1], args[2], args[3]),
         SYSCALL_SHMGET => sys_shmget(args[0], args[1], args[2]),
         SYSCALL_SHMCTL => sys_shmctl(args[0], args[1], args[2] as *mut u8),
         SYSCALL_SHMAT => sys_shmat(args[0], args[1], args[2]),
@@ -414,16 +442,26 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         ),
         SYSCALL_SETPGID => sys_setpgid(args[0], args[1]),
         SYSCALL_GETPGID => sys_getpgid(args[0]),
+        SYSCALL_GETSID => sys_getsid(args[0]),
         SYSCALL_SETSID => sys_setsid(),
         SYSCALL_MADVISE => sys_madvise(args[0], args[1], args[2]),
         SYSCALL_STATFS => sys_statfs(args[0] as *const u8, args[1] as *mut u8),
         SYSCALL_FSTATFS => sys_fstatfs(args[0], args[1] as *mut u8),
         SYSCALL_PRCTL => 0,
+        SYSCALL_GETRLIMIT => sys_getrlimit(args[0], args[1] as *mut u8),
+        SYSCALL_SETRLIMIT => sys_setrlimit(args[0], args[1] as *const u8),
         SYSCALL_PRLIMIT64 => {
             sys_prlimit64(args[0], args[1], args[2] as *const u8, args[3] as *mut u8)
         }
-        SYSCALL_SYSINFO => -38,
-        SYSCALL_SCHED_GETAFFINITY => -38,
+        SYSCALL_SYSINFO => sys_sysinfo(args[0] as *mut u8),
+        SYSCALL_SETPRIORITY => sys_setpriority(args[0], args[1], args[2] as isize),
+        SYSCALL_GETPRIORITY => sys_getpriority(args[0], args[1]),
+        SYSCALL_SCHED_SETAFFINITY => {
+            sys_sched_setaffinity(args[0], args[1], args[2] as *const u8)
+        }
+        SYSCALL_SCHED_GETAFFINITY => {
+            sys_sched_getaffinity(args[0], args[1], args[2] as *mut u8)
+        }
         SYSCALL_EPOLL_CREATE1 => -38,
         SYSCALL_STATX => sys_statx(
             args[0] as isize,
@@ -463,6 +501,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[4],
         ),
         SYSCALL_FTRUNCATE => sys_ftruncate(args[0], args[1] as u64),
+        SYSCALL_CLOSE_RANGE => sys_close_range(args[0], args[1], args[2]),
         _ => -38,
     };
     LAST_SYSCALL_RET.store(ret as usize, Ordering::Relaxed);

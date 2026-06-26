@@ -10,10 +10,18 @@ use crate::task::{
 };
 
 use crate::fs::stdio::stdout_release_if_owner;
+use core::sync::atomic::{AtomicBool, Ordering};
 
-fn current_task_killed() -> bool {
+const O_NONBLOCK: usize = 0x800;
+
+fn current_task_interrupted() -> bool {
     current_task()
-        .and_then(|task| task.try_inner_borrow().map(|inner| inner.killed))
+        .and_then(|task| {
+            task.try_inner_borrow().map(|inner| {
+                let pending = inner.signals & !inner.signal_mask;
+                inner.killed || !pending.is_empty()
+            })
+        })
         .unwrap_or(false)
 }
 
@@ -21,6 +29,7 @@ pub struct Pipe {
     readable: bool,
     writable: bool,
     buffer: Arc<UPSafeCell<PipeRingBuffer>>,
+    nonblock: AtomicBool,
 }
 
 impl Pipe {
@@ -29,6 +38,7 @@ impl Pipe {
             readable: true,
             writable: false,
             buffer,
+            nonblock: AtomicBool::new(false),
         }
     }
     pub fn write_end_with_buffer(buffer: Arc<UPSafeCell<PipeRingBuffer>>) -> Self {
@@ -36,10 +46,14 @@ impl Pipe {
             readable: false,
             writable: true,
             buffer,
+            nonblock: AtomicBool::new(false),
         }
     }
     fn wait_key(&self) -> usize {
         Arc::as_ptr(&self.buffer) as usize
+    }
+    fn is_nonblock(&self) -> bool {
+        self.nonblock.load(Ordering::Relaxed)
     }
 }
 
@@ -178,7 +192,7 @@ impl File for Pipe {
         }
         let mut already_read = 0usize;
         loop {
-            if current_task_killed() {
+            if current_task_interrupted() {
                 return -4;
             }
             let (loop_read, write_end_closed) = {
@@ -193,6 +207,9 @@ impl File for Pipe {
                 }
                 if write_end_closed {
                     return already_read as isize;
+                }
+                if self.is_nonblock() {
+                    return -11;
                 }
                 stdout_release_if_owner();
                 block_current_and_run_next(BlockReason::PipeRead(self.wait_key()));
@@ -219,7 +236,7 @@ impl File for Pipe {
         }
         let mut already_write = 0usize;
         loop {
-            if current_task_killed() {
+            if current_task_interrupted() {
                 return -4;
             }
             let (loop_write, read_end_closed) = {
@@ -234,6 +251,9 @@ impl File for Pipe {
                 return -32;
             }
             if loop_write == 0 {
+                if self.is_nonblock() {
+                    return -11;
+                }
                 stdout_release_if_owner();
                 block_current_and_run_next(BlockReason::PipeWrite(self.wait_key()));
                 continue;
@@ -266,7 +286,19 @@ impl File for Pipe {
     fn stat(&self) -> Kstat {
         Kstat::new(S_IFIFO)
     }
-    fn set_flags(&self, _flags: usize) -> bool {
+    fn get_flags(&self) -> usize {
+        let mut flags = 0x8000usize;
+        if self.writable {
+            flags |= 1;
+        }
+        if self.is_nonblock() {
+            flags |= O_NONBLOCK;
+        }
+        flags
+    }
+    fn set_flags(&self, flags: usize) -> bool {
+        self.nonblock
+            .store((flags & O_NONBLOCK) != 0, Ordering::Relaxed);
         true
     }
     fn dup_ref(&self) {

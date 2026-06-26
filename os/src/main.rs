@@ -5,8 +5,9 @@
 use crate::{
     syscall::syscall,
     task::{
-        check_and_wake_up_tasks, check_signals_error_of_current, current_add_signal, current_task,
-        exit_current_and_run_next, force_exit_task_group, handle_signals,
+        check_and_wake_up_tasks, check_itimers, check_signals_error_of_current,
+        current_add_signal, current_task, exit_current_and_run_next, force_exit_task_group,
+        handle_signals,
         suspend_current_and_run_next, SignalFlags,
     },
 };
@@ -161,7 +162,7 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             net::net_poll();
             net::wake_net_blocked_tasks();
             check_and_wake_up_tasks();
-            check_itimer();
+            check_itimers();
             if current_task().is_some() {
                 suspend_current_and_run_next();
             }
@@ -186,25 +187,6 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
     // kernel time accounting
     if let Some(task) = crate::task::current_task() {
         task.record_time_kernel_to_user();
-    }
-}
-
-fn check_itimer() {
-    let Some(task) = current_task() else { return };
-    let Some(mut inner) = task.try_inner_exclusive_access() else {
-        return;
-    };
-    if inner.itimer_expire == 0 {
-        return;
-    }
-    let now = polyhal::time::Time::now().to_usec() as u64;
-    if now >= inner.itimer_expire {
-        inner.signals.insert(SignalFlags::SIGALRM);
-        if inner.itimer_interval_us > 0 {
-            inner.itimer_expire = now + inner.itimer_interval_us;
-        } else {
-            inner.itimer_expire = 0;
-        }
     }
 }
 

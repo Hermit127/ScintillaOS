@@ -296,6 +296,13 @@ impl OSInode {
         }
     }
 
+    pub fn update_cached_mode(&self, mode: u32) {
+        let mut inner = self.inner.exclusive_access();
+        if let Some(ref mut st) = inner.cached_stat {
+            st.st_mode = mode;
+        }
+    }
+
     pub fn update_cached_times(&self, atime: Option<i64>, mtime: Option<i64>, ctime: Option<i64>) {
         let mut inner = self.inner.exclusive_access();
         if let Some(ref mut st) = inner.cached_stat {
@@ -313,6 +320,34 @@ impl OSInode {
 
     pub fn align_up(value: usize, align: usize) -> usize {
         (value + align - 1) & !(align - 1)
+    }
+
+    fn fill_gap_with_zero(file: &mut ext4_file, from: usize, to: usize) -> bool {
+        if from >= to {
+            return true;
+        }
+        let mut pos = from;
+        let zeros = [0u8; 4096];
+        unsafe {
+            ext4_fseek(file, from as i64, SEEK_SET as u32);
+        }
+        while pos < to {
+            let chunk = (to - pos).min(zeros.len());
+            let mut written: usize = 0;
+            let rc = unsafe {
+                ext4_fwrite(
+                    file,
+                    zeros[..chunk].as_ptr() as *const core::ffi::c_void,
+                    chunk,
+                    &mut written,
+                )
+            };
+            if rc != EOK as i32 || written == 0 {
+                return false;
+            }
+            pos += written;
+        }
+        true
     }
 }
 
@@ -523,8 +558,8 @@ pub fn follow_symlink(
 pub fn mkdir_at(base: Option<Arc<Dentry>>, path: &str, mode: u32) -> bool {
     let start = base.unwrap_or_else(|| crate::fs::vfs::ROOT_DENTRY.clone());
 
-    if let Some(existing) = vfs_resolve_path(&start, path) {
-        return existing.is_dir;
+    if vfs_resolve_path(&start, path).is_some() {
+        return false;
     }
 
     let (parent, name) = match vfs_resolve_parent_and_name(&start, path) {
@@ -689,6 +724,10 @@ impl File for OSInode {
         let mut inner = self.inner.exclusive_access();
         let saved_offset = inner.offset;
         if let Some(ref mut file) = inner.file_handle {
+            let size = unsafe { ext4_fsize(file) as usize };
+            if offset > size && !Self::fill_gap_with_zero(file, size, offset) {
+                return -1;
+            }
             unsafe {
                 ext4_fseek(file, offset as i64, SEEK_SET as u32);
             }
@@ -760,6 +799,11 @@ impl File for OSInode {
             } else {
                 cur_offset
             };
+            let size = unsafe { ext4_fsize(file) as usize };
+            if off > size && !Self::fill_gap_with_zero(file, size, off) {
+                inner.offset = unsafe { ext4_fsize(file) as usize };
+                return -1;
+            }
             unsafe {
                 ext4_fseek(file, off as i64, SEEK_SET as u32);
             }

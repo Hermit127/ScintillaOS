@@ -22,6 +22,9 @@ use polyhal_trap::trapframe::TrapFrameArgs;
 
 pub const SIGNAL_RETURN_TRAMPOLINE: usize = 0x7ffeff000;
 const SA_SIGINFO: usize = 4;
+const SA_NOCLDWAIT: usize = 2;
+const SIG_IGN: usize = 1;
+const SIGCHLD_NUM: usize = 17;
 const SIGINFO_SIZE: usize = 128;
 const UCONTEXT_SIZE: usize = 512;
 const UCONTEXT_SIGMASK_OFFSET: usize = 40;
@@ -222,12 +225,78 @@ pub fn wake_blocked_task(task: &Arc<TaskControlBlock>) {
     }
 }
 
+pub fn check_itimers() {
+    let now = polyhal::time::Time::now().to_usec() as u64;
+    let tasks: Vec<Arc<TaskControlBlock>> = {
+        let map = PID2TCB.exclusive_access();
+        map.values().cloned().collect()
+    };
+    for task in tasks {
+        let expired = {
+            let Some(mut inner) = task.try_inner_exclusive_access() else {
+                continue;
+            };
+            if inner.task_status == TaskStatus::Zombie
+                || inner.itimer_expire == 0
+                || now < inner.itimer_expire
+            {
+                false
+            } else {
+                inner.signals.insert(SignalFlags::SIGALRM);
+                if inner.itimer_interval_us > 0 {
+                    inner.itimer_expire = now + inner.itimer_interval_us;
+                } else {
+                    inner.itimer_expire = 0;
+                }
+                true
+            }
+        };
+        if expired {
+            wake_blocked_task(&task);
+        }
+    }
+}
+
 fn notify_parent_sigchld(parent: &Arc<TaskControlBlock>) {
     {
         let mut inner = parent.inner_exclusive_access();
         inner.signals.insert(SignalFlags::SIGCHLD);
     }
     wake_blocked_task(parent);
+}
+
+fn wake_parent_waiter(parent: &Arc<TaskControlBlock>) {
+    let mut queue = WAITPID_QUEUE.exclusive_access();
+    if let Some(idx) = queue.iter().position(|t| t.getpid() == parent.getpid()) {
+        let parent_task = queue.remove(idx);
+        drop(queue);
+        let mut pinner = parent_task.inner_exclusive_access();
+        pinner.task_status = TaskStatus::Ready;
+        pinner.block_reason = None;
+        drop(pinner);
+        add_task(parent_task);
+    }
+}
+
+fn parent_auto_reaps_sigchld(parent: &Arc<TaskControlBlock>) -> bool {
+    parent
+        .try_inner_borrow()
+        .map(|inner| {
+            let action = inner.signal_actions.table[SIGCHLD_NUM];
+            action.handler == SIG_IGN || (action.flags & SA_NOCLDWAIT) != 0
+        })
+        .unwrap_or(false)
+}
+
+fn detach_child_from_parent(parent: &Arc<TaskControlBlock>, child_pid: usize) {
+    let mut parent_inner = parent.inner_exclusive_access();
+    if let Some(idx) = parent_inner
+        .children
+        .iter()
+        .position(|child| child.getpid() == child_pid)
+    {
+        parent_inner.children.remove(idx);
+    }
 }
 
 fn remove_task_from_block_queues(pid: usize) -> bool {
@@ -284,15 +353,12 @@ pub fn force_exit_task(task: &Arc<TaskControlBlock>, exit_code: i32) {
     };
 
     if let Some(parent) = parent {
-        notify_parent_sigchld(&parent);
-        let mut queue = WAITPID_QUEUE.exclusive_access();
-        if let Some(idx) = queue.iter().position(|t| t.getpid() == parent.getpid()) {
-            let parent_task = queue.remove(idx);
-            drop(queue);
-            let mut pinner = parent_task.inner_exclusive_access();
-            pinner.task_status = TaskStatus::Ready;
-            drop(pinner);
-            add_task(parent_task);
+        if parent_auto_reaps_sigchld(&parent) {
+            detach_child_from_parent(&parent, pid);
+            wake_parent_waiter(&parent);
+        } else {
+            notify_parent_sigchld(&parent);
+            wake_parent_waiter(&parent);
         }
     }
 
@@ -417,15 +483,12 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
 
     // wake parent waiting in waitpid
     if let Some(parent) = parent {
-        notify_parent_sigchld(&parent);
-        let mut queue = WAITPID_QUEUE.exclusive_access();
-        if let Some(idx) = queue.iter().position(|t| t.getpid() == parent.getpid()) {
-            let parent_task = queue.remove(idx);
-            drop(queue);
-            let mut pinner = parent_task.inner_exclusive_access();
-            pinner.task_status = TaskStatus::Ready;
-            drop(pinner);
-            add_task(parent_task);
+        if parent_auto_reaps_sigchld(&parent) {
+            detach_child_from_parent(&parent, pid);
+            wake_parent_waiter(&parent);
+        } else {
+            notify_parent_sigchld(&parent);
+            wake_parent_waiter(&parent);
         }
     }
 

@@ -17,6 +17,7 @@ pub struct SocketFile {
     pub handle: UPSafeCell<SocketHandle>,
     pub socket_type: SocketType,
     pub nonblock: AtomicBool,
+    ref_count: UPSafeCell<usize>,
     pub peer_endpoint: UPSafeCell<Option<IpEndpoint>>,
     pub local_endpoint: UPSafeCell<Option<IpEndpoint>>,
     pub local_tcp: UPSafeCell<Option<(usize, bool)>>,
@@ -29,6 +30,7 @@ impl SocketFile {
             handle: unsafe { UPSafeCell::new(handle) },
             socket_type,
             nonblock: AtomicBool::new(nonblock),
+            ref_count: unsafe { UPSafeCell::new(1) },
             peer_endpoint: unsafe { UPSafeCell::new(None) },
             local_endpoint: unsafe { UPSafeCell::new(None) },
             local_tcp: unsafe { UPSafeCell::new(None) },
@@ -143,6 +145,10 @@ impl File for SocketFile {
         true
     }
 
+    fn dup_ref(&self) {
+        *self.ref_count.exclusive_access() += 1;
+    }
+
     fn poll(&self) -> (bool, bool, bool) {
         if let Some((conn_id, server_side)) = self.get_local_tcp() {
             return super::syscall::local_tcp_poll(conn_id, server_side);
@@ -205,6 +211,17 @@ impl File for SocketFile {
     }
 
     fn close_ref(&self) {
+        let should_close = {
+            let mut ref_count = self.ref_count.exclusive_access();
+            if *ref_count > 0 {
+                *ref_count -= 1;
+            }
+            *ref_count == 0
+        };
+        if !should_close {
+            return;
+        }
+
         if let Some((conn_id, server_side)) = self.get_local_tcp() {
             super::syscall::local_tcp_close(conn_id, server_side);
         }
@@ -213,6 +230,16 @@ impl File for SocketFile {
                 super::syscall::local_tcp_unlisten(local.port);
             }
         }
+
+        let handle = self.get_handle();
+        #[cfg(any(
+            target_arch = "riscv64",
+            target_arch = "aarch64",
+            target_arch = "loongarch64"
+        ))]
+        crate::net::with_net_iface(|iface| {
+            iface.sockets.remove(handle);
+        });
     }
 
     fn as_any(&self) -> &dyn core::any::Any {

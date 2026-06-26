@@ -1,9 +1,9 @@
 use crate::fs::vfs::{
-    vfs_lookup, vfs_resolve_path, vfs_resolve_with_fallback, Dentry, VfsSuperBlock,
+    vfs_create, vfs_lookup, vfs_resolve_path, vfs_resolve_with_fallback, Dentry, VfsSuperBlock,
 };
 use crate::fs::{
-    follow_symlink, link_at, make_pipe, mkdir_at, open_file_at, rename_at, symlink_at, unlink_at,
-    DevNull, DevZero, File, Kstat, OpenFlags, Urandom,
+    follow_symlink, link_at, make_pipe, open_file_at, rename_at, symlink_at, unlink_at, DevNull,
+    DevZero, File, Kstat, OpenFlags, Urandom,
 };
 use crate::mm::{translated_byte_buffer, translated_refmut, translated_str};
 use crate::task::{current_task, current_user_token, PID2TCB};
@@ -32,6 +32,9 @@ fn map_dev_shm_path(path: &str) -> String {
 }
 
 fn valid_user_write_buf(ptr: *mut u8, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
     if ptr.is_null() {
         return false;
     }
@@ -40,6 +43,20 @@ fn valid_user_write_buf(ptr: *mut u8, len: usize) -> bool {
     };
     let inner = task.inner_exclusive_access();
     inner.memory_set.valid_user_buf(ptr as *const u8, len, true)
+}
+
+fn valid_user_read_buf(ptr: *const u8, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    if ptr.is_null() {
+        return false;
+    }
+    let Some(task) = current_task() else {
+        return false;
+    };
+    let inner = task.inner_exclusive_access();
+    inner.memory_set.valid_user_buf(ptr, len, false)
 }
 
 fn fd_path_for_proc(fd: usize) -> Option<String> {
@@ -198,6 +215,105 @@ fn resolve_base_dir(dirfd: isize) -> Option<Arc<Dentry>> {
     vfs_resolve_path(&cwd, &path)
 }
 
+fn resolve_base_dir_for_path(dirfd: isize, path: &str) -> Result<Arc<Dentry>, isize> {
+    if path.starts_with('/') {
+        return Ok(current_task()
+            .map(|task| task.inner_exclusive_access().root.clone())
+            .unwrap_or_else(|| crate::fs::vfs::ROOT_DENTRY.clone()));
+    }
+    let Some(task) = current_task() else {
+        return Err(-9);
+    };
+    if dirfd == AT_FDCWD {
+        return Ok(task.inner_exclusive_access().cwd.clone());
+    }
+    if dirfd < 0 {
+        return Err(-9);
+    }
+    let inner = task.inner_exclusive_access();
+    let fd = dirfd as usize;
+    if fd >= inner.fd_table.len() {
+        return Err(-9);
+    }
+    let Some(file) = &inner.fd_table[fd] else {
+        return Err(-9);
+    };
+    if !file.is_dir() {
+        return Err(-20);
+    }
+    if let Some(inode) = file.as_any().downcast_ref::<crate::fs::inode::OSInode>() {
+        Ok(inode.get_dentry().clone())
+    } else {
+        Err(-20)
+    }
+}
+
+fn resolve_parent_and_name_checked(
+    start: &Arc<Dentry>,
+    path: &str,
+) -> Result<(Arc<Dentry>, String), isize> {
+    let path = path.trim_matches('\0');
+    if path.is_empty() {
+        return Err(-2);
+    }
+
+    let mut current = if path.starts_with('/') {
+        current_task()
+            .map(|task| task.inner_exclusive_access().root.clone())
+            .unwrap_or_else(|| crate::fs::vfs::ROOT_DENTRY.clone())
+    } else {
+        start.clone()
+    };
+
+    let components: Vec<&str> = path
+        .split('/')
+        .filter(|component| !component.is_empty() && *component != ".")
+        .collect();
+    if components.is_empty() {
+        return Err(-2);
+    }
+
+    for component in components.iter().take(components.len() - 1) {
+        if !current.is_dir {
+            return Err(-20);
+        }
+        current = vfs_lookup(&current, component).ok_or(-2isize)?;
+    }
+
+    if !current.is_dir {
+        return Err(-20);
+    }
+
+    Ok((current, String::from(*components.last().unwrap())))
+}
+
+fn resolve_path_checked(start: &Arc<Dentry>, path: &str) -> Result<Arc<Dentry>, isize> {
+    let path = path.trim_matches('\0');
+    if path.is_empty() {
+        return Err(-2);
+    }
+
+    let mut current = if path.starts_with('/') {
+        current_task()
+            .map(|task| task.inner_exclusive_access().root.clone())
+            .unwrap_or_else(|| crate::fs::vfs::ROOT_DENTRY.clone())
+    } else {
+        start.clone()
+    };
+
+    for component in path
+        .split('/')
+        .filter(|component| !component.is_empty() && *component != ".")
+    {
+        if !current.is_dir {
+            return Err(-20);
+        }
+        current = vfs_lookup(&current, component).ok_or(-2isize)?;
+    }
+
+    Ok(current)
+}
+
 pub fn sys_write(fd: usize, buf: *mut u8, len: usize) -> isize {
     let token = current_user_token();
     let task = current_task().unwrap();
@@ -255,18 +371,13 @@ pub fn sys_open(path: *const u8, flags: u32) -> isize {
 
 pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> isize {
     let task = current_task().unwrap();
-    // Validate path before reading
-    {
-        let inner = task.inner_exclusive_access();
-        let end_of_page =
-            ((path as usize) + crate::config::PAGE_SIZE) & !(crate::config::PAGE_SIZE - 1);
-        let first_page_len = 4096.min(end_of_page - (path as usize));
-        if !inner.memory_set.valid_user_buf(path, first_page_len, false) {
-            return -14;
-        }
+    let raw_path = match translated_path_bounded(path) {
+        Ok(path) => path,
+        Err(errno) => return errno,
+    };
+    if path_has_too_long_component(&raw_path) {
+        return -36;
     }
-    let token = current_user_token();
-    let raw_path = translated_str(token, path);
     let path = map_dev_shm_path(&raw_path);
 
     // proc filesystem intercept
@@ -316,9 +427,9 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> isize
     }
 
     let open_flags = OpenFlags::from_raw(flags);
-    let base_dir = resolve_base_dir(dirfd);
-    let Some(base) = base_dir.clone() else {
-        return -2;
+    let base = match resolve_base_dir_for_path(dirfd, path.as_str()) {
+        Ok(base) => base,
+        Err(errno) => return errno,
     };
     if path.is_empty() {
         return -2;
@@ -348,7 +459,7 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> isize
     } else if !open_flags.create_requested() {
         return -2;
     }
-    let inode = open_file_at(base_dir, path.as_str(), open_flags, mode as u32);
+    let inode = open_file_at(Some(base), path.as_str(), open_flags, mode as u32);
 
     if let Some(inode) = inode {
         let (fd, tgid, cloexec) = {
@@ -369,9 +480,9 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> isize
 }
 
 fn sys_open_tmpfile(dirfd: isize, path: &str, mode: u32) -> isize {
-    let base = match resolve_base_dir(dirfd) {
-        Some(base) => base,
-        None => return -2,
+    let base = match resolve_base_dir_for_path(dirfd, path) {
+        Ok(base) => base,
+        Err(errno) => return errno,
     };
     let dir = match vfs_resolve_with_fallback(&base, path).and_then(|d| {
         if d.is_dir {
@@ -406,7 +517,8 @@ fn sys_open_tmpfile(dirfd: isize, path: &str, mode: u32) -> isize {
 
 fn open_proc(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
     use crate::fs::proc::{
-        DevRtcFile, ProcDirFile, ProcMeminfoFile, ProcMountsFile, ProcPidStatFile, ProcStaticFile,
+        DevRtcFile, ProcDirFile, ProcMeminfoFile, ProcMountsFile, ProcPidStatFile,
+        ProcPidStatusFile, ProcStaticFile,
     };
     if path == "/proc" {
         return Some(Arc::new(ProcDirFile::new()));
@@ -425,6 +537,14 @@ fn open_proc(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
     if path == "/proc/sys/kernel/pid_max" {
         return Some(Arc::new(ProcStaticFile::new("4194304\n")));
     }
+    if path == "/proc/self/stat" {
+        let pid = current_task().map(|task| task.getpid())?;
+        return Some(Arc::new(ProcPidStatFile::new(pid)));
+    }
+    if path == "/proc/self/status" {
+        let pid = current_task().map(|task| task.getpid())?;
+        return Some(Arc::new(ProcPidStatusFile::new(pid)));
+    }
     if path == "/dev/rtc" || path == "/dev/misc/rtc" {
         return Some(Arc::new(DevRtcFile));
     }
@@ -434,6 +554,14 @@ fn open_proc(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
     {
         if let Ok(pid) = pid_str.parse::<usize>() {
             return Some(Arc::new(ProcPidStatFile::new(pid)));
+        }
+    }
+    if let Some(pid_str) = path
+        .strip_prefix("/proc/")
+        .and_then(|s| s.strip_suffix("/status"))
+    {
+        if let Ok(pid) = pid_str.parse::<usize>() {
+            return Some(Arc::new(ProcPidStatusFile::new(pid)));
         }
     }
     None
@@ -472,11 +600,13 @@ pub fn sys_mkdir(path: *const u8, mode: u32) -> isize {
 }
 
 pub fn sys_mkdirat(dirfd: isize, path: *const u8, mode: u32) -> isize {
-    if path.is_null() {
-        return -14; // EFAULT
+    let path = match translated_path_bounded(path) {
+        Ok(path) => path,
+        Err(errno) => return errno,
+    };
+    if path_has_too_long_component(&path) {
+        return -36;
     }
-    let token = current_user_token();
-    let path = translated_str(token, path);
     let base_dir = if path.starts_with('/') {
         current_task()
             .map(|task| task.inner_exclusive_access().root.clone())
@@ -504,7 +634,20 @@ pub fn sys_mkdirat(dirfd: isize, path: *const u8, mode: u32) -> isize {
             return -20; // ENOTDIR
         }
     };
-    if mkdir_at(Some(base_dir), path.as_str(), mode) {
+    if path.is_empty() {
+        return -2;
+    }
+    let (parent, name) = match resolve_parent_and_name_checked(&base_dir, path.as_str()) {
+        Ok(parts) => parts,
+        Err(errno) => return errno,
+    };
+    if vfs_lookup(&parent, &name).is_some() {
+        return -17;
+    }
+    if !can_modify_directory(&parent) {
+        return -13;
+    }
+    if vfs_create(&parent, &name, true, mode).is_some() {
         0
     } else {
         -2 // ENOENT
@@ -518,36 +661,47 @@ pub fn sys_unlink(path: *const u8) -> isize {
 const AT_REMOVEDIR: u32 = 0x200;
 
 pub fn sys_unlinkat(dirfd: isize, path: *const u8, flags: u32) -> isize {
-    if path.is_null() {
-        return -1;
-    }
     let is_dir = (flags & AT_REMOVEDIR) != 0;
     if flags != 0 && !is_dir {
-        return -1;
+        return -22;
     }
-    let token = current_user_token();
-    let raw_path = translated_str(token, path);
-    let path = map_dev_shm_path(&raw_path);
-    let base_dir = match resolve_base_dir(dirfd) {
-        Some(base) => base,
-        None => return -1,
+    let raw_path = match translated_path_bounded(path) {
+        Ok(path) => path,
+        Err(errno) => return errno,
     };
-    if path.starts_with("/tmp/iperf3.") {
-        return 0;
+    if path_has_too_long_component(&raw_path) {
+        return -36;
+    }
+    let path = map_dev_shm_path(&raw_path);
+    let base_dir = match resolve_base_dir_for_path(dirfd, path.as_str()) {
+        Ok(base) => base,
+        Err(errno) => return errno,
+    };
+    if path.is_empty() {
+        return -2;
+    }
+    let (parent, name) = match resolve_parent_and_name_checked(&base_dir, path.as_str()) {
+        Ok(parts) => parts,
+        Err(errno) => return errno,
+    };
+    let dentry = match vfs_lookup(&parent, &name) {
+        Some(dentry) => dentry,
+        None => return -2,
+    };
+    if dentry.is_dir && !is_dir {
+        return -21;
+    }
+    if !dentry.is_dir && is_dir {
+        return -20;
+    }
+    if !can_modify_directory(&parent) {
+        return -13;
     }
     if unlink_at(Some(base_dir.clone()), path.as_str(), is_dir) {
         if !is_dir {
-            crate::syscall::process::remove_shared_file_mappings(&path);
+            crate::syscall::process::remove_shared_file_mappings(&dentry.fs_path);
         }
         0
-    } else if let Some(dentry) = vfs_resolve_with_fallback(&base_dir, path.as_str()) {
-        if dentry.is_dir && !is_dir {
-            -21 // EISDIR
-        } else if !dentry.is_dir && is_dir {
-            -20 // ENOTDIR
-        } else {
-            -1
-        }
     } else {
         -1
     }
@@ -581,6 +735,29 @@ pub fn sys_chdir(path: *const u8) -> isize {
     }
     let mut inner = task.inner_exclusive_access();
     inner.cwd = dir_dentry;
+    0
+}
+
+pub fn sys_fchdir(fd: usize) -> isize {
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+    if fd >= inner.fd_table.len() || inner.fd_table[fd].is_none() {
+        return -9;
+    }
+    let file = inner.fd_table[fd].as_ref().unwrap().clone();
+    let dentry = file
+        .as_any()
+        .downcast_ref::<crate::fs::inode::OSInode>()
+        .map(|inode| inode.dentry().clone());
+    drop(inner);
+    let Some(dentry) = dentry else {
+        return -20;
+    };
+    if !dentry.is_dir {
+        return -20;
+    }
+    let mut inner = task.inner_exclusive_access();
+    inner.cwd = dentry;
     0
 }
 
@@ -811,12 +988,50 @@ fn inode_perm_allows(
     let other_perm = mode & 0o7;
     let perm = if uid == check_uid {
         owner_perm
-    } else if gid == check_gid {
+    } else if gid == check_gid || current_has_group(gid) {
         group_perm
     } else {
         other_perm
     };
     (perm & need) == need
+}
+
+fn current_has_group(gid: u32) -> bool {
+    current_task()
+        .map(|task| {
+            let inner = task.inner_exclusive_access();
+            inner.egid == gid || inner.supplementary_groups.contains(&gid)
+        })
+        .unwrap_or(false)
+}
+
+fn can_modify_directory(dir: &Arc<Dentry>) -> bool {
+    let Some(task) = current_task() else {
+        return false;
+    };
+    let (euid, egid) = {
+        let inner = task.inner_exclusive_access();
+        (inner.euid, inner.egid)
+    };
+    if euid == 0 {
+        return true;
+    }
+    match dir.super_block.get_inode_info(&dir.fs_path) {
+        Some(info) => inode_perm_allows(info.mode, info.uid, info.gid, euid, egid, 0o3),
+        None => false,
+    }
+}
+
+fn chmod_requested_mode(requested: u32, file_gid: u32) -> u32 {
+    let mut perm = requested & 0o7777;
+    let Some(task) = current_task() else {
+        return perm;
+    };
+    let euid = task.inner_exclusive_access().euid;
+    if euid != 0 && (perm & 0o2000) != 0 && !current_has_group(file_gid) {
+        perm &= !0o2000;
+    }
+    perm
 }
 
 fn can_traverse_to_leaf(base: &Arc<Dentry>, path: &str, check_uid: u32, check_gid: u32) -> bool {
@@ -865,13 +1080,18 @@ pub fn sys_faccessat2(dirfd: isize, path: *const u8, mode: usize, flags: usize) 
     const AT_EACCESS: usize = 0x200;
     const AT_EMPTY_PATH: usize = 0x1000;
 
-    let token = current_user_token();
-    let path_str = translated_str(token, path);
     if mode & !(R_OK | W_OK | X_OK) != 0 {
         return -22;
     }
     if flags & !(AT_SYMLINK_NOFOLLOW | AT_EACCESS | AT_EMPTY_PATH) != 0 {
         return -22;
+    }
+    let path_str = match translated_path_bounded(path) {
+        Ok(path) => path,
+        Err(errno) => return errno,
+    };
+    if path_has_too_long_component(&path_str) {
+        return -36;
     }
 
     if path_str.is_empty() && flags & AT_EMPTY_PATH == 0 {
@@ -892,9 +1112,9 @@ pub fn sys_faccessat2(dirfd: isize, path: *const u8, mode: usize, flags: usize) 
         }
         return 0;
     }
-    let base = match resolve_base_dir(dirfd) {
-        Some(b) => b,
-        None => return -2,
+    let base = match resolve_base_dir_for_path(dirfd, path_str.as_str()) {
+        Ok(b) => b,
+        Err(errno) => return errno,
     };
     let task = current_task().unwrap();
     let (uid, gid, euid, egid) = {
@@ -909,14 +1129,14 @@ pub fn sys_faccessat2(dirfd: isize, path: *const u8, mode: usize, flags: usize) 
     if !can_traverse_to_leaf(&base, &path_str, check_uid, check_gid) {
         return -13;
     }
-    let dentry = match vfs_resolve_with_fallback(&base, &path_str) {
-        Some(d) => d,
-        None => return -2,
+    let dentry = match resolve_path_checked(&base, &path_str) {
+        Ok(d) => d,
+        Err(errno) => return errno,
     };
     let dentry = if flags & AT_SYMLINK_NOFOLLOW == 0 {
         match crate::fs::follow_symlink(&base, dentry, 0) {
             Some(d) => d,
-            None => return -2,
+            None => return -40,
         }
     } else {
         dentry
@@ -991,10 +1211,11 @@ pub fn sys_fchmodat(dirfd: isize, path: *const u8, mode: u32) -> isize {
         }
     }
 
-    let old_mode = match dentry.super_block.get_inode_info(fs_path) {
-        Some(info) => info.mode,
+    let info = match dentry.super_block.get_inode_info(fs_path) {
+        Some(info) => info,
         None => return -2,
     };
+    let old_mode = info.mode;
     let file_type = if dentry.is_dir {
         crate::fs::S_IFDIR
     } else {
@@ -1005,9 +1226,10 @@ pub fn sys_fchmodat(dirfd: isize, path: *const u8, mode: u32) -> isize {
             old_type
         }
     };
+    let new_perm = chmod_requested_mode(mode, info.gid);
     let rc = dentry
         .super_block
-        .set_mode(fs_path, file_type | (mode & 0o7777));
+        .set_mode(fs_path, file_type | new_perm);
     if rc != 0 {
         return -1;
     }
@@ -1029,12 +1251,23 @@ fn resolve_fd_dentry(fd: usize) -> Option<Arc<Dentry>> {
 }
 
 pub fn sys_fchmod(fd: usize, mode: u32) -> isize {
-    let dentry = match resolve_fd_dentry(fd) {
-        Some(d) => d,
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+    if fd >= inner.fd_table.len() {
+        return -9;
+    }
+    let file = match inner.fd_table[fd].as_ref() {
+        Some(file) => file.clone(),
         None => return -9,
     };
+    drop(inner);
 
-    let task = current_task().unwrap();
+    let inode = match file.as_any().downcast_ref::<crate::fs::inode::OSInode>() {
+        Some(inode) => inode,
+        None => return -9,
+    };
+    let dentry = inode.get_dentry().clone();
+
     let euid = {
         let inner = task.inner_exclusive_access();
         inner.euid
@@ -1051,10 +1284,11 @@ pub fn sys_fchmod(fd: usize, mode: u32) -> isize {
         }
     }
 
-    let old_mode = match dentry.super_block.get_inode_info(fs_path) {
-        Some(info) => info.mode,
+    let info = match dentry.super_block.get_inode_info(fs_path) {
+        Some(info) => info,
         None => return -9,
     };
+    let old_mode = info.mode;
     let file_type = if dentry.is_dir {
         crate::fs::S_IFDIR
     } else {
@@ -1065,15 +1299,15 @@ pub fn sys_fchmod(fd: usize, mode: u32) -> isize {
             old_type
         }
     };
-    let rc = dentry
-        .super_block
-        .set_mode(fs_path, file_type | (mode & 0o7777));
+    let new_mode = file_type | chmod_requested_mode(mode, info.gid);
+    let rc = dentry.super_block.set_mode(fs_path, new_mode);
     if rc != 0 {
         return -1;
     }
 
     let now_sec = (polyhal::time::Time::now().to_msec() / 1000) as u32;
     dentry.super_block.set_ctime(fs_path, now_sec);
+    inode.update_cached_mode(new_mode);
     0
 }
 
@@ -1146,6 +1380,10 @@ pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
     const F_DUPFD_CLOEXEC: usize = 1030;
     const FD_CLOEXEC: usize = 1;
     const MAX_FD: usize = 1024;
+    const F_RDLCK: i16 = 0;
+    const F_WRLCK: i16 = 1;
+    const F_UNLCK: i16 = 2;
+    const FLOCK_SIZE: usize = 32;
 
     let task = current_task().unwrap();
     let mut inner = task.inner_exclusive_access();
@@ -1213,46 +1451,38 @@ pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
         }
         // File locking stubs (both 32-bit: 5/6/7 and 64-bit: 12/13/14)
         5 | 12 => {
-            // F_GETLK
-            let token = inner.get_user_token();
-            let cur_type = inner.fd_table[fd]
-                .as_ref()
-                .and_then(|f| f.as_any().downcast_ref::<crate::fs::inode::OSInode>())
-                .map(|ino| ino.get_lock_type())
-                .unwrap_or(2);
-            let size = 32;
+            let pid = current_task().map(|task| task.getpid() as i32).unwrap_or(0);
             if !inner
                 .memory_set
-                .valid_user_buf(arg as *const u8, size, true)
+                .valid_user_buf(arg as *const u8, FLOCK_SIZE, true)
             {
                 return -14;
             }
             let token = inner.get_user_token();
             drop(inner);
-            let buf = crate::mm::translated_byte_buffer(token, arg as *mut u8, size);
-            for b in buf.iter_mut() {
-                *b = 0;
-            }
-            buf[0] = cur_type as u8;
+            let buf = crate::mm::translated_byte_buffer(token, arg as *mut u8, FLOCK_SIZE);
+            let lock_type = F_UNLCK.to_le_bytes();
+            buf[0..2].copy_from_slice(&lock_type);
+            buf[24..28].copy_from_slice(&pid.to_le_bytes());
             return 0;
         }
         6 | 7 | 13 | 14 => {
-            // F_SETLK / F_SETLKW
-            if let Some(inode) = inner.fd_table[fd]
-                .as_ref()
-                .and_then(|f| f.as_any().downcast_ref::<crate::fs::inode::OSInode>())
+            if !inner
+                .memory_set
+                .valid_user_buf(arg as *const u8, FLOCK_SIZE, false)
             {
-                inode.set_lock_type(1); // F_WRLCK
+                return -14;
             }
-            0
-        }
-        2 | 15 => {
-            // F_UNLCK
-            if let Some(inode) = inner.fd_table[fd]
-                .as_ref()
-                .and_then(|f| f.as_any().downcast_ref::<crate::fs::inode::OSInode>())
-            {
-                inode.set_lock_type(2); // F_UNLCK
+            let token = inner.get_user_token();
+            let file = inner.fd_table[fd].as_ref().unwrap().clone();
+            drop(inner);
+            let buf = crate::mm::translated_byte_buffer(token, arg as *mut u8, FLOCK_SIZE);
+            let lock_type = i16::from_le_bytes([buf[0], buf[1]]);
+            if !matches!(lock_type, F_RDLCK | F_WRLCK | F_UNLCK) {
+                return -22;
+            }
+            if let Some(inode) = file.as_any().downcast_ref::<crate::fs::inode::OSInode>() {
+                inode.set_lock_type(lock_type);
             }
             0
         }
@@ -1423,6 +1653,10 @@ pub fn sys_pipe2(pipe: *mut usize, flags: usize) -> isize {
     let (read_fd, write_fd) = {
         let mut inner = task.inner_exclusive_access();
         let (pipe_read, pipe_write) = make_pipe();
+        if flags & O_NONBLOCK != 0 {
+            pipe_read.set_flags(O_NONBLOCK);
+            pipe_write.set_flags(O_NONBLOCK);
+        }
         let read_fd = inner.alloc_fd();
         if read_fd >= inner.fd_table.len() {
             return -24;
@@ -1629,8 +1863,14 @@ pub fn sys_linkat(
 }
 
 pub fn sys_readlinkat(dirfd: isize, path: *const u8, buf: *mut u8, bufsiz: usize) -> isize {
-    if buf.is_null() || bufsiz == 0 {
-        return -22; // EINVAL
+    if path.is_null() || buf.is_null() {
+        return -14;
+    }
+    if bufsiz == 0 {
+        return -22;
+    }
+    if !valid_user_write_buf(buf, bufsiz) {
+        return -14;
     }
 
     let token = current_user_token();
@@ -1935,8 +2175,11 @@ pub fn sys_mount(
         translated_str(token, source)
     };
 
-    if fstype_str.as_str() != "ext4" && fstype_str.as_str() != "vfat" {
-        return -22;
+    let fstype_name = fstype_str.trim_end_matches('\0');
+    let source_name = source_str.trim_end_matches('\0');
+
+    if fstype_name != "ext4" && fstype_name != "vfat" {
+        return -19;
     }
 
     let task = current_task().unwrap();
@@ -1954,7 +2197,7 @@ pub fn sys_mount(
         return -20;
     }
 
-    if fstype_str.as_str() == "vfat" && matches!(source_str.as_str(), "/dev/vda2" | "vda2") {
+    if fstype_name == "vfat" && matches!(source_name, "/dev/vda2" | "vda2") {
         return 0;
     }
 
@@ -1968,12 +2211,13 @@ pub fn sys_mount(
         }
     }
 
-    let blk_dev = match source_str.as_str() {
-        "vda" => BLOCK_DEVICE.clone(),
-        "vdb" => crate::drivers::ROOT_BLOCK_DEVICE.clone(),
-        "vdc" => Arc::new(VirtIOBlock::new_at(polyhal::PhysAddr::new(0x10003000))),
-        "vdd" => Arc::new(VirtIOBlock::new_at(polyhal::PhysAddr::new(0x10004000))),
-        _ => BLOCK_DEVICE.clone(),
+    let blk_dev = match source_name {
+        "" | "vda" | "/dev/vda" => BLOCK_DEVICE.clone(),
+        "vdb" | "/dev/vdb" => ROOT_BLOCK_DEVICE.clone(),
+        "vdc" | "/dev/vdc" => Arc::new(VirtIOBlock::new_at(polyhal::PhysAddr::new(0x10003000))),
+        "vdd" | "/dev/vdd" => Arc::new(VirtIOBlock::new_at(polyhal::PhysAddr::new(0x10004000))),
+        name if name.starts_with("/dev/") => return -15,
+        _ => return -2,
     };
     let mut lwext4_mount_path =
         String::from(target_path.trim_end_matches('\0').trim_end_matches('/'));
@@ -2068,15 +2312,32 @@ fn fill_statfs_from_dentry(dentry: &Arc<Dentry>, buf: &mut StatFs) {
 
 pub fn sys_statfs(path: *const u8, buf: *mut u8) -> isize {
     let token = current_user_token();
-    let path = translated_str(token, path);
+    if !valid_user_write_buf(buf, core::mem::size_of::<StatFs>()) {
+        return -14;
+    }
+    let path = match translated_path_bounded(path) {
+        Ok(path) => path,
+        Err(errno) => return errno,
+    };
+    if path_has_too_long_component(&path) {
+        return -36;
+    }
     let task = current_task().unwrap();
     let cwd = {
         let inner = task.inner_exclusive_access();
         inner.cwd.clone()
     };
-    let dentry = match vfs_resolve_path(&cwd, path.as_str()) {
-        Some(d) => d,
-        None => return -1,
+    let dentry = match resolve_path_checked(&cwd, path.as_str()) {
+        Ok(d) => d,
+        Err(errno) => return errno,
+    };
+    let dentry = if dentry.is_link {
+        match follow_symlink(&cwd, dentry, 0) {
+            Some(target) => target,
+            None => return -40,
+        }
+    } else {
+        dentry
     };
     let st = translated_refmut(token, buf as *mut StatFs);
     fill_statfs_from_dentry(&dentry, st);
@@ -2084,33 +2345,63 @@ pub fn sys_statfs(path: *const u8, buf: *mut u8) -> isize {
 }
 
 pub fn sys_pread64(fd: usize, buf: *mut u8, len: usize, offset: usize) -> isize {
+    if offset > isize::MAX as usize {
+        return -22;
+    }
     let token = current_user_token();
     let task = current_task().unwrap();
     let inner = task.inner_exclusive_access();
     if fd >= inner.fd_table.len() || inner.fd_table[fd].is_none() {
-        return -1;
+        return -9;
     }
     let file = inner.fd_table[fd].as_ref().unwrap().clone();
+    let inode = file
+        .as_any()
+        .downcast_ref::<crate::fs::inode::OSInode>();
+    if inode.is_none() {
+        return -29;
+    }
+    if file.is_dir() {
+        return -21;
+    }
     if !file.readable() {
-        return -1;
+        return -9;
     }
     drop(inner);
+    if !valid_user_write_buf(buf, len) {
+        return -14;
+    }
     let user_buf = translated_byte_buffer(token, buf, len);
     file.read_at(offset, user_buf)
 }
 
 pub fn sys_pwrite64(fd: usize, buf: *mut u8, len: usize, offset: usize) -> isize {
+    if offset > isize::MAX as usize {
+        return -22;
+    }
     let token = current_user_token();
     let task = current_task().unwrap();
     let inner = task.inner_exclusive_access();
     if fd >= inner.fd_table.len() || inner.fd_table[fd].is_none() {
-        return -1;
+        return -9;
     }
     let file = inner.fd_table[fd].as_ref().unwrap().clone();
+    let inode = file
+        .as_any()
+        .downcast_ref::<crate::fs::inode::OSInode>();
+    if inode.is_none() {
+        return -29;
+    }
+    if file.is_dir() {
+        return -21;
+    }
     if !file.writable() {
-        return -1;
+        return -9;
     }
     drop(inner);
+    if !valid_user_read_buf(buf as *const u8, len) {
+        return -14;
+    }
     let user_buf = translated_byte_buffer(token, buf, len);
     file.write_at(offset, user_buf)
 }
@@ -2118,8 +2409,14 @@ pub fn sys_pwrite64(fd: usize, buf: *mut u8, len: usize, offset: usize) -> isize
 pub fn sys_preadv(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> isize {
     use crate::mm::translated_ref;
     const IOV_MAX: usize = 1024;
-    if iovcnt == 0 || iovcnt > IOV_MAX {
+    if offset > isize::MAX as usize {
         return -22;
+    }
+    if iovcnt > IOV_MAX {
+        return -22;
+    }
+    if iovcnt == 0 {
+        return 0;
     }
     let token = current_user_token();
     let task = current_task().unwrap();
@@ -2134,6 +2431,15 @@ pub fn sys_preadv(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> is
         return -9;
     }
     let file = inner.fd_table[fd].as_ref().unwrap().clone();
+    let inode = file
+        .as_any()
+        .downcast_ref::<crate::fs::inode::OSInode>();
+    if inode.is_none() {
+        return -29;
+    }
+    if file.is_dir() {
+        return -21;
+    }
     if !file.readable() {
         return -9;
     }
@@ -2145,13 +2451,18 @@ pub fn sys_preadv(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> is
     }
     let mut off = offset;
     let mut total = 0isize;
+    let mut requested = 0usize;
     for i in 0..iovcnt {
         let iov_ptr = unsafe { iov.add(i * core::mem::size_of::<IoVec>()) };
         let iov: &IoVec = translated_ref(token, iov_ptr as *const IoVec);
         if iov.iov_len == 0 {
             continue;
         }
-        if iov.iov_len > 0x7FFF_FFFF {
+        requested = match requested.checked_add(iov.iov_len) {
+            Some(sum) if sum <= isize::MAX as usize => sum,
+            _ => return -22,
+        };
+        if iov.iov_len > isize::MAX as usize {
             return -22;
         }
         let task = current_task().unwrap();
@@ -2182,8 +2493,14 @@ pub fn sys_preadv(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> is
 pub fn sys_pwritev(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> isize {
     use crate::mm::translated_ref;
     const IOV_MAX: usize = 1024;
-    if iovcnt == 0 || iovcnt > IOV_MAX {
+    if offset > isize::MAX as usize {
         return -22;
+    }
+    if iovcnt > IOV_MAX {
+        return -22;
+    }
+    if iovcnt == 0 {
+        return 0;
     }
     let token = current_user_token();
     let task = current_task().unwrap();
@@ -2199,6 +2516,15 @@ pub fn sys_pwritev(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> i
         return -9;
     }
     let file = inner.fd_table[fd].as_ref().unwrap().clone();
+    let inode = file
+        .as_any()
+        .downcast_ref::<crate::fs::inode::OSInode>();
+    if inode.is_none() {
+        return -29;
+    }
+    if file.is_dir() {
+        return -21;
+    }
     if !file.writable() {
         return -9;
     }
@@ -2210,13 +2536,18 @@ pub fn sys_pwritev(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> i
     }
     let mut off = offset;
     let mut total = 0isize;
+    let mut requested = 0usize;
     for i in 0..iovcnt {
         let iov_ptr = unsafe { iov.add(i * core::mem::size_of::<IoVec>()) };
         let iov: &IoVec = translated_ref(token, iov_ptr as *const IoVec);
         if iov.iov_len == 0 {
             continue;
         }
-        if iov.iov_len > 0x7FFF_FFFF {
+        requested = match requested.checked_add(iov.iov_len) {
+            Some(sum) if sum <= isize::MAX as usize => sum,
+            _ => return -22,
+        };
+        if iov.iov_len > isize::MAX as usize {
             return -22;
         }
         let task = current_task().unwrap();
@@ -2307,41 +2638,67 @@ pub fn sys_syncfs(fd: usize) -> isize {
 
 pub fn sys_fallocate(fd: usize, mode: usize, offset: usize, len: usize) -> isize {
     const FALLOC_FL_KEEP_SIZE: usize = 0x01;
-    if fd >= 1024 || len == 0 {
+    const EFBIG: isize = -27;
+    if len == 0 {
         return -22;
     }
-    if mode & !FALLOC_FL_KEEP_SIZE != 0 {
-        return -38;
+    if offset > isize::MAX as usize || len > isize::MAX as usize {
+        return -22;
     }
+    let Some(end) = offset.checked_add(len) else {
+        return EFBIG;
+    };
+    if end > isize::MAX as usize {
+        return EFBIG;
+    }
+    if mode & !FALLOC_FL_KEEP_SIZE != 0 {
+        return -95;
+    }
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+    if fd >= inner.fd_table.len() || inner.fd_table[fd].is_none() {
+        return -9;
+    }
+    let file = inner.fd_table[fd].as_ref().unwrap().clone();
+    if !file.writable() {
+        return -9;
+    }
+    if file.as_any().downcast_ref::<crate::fs::inode::OSInode>().is_none() {
+        return -29;
+    }
+    drop(inner);
     if mode & FALLOC_FL_KEEP_SIZE != 0 {
         return 0;
     }
-    crate::syscall::fs::sys_ftruncate(fd, (offset + len) as u64)
+    crate::syscall::fs::sys_ftruncate(fd, end as u64)
 }
 
-pub fn sys_fadvise64(fd: usize, offset: usize, len: usize, advice: usize) -> isize {
-    const POSIX_FADV_NORMAL: usize = 0;
-    const POSIX_FADV_RANDOM: usize = 1;
-    const POSIX_FADV_SEQUENTIAL: usize = 2;
-    const POSIX_FADV_WILLNEED: usize = 3;
-    const POSIX_FADV_DONTNEED: usize = 4;
+pub fn sys_fadvise64(fd: usize, _offset: usize, _len: usize, advice: usize) -> isize {
     const POSIX_FADV_NOREUSE: usize = 5;
     if advice > POSIX_FADV_NOREUSE {
         return -22;
+    }
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+    if fd >= inner.fd_table.len() || inner.fd_table[fd].is_none() {
+        return -9;
     }
     0
 }
 
 pub fn sys_fstatfs(fd: usize, buf: *mut u8) -> isize {
     let token = current_user_token();
+    if !valid_user_write_buf(buf, core::mem::size_of::<StatFs>()) {
+        return -14;
+    }
     let task = current_task().unwrap();
     let inner = task.inner_exclusive_access();
     if fd >= inner.fd_table.len() {
-        return -1;
+        return -9;
     }
     let file = match &inner.fd_table[fd] {
         Some(f) => f.clone(),
-        None => return -1,
+        None => return -9,
     };
     let dentry = file
         .as_any()
@@ -2353,20 +2710,27 @@ pub fn sys_fstatfs(fd: usize, buf: *mut u8) -> isize {
             fill_statfs_from_dentry(d, st);
             0
         }
-        None => return -1,
+        None => return -9,
     }
 }
 
 pub fn sys_ftruncate(fd: usize, length: u64) -> isize {
+    if length > isize::MAX as u64 {
+        return -22;
+    }
     let task = current_task().unwrap();
     let inner = task.inner_exclusive_access();
     if fd >= inner.fd_table.len() {
-        return -1;
+        return -9;
     }
     let file = match &inner.fd_table[fd] {
         Some(f) => f.clone(),
-        None => return -1,
+        None => return -9,
     };
+    if !file.writable() {
+        return -22;
+    }
+    drop(inner);
     let dentry = file
         .as_any()
         .downcast_ref::<crate::fs::inode::OSInode>()
@@ -2374,6 +2738,7 @@ pub fn sys_ftruncate(fd: usize, length: u64) -> isize {
     match dentry {
         Some(d) => {
             if d.super_block.truncate_file(&d.fs_path, length) {
+                crate::syscall::process::remove_shared_file_mappings(&d.fs_path);
                 if let Some(inode) = file.as_any().downcast_ref::<crate::fs::inode::OSInode>() {
                     inode.update_cached_size(length as i64);
                 }
@@ -2382,13 +2747,26 @@ pub fn sys_ftruncate(fd: usize, length: u64) -> isize {
                 -1
             }
         }
-        None => -1,
+        None => -22,
     }
 }
 
 // ---- flock (32) ----
 
-pub fn sys_flock(_fd: usize, _op: usize) -> isize {
+pub fn sys_flock(fd: usize, op: usize) -> isize {
+    const LOCK_SH: usize = 1;
+    const LOCK_EX: usize = 2;
+    const LOCK_NB: usize = 4;
+    const LOCK_UN: usize = 8;
+    let op_kind = op & !LOCK_NB;
+    if op_kind != LOCK_SH && op_kind != LOCK_EX && op_kind != LOCK_UN {
+        return -22;
+    }
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+    if fd >= inner.fd_table.len() || inner.fd_table[fd].is_none() {
+        return -9;
+    }
     0
 }
 
@@ -2417,7 +2795,15 @@ pub fn sys_mknodat(dirfd: isize, path: *const u8, mode: u32, _dev: usize) -> isi
 
 // ---- readahead (213) ----
 
-pub fn sys_readahead(_fd: usize, _offset: usize, _count: usize) -> isize {
+pub fn sys_readahead(fd: usize, _offset: usize, _count: usize) -> isize {
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+    if fd >= inner.fd_table.len() || inner.fd_table[fd].is_none() {
+        return -9;
+    }
+    if !inner.fd_table[fd].as_ref().unwrap().readable() {
+        return -9;
+    }
     0
 }
 
@@ -2439,15 +2825,33 @@ pub fn sys_copy_file_range(
     if fd_out >= inner.fd_table.len() || inner.fd_table[fd_out].is_none() {
         return -9;
     }
+    let word = core::mem::size_of::<usize>();
+    if !off_in.is_null() && !inner.memory_set.valid_user_buf(off_in as *const u8, word, true) {
+        return -14;
+    }
+    if !off_out.is_null() && !inner.memory_set.valid_user_buf(off_out as *const u8, word, true) {
+        return -14;
+    }
+    let token = inner.get_user_token();
+    let in_start = if off_in.is_null() {
+        None
+    } else {
+        Some(*translated_refmut(token, off_in))
+    };
+    let out_start = if off_out.is_null() {
+        None
+    } else {
+        Some(*translated_refmut(token, off_out))
+    };
     let f_in = inner.fd_table[fd_in].as_ref().unwrap().clone();
     let f_out = inner.fd_table[fd_out].as_ref().unwrap().clone();
     drop(inner);
 
-    if let Some(ref off) = unsafe { off_in.as_ref() } {
-        f_in.seek(**off);
+    if let Some(off) = in_start {
+        f_in.seek(off);
     }
-    if let Some(ref off) = unsafe { off_out.as_ref() } {
-        f_out.seek(**off);
+    if let Some(off) = out_start {
+        f_out.seek(off);
     }
 
     let mut buf = [0u8; 4096];
@@ -2463,6 +2867,13 @@ pub fn sys_copy_file_range(
             break;
         }
         total += w;
+    }
+    let copied = total.max(0) as usize;
+    if let Some(off) = in_start {
+        *translated_refmut(token, off_in) = off + copied;
+    }
+    if let Some(off) = out_start {
+        *translated_refmut(token, off_out) = off + copied;
     }
     total
 }
@@ -2482,12 +2893,36 @@ pub fn sys_memfd_create(_name: *const u8, _flags: usize) -> isize {
 
 // ---- close_range (436) ----
 
-pub fn sys_close_range(first: usize, last: usize, _flags: usize) -> isize {
+pub fn sys_close_range(first: usize, last: usize, flags: usize) -> isize {
+    const CLOSE_RANGE_UNSHARE: usize = 1 << 1;
+    const CLOSE_RANGE_CLOEXEC: usize = 1 << 2;
+    if first > last {
+        return -22;
+    }
+    if flags & !(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) != 0 {
+        return -22;
+    }
     let task = current_task().unwrap();
     let mut inner = task.inner_exclusive_access();
     let last = last.min(inner.fd_table.len().saturating_sub(1));
-    for fd in first..=last {
-        inner.close_fd(fd);
+    if first > last {
+        return 0;
+    }
+    if flags & CLOSE_RANGE_CLOEXEC != 0 {
+        for fd in first..=last {
+            if fd < inner.fd_cloexec.len() && inner.fd_table.get(fd).and_then(|f| f.as_ref()).is_some() {
+                inner.fd_cloexec[fd] = true;
+            }
+        }
+    } else {
+        let tgid = inner.tgid;
+        for fd in first..=last {
+            inner.close_fd(fd);
+        }
+        drop(inner);
+        for fd in first..=last {
+            close_fd_for_thread_group(task.getpid(), tgid, fd);
+        }
     }
     0
 }

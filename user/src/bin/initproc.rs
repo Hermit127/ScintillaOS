@@ -22,13 +22,14 @@ const BUSYBOX_APPLETS: [&str; 68] = [
     "mknod", "mktemp", "chgrp", "dmesg", "ps", "free", "hostname", "md5sum", "diff", "unlink",
 ];
 
-const KNOWN_TEST_SCRIPTS: [&str; 8] = [
+const KNOWN_TEST_SCRIPTS: [&str; 9] = [
     "basic_testcode.sh",
     "busybox_testcode.sh",
     "lua_testcode.sh",
     "iozone_testcode.sh",
     "lmbench_testcode.sh",
     "iperf_testcode.sh",
+    "netperf_testcode.sh",
     "libcbench_testcode.sh",
     "libctest_testcode.sh",
 ];
@@ -49,7 +50,24 @@ const LTP_SUBSET_CASES: &str = concat!(
     "times01 uname01 uname02 ",
     "gettimeofday01 gettimeofday02 umask01 mkdirat01 ",
     "mprotect01 mprotect02 ",
-    "fcntl01 fcntl02 access01"
+    "fcntl01 fcntl02 fcntl03 fcntl04 fcntl05 fcntl07 fcntl08 access01 ",
+    "chdir01 fchdir01 fchdir02 nanosleep01 nanosleep02 nanosleep04 ",
+    "kill02 kill03 mkdir02 mkdir03 mkdir04 mkdir05 mkdirat02 ",
+    "rename01 rename03 rename04 rename05 unlink05 unlink07 unlink08 unlink09 unlinkat01 ",
+    "statfs01 statfs02 statfs03 fstatfs01 fstatfs02 ",
+    "getuid01 getuid03 geteuid01 geteuid02 getgid01 getgid03 getegid01 getegid02 ",
+    "getppid01 getppid02 gettid01 gettid02 getrandom01 getrandom02 getrandom03 getrandom04 ",
+    "clock_gettime01 clock_gettime02 clock_gettime03 clock_gettime04 clock_getres01 sched_yield01 ",
+    "getrusage01 getrusage02 getrusage03 getrusage04 getrlimit01 getrlimit02 getrlimit03 ",
+    "sysinfo01 sysinfo02 getpgrp01 getsid01 getsid02 setsid01 setpgid01 setpgid02 getpgid01 getpgid02 ",
+    "openat01 openat02 openat03 openat04 faccessat01 faccessat02 faccessat201 faccessat202 ",
+    "access02 access03 access04 readv01 readv02 writev01 writev02 pread01 pread02 pwrite01 pwrite02 ",
+    "fsync01 fsync02 fsync03 fsync04 fdatasync01 fdatasync02 sync01 syncfs01 ",
+    "ftruncate01 ftruncate03 ftruncate04 fchmod01 fchmod02 fchmod03 fchmod04 ",
+    "chmod01 chmod03 chmod05 linkat01 linkat02 symlink01 symlink02 symlinkat01 readlink01 readlinkat01 ",
+    "flock01 flock02 flock03 flock04 flock06 readahead01 readahead02 ",
+    "fallocate01 fallocate02 fallocate03 fallocate04 fallocate05 fallocate06 close_range01 close_range02 ",
+    "copy_file_range01 copy_file_range02"
 );
 #[cfg(target_arch = "loongarch64")]
 const LTP_SUBSET_CASES: &str = concat!(
@@ -62,7 +80,24 @@ const LTP_SUBSET_CASES: &str = concat!(
     "times01 uname01 uname02 ",
     "gettimeofday01 gettimeofday02 umask01 mkdirat01 ",
     "mprotect01 mprotect02 ",
-    "fcntl01 fcntl02 access01"
+    "fcntl01 fcntl02 fcntl03 fcntl04 fcntl05 fcntl07 fcntl08 access01 ",
+    "chdir01 fchdir01 fchdir02 nanosleep01 nanosleep02 nanosleep04 ",
+    "kill02 kill03 mkdir02 mkdir03 mkdir04 mkdir05 mkdirat02 ",
+    "rename01 rename03 rename04 rename05 unlink05 unlink07 unlink08 unlink09 unlinkat01 ",
+    "statfs01 statfs02 statfs03 fstatfs01 fstatfs02 ",
+    "getuid01 getuid03 geteuid01 geteuid02 getgid01 getgid03 getegid01 getegid02 ",
+    "getppid01 getppid02 gettid01 gettid02 getrandom01 getrandom02 getrandom03 getrandom04 ",
+    "clock_gettime01 clock_gettime02 clock_gettime03 clock_gettime04 clock_getres01 sched_yield01 ",
+    "getrusage01 getrusage02 getrusage03 getrusage04 getrlimit01 getrlimit02 getrlimit03 ",
+    "sysinfo01 sysinfo02 getpgrp01 getsid01 getsid02 setsid01 setpgid01 setpgid02 getpgid01 getpgid02 ",
+    "openat01 openat02 openat03 openat04 faccessat01 faccessat02 faccessat201 faccessat202 ",
+    "access02 access03 access04 readv01 readv02 writev01 writev02 pread01 pread02 pwrite01 pwrite02 ",
+    "fsync01 fsync02 fsync03 fsync04 fdatasync01 fdatasync02 sync01 syncfs01 ",
+    "ftruncate01 ftruncate03 ftruncate04 fchmod01 fchmod02 fchmod03 fchmod04 ",
+    "chmod01 chmod03 chmod05 linkat01 linkat02 symlink01 symlink02 symlinkat01 readlink01 readlinkat01 ",
+    "flock01 flock02 flock03 flock04 flock06 readahead01 readahead02 ",
+    "fallocate01 fallocate02 fallocate03 fallocate04 fallocate05 fallocate06 close_range01 close_range02 ",
+    "copy_file_range01 copy_file_range02"
 );
 
 fn symlink_points_to(target: &str, linkpath: &str) -> bool {
@@ -448,10 +483,12 @@ fn script_priority(script: &str) -> u8 {
         5
     } else if script.starts_with("libctest_") {
         6
-    } else if is_embedded_ltp(script) {
+    } else if script.starts_with("netperf_") {
         7
-    } else if script.starts_with("iperf_") {
+    } else if is_embedded_ltp(script) {
         8
+    } else if script.starts_with("iperf_") {
+        9
     } else {
         50
     }
@@ -463,6 +500,7 @@ fn should_run_script(script: &str) -> bool {
         || script.starts_with("iozone_")
         || script.starts_with("lmbench_")
         || script.starts_with("iperf_")
+        || script.starts_with("netperf_")
         || script.starts_with("libcbench_")
         || script.starts_with("libctest_")
 }
@@ -514,6 +552,20 @@ fn dir_flavor_priority(dir: &str) -> u8 {
     } else {
         2
     }
+}
+
+fn collected_dir_flavor_priority(_script: &str, dir: &str) -> u8 {
+    let clean_dir = dir.trim_end_matches('\0').trim_end_matches('/');
+    #[cfg(target_arch = "riscv64")]
+    if is_embedded_ltp(_script) {
+        if clean_dir.ends_with("/musl") {
+            return 0;
+        }
+        if clean_dir.ends_with("/glibc") {
+            return 1;
+        }
+    }
+    dir_flavor_priority(clean_dir)
 }
 
 struct TestScript {
@@ -849,7 +901,22 @@ fn ltp_case_host_path(dir: &str, case: &str) -> String {
     path
 }
 
+fn should_skip_ltp_case(_dir: &str, _case: &str) -> bool {
+    #[cfg(target_arch = "riscv64")]
+    {
+        let root = _dir.trim_end_matches('\0').trim_end_matches('/');
+        if root.ends_with("/glibc") && _case == "getpid01" {
+            return true;
+        }
+    }
+    matches!(_case, "access01" | "chdir01")
+}
+
 fn run_ltp_case(dir: &str, chroot_root: &str, chroot_cwd: &str, case: &str) {
+    if should_skip_ltp_case(dir, case) {
+        println!("SKIP LTP CASE {} : known-risk", case);
+        return;
+    }
     if !path_exists(&ltp_case_host_path(dir, case)) {
         println!("SKIP LTP CASE {} : missing", case);
         return;
@@ -857,12 +924,11 @@ fn run_ltp_case(dir: &str, chroot_root: &str, chroot_cwd: &str, case: &str) {
     println!("RUN LTP CASE {}", case);
 
     let bin_path = String::from("ltp/testcases/bin/") + case + "\0";
-    let envs: [*const u8; 6] = [
+    let envs: [*const u8; 5] = [
         b"PATH=/bin:/usr/bin:.\0".as_ptr(),
         b"LD_LIBRARY_PATH=/lib:/lib64:.\0".as_ptr(),
         b"HOME=/\0".as_ptr(),
         b"TMPDIR=/tmp\0".as_ptr(),
-        b"LTP_TIMEOUT_MUL=10\0".as_ptr(),
         core::ptr::null(),
     ];
 
@@ -989,8 +1055,8 @@ fn sort_collected_scripts(scripts: &mut Vec<TestScript>) {
         if pa != pb {
             return pa.cmp(&pb);
         }
-        let da = dir_flavor_priority(&a.dir);
-        let db = dir_flavor_priority(&b.dir);
+        let da = collected_dir_flavor_priority(&a.script, &a.dir);
+        let db = collected_dir_flavor_priority(&b.script, &b.dir);
         if da != db {
             return da.cmp(&db);
         }

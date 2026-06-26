@@ -1,4 +1,5 @@
 use crate::sync::UPSafeCell;
+use alloc::collections::BTreeMap;
 use alloc::ffi::CString;
 use alloc::format;
 use alloc::string::String;
@@ -10,6 +11,25 @@ use lazy_static::*;
 use super::block_device_stream::{BlockDeviceStream, BlockDeviceStreamOp, Ext4Wrapper};
 use lwext4_rust::bindings::*;
 use lwext4_rust::Ext4BlockWrapper;
+
+const PATH_OWNER_CACHE_MAX_ENTRIES: usize = 1024;
+
+lazy_static! {
+    static ref PATH_OWNER_CACHE: UPSafeCell<BTreeMap<String, (u32, u32)>> =
+        unsafe { UPSafeCell::new(BTreeMap::new()) };
+}
+
+fn record_path_owner(fs_path: &str, uid: u32, gid: u32) {
+    let mut cache = PATH_OWNER_CACHE.exclusive_access();
+    if !cache.contains_key(fs_path) && cache.len() >= PATH_OWNER_CACHE_MAX_ENTRIES {
+        cache.clear();
+    }
+    cache.insert(String::from(fs_path), (uid, gid));
+}
+
+fn cached_path_owner(fs_path: &str) -> Option<(u32, u32)> {
+    PATH_OWNER_CACHE.exclusive_access().get(fs_path).copied()
+}
 
 // ==================== DirEntry (local) ====================
 
@@ -168,6 +188,10 @@ impl VfsSuperBlock {
             let c_path_owner = CString::new(fs_path).ok()?;
             unsafe {
                 ext4_owner_get(c_path_owner.as_ptr() as *const c_char, &mut uid, &mut gid);
+            }
+            if let Some((cached_uid, cached_gid)) = cached_path_owner(fs_path) {
+                uid = cached_uid;
+                gid = cached_gid;
             }
 
             let mut atime: u32 = 0;
@@ -511,6 +535,9 @@ impl VfsSuperBlock {
         self.with_fs(|_fs| {
             if let Ok(c_path) = CString::new(fs_path) {
                 let r = unsafe { ext4_owner_set(c_path.as_ptr() as *const c_char, uid, gid) };
+                if r == EOK as i32 {
+                    record_path_owner(fs_path, uid, gid);
+                }
                 r
             } else {
                 -1
@@ -803,7 +830,13 @@ pub fn vfs_resolve_parent_and_name(
 
     let filename = String::from(*components.last().unwrap());
     for i in 0..components.len() - 1 {
+        if !current.is_dir {
+            return None;
+        }
         current = vfs_lookup(&current, components[i])?;
+    }
+    if !current.is_dir {
+        return None;
     }
 
     Some((current, filename))
@@ -823,9 +856,22 @@ pub fn vfs_create(
 
     let child = Dentry::new_child(parent, name, inode_num, is_dir, false);
 
-    let umask = crate::task::current_task()
-        .map(|t| t.inner_exclusive_access().umask)
-        .unwrap_or(0o22);
+    let (uid, egid, umask) = crate::task::current_task()
+        .map(|t| {
+            let inner = t.inner_exclusive_access();
+            (inner.euid, inner.egid, inner.umask)
+        })
+        .unwrap_or((0, 0, 0o22));
+    let parent_info = parent.super_block.get_inode_info(&parent.fs_path);
+    let parent_sgid = parent_info
+        .as_ref()
+        .map(|info| (info.mode & 0o2000) != 0)
+        .unwrap_or(false);
+    let gid = if parent_sgid {
+        parent_info.as_ref().map(|info| info.gid).unwrap_or(egid)
+    } else {
+        egid
+    };
     let mode_type = mode & 0o170000;
     let file_type = if is_dir {
         0o040000
@@ -834,8 +880,13 @@ pub fn vfs_create(
     } else {
         0o100000
     };
-    let effective_mode = file_type | (mode & !umask & 0o7777);
+    let mut effective_perm = mode & !umask & 0o7777;
+    if is_dir && parent_sgid {
+        effective_perm |= 0o2000;
+    }
+    let effective_mode = file_type | effective_perm;
     let fs_path = child.fs_path.clone();
+    child.super_block.set_owner(&fs_path, uid, gid);
     child.super_block.set_mode(&fs_path, effective_mode);
 
     cache_child(parent, child.clone());

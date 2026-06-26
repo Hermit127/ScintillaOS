@@ -122,8 +122,12 @@ impl ProcPidStatFile {
                 .and_then(|w| w.upgrade())
                 .map(|p| p.getpid())
                 .unwrap_or(0);
-            format!("{} ({}) {} {} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
-                self.pid, cmd, state, ppid)
+            let pgid = inner.pgid;
+            let sid = inner.sid;
+            let utime = inner.utime.max(1);
+            let stime = inner.stime;
+            format!("{} ({}) {} {} {} {} 0 0 0 0 0 0 0 {} {} 0 0 20 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+                self.pid, cmd, state, ppid, pgid, sid, utime, stime)
         } else {
             String::new()
         }
@@ -131,6 +135,88 @@ impl ProcPidStatFile {
 }
 
 impl File for ProcPidStatFile {
+    fn readable(&self) -> bool {
+        true
+    }
+    fn writable(&self) -> bool {
+        false
+    }
+    fn read(&self, buf: &mut [u8]) -> isize {
+        let mut off = self.offset.exclusive_access();
+        let content = self.build_content();
+        let bytes = content.as_bytes();
+        if *off >= bytes.len() {
+            return 0;
+        }
+        let len = buf.len().min(bytes.len() - *off);
+        buf[..len].copy_from_slice(&bytes[*off..*off + len]);
+        *off += len;
+        len as isize
+    }
+    fn write(&self, _buf: &mut [u8]) -> isize {
+        -1
+    }
+    fn stat(&self) -> Kstat {
+        let mut st = Kstat::new(super::S_IFREG);
+        st.st_size = self.build_content().len() as i64;
+        st.st_mode = super::S_IFREG | 0o444;
+        st
+    }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+pub struct ProcPidStatusFile {
+    pid: usize,
+    offset: UPSafeCell<usize>,
+}
+
+impl ProcPidStatusFile {
+    pub fn new(pid: usize) -> Self {
+        Self {
+            pid,
+            offset: unsafe { UPSafeCell::new(0) },
+        }
+    }
+
+    fn build_content(&self) -> String {
+        use alloc::format;
+        if let Some(task) = crate::task::pid2task(self.pid) {
+            let inner = task.inner_exclusive_access();
+            let state = match inner.task_status {
+                crate::task::TaskStatus::Running => "R (running)",
+                crate::task::TaskStatus::Zombie => "Z (zombie)",
+                _ => "S (sleeping)",
+            };
+            let ppid = inner
+                .parent
+                .as_ref()
+                .and_then(|w| w.upgrade())
+                .map(|p| p.getpid())
+                .unwrap_or(0);
+            format!(
+                "Name:\tinitproc\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t{} {} {} {}\nGid:\t{} {} {} {}\nVmLck:\t       0 kB\nVmSwap:\t       0 kB\nThreads:\t1\nCpus_allowed:\t1\nMems_allowed:\t1\n",
+                state,
+                inner.tgid,
+                self.pid,
+                ppid,
+                inner.uid,
+                inner.euid,
+                inner.euid,
+                inner.euid,
+                inner.gid,
+                inner.egid,
+                inner.egid,
+                inner.egid
+            )
+        } else {
+            String::new()
+        }
+    }
+}
+
+impl File for ProcPidStatusFile {
     fn readable(&self) -> bool {
         true
     }

@@ -6,6 +6,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use lazy_static::lazy_static;
 use log::*;
 use polyhal::pagetable::{MappingFlags, MappingSize, PageTable, PageTableWrapper};
 use polyhal::{PhysAddr, VirtAddr};
@@ -29,6 +30,14 @@ pub struct LoadedElf {
     pub interp_path: Option<alloc::string::String>,
     pub interp_base: usize,
     pub program_entry: usize,
+}
+
+lazy_static! {
+    static ref RETIRED_USER_PAGE_TABLE: Arc<PageTableWrapper> = Arc::new(PageTableWrapper::alloc());
+}
+
+fn retired_user_page_table() -> Arc<PageTableWrapper> {
+    RETIRED_USER_PAGE_TABLE.clone()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -869,22 +878,24 @@ impl MemorySet {
             } else if !area.map_perm.contains(MapPermission::R) {
                 return false;
             }
-            if self.translate(vaddr).is_none() {
-                return false;
-            }
             vpn += crate::config::PAGE_SIZE;
         }
         true
     }
     pub fn recycle_data_pages(&mut self) {
-        if self.shared_page_table {
-            self.areas.clear();
-            return;
-        }
-        for area in self.areas.iter_mut() {
-            area.unmap(&self.page_table);
+        let old_root = self.page_table.0.root().raw();
+        if !self.shared_page_table {
+            for area in self.areas.iter_mut() {
+                area.unmap(&self.page_table);
+            }
         }
         self.areas.clear();
+        let retired = retired_user_page_table();
+        if PageTable::current().root().raw() == old_root {
+            retired.change();
+        }
+        self.page_table = retired;
+        self.shared_page_table = false;
     }
     pub fn shrink_to(&mut self, limit_va: VirtAddr) {
         self.areas.retain_mut(|area| {
@@ -1004,23 +1015,15 @@ impl MemorySet {
         file: alloc::sync::Arc<dyn crate::fs::File>,
         offset: usize,
     ) -> bool {
-        if !self.insert_framed_area(start_addr, end_addr, permission) {
+        let start_addr = start_addr.floor();
+        let end_addr = end_addr.ceil();
+        if start_addr >= end_addr || self.is_overlap(start_addr, end_addr) {
             return false;
         }
-        let area = self.areas.last_mut().unwrap();
+        let mut area = MapArea::new(start_addr, end_addr, MapType::Framed, permission);
         area.file = Some(file.clone());
         area.file_offset = offset;
-        file.seek(offset);
-        for vaddr in area.vaddr_range.clone() {
-            let frame = match area.data_frames.get(&vaddr) {
-                Some(frame) => frame,
-                None => break,
-            };
-            let page = frame.paddr.slice_mut_with_len(crate::config::PAGE_SIZE);
-            if file.read(page) <= 0 {
-                break;
-            }
-        }
+        self.areas.push(area);
         true
     }
 
@@ -1093,6 +1096,7 @@ impl MemorySet {
                 .filter(|&v| v >= ss && v < end_addr)
                 .collect();
             for vpn in vpns {
+                Self::sync_shared_file_page(area, vpn);
                 if flags & MS_INVALIDATE != 0 {
                     self.page_table.unmap_page(vpn);
                 }
@@ -1120,6 +1124,7 @@ impl MemorySet {
                 return -12;
             };
             if permission.contains(MapPermission::W)
+                && area.shared
                 && area.file.as_ref().is_some_and(|file| !file.writable())
             {
                 return -13;
@@ -1236,6 +1241,7 @@ impl MemorySet {
                     .map(|(&k, _)| k)
                     .collect();
                 for vaddr in &frame_keys {
+                    Self::sync_shared_file_page(&self.areas[i], *vaddr);
                     if self
                         .page_table
                         .translate(*vaddr)
@@ -1289,6 +1295,29 @@ impl MemorySet {
         }
 
         unmapped_any
+    }
+
+    fn sync_shared_file_page(area: &MapArea, vpn: VirtAddr) {
+        if !area.shared || !area.map_perm.contains(MapPermission::W) {
+            return;
+        }
+        let Some(file) = area.file.as_ref() else {
+            return;
+        };
+        if !file.writable() {
+            return;
+        }
+        let Some(frame) = area.data_frames.get(&vpn) else {
+            return;
+        };
+        let file_off = area.file_offset + (vpn.raw() - area.vaddr_range.get_start().raw());
+        let file_size = file.stat().st_size.max(0) as usize;
+        if file_off >= file_size {
+            return;
+        }
+        let write_len = crate::config::PAGE_SIZE.min(file_size - file_off);
+        let buf = frame.paddr.slice_mut_with_len(write_len);
+        let _ = file.write_at(file_off, buf);
     }
 
     pub fn munmap_metadata_only(
