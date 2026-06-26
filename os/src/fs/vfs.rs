@@ -462,7 +462,36 @@ impl VfsSuperBlock {
                 return false;
             }
 
-            let ok = unsafe { ext4_ftruncate(&mut file, size) } == EOK as i32;
+            let old_size = unsafe { ext4_fsize(&mut file) };
+            let ok = if size <= old_size {
+                (unsafe { ext4_ftruncate(&mut file, size) }) == EOK as i32
+            } else {
+                let zeros = [0u8; 4096];
+                let mut pos = old_size as usize;
+                let target = size as usize;
+                unsafe {
+                    ext4_fseek(&mut file, old_size as i64, SEEK_SET as u32);
+                }
+                let mut ok = true;
+                while pos < target {
+                    let chunk = (target - pos).min(zeros.len());
+                    let mut written: usize = 0;
+                    let rc = unsafe {
+                        ext4_fwrite(
+                            &mut file,
+                            zeros[..chunk].as_ptr() as *const core::ffi::c_void,
+                            chunk,
+                            &mut written,
+                        )
+                    };
+                    if rc != EOK as i32 || written == 0 {
+                        ok = false;
+                        break;
+                    }
+                    pos += written;
+                }
+                ok
+            };
             unsafe {
                 ext4_fclose(&mut file);
             }

@@ -248,6 +248,8 @@ impl OSInode {
                 st.st_blksize = EXT4_BLOCK_SIZE;
                 st.st_blocks = info.blocks_count;
                 st.st_nlink = info.links_count.max(1);
+                st.st_uid = info.uid;
+                st.st_gid = info.gid;
                 if file_type == S_IFDIR {
                     st.st_nlink = st.st_nlink.max(2);
                 }
@@ -290,6 +292,19 @@ impl OSInode {
 
     pub fn update_cached_size(&self, size: i64) {
         let mut inner = self.inner.exclusive_access();
+        if let Some(ref mut st) = inner.cached_stat {
+            st.st_size = size;
+            st.st_blocks = ((size.max(0) as u64) + 511) / 512;
+        }
+    }
+
+    pub fn refresh_after_truncate(&self, size: i64) {
+        let mut inner = self.inner.exclusive_access();
+        if let Some(mut file) = inner.file_handle.take() {
+            unsafe {
+                ext4_fclose(&mut file);
+            }
+        }
         if let Some(ref mut st) = inner.cached_stat {
             st.st_size = size;
             st.st_blocks = ((size.max(0) as u64) + 511) / 512;
@@ -478,14 +493,6 @@ fn open_file_new(
     let dentry = follow_symlink(&start, vfs_resolve_with_fallback(&start, path)?, 0)?;
     if want_dir && !dentry.is_dir {
         return None;
-    }
-
-    if !dentry.is_dir
-        && (flags.trunc_requested()
-            || flags.contains(OpenFlags::WRONLY)
-            || flags.contains(OpenFlags::RDWR))
-    {
-        root_make_accessible(&dentry, 0o666);
     }
 
     if flags.trunc_requested() && !dentry.is_dir {

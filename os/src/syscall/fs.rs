@@ -369,6 +369,33 @@ pub fn sys_open(path: *const u8, flags: u32) -> isize {
     sys_openat(AT_FDCWD, path, flags, 0)
 }
 
+fn open_existing_access(dentry: &Arc<Dentry>, flags: OpenFlags) -> isize {
+    let (readable, writable) = flags.read_write();
+    let need = ((readable as u32) * 0o4)
+        | (((writable || flags.trunc_requested()) as u32) * 0o2);
+    if need == 0 {
+        return 0;
+    }
+    if dentry.is_dir {
+        return if writable || flags.trunc_requested() { -21 } else { 0 };
+    }
+    let Some(task) = current_task() else {
+        return -13;
+    };
+    let (euid, egid) = {
+        let inner = task.inner_exclusive_access();
+        (inner.euid, inner.egid)
+    };
+    if euid == 0 {
+        return 0;
+    }
+    match dentry.super_block.get_inode_info(&dentry.fs_path) {
+        Some(info) if inode_perm_allows(info.mode, info.uid, info.gid, euid, egid, need) => 0,
+        Some(_) => -13,
+        None => -2,
+    }
+}
+
 pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> isize {
     let task = current_task().unwrap();
     let raw_path = match translated_path_bounded(path) {
@@ -441,6 +468,10 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> isize
         }
         if open_flags.create_requested() && open_flags.excl_requested() {
             return -17;
+        }
+        let access = open_existing_access(&existing, open_flags);
+        if access != 0 {
+            return access;
         }
         if flags & O_NOATIME != 0 {
             let euid = {
@@ -637,13 +668,13 @@ pub fn sys_mkdirat(dirfd: isize, path: *const u8, mode: u32) -> isize {
     if path.is_empty() {
         return -2;
     }
+    if vfs_resolve_path(&base_dir, path.as_str()).is_some() {
+        return -17;
+    }
     let (parent, name) = match resolve_parent_and_name_checked(&base_dir, path.as_str()) {
         Ok(parts) => parts,
         Err(errno) => return errno,
     };
-    if vfs_lookup(&parent, &name).is_some() {
-        return -17;
-    }
     if !can_modify_directory(&parent) {
         return -13;
     }
@@ -2740,7 +2771,7 @@ pub fn sys_ftruncate(fd: usize, length: u64) -> isize {
             if d.super_block.truncate_file(&d.fs_path, length) {
                 crate::syscall::process::remove_shared_file_mappings(&d.fs_path);
                 if let Some(inode) = file.as_any().downcast_ref::<crate::fs::inode::OSInode>() {
-                    inode.update_cached_size(length as i64);
+                    inode.refresh_after_truncate(length as i64);
                 }
                 0
             } else {

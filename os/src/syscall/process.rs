@@ -2264,15 +2264,33 @@ pub fn sys_gettid() -> isize {
     current_task().map(|t| t.getpid() as isize).unwrap_or(-1)
 }
 
+fn is_no_id_change(id: usize) -> bool {
+    id == usize::MAX || id == u32::MAX as usize
+}
+
+fn parse_optional_id(id: usize) -> Result<Option<u32>, isize> {
+    if is_no_id_change(id) {
+        Ok(None)
+    } else if id > u32::MAX as usize {
+        Err(-22)
+    } else {
+        Ok(Some(id as u32))
+    }
+}
+
 pub fn sys_setuid(uid: u32) -> isize {
     if let Some(task) = current_task() {
         let mut inner = task.inner_exclusive_access();
+        if uid == u32::MAX {
+            return -22;
+        }
         if inner.euid == 0 {
             inner.uid = uid;
             inner.euid = uid;
+            inner.suid = uid;
             return 0;
         }
-        if uid == inner.uid || uid == inner.euid {
+        if uid == inner.uid || uid == inner.euid || uid == inner.suid {
             inner.euid = uid;
             return 0;
         }
@@ -2285,12 +2303,16 @@ pub fn sys_setuid(uid: u32) -> isize {
 pub fn sys_setgid(gid: u32) -> isize {
     if let Some(task) = current_task() {
         let mut inner = task.inner_exclusive_access();
-        if inner.egid == 0 {
+        if gid == u32::MAX {
+            return -22;
+        }
+        if inner.euid == 0 {
             inner.gid = gid;
             inner.egid = gid;
+            inner.sgid = gid;
             return 0;
         }
-        if gid == inner.gid || gid == inner.egid {
+        if gid == inner.gid || gid == inner.egid || gid == inner.sgid {
             inner.egid = gid;
             return 0;
         }
@@ -3016,9 +3038,14 @@ pub fn sys_clock_getres(clk_id: usize, res: *mut u8) -> isize {
 // ---- getgroups/setgroups (158/159) ----
 
 pub fn sys_getgroups(size: usize, list: *mut u32) -> isize {
+    const NGROUPS_MAX: usize = 65536;
     let task = current_task().unwrap();
     let inner = task.inner_exclusive_access();
-    let count = inner.supplementary_groups.len();
+    let groups = inner.supplementary_groups.clone();
+    let count = groups.len();
+    if size > NGROUPS_MAX {
+        return -22;
+    }
     if size == 0 {
         return count as isize;
     }
@@ -3036,7 +3063,8 @@ pub fn sys_getgroups(size: usize, list: *mut u32) -> isize {
         return -14;
     }
     let token = inner.get_user_token();
-    for (idx, gid) in inner.supplementary_groups.iter().enumerate() {
+    drop(inner);
+    for (idx, gid) in groups.iter().enumerate() {
         *crate::mm::translated_refmut(token, unsafe { list.add(idx) }) = *gid;
     }
     count as isize
@@ -3064,10 +3092,12 @@ pub fn sys_setgroups(size: usize, list: *const u32) -> isize {
         return -14;
     }
     let token = inner.get_user_token();
+    drop(inner);
     let mut groups = Vec::with_capacity(size);
     for idx in 0..size {
         groups.push(*translated_ref(token, unsafe { list.add(idx) }));
     }
+    let mut inner = task.inner_exclusive_access();
     inner.supplementary_groups = groups;
     0
 }
@@ -3086,7 +3116,7 @@ pub fn sys_getresuid(ruid: *mut u32, euid: *mut u32, suid: *mut u32) -> isize {
     let token = inner.get_user_token();
     *crate::mm::translated_refmut(token, ruid) = inner.uid;
     *crate::mm::translated_refmut(token, euid) = inner.euid;
-    *crate::mm::translated_refmut(token, suid) = inner.euid;
+    *crate::mm::translated_refmut(token, suid) = inner.suid;
     0
 }
 
@@ -3102,27 +3132,40 @@ pub fn sys_getresgid(rgid: *mut u32, egid: *mut u32, sgid: *mut u32) -> isize {
     let token = inner.get_user_token();
     *crate::mm::translated_refmut(token, rgid) = inner.gid;
     *crate::mm::translated_refmut(token, egid) = inner.egid;
-    *crate::mm::translated_refmut(token, sgid) = inner.egid;
+    *crate::mm::translated_refmut(token, sgid) = inner.sgid;
     0
 }
 
 pub fn sys_setresuid(ruid: usize, euid: usize, suid: usize) -> isize {
     let task = current_task().unwrap();
     let mut inner = task.inner_exclusive_access();
-    let old_euid = inner.euid;
-    if old_euid == 0 {
-    } else if ruid != usize::MAX && ruid != inner.uid as usize && ruid != inner.euid as usize {
-        return -1;
-    } else if euid != usize::MAX && euid != inner.uid as usize && euid != inner.euid as usize {
-        return -1;
-    } else if suid != usize::MAX && suid != inner.uid as usize && suid != inner.euid as usize {
-        return -1;
+    let ruid = match parse_optional_id(ruid) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let euid = match parse_optional_id(euid) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let suid = match parse_optional_id(suid) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if inner.euid != 0 {
+        for id in [ruid, euid, suid].into_iter().flatten() {
+            if id != inner.uid && id != inner.euid && id != inner.suid {
+                return -1;
+            }
+        }
     }
-    if ruid != usize::MAX {
-        inner.uid = ruid as u32;
+    if let Some(id) = ruid {
+        inner.uid = id;
     }
-    if euid != usize::MAX {
-        inner.euid = euid as u32;
+    if let Some(id) = euid {
+        inner.euid = id;
+    }
+    if let Some(id) = suid {
+        inner.suid = id;
     }
     0
 }
@@ -3130,20 +3173,33 @@ pub fn sys_setresuid(ruid: usize, euid: usize, suid: usize) -> isize {
 pub fn sys_setresgid(rgid: usize, egid: usize, sgid: usize) -> isize {
     let task = current_task().unwrap();
     let mut inner = task.inner_exclusive_access();
-    let old_egid = inner.egid;
-    if old_egid == 0 {
-    } else if rgid != usize::MAX && rgid != inner.gid as usize && rgid != inner.egid as usize {
-        return -1;
-    } else if egid != usize::MAX && egid != inner.gid as usize && egid != inner.egid as usize {
-        return -1;
-    } else if sgid != usize::MAX && sgid != inner.gid as usize && sgid != inner.egid as usize {
-        return -1;
+    let rgid = match parse_optional_id(rgid) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let egid = match parse_optional_id(egid) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let sgid = match parse_optional_id(sgid) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if inner.euid != 0 {
+        for id in [rgid, egid, sgid].into_iter().flatten() {
+            if id != inner.gid && id != inner.egid && id != inner.sgid {
+                return -1;
+            }
+        }
     }
-    if rgid != usize::MAX {
-        inner.gid = rgid as u32;
+    if let Some(id) = rgid {
+        inner.gid = id;
     }
-    if egid != usize::MAX {
-        inner.egid = egid as u32;
+    if let Some(id) = egid {
+        inner.egid = id;
+    }
+    if let Some(id) = sgid {
+        inner.sgid = id;
     }
     0
 }
@@ -3151,23 +3207,36 @@ pub fn sys_setresgid(rgid: usize, egid: usize, sgid: usize) -> isize {
 pub fn sys_setreuid(ruid: usize, euid: usize) -> isize {
     let task = current_task().unwrap();
     let mut inner = task.inner_exclusive_access();
-    let old_euid = inner.euid;
-    if old_euid != 0 {
-        if ruid != usize::MAX && ruid != inner.uid as usize && ruid != inner.euid as usize {
-            return -1;
+    let ruid = match parse_optional_id(ruid) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let euid = match parse_optional_id(euid) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let old_uid = inner.uid;
+    if inner.euid != 0 {
+        if let Some(id) = ruid {
+            if id != inner.uid && id != inner.euid {
+                return -1;
+            }
         }
-        if euid != usize::MAX && euid != inner.uid as usize && euid != inner.euid as usize {
-            return -1;
+        if let Some(id) = euid {
+            if id != inner.uid && id != inner.euid && id != inner.suid {
+                return -1;
+            }
         }
     }
-    if ruid != usize::MAX {
-        inner.uid = ruid as u32;
-        if euid == usize::MAX {
-            inner.euid = ruid as u32;
-        }
+    let update_suid = ruid.is_some() || euid.map(|id| id != old_uid).unwrap_or(false);
+    if let Some(id) = ruid {
+        inner.uid = id;
     }
-    if euid != usize::MAX {
-        inner.euid = euid as u32;
+    if let Some(id) = euid {
+        inner.euid = id;
+    }
+    if update_suid {
+        inner.suid = inner.euid;
     }
     0
 }
@@ -3175,23 +3244,36 @@ pub fn sys_setreuid(ruid: usize, euid: usize) -> isize {
 pub fn sys_setregid(rgid: usize, egid: usize) -> isize {
     let task = current_task().unwrap();
     let mut inner = task.inner_exclusive_access();
-    let old_egid = inner.egid;
-    if old_egid != 0 {
-        if rgid != usize::MAX && rgid != inner.gid as usize && rgid != inner.egid as usize {
-            return -1;
+    let rgid = match parse_optional_id(rgid) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let egid = match parse_optional_id(egid) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let old_gid = inner.gid;
+    if inner.euid != 0 {
+        if let Some(id) = rgid {
+            if id != inner.gid && id != inner.egid {
+                return -1;
+            }
         }
-        if egid != usize::MAX && egid != inner.gid as usize && egid != inner.egid as usize {
-            return -1;
+        if let Some(id) = egid {
+            if id != inner.gid && id != inner.egid && id != inner.sgid {
+                return -1;
+            }
         }
     }
-    if rgid != usize::MAX {
-        inner.gid = rgid as u32;
-        if egid == usize::MAX {
-            inner.egid = rgid as u32;
-        }
+    let update_sgid = rgid.is_some() || egid.map(|id| id != old_gid).unwrap_or(false);
+    if let Some(id) = rgid {
+        inner.gid = id;
     }
-    if egid != usize::MAX {
-        inner.egid = egid as u32;
+    if let Some(id) = egid {
+        inner.egid = id;
+    }
+    if update_sgid {
+        inner.sgid = inner.egid;
     }
     0
 }

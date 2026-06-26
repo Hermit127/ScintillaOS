@@ -23,6 +23,7 @@ use lazy_static::*;
 
 const SOCKET_BUFFER_SIZE: usize = 65536;
 const UDP_META_COUNT: usize = 16;
+const AF_UNIX: usize = 1;
 const AF_INET: usize = 2;
 const SOCK_STREAM: usize = 1;
 const SOCK_DGRAM: usize = 2;
@@ -124,7 +125,9 @@ fn dummy_socket_handle() -> SocketHandle {
 }
 
 fn create_socket_fd(st: SocketType, nonblock: bool, cloexec: bool) -> isize {
-    let handle = if net_ready() {
+    let handle = if st == SocketType::Unix {
+        dummy_socket_handle()
+    } else if net_ready() {
         match add_to_socket_set(st) {
             Some((handle, _)) => handle,
             None => return -105,
@@ -239,6 +242,14 @@ fn parse_sockaddr_in(ptr: *const u8) -> Option<(u32, u16)> {
     Some((addr, port))
 }
 
+fn sockaddr_family(ptr: *const u8) -> Option<u16> {
+    if ptr.is_null() {
+        return None;
+    }
+    let token = current_user_token();
+    Some(*translated_ref(token, ptr as *const u16))
+}
+
 fn write_sockaddr_in(ptr: *mut u8, sin_addr: u32, sin_port: u16) {
     let token = current_user_token();
     let sa = SockAddrIn {
@@ -292,6 +303,9 @@ fn copy_to_iov(buf: &[u8], iov: *mut Iovec, iovcnt: usize) -> usize {
 }
 
 fn add_to_socket_set(st: SocketType) -> Option<(SocketHandle, SocketType)> {
+    if st == SocketType::Unix {
+        return None;
+    }
     crate::net::with_net_iface(|iface| {
         let handle = match st {
             SocketType::Tcp => {
@@ -310,6 +324,7 @@ fn add_to_socket_set(st: SocketType) -> Option<(SocketHandle, SocketType)> {
                 );
                 iface.sockets.add(sock)
             }
+            SocketType::Unix => unreachable!(),
         };
         (handle, st)
     })
@@ -907,14 +922,12 @@ pub(crate) fn udp_read_socket(
 }
 
 pub fn sys_socket(domain: usize, type_: usize, _protocol: usize) -> isize {
-    if domain != AF_INET {
-        return -97;
-    }
-
-    let st = match type_ & 0x0F {
-        SOCK_STREAM => SocketType::Tcp,
-        SOCK_DGRAM => SocketType::Udp,
-        _ => return -22,
+    let st = match (domain, type_ & 0x0F) {
+        (AF_INET, SOCK_STREAM) => SocketType::Tcp,
+        (AF_INET, SOCK_DGRAM) => SocketType::Udp,
+        (AF_UNIX, SOCK_STREAM) | (AF_UNIX, SOCK_DGRAM) => SocketType::Unix,
+        (AF_INET | AF_UNIX, _) => return -22,
+        _ => return -97,
     };
 
     let nonblock = (type_ & SOCK_NONBLOCK) != 0;
@@ -986,6 +999,7 @@ pub fn sys_bind(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
             .map(|_| 0)
             .unwrap_or(-22)
         }
+        SocketType::Unix => -95,
     })
     .unwrap_or(-1);
     if ret == 0 {
@@ -1003,18 +1017,33 @@ pub fn sys_bind(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
 }
 
 pub fn sys_connect(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
-    if addr.is_null() || addrlen < 8 {
+    if addr.is_null() {
+        return -14;
+    }
+
+    let (handle, st, nonblock) = match sock_lookup(sockfd) {
+        Some(v) => v,
+        None => return -9,
+    };
+
+    if st == SocketType::Unix {
+        if addrlen < 2 {
+            return -22;
+        }
+        return match sockaddr_family(addr) {
+            Some(family) if family as usize == AF_UNIX => -2,
+            Some(_) => -97,
+            None => -14,
+        };
+    }
+
+    if addrlen < 8 {
         return -14;
     }
 
     let (ip, port) = match parse_sockaddr_in(addr) {
         Some(v) => v,
         None => return -22,
-    };
-
-    let (handle, st, nonblock) = match sock_lookup(sockfd) {
-        Some(v) => v,
-        None => return -9,
     };
 
     let remote = IpEndpoint::new(
@@ -1383,6 +1412,7 @@ pub fn sys_sendto(
             }
             udp_send(handle, data, dest)
         }
+        SocketType::Unix => -107,
     }
 }
 
@@ -1429,6 +1459,7 @@ pub fn sys_recvfrom(
                 core::mem::transmute(handle)
             }));
         },
+        SocketType::Unix => -107,
     };
 
     // Fill source address for UDP if requested
@@ -1503,6 +1534,7 @@ pub fn sys_sendmsg(sockfd: usize, msg: *const u8, flags: usize) -> isize {
             }
             udp_send(handle, &buf[..copied], dest)
         }
+        SocketType::Unix => -107,
     }
 }
 
@@ -1559,6 +1591,7 @@ pub fn sys_recvmsg(sockfd: usize, msg: *mut u8, flags: usize) -> isize {
                 core::mem::transmute(handle)
             }));
         },
+        SocketType::Unix => -107,
     };
 
     if result > 0 {
@@ -1788,6 +1821,7 @@ pub fn sys_getpeername(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isi
                 )
             })
         }),
+        SocketType::Unix => None,
     };
 
     match peer {
@@ -1834,6 +1868,7 @@ pub fn sys_getsockname(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isi
             )
         })
         .or_else(|| get_socket_local_endpoint(sockfd)),
+        SocketType::Unix => None,
     };
 
     match local {

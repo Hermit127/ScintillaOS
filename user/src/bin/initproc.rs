@@ -56,14 +56,21 @@ const LTP_SUBSET_CASES: &str = concat!(
     "rename01 rename03 rename04 rename05 unlink05 unlink07 unlink08 unlink09 unlinkat01 ",
     "statfs01 statfs02 statfs03 fstatfs01 fstatfs02 ",
     "getuid01 getuid03 geteuid01 geteuid02 getgid01 getgid03 getegid01 getegid02 ",
+    "getresuid01 getresuid02 getresuid03 getresgid01 getresgid02 getresgid03 ",
+    "getgroups01 getgroups03 setgroups01 setgroups02 setgroups04 ",
+    "setuid01 setuid03 setgid01 setgid02 setgid03 setegid01 setegid02 ",
+    "setreuid01 setreuid02 setreuid03 setreuid04 setreuid05 setreuid06 setreuid07 ",
+    "setregid01 setregid02 setregid03 setregid04 ",
+    "setresuid01 setresuid02 setresuid03 setresuid04 setresuid05 ",
+    "setresgid01 setresgid02 setresgid03 setresgid04 ",
     "getppid01 getppid02 gettid01 gettid02 getrandom01 getrandom02 getrandom03 getrandom04 ",
     "clock_gettime01 clock_gettime02 clock_gettime03 clock_gettime04 clock_getres01 sched_yield01 ",
     "getrusage01 getrusage02 getrusage03 getrusage04 getrlimit01 getrlimit02 getrlimit03 ",
     "sysinfo01 sysinfo02 getpgrp01 getsid01 getsid02 setsid01 setpgid01 setpgid02 getpgid01 getpgid02 ",
-    "openat01 openat02 openat03 openat04 faccessat01 faccessat02 faccessat201 faccessat202 ",
+    "creat08 open10 openat01 openat02 openat03 openat04 faccessat01 faccessat02 faccessat201 faccessat202 ",
     "access02 access03 access04 readv01 readv02 writev01 writev02 pread01 pread02 pwrite01 pwrite02 ",
     "fsync01 fsync02 fsync03 fsync04 fdatasync01 fdatasync02 sync01 syncfs01 ",
-    "ftruncate01 ftruncate03 ftruncate04 fchmod01 fchmod02 fchmod03 fchmod04 ",
+    "ftruncate01 ftruncate03 ftruncate04 fchmod01 fchmod02 fchmod03 fchmod04 fchmod05 ",
     "chmod01 chmod03 chmod05 linkat01 linkat02 symlink01 symlink02 symlinkat01 readlink01 readlinkat01 ",
     "flock01 flock02 flock03 flock04 flock06 readahead01 readahead02 ",
     "fallocate01 fallocate02 fallocate03 fallocate04 fallocate05 fallocate06 close_range01 close_range02 ",
@@ -86,14 +93,21 @@ const LTP_SUBSET_CASES: &str = concat!(
     "rename01 rename03 rename04 rename05 unlink05 unlink07 unlink08 unlink09 unlinkat01 ",
     "statfs01 statfs02 statfs03 fstatfs01 fstatfs02 ",
     "getuid01 getuid03 geteuid01 geteuid02 getgid01 getgid03 getegid01 getegid02 ",
+    "getresuid01 getresuid02 getresuid03 getresgid01 getresgid02 getresgid03 ",
+    "getgroups01 getgroups03 setgroups01 setgroups02 setgroups04 ",
+    "setuid01 setuid03 setgid01 setgid02 setgid03 setegid01 setegid02 ",
+    "setreuid01 setreuid02 setreuid03 setreuid04 setreuid05 setreuid06 setreuid07 ",
+    "setregid01 setregid02 setregid03 setregid04 ",
+    "setresuid01 setresuid02 setresuid03 setresuid04 setresuid05 ",
+    "setresgid01 setresgid02 setresgid03 setresgid04 ",
     "getppid01 getppid02 gettid01 gettid02 getrandom01 getrandom02 getrandom03 getrandom04 ",
     "clock_gettime01 clock_gettime02 clock_gettime03 clock_gettime04 clock_getres01 sched_yield01 ",
     "getrusage01 getrusage02 getrusage03 getrusage04 getrlimit01 getrlimit02 getrlimit03 ",
     "sysinfo01 sysinfo02 getpgrp01 getsid01 getsid02 setsid01 setpgid01 setpgid02 getpgid01 getpgid02 ",
-    "openat01 openat02 openat03 openat04 faccessat01 faccessat02 faccessat201 faccessat202 ",
+    "creat08 open10 openat01 openat02 openat03 openat04 faccessat01 faccessat02 faccessat201 faccessat202 ",
     "access02 access03 access04 readv01 readv02 writev01 writev02 pread01 pread02 pwrite01 pwrite02 ",
     "fsync01 fsync02 fsync03 fsync04 fdatasync01 fdatasync02 sync01 syncfs01 ",
-    "ftruncate01 ftruncate03 ftruncate04 fchmod01 fchmod02 fchmod03 fchmod04 ",
+    "ftruncate01 ftruncate03 ftruncate04 fchmod01 fchmod02 fchmod03 fchmod04 fchmod05 ",
     "chmod01 chmod03 chmod05 linkat01 linkat02 symlink01 symlink02 symlinkat01 readlink01 readlinkat01 ",
     "flock01 flock02 flock03 flock04 flock06 readahead01 readahead02 ",
     "fallocate01 fallocate02 fallocate03 fallocate04 fallocate05 fallocate06 close_range01 close_range02 ",
@@ -181,6 +195,8 @@ fn setup_runtime_dirs(root: &str) {
     mkdir_path(&(String::from(root) + "/usr/bin"));
     mkdir_path(&(String::from(root) + "/etc"));
     mkdir_path(&(String::from(root) + "/tmp"));
+    mkdir_path(&(String::from(root) + "/var"));
+    mkdir_path(&(String::from(root) + "/var/tmp"));
     mkdir_path(&(String::from(root) + "/mnt"));
     mkdir_path(&(String::from(root) + "/lib"));
     mkdir_path(&(String::from(root) + "/lib64"));

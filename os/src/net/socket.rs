@@ -11,6 +11,7 @@ pub const S_IFSOCK: u32 = 0o140000;
 pub enum SocketType {
     Tcp,
     Udp,
+    Unix,
 }
 
 pub struct SocketFile {
@@ -99,6 +100,7 @@ impl File for SocketFile {
         match self.socket_type {
             SocketType::Tcp => super::syscall::tcp_recv(handle, nonblock, buf),
             SocketType::Udp => super::syscall::udp_read_socket(self, handle, nonblock, buf),
+            SocketType::Unix => -107,
         }
     }
 
@@ -121,6 +123,7 @@ impl File for SocketFile {
                 }
                 super::syscall::udp_write(handle, data, peer)
             }
+            SocketType::Unix => -107,
         };
         result
     }
@@ -197,6 +200,7 @@ impl File for SocketFile {
                     let sock: &UdpSocket = iface.sockets.get(handle);
                     (sock.can_recv(), true, false)
                 }
+                SocketType::Unix => (false, true, false),
             })
             .unwrap_or((false, false, false))
         }
@@ -237,9 +241,11 @@ impl File for SocketFile {
             target_arch = "aarch64",
             target_arch = "loongarch64"
         ))]
-        crate::net::with_net_iface(|iface| {
-            iface.sockets.remove(handle);
-        });
+        if self.socket_type != SocketType::Unix {
+            crate::net::with_net_iface(|iface| {
+                iface.sockets.remove(handle);
+            });
+        }
     }
 
     fn as_any(&self) -> &dyn core::any::Any {

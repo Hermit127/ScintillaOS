@@ -203,11 +203,11 @@ impl ProcPidStatusFile {
                 ppid,
                 inner.uid,
                 inner.euid,
-                inner.euid,
+                inner.suid,
                 inner.euid,
                 inner.gid,
                 inner.egid,
-                inner.egid,
+                inner.sgid,
                 inner.egid
             )
         } else {
