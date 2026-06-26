@@ -49,42 +49,6 @@ const SHUT_RDWR: usize = 2;
 const LOCAL_TCP_BUFFER_LIMIT: usize = 256 * 1024;
 static NEXT_EPHEMERAL_PORT: AtomicU16 = AtomicU16::new(49152);
 static NEXT_DUMMY_HANDLE: AtomicUsize = AtomicUsize::new(1_000_000);
-static LOCAL_UDP_DEBUG_COUNT: AtomicUsize = AtomicUsize::new(0);
-static LOCAL_UDP_DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
-static LOCAL_UDP_BIG_RECV_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-fn log_local_udp_event(tag: &str, src: IpEndpoint, dst_port: u16, len: usize) {
-    let idx = LOCAL_UDP_DEBUG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if idx < 16 {
-        println!(
-            "[udp-local] {} src={:?} dst_port={} len={}",
-            tag, src, dst_port, len
-        );
-    }
-}
-
-fn log_local_udp_drop(src: IpEndpoint, dst_port: u16, len: usize) {
-    let idx = LOCAL_UDP_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
-    if idx < 8 {
-        println!(
-            "[udp-local] drop src={:?} dst_port={} len={}",
-            src, dst_port, len
-        );
-    }
-}
-
-fn log_local_udp_big_recv(tag: &str, src: IpEndpoint, dst_port: u16, len: usize) {
-    if len < 100 {
-        return;
-    }
-    let idx = LOCAL_UDP_BIG_RECV_COUNT.fetch_add(1, Ordering::Relaxed);
-    if idx < 16 {
-        println!(
-            "[udp-local] {} src={:?} dst_port={} len={}",
-            tag, src, dst_port, len
-        );
-    }
-}
 
 #[derive(Clone)]
 struct LocalUdpPacket {
@@ -744,10 +708,8 @@ fn enqueue_local_udp(src: IpEndpoint, data: &[u8], dest: IpEndpoint) -> isize {
     {
         let mut queue = LOCAL_UDP_QUEUE.exclusive_access();
         if queue.len() >= 256 {
-            log_local_udp_drop(src, dest.port, data.len());
             return data.len() as isize;
         }
-        log_local_udp_event("enqueue", src, dest.port, data.len());
         queue.push_back(LocalUdpPacket {
             dst_port: dest.port,
             src,
@@ -847,8 +809,6 @@ fn try_recv_local_udp(
     };
     let n = packet.data.len().min(buf.len());
     buf[..n].copy_from_slice(&packet.data[..n]);
-    log_local_udp_event("recv_fd", packet.src, local.port, n);
-    log_local_udp_big_recv("recv_fd_big", packet.src, local.port, n);
     drop(queue);
 
     if !src_addr.is_null() && !addrlen.is_null() {
@@ -879,8 +839,6 @@ fn try_recv_local_udp_socket(
     };
     let n = packet.data.len().min(buf.len());
     buf[..n].copy_from_slice(&packet.data[..n]);
-    log_local_udp_event("recv_sock", packet.src, local.port, n);
-    log_local_udp_big_recv("recv_sock_big", packet.src, local.port, n);
     Some(n as isize)
 }
 

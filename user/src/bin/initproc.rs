@@ -775,13 +775,8 @@ fn run_libctest(dir: &str) {
     let mut command = String::from("echo \"#### OS COMP TEST GROUP START ");
     command.push_str(label);
     command.push_str(" ####\"; ");
-    command.push_str("if [ -f run-static.sh ]; then ");
-    command.push_str("while IFS= read -r line; do ");
-    command.push_str("case \"$line\" in *pthread_robust_detach*) ");
-    command.push_str("echo \"[initproc] [SKIP] libctest tail after stable static prefix\"; break;; esac; ");
-    command.push_str("sh -c \"$line\"; ");
-    command.push_str("done < run-static.sh; ");
-    command.push_str("fi; ");
+    command.push_str("if [ -f run-static.sh ]; then sh run-static.sh; fi; ");
+    command.push_str("if [ -f run-dynamic.sh ]; then sh run-dynamic.sh; fi; ");
     command.push_str("echo \"#### OS COMP TEST GROUP END ");
     command.push_str(label);
     command.push_str(" ####\"\0");
@@ -940,11 +935,14 @@ fn run_ltp_case(dir: &str, chroot_root: &str, chroot_cwd: &str, case: &str) {
     println!("RUN LTP CASE {}", case);
 
     let bin_path = String::from("ltp/testcases/bin/") + case + "\0";
-    let envs: [*const u8; 5] = [
-        b"PATH=/bin:/usr/bin:.\0".as_ptr(),
+    let envs: [*const u8; 8] = [
+        b"PATH=/ltp/testcases/bin:/bin:/usr/bin:.\0".as_ptr(),
         b"LD_LIBRARY_PATH=/lib:/lib64:.\0".as_ptr(),
         b"HOME=/\0".as_ptr(),
         b"TMPDIR=/tmp\0".as_ptr(),
+        b"LTP_DEV=/dev/vda\0".as_ptr(),
+        b"LTP_SINGLE_FS_TYPE=tmpfs\0".as_ptr(),
+        b"LTP_DEV_FS_TYPE=tmpfs\0".as_ptr(),
         core::ptr::null(),
     ];
 

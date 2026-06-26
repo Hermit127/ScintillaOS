@@ -1,6 +1,6 @@
 use super::vfs::{
     dentry_parent, vfs_create, vfs_resolve_parent_and_name, vfs_resolve_path,
-    vfs_resolve_with_fallback, Dentry, DirEntry,
+    vfs_resolve_with_fallback, vfs_tmpfs_can_resize, vfs_tmpfs_commit_resize, Dentry, DirEntry,
 };
 use super::{File, Kstat, S_IFDIR, S_IFIFO, S_IFREG};
 use crate::sync::UPSafeCell;
@@ -27,6 +27,8 @@ lazy_static! {
     static ref PATH_TIME_CACHE: UPSafeCell<BTreeMap<String, CachedTimes>> =
         unsafe { UPSafeCell::new(BTreeMap::new()) };
     static ref PATH_SPECIAL_MODE_CACHE: UPSafeCell<BTreeMap<String, u32>> =
+        unsafe { UPSafeCell::new(BTreeMap::new()) };
+    static ref PATH_FS_FLAGS_CACHE: UPSafeCell<BTreeMap<String, usize>> =
         unsafe { UPSafeCell::new(BTreeMap::new()) };
 }
 
@@ -75,6 +77,23 @@ fn path_cached_times(fs_path: &str) -> CachedTimes {
         .get(fs_path)
         .copied()
         .unwrap_or_default()
+}
+
+pub fn set_path_fs_flags(fs_path: &str, flags: usize) {
+    let mut cache = PATH_FS_FLAGS_CACHE.exclusive_access();
+    if flags == 0 {
+        cache.remove(fs_path);
+    } else {
+        cache.insert(String::from(fs_path), flags);
+    }
+}
+
+pub fn path_fs_flags(fs_path: &str) -> usize {
+    PATH_FS_FLAGS_CACHE
+        .exclusive_access()
+        .get(fs_path)
+        .copied()
+        .unwrap_or(0)
 }
 
 // ==================== OSInode ====================
@@ -378,6 +397,7 @@ bitflags! {
         const TRUNC = 0x200;
         const APPEND = 0x400;
         const DIRECTORY = 0x10000;
+        const PATH = 0x200000;
     }
 }
 
@@ -403,7 +423,9 @@ impl OpenFlags {
     }
 
     pub fn read_write(&self) -> (bool, bool) {
-        if self.contains(Self::WRONLY) {
+        if self.contains(Self::PATH) {
+            (false, false)
+        } else if self.contains(Self::WRONLY) {
             (false, true)
         } else if self.contains(Self::RDWR) {
             (true, true)
@@ -732,6 +754,18 @@ impl File for OSInode {
         let saved_offset = inner.offset;
         if let Some(ref mut file) = inner.file_handle {
             let size = unsafe { ext4_fsize(file) as usize };
+            let Some(requested_new_size) = offset.checked_add(buf.len()) else {
+                return -27;
+            };
+            let requested_new_size = requested_new_size.max(size);
+            if !vfs_tmpfs_can_resize(
+                &self.dentry.path,
+                &self.dentry.fs_path,
+                size as u64,
+                requested_new_size as u64,
+            ) {
+                return -28;
+            }
             if offset > size && !Self::fill_gap_with_zero(file, size, offset) {
                 return -1;
             }
@@ -762,6 +796,14 @@ impl File for OSInode {
                 st.st_size = new_size;
                 st.st_blocks = ((st.st_size.max(0) as u64) + 511) / 512;
             }
+            if total > 0 {
+                vfs_tmpfs_commit_resize(
+                    &self.dentry.path,
+                    &self.dentry.fs_path,
+                    size as u64,
+                    new_size.max(0) as u64,
+                );
+            }
             if total == 0 && !buf.is_empty() {
                 inner.file_handle = None;
                 drop(inner);
@@ -772,10 +814,34 @@ impl File for OSInode {
                 if written > 0 {
                     let new_size = (offset + written) as i64;
                     self.update_cached_size(new_size);
+                    vfs_tmpfs_commit_resize(
+                        &self.dentry.path,
+                        &self.dentry.fs_path,
+                        size as u64,
+                        new_size.max(0) as u64,
+                    );
                 }
                 return written as isize;
             }
             return total as isize;
+        }
+        let old_size = self
+            .dentry
+            .super_block
+            .get_inode_info(&self.dentry.fs_path)
+            .map(|info| info.size as usize)
+            .unwrap_or(0);
+        let Some(requested_new_size) = offset.checked_add(buf.len()) else {
+            return -27;
+        };
+        let requested_new_size = requested_new_size.max(old_size);
+        if !vfs_tmpfs_can_resize(
+            &self.dentry.path,
+            &self.dentry.fs_path,
+            old_size as u64,
+            requested_new_size as u64,
+        ) {
+            return -28;
         }
         drop(inner);
         let written = self
@@ -785,6 +851,12 @@ impl File for OSInode {
         if written > 0 {
             let new_size = (offset + written) as i64;
             self.update_cached_size(new_size);
+            vfs_tmpfs_commit_resize(
+                &self.dentry.path,
+                &self.dentry.fs_path,
+                old_size as u64,
+                new_size.max(0) as u64,
+            );
         }
         written as isize
     }
@@ -807,6 +879,18 @@ impl File for OSInode {
                 cur_offset
             };
             let size = unsafe { ext4_fsize(file) as usize };
+            let Some(requested_new_size) = off.checked_add(buf.len()) else {
+                return -27;
+            };
+            let requested_new_size = requested_new_size.max(size);
+            if !vfs_tmpfs_can_resize(
+                &self.dentry.path,
+                &self.dentry.fs_path,
+                size as u64,
+                requested_new_size as u64,
+            ) {
+                return -28;
+            }
             if off > size && !Self::fill_gap_with_zero(file, size, off) {
                 inner.offset = unsafe { ext4_fsize(file) as usize };
                 return -1;
@@ -836,6 +920,14 @@ impl File for OSInode {
                 st.st_size = new_size;
                 st.st_blocks = ((st.st_size.max(0) as u64) + 511) / 512;
             }
+            if total > 0 {
+                vfs_tmpfs_commit_resize(
+                    &self.dentry.path,
+                    &self.dentry.fs_path,
+                    size as u64,
+                    new_size.max(0) as u64,
+                );
+            }
             if total == 0 && !buf.is_empty() {
                 inner.file_handle = None;
                 drop(inner);
@@ -848,6 +940,14 @@ impl File for OSInode {
                 if let Some(ref mut st) = inner.cached_stat {
                     st.st_size = (off + rw_count) as i64;
                     st.st_blocks = ((st.st_size.max(0) as u64) + 511) / 512;
+                }
+                if rw_count > 0 {
+                    vfs_tmpfs_commit_resize(
+                        &self.dentry.path,
+                        &self.dentry.fs_path,
+                        size as u64,
+                        (off + rw_count) as u64,
+                    );
                 }
                 return rw_count as isize;
             }
@@ -862,6 +962,24 @@ impl File for OSInode {
         } else {
             inner.offset
         };
+        let old_size = self
+            .dentry
+            .super_block
+            .get_inode_info(&self.dentry.fs_path)
+            .map(|info| info.size as usize)
+            .unwrap_or(0);
+        let Some(requested_new_size) = off.checked_add(buf.len()) else {
+            return -27;
+        };
+        let requested_new_size = requested_new_size.max(old_size);
+        if !vfs_tmpfs_can_resize(
+            &self.dentry.path,
+            &self.dentry.fs_path,
+            old_size as u64,
+            requested_new_size as u64,
+        ) {
+            return -28;
+        }
         drop(inner);
         let rw_count = self
             .dentry
@@ -872,6 +990,14 @@ impl File for OSInode {
         if let Some(ref mut st) = inner.cached_stat {
             st.st_size = (off + rw_count) as i64;
             st.st_blocks = ((st.st_size.max(0) as u64) + 511) / 512;
+        }
+        if rw_count > 0 {
+            vfs_tmpfs_commit_resize(
+                &self.dentry.path,
+                &self.dentry.fs_path,
+                old_size as u64,
+                (off + rw_count) as u64,
+            );
         }
         rw_count as isize
     }

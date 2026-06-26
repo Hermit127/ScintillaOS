@@ -620,6 +620,9 @@ impl MemorySet {
         vaddr: polyhal::VirtAddr,
         write_fault: bool,
     ) -> Option<PageFaultResult> {
+        if vaddr.raw() < crate::config::PAGE_SIZE {
+            return None;
+        }
         let vpn = vaddr.floor();
         let area = match self
             .areas
@@ -845,6 +848,9 @@ impl MemorySet {
     pub fn valid_user_buf(&self, ptr: *const u8, len: usize, need_write: bool) -> bool {
         if len == 0 {
             return true;
+        }
+        if ptr.is_null() {
+            return false;
         }
         let addr = ptr as usize;
         let addr_end = addr.checked_add(len.saturating_sub(1));

@@ -681,6 +681,130 @@ pub struct Mount {
 
 lazy_static! {
     pub static ref MOUNT_TABLE: UPSafeCell<Vec<Mount>> = unsafe { UPSafeCell::new(Vec::new()) };
+    static ref READONLY_MOUNT_PATHS: UPSafeCell<Vec<String>> = unsafe { UPSafeCell::new(Vec::new()) };
+    static ref TMPFS_MOUNTS: UPSafeCell<Vec<TmpfsMount>> = unsafe { UPSafeCell::new(Vec::new()) };
+}
+
+struct TmpfsMount {
+    path: String,
+    limit: Option<u64>,
+    used: u64,
+    files: BTreeMap<String, u64>,
+}
+
+fn normalize_mount_path(path: &str) -> String {
+    let trimmed = path.trim_end_matches('\0').trim_end_matches('/');
+    if trimmed.is_empty() {
+        String::from("/")
+    } else {
+        String::from(trimmed)
+    }
+}
+
+fn path_is_under_mount(path: &str, mount_path: &str) -> bool {
+    if mount_path == "/" {
+        return true;
+    }
+    path == mount_path
+        || path
+            .strip_prefix(mount_path)
+            .map(|suffix| suffix.starts_with('/'))
+            .unwrap_or(false)
+}
+
+pub fn vfs_set_readonly_mount(path: &str, readonly: bool) {
+    let normalized = normalize_mount_path(path);
+    let mut paths = READONLY_MOUNT_PATHS.exclusive_access();
+    if readonly {
+        if !paths.iter().any(|p| p == &normalized) {
+            paths.push(normalized);
+        }
+    } else {
+        paths.retain(|p| p != &normalized);
+    }
+}
+
+pub fn vfs_path_is_readonly(path: &str) -> bool {
+    let normalized = normalize_mount_path(path);
+    READONLY_MOUNT_PATHS
+        .exclusive_access()
+        .iter()
+        .any(|mount_path| path_is_under_mount(&normalized, mount_path))
+}
+
+pub fn vfs_dentry_is_readonly(dentry: &Arc<Dentry>) -> bool {
+    vfs_path_is_readonly(&dentry.path)
+}
+
+pub fn vfs_set_tmpfs_mount(path: &str, limit: Option<u64>) {
+    let normalized = normalize_mount_path(path);
+    let mut mounts = TMPFS_MOUNTS.exclusive_access();
+    if let Some(mount) = mounts.iter_mut().find(|mount| mount.path == normalized) {
+        mount.limit = limit;
+        mount.used = 0;
+        mount.files.clear();
+        return;
+    }
+    mounts.push(TmpfsMount {
+        path: normalized,
+        limit,
+        used: 0,
+        files: BTreeMap::new(),
+    });
+}
+
+pub fn vfs_clear_tmpfs_mount(path: &str) {
+    let normalized = normalize_mount_path(path);
+    TMPFS_MOUNTS
+        .exclusive_access()
+        .retain(|mount| mount.path != normalized);
+}
+
+pub fn vfs_tmpfs_can_resize(path: &str, file_key: &str, old_size: u64, new_size: u64) -> bool {
+    let normalized = normalize_mount_path(path);
+    let mut mounts = TMPFS_MOUNTS.exclusive_access();
+    let Some(mount) = mounts
+        .iter_mut()
+        .filter(|mount| path_is_under_mount(&normalized, &mount.path))
+        .max_by_key(|mount| mount.path.len())
+    else {
+        return true;
+    };
+
+    if !mount.files.contains_key(file_key) {
+        mount.used = mount.used.saturating_add(old_size);
+        mount.files.insert(String::from(file_key), old_size);
+    }
+
+    let current = mount.files.get(file_key).copied().unwrap_or(old_size);
+    if new_size <= current {
+        return true;
+    }
+    let delta = new_size - current;
+    mount
+        .limit
+        .map(|limit| mount.used.saturating_add(delta) <= limit)
+        .unwrap_or(true)
+}
+
+pub fn vfs_tmpfs_commit_resize(path: &str, file_key: &str, old_size: u64, new_size: u64) {
+    let normalized = normalize_mount_path(path);
+    let mut mounts = TMPFS_MOUNTS.exclusive_access();
+    let Some(mount) = mounts
+        .iter_mut()
+        .filter(|mount| path_is_under_mount(&normalized, &mount.path))
+        .max_by_key(|mount| mount.path.len())
+    else {
+        return;
+    };
+
+    let current = mount.files.get(file_key).copied().unwrap_or(old_size);
+    if new_size >= current {
+        mount.used = mount.used.saturating_add(new_size - current);
+    } else {
+        mount.used = mount.used.saturating_sub(current - new_size);
+    }
+    mount.files.insert(String::from(file_key), new_size);
 }
 
 fn lookup_mount(dentry: &Arc<Dentry>) -> Option<Arc<Dentry>> {

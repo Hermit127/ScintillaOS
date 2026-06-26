@@ -327,6 +327,11 @@ pub fn sys_mount(source: &str, target: &str, fstype: &str, flags: usize, data: &
     let src = alloc::format!("{}\0", source);
     let tgt = alloc::format!("{}\0", target);
     let fst = alloc::format!("{}\0", fstype);
+    let data_ptr = if data.is_empty() {
+        0
+    } else {
+        data.as_ptr() as usize
+    };
     syscall(
         SYSCALL_MOUNT,
         [
@@ -334,7 +339,7 @@ pub fn sys_mount(source: &str, target: &str, fstype: &str, flags: usize, data: &
             tgt.as_ptr() as usize,
             fst.as_ptr() as usize,
             flags,
-            data.as_ptr() as usize,
+            data_ptr,
             0,
         ],
     )

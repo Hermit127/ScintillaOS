@@ -1,6 +1,6 @@
 use polyhal::debug_console::DebugConsole;
 
-use super::{File, Kstat, S_IFCHR, S_IFSOCK};
+use super::{File, Kstat, S_IFBLK, S_IFCHR, S_IFSOCK};
 use crate::task::{current_task, suspend_current_and_run_next};
 use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
@@ -185,6 +185,46 @@ impl File for DevZero {
     }
     fn stat(&self) -> Kstat {
         Kstat::new(S_IFCHR)
+    }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+pub struct DevBlock {
+    index: usize,
+}
+
+impl DevBlock {
+    pub fn new(index: usize) -> Self {
+        Self { index }
+    }
+
+    pub fn capacity_bytes(&self) -> u64 {
+        crate::drivers::block::get_block_device(self.index)
+            .and_then(|dev| dev.capacity_bytes())
+            .unwrap_or(512 * 1024 * 1024)
+    }
+}
+
+impl File for DevBlock {
+    fn readable(&self) -> bool {
+        true
+    }
+    fn writable(&self) -> bool {
+        true
+    }
+    fn read(&self, _buf: &mut [u8]) -> isize {
+        -22
+    }
+    fn write(&self, _buf: &mut [u8]) -> isize {
+        -22
+    }
+    fn stat(&self) -> Kstat {
+        let mut st = Kstat::new(S_IFBLK | 0o660);
+        st.st_rdev = 0xfe00 + self.index as u64;
+        st.st_size = self.capacity_bytes() as i64;
+        st
     }
     fn as_any(&self) -> &dyn core::any::Any {
         self

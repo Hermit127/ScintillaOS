@@ -63,6 +63,14 @@ fn sync_shared_vm_after_page_fault(
     );
 }
 
+fn exit_current_on_user_fault(signal: i32) -> ! {
+    let exit_code = -signal;
+    if let Some(task) = current_task() {
+        force_exit_task_group(&task, exit_code);
+    }
+    exit_current_and_run_next(exit_code);
+}
+
 /// kernel interrupt
 #[polyhal::arch_interrupt]
 fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
@@ -97,7 +105,7 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             let fault_result = inner.memory_set.handle_page_fault(vaddr, true);
             if fault_result.is_none() {
                 drop(inner);
-                current_add_signal(SignalFlags::SIGSEGV);
+                exit_current_on_user_fault(11);
             } else {
                 let should_sync =
                     fault_result == Some(crate::mm::PageFaultResult::SharedMetadataChanged);
@@ -124,7 +132,7 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             let fault_result = inner.memory_set.handle_page_fault(vaddr, false);
             if fault_result.is_none() {
                 drop(inner);
-                current_add_signal(SignalFlags::SIGSEGV);
+                exit_current_on_user_fault(11);
             } else {
                 let should_sync =
                     fault_result == Some(crate::mm::PageFaultResult::SharedMetadataChanged);
@@ -141,7 +149,7 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             let fault_result = inner.memory_set.handle_page_fault(vaddr, false);
             if fault_result.is_none() {
                 drop(inner);
-                current_add_signal(SignalFlags::SIGSEGV);
+                exit_current_on_user_fault(11);
             } else {
                 let should_sync =
                     fault_result == Some(crate::mm::PageFaultResult::SharedMetadataChanged);
