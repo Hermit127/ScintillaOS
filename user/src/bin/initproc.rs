@@ -39,79 +39,36 @@ const EMBEDDED_BASIC_GLIBC: &str = "__embedded_basic_glibc__";
 const EMBEDDED_LTP: &str = "__embedded_ltp__";
 const TEST_TIMEOUT_SECS: &str = "1800";
 const RUN_IPERF_SCRIPTS: bool = false;
-#[cfg(not(target_arch = "loongarch64"))]
+const RUN_NETPERF_SCRIPTS: bool = false;
 const LTP_SUBSET_CASES: &str = concat!(
-    "close01 close02 open01 open02 read01 read02 write01 write02 ",
-    "lseek01 lseek02 fstat01 fstat02 fstat03 ",
-    "dup01 dup02 dup201 dup202 pipe01 pipe02 ",
-    "brk01 brk02 mmap01 mmap02 munmap01 munmap02 ",
-    "fork01 fork02 fork03 exit_group01 wait01 wait02 ",
-    "getpid01 getpid02 getcwd01 getcwd02 chdir04 ",
-    "times01 uname01 uname02 ",
-    "gettimeofday01 gettimeofday02 umask01 mkdirat01 ",
-    "mprotect01 mprotect02 ",
-    "fcntl01 fcntl02 fcntl03 fcntl04 fcntl05 fcntl07 fcntl08 access01 ",
-    "chdir01 fchdir01 fchdir02 nanosleep01 nanosleep02 nanosleep04 ",
-    "kill02 kill03 mkdir02 mkdir03 mkdir04 mkdir05 mkdirat02 ",
-    "rename01 rename03 rename04 rename05 unlink05 unlink07 unlink08 unlink09 unlinkat01 ",
-    "statfs01 statfs02 statfs03 fstatfs01 fstatfs02 ",
-    "getuid01 getuid03 geteuid01 geteuid02 getgid01 getgid03 getegid01 getegid02 ",
-    "getresuid01 getresuid02 getresuid03 getresgid01 getresgid02 getresgid03 ",
-    "getgroups01 getgroups03 setgroups01 setgroups02 setgroups04 ",
-    "setuid01 setuid03 setgid01 setgid02 setgid03 setegid01 setegid02 ",
-    "setreuid01 setreuid02 setreuid03 setreuid04 setreuid05 setreuid06 setreuid07 ",
-    "setregid01 setregid02 setregid03 setregid04 ",
-    "setresuid01 setresuid02 setresuid03 setresuid04 setresuid05 ",
+    "access03 access04 brk01 brk02 chdir04 chmod01 chmod03 chmod05 ",
+    "clock_getres01 clock_gettime01 clock_gettime02 close01 close02 close_range02 creat08 ",
+    "dup01 dup02 dup201 dup202 exit_group01 faccessat02 faccessat202 ",
+    "fallocate01 fallocate02 fallocate03 fchdir01 fchdir02 ",
+    "fchmod01 fchmod02 fchmod03 fchmod04 fchmod05 ",
+    "fcntl01 fcntl02 fcntl03 fcntl04 fcntl05 fcntl08 ",
+    "fdatasync01 fdatasync02 flock01 flock02 fork01 fork03 ",
+    "fstat02 fstat03 fstatfs02 fsync02 fsync03 ftruncate01 ftruncate03 ",
+    "getcwd01 getcwd02 getegid01 getegid02 geteuid01 geteuid02 ",
+    "getgid01 getgid03 getgroups01 getgroups03 getpgid01 getpgid02 getpgrp01 ",
+    "getpid01 getpid02 getppid01 getppid02 ",
+    "getrandom01 getrandom02 getrandom03 getrandom04 ",
+    "getresgid01 getresgid02 getresgid03 getresuid01 getresuid02 getresuid03 ",
+    "getrlimit01 getrlimit02 getrlimit03 getrusage01 getrusage02 getrusage04 ",
+    "getsid01 getsid02 gettid01 gettid02 gettimeofday01 gettimeofday02 getuid01 getuid03 ",
+    "kill02 kill03 lseek01 lseek02 mkdir02 mkdir04 mkdir05 mkdirat01 ",
+    "mmap01 mmap02 mprotect01 nanosleep01 nanosleep02 nanosleep04 ",
+    "open01 open02 open10 pipe01 pipe02 ",
+    "pread01 pread02 pwrite01 pwrite02 read01 read02 readahead01 readlink01 ",
+    "readv01 readv02 sched_yield01 ",
+    "setegid01 setegid02 setgid01 setgid03 setgroups01 setgroups02 setgroups04 ",
+    "setpgid01 setpgid02 setregid01 setregid02 setregid03 setregid04 ",
     "setresgid01 setresgid02 setresgid03 setresgid04 ",
-    "getppid01 getppid02 gettid01 gettid02 getrandom01 getrandom02 getrandom03 getrandom04 ",
-    "clock_gettime01 clock_gettime02 clock_gettime03 clock_gettime04 clock_getres01 sched_yield01 ",
-    "getrusage01 getrusage02 getrusage03 getrusage04 getrlimit01 getrlimit02 getrlimit03 ",
-    "sysinfo01 sysinfo02 getpgrp01 getsid01 getsid02 setsid01 setpgid01 setpgid02 getpgid01 getpgid02 ",
-    "creat08 open10 openat01 openat02 openat03 openat04 faccessat01 faccessat02 faccessat201 faccessat202 ",
-    "access02 access03 access04 readv01 readv02 writev01 writev02 pread01 pread02 pwrite01 pwrite02 ",
-    "fsync01 fsync02 fsync03 fsync04 fdatasync01 fdatasync02 sync01 syncfs01 ",
-    "ftruncate01 ftruncate03 ftruncate04 fchmod01 fchmod02 fchmod03 fchmod04 fchmod05 ",
-    "chmod01 chmod03 chmod05 linkat01 linkat02 symlink01 symlink02 symlinkat01 readlink01 readlinkat01 ",
-    "flock01 flock02 flock03 flock04 flock06 readahead01 readahead02 ",
-    "fallocate01 fallocate02 fallocate03 fallocate04 fallocate05 fallocate06 close_range01 close_range02 ",
-    "copy_file_range01 copy_file_range02"
-);
-#[cfg(target_arch = "loongarch64")]
-const LTP_SUBSET_CASES: &str = concat!(
-    "close01 close02 open01 open02 read01 read02 write01 write02 ",
-    "lseek01 lseek02 fstat01 fstat02 fstat03 ",
-    "dup01 dup02 dup201 dup202 pipe01 pipe02 ",
-    "brk01 brk02 mmap01 mmap02 ",
-    "fork01 fork02 fork03 exit_group01 wait01 wait02 ",
-    "getpid01 getpid02 getcwd01 getcwd02 chdir04 ",
-    "times01 uname01 uname02 ",
-    "gettimeofday01 gettimeofday02 umask01 mkdirat01 ",
-    "mprotect01 mprotect02 ",
-    "fcntl01 fcntl02 fcntl03 fcntl04 fcntl05 fcntl07 fcntl08 access01 ",
-    "chdir01 fchdir01 fchdir02 nanosleep01 nanosleep02 nanosleep04 ",
-    "kill02 kill03 mkdir02 mkdir03 mkdir04 mkdir05 mkdirat02 ",
-    "rename01 rename03 rename04 rename05 unlink05 unlink07 unlink08 unlink09 unlinkat01 ",
-    "statfs01 statfs02 statfs03 fstatfs01 fstatfs02 ",
-    "getuid01 getuid03 geteuid01 geteuid02 getgid01 getgid03 getegid01 getegid02 ",
-    "getresuid01 getresuid02 getresuid03 getresgid01 getresgid02 getresgid03 ",
-    "getgroups01 getgroups03 setgroups01 setgroups02 setgroups04 ",
-    "setuid01 setuid03 setgid01 setgid02 setgid03 setegid01 setegid02 ",
-    "setreuid01 setreuid02 setreuid03 setreuid04 setreuid05 setreuid06 setreuid07 ",
-    "setregid01 setregid02 setregid03 setregid04 ",
     "setresuid01 setresuid02 setresuid03 setresuid04 setresuid05 ",
-    "setresgid01 setresgid02 setresgid03 setresgid04 ",
-    "getppid01 getppid02 gettid01 gettid02 getrandom01 getrandom02 getrandom03 getrandom04 ",
-    "clock_gettime01 clock_gettime02 clock_gettime03 clock_gettime04 clock_getres01 sched_yield01 ",
-    "getrusage01 getrusage02 getrusage03 getrusage04 getrlimit01 getrlimit02 getrlimit03 ",
-    "sysinfo01 sysinfo02 getpgrp01 getsid01 getsid02 setsid01 setpgid01 setpgid02 getpgid01 getpgid02 ",
-    "creat08 open10 openat01 openat02 openat03 openat04 faccessat01 faccessat02 faccessat201 faccessat202 ",
-    "access02 access03 access04 readv01 readv02 writev01 writev02 pread01 pread02 pwrite01 pwrite02 ",
-    "fsync01 fsync02 fsync03 fsync04 fdatasync01 fdatasync02 sync01 syncfs01 ",
-    "ftruncate01 ftruncate03 ftruncate04 fchmod01 fchmod02 fchmod03 fchmod04 fchmod05 ",
-    "chmod01 chmod03 chmod05 linkat01 linkat02 symlink01 symlink02 symlinkat01 readlink01 readlinkat01 ",
-    "flock01 flock02 flock03 flock04 flock06 readahead01 readahead02 ",
-    "fallocate01 fallocate02 fallocate03 fallocate04 fallocate05 fallocate06 close_range01 close_range02 ",
-    "copy_file_range01 copy_file_range02"
+    "setreuid01 setreuid02 setreuid03 setreuid04 setreuid05 setreuid06 setreuid07 ",
+    "setsid01 setuid01 setuid03 statfs02 statfs03 symlink01 symlink02 ",
+    "sysinfo01 sysinfo02 times01 umask01 uname01 uname02 ",
+    "unlink05 unlink07 unlink08 wait01 wait02 write01 write02 writev01 writev02"
 );
 
 fn symlink_points_to(target: &str, linkpath: &str) -> bool {
@@ -198,6 +155,7 @@ fn setup_runtime_dirs(root: &str) {
     mkdir_path(&(String::from(root) + "/var"));
     mkdir_path(&(String::from(root) + "/var/tmp"));
     mkdir_path(&(String::from(root) + "/mnt"));
+    mkdir_path(&(String::from(root) + "/boot"));
     mkdir_path(&(String::from(root) + "/lib"));
     mkdir_path(&(String::from(root) + "/lib64"));
     ensure_account_files(root);
@@ -221,7 +179,15 @@ fn ensure_account_files(root: &str) {
         b"root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/tmp:/bin/false\n",
     );
     let group = String::from(root) + "/etc/group\0";
-    write_text_file(&group, b"root:x:0:\nnogroup:x:65534:\n");
+    write_text_file(
+        &group,
+        b"root:x:0:\ndaemon:x:1:\nusers:x:100:\nnogroup:x:65534:\n",
+    );
+    let config = String::from(root) + "/boot/config-5.10.0\0";
+    write_text_file(
+        &config,
+        b"# CONFIG_TIME_NS is not set\n# CONFIG_MANDATORY_FILE_LOCKING is not set\n",
+    );
 }
 
 fn setup_lmbench_wrapper_paths(chroot_root: &str, chroot_cwd: &str) {
@@ -495,13 +461,13 @@ fn script_priority(script: &str) -> u8 {
         3
     } else if script.starts_with("iozone_") {
         4
-    } else if script.starts_with("libcbench_") {
-        5
     } else if script.starts_with("libctest_") {
-        6
-    } else if script.starts_with("netperf_") {
-        7
+        5
     } else if is_embedded_ltp(script) {
+        6
+    } else if script.starts_with("libcbench_") {
+        7
+    } else if script.starts_with("netperf_") {
         8
     } else if script.starts_with("iperf_") {
         9
@@ -530,7 +496,8 @@ fn should_run_script_in_dir(dir: &str, script: &str) -> bool {
 }
 
 fn should_skip_script_path(path: &str) -> bool {
-    !RUN_IPERF_SCRIPTS && path.ends_with("/iperf_testcode.sh")
+    (!RUN_IPERF_SCRIPTS && path.ends_with("/iperf_testcode.sh"))
+        || (!RUN_NETPERF_SCRIPTS && path.ends_with("/netperf_testcode.sh"))
 }
 
 fn script_budget(script: &str) -> &'static str {
@@ -913,13 +880,6 @@ fn ltp_case_host_path(dir: &str, case: &str) -> String {
 }
 
 fn should_skip_ltp_case(_dir: &str, _case: &str) -> bool {
-    #[cfg(target_arch = "riscv64")]
-    {
-        let root = _dir.trim_end_matches('\0').trim_end_matches('/');
-        if root.ends_with("/glibc") && _case == "getpid01" {
-            return true;
-        }
-    }
     matches!(_case, "access01" | "chdir01")
 }
 

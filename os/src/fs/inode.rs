@@ -397,6 +397,7 @@ bitflags! {
         const TRUNC = 0x200;
         const APPEND = 0x400;
         const DIRECTORY = 0x10000;
+        const NOFOLLOW = 0x20000;
         const PATH = 0x200000;
     }
 }
@@ -420,6 +421,14 @@ impl OpenFlags {
 
     pub fn directory_requested(&self) -> bool {
         self.contains(Self::DIRECTORY)
+    }
+
+    pub fn nofollow_requested(&self) -> bool {
+        self.contains(Self::NOFOLLOW)
+    }
+
+    pub fn path_requested(&self) -> bool {
+        self.contains(Self::PATH)
     }
 
     pub fn read_write(&self) -> (bool, bool) {
@@ -482,9 +491,18 @@ fn open_file_new(
             return None;
         }
 
-        if let Some(dentry) =
-            vfs_resolve_with_fallback(&start, path).and_then(|d| follow_symlink(&start, d, 0))
-        {
+        let existing = vfs_resolve_with_fallback(&start, path);
+        if let Some(dentry) = existing.and_then(|d| {
+            if flags.nofollow_requested() && d.is_link {
+                if flags.path_requested() {
+                    Some(d)
+                } else {
+                    None
+                }
+            } else {
+                follow_symlink(&start, d, 0)
+            }
+        }) {
             if !dentry.is_dir {
                 if flags.excl_requested() {
                     return None;
@@ -512,7 +530,15 @@ fn open_file_new(
         )));
     }
 
-    let dentry = follow_symlink(&start, vfs_resolve_with_fallback(&start, path)?, 0)?;
+    let raw_dentry = vfs_resolve_with_fallback(&start, path)?;
+    let dentry = if flags.nofollow_requested() && raw_dentry.is_link {
+        if !flags.path_requested() {
+            return None;
+        }
+        raw_dentry
+    } else {
+        follow_symlink(&start, raw_dentry, 0)?
+    };
     if want_dir && !dentry.is_dir {
         return None;
     }
@@ -797,6 +823,7 @@ impl File for OSInode {
                 st.st_blocks = ((st.st_size.max(0) as u64) + 511) / 512;
             }
             if total > 0 {
+                crate::fs::record_block_write_bytes(total);
                 vfs_tmpfs_commit_resize(
                     &self.dentry.path,
                     &self.dentry.fs_path,
@@ -812,6 +839,7 @@ impl File for OSInode {
                     .super_block
                     .write_at(&self.dentry.fs_path, offset, buf);
                 if written > 0 {
+                    crate::fs::record_block_write_bytes(written);
                     let new_size = (offset + written) as i64;
                     self.update_cached_size(new_size);
                     vfs_tmpfs_commit_resize(
@@ -849,6 +877,7 @@ impl File for OSInode {
             .super_block
             .write_at(&self.dentry.fs_path, offset, buf);
         if written > 0 {
+            crate::fs::record_block_write_bytes(written);
             let new_size = (offset + written) as i64;
             self.update_cached_size(new_size);
             vfs_tmpfs_commit_resize(
@@ -921,6 +950,7 @@ impl File for OSInode {
                 st.st_blocks = ((st.st_size.max(0) as u64) + 511) / 512;
             }
             if total > 0 {
+                crate::fs::record_block_write_bytes(total);
                 vfs_tmpfs_commit_resize(
                     &self.dentry.path,
                     &self.dentry.fs_path,
@@ -942,6 +972,7 @@ impl File for OSInode {
                     st.st_blocks = ((st.st_size.max(0) as u64) + 511) / 512;
                 }
                 if rw_count > 0 {
+                    crate::fs::record_block_write_bytes(rw_count);
                     vfs_tmpfs_commit_resize(
                         &self.dentry.path,
                         &self.dentry.fs_path,
@@ -992,6 +1023,7 @@ impl File for OSInode {
             st.st_blocks = ((st.st_size.max(0) as u64) + 511) / 512;
         }
         if rw_count > 0 {
+            crate::fs::record_block_write_bytes(rw_count);
             vfs_tmpfs_commit_resize(
                 &self.dentry.path,
                 &self.dentry.fs_path,
@@ -1034,7 +1066,7 @@ impl File for OSInode {
             let entry = &entries[entry_index];
             let name = entry.get_name();
             let name_bytes = name.as_bytes();
-            if name_bytes.is_empty() {
+            if name_bytes.is_empty() || name.starts_with(".tmpfile.") {
                 entry_index += 1;
                 continue;
             }

@@ -44,8 +44,14 @@ lazy_static! {
         unsafe { UPSafeCell::new(Vec::new()) };
     static ref SHARED_FILE_MAPPINGS: UPSafeCell<Vec<SharedFileMapping>> =
         unsafe { UPSafeCell::new(Vec::new()) };
-    static ref FUTEX_WAITERS: UPSafeCell<BTreeMap<usize, Vec<Arc<TaskControlBlock>>>> =
+    static ref FUTEX_WAITERS: UPSafeCell<BTreeMap<FutexKey, Vec<Arc<TaskControlBlock>>>> =
         unsafe { UPSafeCell::new(BTreeMap::new()) };
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct FutexKey {
+    namespace: usize,
+    addr: usize,
 }
 
 static LAST_USER_TIME_US: AtomicU64 = AtomicU64::new(0);
@@ -548,7 +554,7 @@ fn user_u32(task: &Arc<TaskControlBlock>, addr: usize) -> Option<u32> {
     Some(*translated_ref(token, addr as *const u32))
 }
 
-fn set_user_u32(task: &Arc<TaskControlBlock>, addr: usize, value: u32) -> Option<Vec<usize>> {
+fn set_user_u32(task: &Arc<TaskControlBlock>, addr: usize, value: u32) -> Option<Vec<FutexKey>> {
     if addr == 0 {
         return None;
     }
@@ -562,28 +568,53 @@ fn set_user_u32(task: &Arc<TaskControlBlock>, addr: usize, value: u32) -> Option
         }
         (
             inner.memory_set.token(),
-            futex_keys_for_addr(&inner, addr, true),
+            futex_all_keys_for_addr(&inner, addr),
         )
     };
     *translated_refmut(token, addr as *mut u32) = value;
     Some(keys)
 }
 
-fn futex_keys_for_addr(inner: &TaskControlBlockInner, addr: usize, shared: bool) -> Vec<usize> {
-    let mut keys = Vec::new();
-    keys.push(addr);
-    if shared {
-        if let Some((paddr, _)) = inner.memory_set.translate(polyhal::VirtAddr::from(addr)) {
-            let key = paddr.raw();
-            if key != addr {
-                keys.push(key);
-            }
+fn futex_private_key(inner: &TaskControlBlockInner, addr: usize) -> FutexKey {
+    FutexKey {
+        namespace: inner.memory_set.token().root().raw(),
+        addr,
+    }
+}
+
+fn futex_shared_key(inner: &TaskControlBlockInner, addr: usize) -> FutexKey {
+    if let Some((paddr, _)) = inner.memory_set.translate(polyhal::VirtAddr::from(addr)) {
+        FutexKey {
+            namespace: 0,
+            addr: paddr.raw(),
         }
+    } else {
+        FutexKey { namespace: 0, addr }
+    }
+}
+
+fn futex_keys_for_addr(inner: &TaskControlBlockInner, addr: usize, shared: bool) -> Vec<FutexKey> {
+    let mut keys = Vec::new();
+    if shared {
+        keys.push(futex_shared_key(inner, addr));
+    } else {
+        keys.push(futex_private_key(inner, addr));
     }
     keys
 }
 
-fn wake_futex_keys(keys: &[usize]) {
+fn futex_all_keys_for_addr(inner: &TaskControlBlockInner, addr: usize) -> Vec<FutexKey> {
+    let mut keys = Vec::new();
+    let private = futex_private_key(inner, addr);
+    let shared = futex_shared_key(inner, addr);
+    keys.push(private);
+    if private != shared {
+        keys.push(shared);
+    }
+    keys
+}
+
+fn wake_futex_keys(keys: &[FutexKey]) {
     for &key in keys {
         let _ = futex_wake_key(key, 1);
     }
@@ -610,7 +641,7 @@ fn futex_owner_gone(owner: u32) -> bool {
     }
 }
 
-fn mark_futex_owner_died(uaddr: *mut u32, shared: bool, key: usize) -> bool {
+fn mark_futex_owner_died(uaddr: *mut u32, shared: bool, key: FutexKey) -> bool {
     if !shared {
         return false;
     }
@@ -661,7 +692,7 @@ fn process_robust_node(
     node: usize,
     futex_offset: isize,
     tid: u32,
-    wake_keys: &mut Vec<usize>,
+    wake_keys: &mut Vec<FutexKey>,
 ) {
     let futex_addr = node.wrapping_add_signed(futex_offset);
     let Some(old) = user_u32(task, futex_addr) else {
@@ -736,15 +767,11 @@ fn clear_current_tid_ptr() {
         (
             tid,
             inner.memory_set.token(),
-            futex_keys_for_addr(&inner, tid, true),
+            futex_all_keys_for_addr(&inner, tid),
         )
     };
     *translated_refmut(token, tid as *mut i32) = 0;
-    let mut keys = wake_keys;
-    if !keys.contains(&tid) {
-        keys.push(tid);
-    }
-    wake_futex_keys(&keys);
+    wake_futex_keys(&wake_keys);
 }
 
 pub fn sys_exit(exit_code: i32) -> ! {
@@ -1491,10 +1518,16 @@ pub fn sys_setsid() -> isize {
         return -3;
     };
     let pid = task.getpid();
-    let mut inner = task.inner_exclusive_access();
-    if inner.pgid == pid {
+    let pid_is_process_group = PID2TCB.exclusive_access().values().any(|candidate| {
+        candidate
+            .try_inner_borrow()
+            .map(|inner| inner.pgid == pid)
+            .unwrap_or(false)
+    });
+    if pid_is_process_group {
         return -1;
     }
+    let mut inner = task.inner_exclusive_access();
     inner.sid = pid;
     inner.pgid = pid;
     pid as isize
@@ -3575,10 +3608,7 @@ pub fn sys_futex(
     let key = {
         let task = current_task().unwrap();
         let inner = task.inner_exclusive_access();
-        futex_keys_for_addr(&inner, uaddr as usize, shared)
-            .last()
-            .copied()
-            .unwrap_or(uaddr as usize)
+        futex_keys_for_addr(&inner, uaddr as usize, shared)[0]
     };
     match op {
         0 => {
@@ -3627,10 +3657,7 @@ pub fn sys_futex(
             let new_key = {
                 let task = current_task().unwrap();
                 let inner = task.inner_exclusive_access();
-                futex_keys_for_addr(&inner, uaddr2 as usize, shared)
-                    .last()
-                    .copied()
-                    .unwrap_or(uaddr2 as usize)
+                futex_keys_for_addr(&inner, uaddr2 as usize, shared)[0]
             };
             futex_requeue_key(key, new_key, val, val2)
         }
@@ -3644,10 +3671,7 @@ pub fn sys_futex(
             let new_key = {
                 let task = current_task().unwrap();
                 let inner = task.inner_exclusive_access();
-                futex_keys_for_addr(&inner, uaddr2 as usize, shared)
-                    .last()
-                    .copied()
-                    .unwrap_or(uaddr2 as usize)
+                futex_keys_for_addr(&inner, uaddr2 as usize, shared)[0]
             };
             futex_requeue_key(key, new_key, val, val2)
         }
@@ -3708,7 +3732,7 @@ pub(crate) fn remove_futex_waiter(pid: usize) -> bool {
     removed
 }
 
-fn futex_wake_key(key: usize, count: usize) -> isize {
+fn futex_wake_key(key: FutexKey, count: usize) -> isize {
     if count == 0 {
         return 0;
     }
@@ -3746,8 +3770,8 @@ fn futex_wake_key(key: usize, count: usize) -> isize {
 }
 
 fn futex_requeue_key(
-    old_key: usize,
-    new_key: usize,
+    old_key: FutexKey,
+    new_key: FutexKey,
     wake_count: usize,
     requeue_count: usize,
 ) -> isize {
@@ -3803,7 +3827,7 @@ fn futex_requeue_key(
     woke + moved as isize
 }
 
-fn futex_wait_current(key: usize, deadline_ns: Option<usize>) -> FutexWaitResult {
+fn futex_wait_current(key: FutexKey, deadline_ns: Option<usize>) -> FutexWaitResult {
     if let Some(deadline) = deadline_ns {
         if polyhal::time::Time::now().to_nsec() as usize >= deadline {
             return FutexWaitResult::TimedOut;

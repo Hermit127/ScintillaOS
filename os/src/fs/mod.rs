@@ -6,6 +6,20 @@ pub mod stdio;
 pub mod vfs;
 
 use alloc::string::String;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+static BLOCK_WRITTEN_BYTES: AtomicU64 = AtomicU64::new(0);
+
+pub fn record_block_write_bytes(bytes: usize) {
+    if bytes > 0 {
+        BLOCK_WRITTEN_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+}
+
+pub fn block_written_sectors() -> u64 {
+    let bytes = BLOCK_WRITTEN_BYTES.load(Ordering::Relaxed);
+    ((bytes + 511) / 512).max(1)
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
