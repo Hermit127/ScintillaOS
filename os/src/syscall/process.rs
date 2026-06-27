@@ -293,9 +293,7 @@ fn thread_group_has_peer(owner_pid: usize, tgid: usize) -> bool {
     })
 }
 
-fn shared_vm_sync_snapshot(
-    inner: &TaskControlBlockInner,
-) -> Option<(usize, usize, Vec<MapArea>)> {
+fn shared_vm_sync_snapshot(inner: &TaskControlBlockInner) -> Option<(usize, usize, Vec<MapArea>)> {
     if inner.memory_set.is_shared() {
         Some((
             inner.tgid,
@@ -650,11 +648,10 @@ fn mark_futex_owner_died(uaddr: *mut u32, shared: bool, key: FutexKey) -> bool {
     };
     let token = {
         let inner = task.inner_exclusive_access();
-        if !inner.memory_set.valid_user_buf(
-            uaddr as *const u8,
-            core::mem::size_of::<u32>(),
-            true,
-        ) {
+        if !inner
+            .memory_set
+            .valid_user_buf(uaddr as *const u8, core::mem::size_of::<u32>(), true)
+        {
             return false;
         }
         inner.memory_set.token()
@@ -670,11 +667,10 @@ fn mark_futex_owner_died(uaddr: *mut u32, shared: bool, key: FutexKey) -> bool {
     let new = (word & FUTEX_WAITERS_BIT) | FUTEX_OWNER_DIED;
     let mut wake_keys = {
         let inner = task.inner_exclusive_access();
-        if !inner.memory_set.valid_user_buf(
-            uaddr as *const u8,
-            core::mem::size_of::<u32>(),
-            true,
-        ) {
+        if !inner
+            .memory_set
+            .valid_user_buf(uaddr as *const u8, core::mem::size_of::<u32>(), true)
+        {
             return false;
         }
         futex_keys_for_addr(&inner, uaddr as usize, shared)
@@ -1085,6 +1081,19 @@ pub fn sys_exec(path: *const u8, mut args: *const usize, mut envp: *const usize)
 /// Else if there is a child process but it is still running, return -2.
 pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: usize) -> isize {
     const WNOHANG: usize = 1;
+    const WUNTRACED: usize = 2;
+    const WCONTINUED: usize = 8;
+    const __WNOTHREAD: usize = 0x2000_0000;
+    const __WALL: usize = 0x4000_0000;
+    const __WCLONE: usize = 0x8000_0000;
+    const VALID_WAITPID_OPTIONS: usize =
+        WNOHANG | WUNTRACED | WCONTINUED | __WNOTHREAD | __WALL | __WCLONE;
+    if options & !VALID_WAITPID_OPTIONS != 0 {
+        return -22;
+    }
+    if pid == i32::MIN as isize {
+        return -3;
+    }
     loop {
         let task = current_task().unwrap();
         let zombie = {
@@ -1452,11 +1461,7 @@ pub fn sys_setpgid(pid: usize, pgid: usize) -> isize {
         return -3;
     };
     let current_pid = current.getpid();
-    let target_pid = if pid == 0 {
-        current_pid
-    } else {
-        pid
-    };
+    let target_pid = if pid == 0 { current_pid } else { pid };
     let new_pgid = if pgid == 0 { target_pid } else { pgid };
     let Some(task) = pid2task(target_pid) else {
         return -3;
@@ -1755,10 +1760,10 @@ fn get_map_permission(prot: usize) -> crate::mm::MapPermission {
         perm |= crate::mm::MapPermission::R;
     }
     if prot & PROT_WRITE != 0 {
-        perm |= crate::mm::MapPermission::W;
+        perm |= crate::mm::MapPermission::R | crate::mm::MapPermission::W;
     }
     if prot & PROT_EXEC != 0 {
-        perm |= crate::mm::MapPermission::X;
+        perm |= crate::mm::MapPermission::R | crate::mm::MapPermission::X;
     }
     perm
 }
@@ -1792,7 +1797,9 @@ pub fn sys_mmap(
             let tgid = inner.tgid;
             let may_sync = ret >= 0 && inner.memory_set.is_shared();
             let areas = if may_sync {
-                inner.memory_set.area_metadata_range($frame_start, $frame_end)
+                inner
+                    .memory_set
+                    .area_metadata_range($frame_start, $frame_end)
             } else {
                 Vec::new()
             };
@@ -1833,15 +1840,19 @@ pub fn sys_mmap(
             let Some(frames) = frames_alloc(pages) else {
                 return -12;
             };
-            sync_and_return!(match inner.memory_set.insert_shared_frames(
+            sync_and_return!(
+                match inner.memory_set.insert_shared_frames(
+                    start_addr,
+                    aligned_len,
+                    &frames,
+                    permission,
+                ) {
+                    Some(addr) => addr.raw() as isize,
+                    None => -12,
+                },
                 start_addr,
-                aligned_len,
-                &frames,
-                permission,
-            ) {
-                Some(addr) => addr.raw() as isize,
-                None => -12,
-            }, start_addr, polyhal::VirtAddr::from(start_addr.raw() + aligned_len));
+                polyhal::VirtAddr::from(start_addr.raw() + aligned_len)
+            );
         }
         if prot == PROT_NONE {
             if !inner
@@ -1892,17 +1903,21 @@ pub fn sys_mmap(
                     let Some(frames) = frames_alloc(pages) else {
                         return -12;
                     };
-                    sync_and_return!(match inner.memory_set.insert_shared_file_frames(
+                    sync_and_return!(
+                        match inner.memory_set.insert_shared_file_frames(
+                            start_addr,
+                            aligned_len,
+                            &frames,
+                            permission,
+                            file,
+                            offset,
+                        ) {
+                            Some(addr) => addr.raw() as isize,
+                            None => -12,
+                        },
                         start_addr,
-                        aligned_len,
-                        &frames,
-                        permission,
-                        file,
-                        offset,
-                    ) {
-                        Some(addr) => addr.raw() as isize,
-                        None => -12,
-                    }, start_addr, polyhal::VirtAddr::from(start_addr.raw() + aligned_len));
+                        polyhal::VirtAddr::from(start_addr.raw() + aligned_len)
+                    );
                 }
                 if permission.contains(MapPermission::W) {
                     let pages = aligned_len / crate::config::PAGE_SIZE;
@@ -1911,7 +1926,28 @@ pub fn sys_mmap(
                     else {
                         return -12;
                     };
-                    sync_and_return!(match inner.memory_set.insert_shared_file_frames(
+                    sync_and_return!(
+                        match inner.memory_set.insert_shared_file_frames(
+                            start_addr,
+                            aligned_len,
+                            &frames,
+                            permission,
+                            file,
+                            offset,
+                        ) {
+                            Some(addr) => addr.raw() as isize,
+                            None => -12,
+                        },
+                        start_addr,
+                        polyhal::VirtAddr::from(start_addr.raw() + aligned_len)
+                    );
+                }
+                let Some(frames) = shared_file_mapping_frames(file.clone(), offset, aligned_len)
+                else {
+                    return -12;
+                };
+                sync_and_return!(
+                    match inner.memory_set.insert_shared_file_frames(
                         start_addr,
                         aligned_len,
                         &frames,
@@ -1921,23 +1957,10 @@ pub fn sys_mmap(
                     ) {
                         Some(addr) => addr.raw() as isize,
                         None => -12,
-                    }, start_addr, polyhal::VirtAddr::from(start_addr.raw() + aligned_len));
-                }
-                let Some(frames) = shared_file_mapping_frames(file.clone(), offset, aligned_len)
-                else {
-                    return -12;
-                };
-                sync_and_return!(match inner.memory_set.insert_shared_file_frames(
+                    },
                     start_addr,
-                    aligned_len,
-                    &frames,
-                    permission,
-                    file,
-                    offset,
-                ) {
-                    Some(addr) => addr.raw() as isize,
-                    None => -12,
-                }, start_addr, polyhal::VirtAddr::from(start_addr.raw() + aligned_len));
+                    polyhal::VirtAddr::from(start_addr.raw() + aligned_len)
+                );
             }
             let ok = inner
                 .memory_set
@@ -2147,6 +2170,36 @@ pub fn sys_uname(uts_ptr: usize) -> isize {
     0
 }
 
+pub fn sys_getcpu(cpu_ptr: *mut u32, node_ptr: *mut u32, _cache: usize) -> isize {
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+    if !cpu_ptr.is_null()
+        && !inner
+            .memory_set
+            .valid_user_buf(cpu_ptr as *const u8, core::mem::size_of::<u32>(), true)
+    {
+        return -14;
+    }
+    if !node_ptr.is_null()
+        && !inner.memory_set.valid_user_buf(
+            node_ptr as *const u8,
+            core::mem::size_of::<u32>(),
+            true,
+        )
+    {
+        return -14;
+    }
+    let token = inner.get_user_token();
+    drop(inner);
+    if !cpu_ptr.is_null() {
+        *translated_refmut(token, cpu_ptr) = 0;
+    }
+    if !node_ptr.is_null() {
+        *translated_refmut(token, node_ptr) = 0;
+    }
+    0
+}
+
 pub fn sys_syslog(action: usize, buf: *mut u8, len: usize) -> isize {
     match action {
         0 | 1 => 0, // open/close log
@@ -2229,10 +2282,8 @@ pub fn sys_nanosleep(req_ptr: usize, rem_ptr: usize) -> isize {
             if !pending.is_empty() {
                 if rem_ptr != 0 {
                     let rem_ns = wakeup_time.saturating_sub(now) as usize;
-                    let rem = crate::mm::translated_refmut(
-                        token,
-                        rem_ptr as *mut crate::task::TimeSpec,
-                    );
+                    let rem =
+                        crate::mm::translated_refmut(token, rem_ptr as *mut crate::task::TimeSpec);
                     rem.tv_sec = rem_ns / 1_000_000_000;
                     rem.tv_nsec = rem_ns % 1_000_000_000;
                 }
@@ -2360,7 +2411,7 @@ pub fn sys_umask(mask: u32) -> isize {
         .map(|t| {
             let mut inner = t.inner_exclusive_access();
             let old = inner.umask;
-            inner.umask = mask;
+            inner.umask = mask & 0o777;
             old as isize
         })
         .unwrap_or(-1)
@@ -2590,49 +2641,137 @@ pub fn sys_mincore(start: usize, len: usize, vec: *mut u8) -> isize {
     if start % crate::config::PAGE_SIZE != 0 || len == 0 {
         return -22;
     }
-    let npages = (len + crate::config::PAGE_SIZE - 1) / crate::config::PAGE_SIZE;
+    let Some(npages) = len
+        .checked_add(crate::config::PAGE_SIZE - 1)
+        .map(|len| len / crate::config::PAGE_SIZE)
+    else {
+        return -12;
+    };
     let task = current_task().unwrap();
     let inner = task.inner_exclusive_access();
-    // Validate vec pointer
+    if !inner.memory_set.user_range_mapped(start, len) {
+        return -12;
+    }
     if !inner.memory_set.valid_user_buf(vec, npages, true) {
         return -14;
     }
-    // Check that the address range is mapped
-    let mut vpn = start;
-    let end = start + len;
-    if end < start {
-        return -22;
-    }
-    while vpn < end {
+
+    let mut residency = Vec::new();
+    residency.resize(npages, 0u8);
+    let mut page = start;
+    for bit in residency.iter_mut() {
         if inner
             .memory_set
-            .translate(polyhal::VirtAddr::from(vpn))
-            .is_none()
+            .translate(polyhal::VirtAddr::from(page))
+            .is_some()
         {
-            return -12;
+            *bit = 1;
         }
-        vpn += crate::config::PAGE_SIZE;
+        page += crate::config::PAGE_SIZE;
     }
     drop(inner);
     let token = current_user_token();
     let buf = crate::mm::translated_byte_buffer(token, vec, npages);
-    for b in buf.iter_mut() {
-        *b = 1;
+    for (dst, src) in buf.iter_mut().zip(residency.iter()) {
+        *dst = *src;
     }
     0
 }
 
 // ---- mlock/mlock2/mlockall/munlock/munlockall (228-231) ----
 
-pub fn sys_mlock(_start: usize, _len: usize) -> isize {
+fn page_range_for_lock(start: usize, len: usize) -> Result<(usize, usize, usize), isize> {
+    let Some(last) = start.checked_add(len.saturating_sub(1)) else {
+        return Err(-12);
+    };
+    let page_start = start & !(crate::config::PAGE_SIZE - 1);
+    let Some(page_end) =
+        (last & !(crate::config::PAGE_SIZE - 1)).checked_add(crate::config::PAGE_SIZE)
+    else {
+        return Err(-12);
+    };
+    let Some(rounded_len) = page_end.checked_sub(page_start) else {
+        return Err(-12);
+    };
+    Ok((page_start, page_end, rounded_len))
+}
+
+fn check_memlock_limit(len: usize) -> isize {
+    let Some(task) = current_task() else {
+        return -1;
+    };
+    let inner = task.inner_exclusive_access();
+    if inner.euid == 0 {
+        return 0;
+    }
+    if inner.rlimit_memlock == 0 {
+        return -1;
+    }
+    if len > inner.rlimit_memlock {
+        return -12;
+    }
     0
 }
 
-pub fn sys_munlock(_start: usize, _len: usize) -> isize {
+pub fn sys_mlock(start: usize, len: usize) -> isize {
+    if len == 0 {
+        return 0;
+    }
+    let Ok((page_start, page_end, rounded_len)) = page_range_for_lock(start, len) else {
+        return -12;
+    };
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+    if !inner.memory_set.user_range_mapped(start, len) {
+        return -12;
+    }
+    drop(inner);
+    let limit = check_memlock_limit(rounded_len);
+    if limit != 0 {
+        return limit;
+    }
+    let mut inner = task.inner_exclusive_access();
+    let mut page = page_start;
+    while page < page_end {
+        let vaddr = polyhal::VirtAddr::from(page);
+        if inner.memory_set.translate(vaddr).is_none()
+            && inner
+                .memory_set
+                .handle_page_fault(vaddr, crate::mm::PageFaultAccess::Read)
+                .is_none()
+        {
+            return -12;
+        }
+        page += crate::config::PAGE_SIZE;
+    }
     0
 }
 
-pub fn sys_mlockall(_flags: usize) -> isize {
+pub fn sys_munlock(start: usize, len: usize) -> isize {
+    if len == 0 {
+        return 0;
+    }
+    if page_range_for_lock(start, len).is_err() {
+        return -12;
+    }
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+    if !inner.memory_set.user_range_mapped(start, len) {
+        return -12;
+    }
+    0
+}
+
+pub fn sys_mlockall(flags: usize) -> isize {
+    const MCL_CURRENT: usize = 1;
+    const MCL_FUTURE: usize = 2;
+    if flags == 0 || flags & !(MCL_CURRENT | MCL_FUTURE) != 0 {
+        return -22;
+    }
+    let limit = check_memlock_limit(usize::MAX);
+    if limit != 0 {
+        return limit;
+    }
     0
 }
 
@@ -2640,13 +2779,37 @@ pub fn sys_munlockall() -> isize {
     0
 }
 
-pub fn sys_mlock2(_start: usize, _len: usize, _flags: usize) -> isize {
+pub fn sys_mlock2(start: usize, len: usize, flags: usize) -> isize {
+    const MLOCK_ONFAULT: usize = 1;
+    if flags & !MLOCK_ONFAULT != 0 {
+        return -22;
+    }
+    if flags == 0 {
+        return sys_mlock(start, len);
+    }
+    if len == 0 {
+        return 0;
+    }
+    let Ok((_, _, rounded_len)) = page_range_for_lock(start, len) else {
+        return -12;
+    };
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+    if !inner.memory_set.user_range_mapped(start, len) {
+        return -12;
+    }
+    drop(inner);
+    let limit = check_memlock_limit(rounded_len);
+    if limit != 0 {
+        return limit;
+    }
     0
 }
 
 // ---- getrlimit/setrlimit (163/164) ----
 
 const RLIMIT_NOFILE: usize = 7;
+const RLIMIT_MEMLOCK: usize = 8;
 const RLIMIT_STACK: usize = 3;
 const RLIMIT_AS: usize = 9;
 const RLIM_NLIMITS: usize = 16;
@@ -2675,12 +2838,19 @@ pub fn sys_getrlimit(resource: usize, rlim_ptr: *mut u8) -> isize {
     }
     let token = inner.get_user_token();
     let rlim = crate::mm::translated_refmut(token, rlim_ptr as *mut RLimit);
-    if resource == RLIMIT_NOFILE {
-        rlim.rlim_cur = inner.rlimit_nofile;
-        rlim.rlim_max = inner.rlimit_nofile_max;
-    } else {
-        rlim.rlim_cur = RLIM_INFINITY;
-        rlim.rlim_max = RLIM_INFINITY;
+    match resource {
+        RLIMIT_NOFILE => {
+            rlim.rlim_cur = inner.rlimit_nofile;
+            rlim.rlim_max = inner.rlimit_nofile_max;
+        }
+        RLIMIT_MEMLOCK => {
+            rlim.rlim_cur = inner.rlimit_memlock;
+            rlim.rlim_max = inner.rlimit_memlock_max;
+        }
+        _ => {
+            rlim.rlim_cur = RLIM_INFINITY;
+            rlim.rlim_max = RLIM_INFINITY;
+        }
     }
     0
 }
@@ -2702,11 +2872,18 @@ pub fn sys_setrlimit(resource: usize, rlim_ptr: *const u8) -> isize {
     }
     let token = inner.get_user_token();
     drop(inner);
-    if resource == RLIMIT_NOFILE {
-        let rlim = translated_ref(token, rlim_ptr as *const RLimit);
-        let mut inner = task.inner_exclusive_access();
-        inner.rlimit_nofile = rlim.rlim_cur.min(1024);
-        inner.rlimit_nofile_max = rlim.rlim_max.min(1024);
+    let rlim = translated_ref(token, rlim_ptr as *const RLimit);
+    let mut inner = task.inner_exclusive_access();
+    match resource {
+        RLIMIT_NOFILE => {
+            inner.rlimit_nofile = rlim.rlim_cur.min(1024);
+            inner.rlimit_nofile_max = rlim.rlim_max.min(1024);
+        }
+        RLIMIT_MEMLOCK => {
+            inner.rlimit_memlock = rlim.rlim_cur;
+            inner.rlimit_memlock_max = rlim.rlim_max;
+        }
+        _ => {}
     }
     0
 }
@@ -2731,20 +2908,16 @@ pub fn sys_prlimit64(
     let caller = current_task().unwrap();
     let caller_inner = caller.inner_exclusive_access();
     if !old_limit.is_null()
-        && !caller_inner.memory_set.valid_user_buf(
-            old_limit,
-            core::mem::size_of::<RLimit>(),
-            true,
-        )
+        && !caller_inner
+            .memory_set
+            .valid_user_buf(old_limit, core::mem::size_of::<RLimit>(), true)
     {
         return -14;
     }
     if !new_limit.is_null()
-        && !caller_inner.memory_set.valid_user_buf(
-            new_limit,
-            core::mem::size_of::<RLimit>(),
-            false,
-        )
+        && !caller_inner
+            .memory_set
+            .valid_user_buf(new_limit, core::mem::size_of::<RLimit>(), false)
     {
         return -14;
     }
@@ -2752,20 +2925,36 @@ pub fn sys_prlimit64(
     drop(caller_inner);
     if !old_limit.is_null() {
         let old = translated_refmut(token, old_limit as *mut RLimit);
-        if resource == RLIMIT_NOFILE {
-            let inner = task.inner_exclusive_access();
-            old.rlim_cur = inner.rlimit_nofile;
-            old.rlim_max = inner.rlimit_nofile_max;
-        } else {
-            old.rlim_cur = RLIM_INFINITY;
-            old.rlim_max = RLIM_INFINITY;
+        let inner = task.inner_exclusive_access();
+        match resource {
+            RLIMIT_NOFILE => {
+                old.rlim_cur = inner.rlimit_nofile;
+                old.rlim_max = inner.rlimit_nofile_max;
+            }
+            RLIMIT_MEMLOCK => {
+                old.rlim_cur = inner.rlimit_memlock;
+                old.rlim_max = inner.rlimit_memlock_max;
+            }
+            _ => {
+                old.rlim_cur = RLIM_INFINITY;
+                old.rlim_max = RLIM_INFINITY;
+            }
         }
     }
-    if !new_limit.is_null() && resource == RLIMIT_NOFILE {
+    if !new_limit.is_null() {
         let new = translated_ref(token, new_limit as *const RLimit);
         let mut inner = task.inner_exclusive_access();
-        inner.rlimit_nofile = new.rlim_cur.min(1024);
-        inner.rlimit_nofile_max = new.rlim_max.min(1024);
+        match resource {
+            RLIMIT_NOFILE => {
+                inner.rlimit_nofile = new.rlim_cur.min(1024);
+                inner.rlimit_nofile_max = new.rlim_max.min(1024);
+            }
+            RLIMIT_MEMLOCK => {
+                inner.rlimit_memlock = new.rlim_cur;
+                inner.rlimit_memlock_max = new.rlim_max;
+            }
+            _ => {}
+        }
     }
     0
 }
@@ -3142,7 +3331,11 @@ pub fn sys_getresuid(ruid: *mut u32, euid: *mut u32, suid: *mut u32) -> isize {
     let inner = task.inner_exclusive_access();
     let word = core::mem::size_of::<u32>();
     for ptr in [ruid, euid, suid] {
-        if ptr.is_null() || !inner.memory_set.valid_user_buf(ptr as *const u8, word, true) {
+        if ptr.is_null()
+            || !inner
+                .memory_set
+                .valid_user_buf(ptr as *const u8, word, true)
+        {
             return -14;
         }
     }
@@ -3158,7 +3351,11 @@ pub fn sys_getresgid(rgid: *mut u32, egid: *mut u32, sgid: *mut u32) -> isize {
     let inner = task.inner_exclusive_access();
     let word = core::mem::size_of::<u32>();
     for ptr in [rgid, egid, sgid] {
-        if ptr.is_null() || !inner.memory_set.valid_user_buf(ptr as *const u8, word, true) {
+        if ptr.is_null()
+            || !inner
+                .memory_set
+                .valid_user_buf(ptr as *const u8, word, true)
+        {
             return -14;
         }
     }
@@ -3341,7 +3538,10 @@ pub fn sys_sched_getaffinity(pid: usize, len: usize, mask: *mut u8) -> isize {
     }
     let task = current_task().unwrap();
     let inner = task.inner_exclusive_access();
-    if !inner.memory_set.valid_user_buf(mask as *const u8, len, true) {
+    if !inner
+        .memory_set
+        .valid_user_buf(mask as *const u8, len, true)
+    {
         return -14;
     }
     let token = inner.get_user_token();
@@ -3361,11 +3561,116 @@ pub fn sys_sched_getaffinity(pid: usize, len: usize, mask: *mut u8) -> isize {
 
 // ---- getpriority/setpriority (140/141) ----
 
-pub fn sys_getpriority(_which: usize, _who: usize) -> isize {
-    20
+fn priority_targets(which: usize, who: usize) -> Result<Vec<Arc<TaskControlBlock>>, isize> {
+    const PRIO_PROCESS: usize = 0;
+    const PRIO_PGRP: usize = 1;
+    const PRIO_USER: usize = 2;
+
+    match which {
+        PRIO_PROCESS => {
+            let pid = if who == 0 {
+                current_task().map(|task| task.getpid()).ok_or(-3isize)?
+            } else {
+                who
+            };
+            pid2task(pid)
+                .map(|task| {
+                    let mut tasks = Vec::new();
+                    tasks.push(task);
+                    tasks
+                })
+                .ok_or(-3)
+        }
+        PRIO_PGRP => {
+            let pgid = if who == 0 {
+                current_task()
+                    .map(|task| task.inner_exclusive_access().pgid)
+                    .ok_or(-3isize)?
+            } else {
+                who
+            };
+            let tasks: Vec<Arc<TaskControlBlock>> = PID2TCB
+                .exclusive_access()
+                .values()
+                .filter(|task| {
+                    task.try_inner_borrow()
+                        .map(|inner| inner.pgid == pgid)
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect();
+            if tasks.is_empty() {
+                Err(-3)
+            } else {
+                Ok(tasks)
+            }
+        }
+        PRIO_USER => {
+            let uid = if who == 0 {
+                current_task()
+                    .map(|task| task.inner_exclusive_access().uid as usize)
+                    .ok_or(-3isize)?
+            } else {
+                who
+            };
+            let tasks: Vec<Arc<TaskControlBlock>> = PID2TCB
+                .exclusive_access()
+                .values()
+                .filter(|task| {
+                    task.try_inner_borrow()
+                        .map(|inner| inner.uid as usize == uid || inner.euid as usize == uid)
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect();
+            if tasks.is_empty() {
+                Err(-3)
+            } else {
+                Ok(tasks)
+            }
+        }
+        _ => Err(-22),
+    }
 }
 
-pub fn sys_setpriority(_which: usize, _who: usize, _prio: isize) -> isize {
+pub fn sys_getpriority(which: usize, who: usize) -> isize {
+    let tasks = match priority_targets(which, who) {
+        Ok(tasks) => tasks,
+        Err(errno) => return errno,
+    };
+    let best = tasks
+        .iter()
+        .filter_map(|task| task.try_inner_borrow().map(|inner| inner.nice))
+        .min()
+        .unwrap_or(0);
+    (20 - best) as isize
+}
+
+pub fn sys_setpriority(which: usize, who: usize, prio: isize) -> isize {
+    let caller = current_task().unwrap();
+    let (caller_uid, caller_euid) = {
+        let inner = caller.inner_exclusive_access();
+        (inner.uid, inner.euid)
+    };
+    let tasks = match priority_targets(which, who) {
+        Ok(tasks) => tasks,
+        Err(errno) => return errno,
+    };
+    let nice = prio.clamp(-20, 19) as i32;
+    for task in &tasks {
+        let inner = task.inner_exclusive_access();
+        if caller_euid != 0 {
+            if caller_euid != inner.euid && caller_uid != inner.euid {
+                return -1;
+            }
+            if nice < inner.nice {
+                return -13;
+            }
+        }
+    }
+    for task in tasks {
+        task.inner_exclusive_access().nice = nice;
+    }
     0
 }
 
@@ -3882,8 +4187,56 @@ fn futex_wait_current(key: FutexKey, deadline_ns: Option<usize>) -> FutexWaitRes
     }
 }
 
-pub fn sys_madvise(_start: usize, _len: usize, _advice: usize) -> isize {
-    0
+pub fn sys_madvise(start: usize, len: usize, advice: usize) -> isize {
+    const MADV_NORMAL: usize = 0;
+    const MADV_RANDOM: usize = 1;
+    const MADV_SEQUENTIAL: usize = 2;
+    const MADV_WILLNEED: usize = 3;
+    const MADV_DONTNEED: usize = 4;
+    const MADV_FREE: usize = 8;
+    const MADV_REMOVE: usize = 9;
+    const MADV_DONTFORK: usize = 10;
+    const MADV_DOFORK: usize = 11;
+    const MADV_MERGEABLE: usize = 12;
+    const MADV_UNMERGEABLE: usize = 13;
+    const MADV_HUGEPAGE: usize = 14;
+    const MADV_NOHUGEPAGE: usize = 15;
+    const MADV_DONTDUMP: usize = 16;
+    const MADV_DODUMP: usize = 17;
+    const MADV_WIPEONFORK: usize = 18;
+    const MADV_KEEPONFORK: usize = 19;
+    const MADV_COLD: usize = 20;
+    const MADV_PAGEOUT: usize = 21;
+
+    if len == 0 {
+        return 0;
+    }
+    if start % crate::config::PAGE_SIZE != 0 {
+        return -22;
+    }
+    let Some(end) = start.checked_add(len.saturating_sub(1)) else {
+        return -22;
+    };
+    if end < start {
+        return -22;
+    }
+
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    if !inner.memory_set.user_range_mapped(start, len) {
+        return -12;
+    }
+
+    match advice {
+        MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED | MADV_DONTFORK
+        | MADV_DOFORK | MADV_HUGEPAGE | MADV_NOHUGEPAGE | MADV_DONTDUMP | MADV_DODUMP
+        | MADV_KEEPONFORK | MADV_COLD | MADV_PAGEOUT => 0,
+        MADV_DONTNEED => inner
+            .memory_set
+            .madvise_private_anonymous_dontneed(polyhal::VirtAddr::from(start), len),
+        MADV_FREE | MADV_REMOVE | MADV_MERGEABLE | MADV_UNMERGEABLE | MADV_WIPEONFORK => -22,
+        _ => -22,
+    }
 }
 
 pub fn sys_set_robust_list(head: usize, len: usize) -> isize {
@@ -3960,7 +4313,7 @@ struct ITimerVal {
 }
 
 pub fn sys_getitimer(which: usize, curr_value_ptr: *mut u8) -> isize {
-    if which != ITIMER_REAL {
+    if which > ITIMER_PROF {
         return -22;
     }
     if curr_value_ptr.is_null() {
@@ -4018,6 +4371,15 @@ pub fn sys_setitimer(which: usize, new_value: *const u8, old_value: *mut u8) -> 
     let now = polyhal::time::Time::now().to_usec() as u64;
 
     if !old_value.is_null() {
+        {
+            let inner = task.inner_exclusive_access();
+            if !inner
+                .memory_set
+                .valid_user_buf(old_value, core::mem::size_of::<ITimerVal>(), true)
+            {
+                return -14;
+            }
+        }
         let mut inner = task.inner_exclusive_access();
         let remaining_usec = if inner.itimer_expire > now {
             inner.itimer_expire - now
@@ -4053,6 +4415,15 @@ pub fn sys_setitimer(which: usize, new_value: *const u8, old_value: *mut u8) -> 
         return 0;
     }
 
+    {
+        let inner = task.inner_exclusive_access();
+        if !inner
+            .memory_set
+            .valid_user_buf(new_value, core::mem::size_of::<ITimerVal>(), false)
+        {
+            return -14;
+        }
+    }
     let new_itv: &ITimerVal = translated_ref(token, new_value as *const ITimerVal);
     if new_itv.it_value.sec < 0
         || new_itv.it_value.usec < 0
@@ -4224,16 +4595,13 @@ pub fn sys_writev(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
         return -9;
     }
     drop(inner);
-    let mut total = 0isize;
+    let mut iovecs = Vec::new();
     let mut requested = 0usize;
     for i in 0..iovcnt {
         let iov_ptr = unsafe { iov.add(i * core::mem::size_of::<IoVec>()) };
         let iov: &IoVec = translated_ref(token, iov_ptr as *const IoVec);
         if iov.iov_len == 0 {
             continue;
-        }
-        if iov.iov_len > isize::MAX as usize {
-            return -22;
         }
         requested = match requested.checked_add(iov.iov_len) {
             Some(sum) if sum <= isize::MAX as usize => sum,
@@ -4246,15 +4614,19 @@ pub fn sys_writev(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
             .valid_user_buf(iov.iov_base as *const u8, iov.iov_len, false);
         drop(inner);
         if !ok {
-            return if total > 0 { total } else { -14 };
+            return -14;
         }
-        let buf = crate::mm::translated_byte_buffer(token, iov.iov_base as *mut u8, iov.iov_len);
+        iovecs.push((iov.iov_base, iov.iov_len));
+    }
+    let mut total = 0isize;
+    for (base, len) in iovecs {
+        let buf = crate::mm::translated_byte_buffer(token, base as *mut u8, len);
         let n = file.write(buf);
         if n < 0 {
             return if total > 0 { total } else { n };
         }
         total += n as isize;
-        if (n as usize) < iov.iov_len {
+        if (n as usize) < len {
             break;
         }
     }
@@ -4264,13 +4636,22 @@ pub fn sys_writev(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
 pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset_ptr: *mut usize, count: usize) -> isize {
     let token = current_user_token();
     let task = current_task().unwrap();
-    let mut inner = task.inner_exclusive_access();
+    let inner = task.inner_exclusive_access();
 
     if in_fd >= inner.fd_table.len() || inner.fd_table[in_fd].is_none() {
         return -9;
     }
     if out_fd >= inner.fd_table.len() || inner.fd_table[out_fd].is_none() {
         return -9;
+    }
+    if !offset_ptr.is_null()
+        && !inner.memory_set.valid_user_buf(
+            offset_ptr as *const u8,
+            core::mem::size_of::<usize>(),
+            true,
+        )
+    {
+        return -14;
     }
 
     let in_file = inner.fd_table[in_fd].as_ref().unwrap().clone();
@@ -4280,11 +4661,14 @@ pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset_ptr: *mut usize, count: 
         return -9;
     }
 
-    let saved_in_off = if !offset_ptr.is_null() {
+    let offset_state = if !offset_ptr.is_null() {
         let off = in_file.get_offset();
         let user_off = *translated_ref(token, offset_ptr);
+        if user_off > isize::MAX as usize {
+            return -22;
+        }
         in_file.seek(user_off);
-        Some(off)
+        Some((off, user_off))
     } else {
         None
     };
@@ -4309,8 +4693,9 @@ pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset_ptr: *mut usize, count: 
         }
     }
 
-    if let Some(off) = saved_in_off {
-        in_file.seek(off);
+    if let Some((saved_off, user_off)) = offset_state {
+        *translated_refmut(token, offset_ptr) = user_off.saturating_add(total.max(0) as usize);
+        in_file.seek(saved_off);
     }
 
     total

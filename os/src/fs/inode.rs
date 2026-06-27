@@ -2,7 +2,7 @@ use super::vfs::{
     dentry_parent, vfs_create, vfs_resolve_parent_and_name, vfs_resolve_path,
     vfs_resolve_with_fallback, vfs_tmpfs_can_resize, vfs_tmpfs_commit_resize, Dentry, DirEntry,
 };
-use super::{File, Kstat, S_IFDIR, S_IFIFO, S_IFREG};
+use super::{File, Kstat, S_IFDIR, S_IFLNK, S_IFREG};
 use crate::sync::UPSafeCell;
 use alloc::collections::BTreeMap;
 use alloc::ffi::CString;
@@ -33,7 +33,7 @@ lazy_static! {
 }
 
 pub fn record_special_path_mode(fs_path: &str, mode_type: u32) {
-    if mode_type == S_IFIFO {
+    if mode_type != 0 && mode_type != S_IFREG {
         PATH_SPECIAL_MODE_CACHE
             .exclusive_access()
             .insert(String::from(fs_path), mode_type);
@@ -255,6 +255,8 @@ impl OSInode {
             Some(info) => {
                 let file_type = if self.dentry.is_dir || info.is_dir {
                     S_IFDIR
+                } else if self.dentry.is_link || info.is_link {
+                    S_IFLNK
                 } else if let Some(mode_type) = path_special_mode(&self.dentry.fs_path) {
                     mode_type
                 } else {
@@ -337,6 +339,16 @@ impl OSInode {
         }
     }
 
+    pub fn update_cached_owner(&self, uid: u32, gid: u32, mode: u32, ctime: i64) {
+        let mut inner = self.inner.exclusive_access();
+        if let Some(ref mut st) = inner.cached_stat {
+            st.st_uid = uid;
+            st.st_gid = gid;
+            st.st_mode = mode;
+            st.st_ctime_sec = ctime;
+        }
+    }
+
     pub fn update_cached_times(&self, atime: Option<i64>, mtime: Option<i64>, ctime: Option<i64>) {
         let mut inner = self.inner.exclusive_access();
         if let Some(ref mut st) = inner.cached_stat {
@@ -350,6 +362,24 @@ impl OSInode {
                 st.st_ctime_sec = ctime;
             }
         }
+    }
+
+    fn now_sec() -> i64 {
+        (polyhal::time::Time::now().to_msec() / 1000) as i64
+    }
+
+    fn update_cached_data_time(inner: &mut OSInodeInner, now_sec: i64) {
+        if let Some(ref mut st) = inner.cached_stat {
+            st.st_mtime_sec = now_sec;
+            st.st_ctime_sec = now_sec;
+        }
+    }
+
+    fn update_path_data_time(&self, now_sec: i64) {
+        let now = now_sec.clamp(0, u32::MAX as i64) as u32;
+        self.dentry.super_block.set_mtime(&self.dentry.fs_path, now);
+        self.dentry.super_block.set_ctime(&self.dentry.fs_path, now);
+        update_path_cached_times(&self.dentry.fs_path, None, Some(now_sec), Some(now_sec));
     }
 
     pub fn align_up(value: usize, align: usize) -> usize {
@@ -823,6 +853,9 @@ impl File for OSInode {
                 st.st_blocks = ((st.st_size.max(0) as u64) + 511) / 512;
             }
             if total > 0 {
+                let now_sec = Self::now_sec();
+                Self::update_cached_data_time(&mut inner, now_sec);
+                self.update_path_data_time(now_sec);
                 crate::fs::record_block_write_bytes(total);
                 vfs_tmpfs_commit_resize(
                     &self.dentry.path,
@@ -842,6 +875,9 @@ impl File for OSInode {
                     crate::fs::record_block_write_bytes(written);
                     let new_size = (offset + written) as i64;
                     self.update_cached_size(new_size);
+                    let now_sec = Self::now_sec();
+                    self.update_cached_times(None, Some(now_sec), Some(now_sec));
+                    self.update_path_data_time(now_sec);
                     vfs_tmpfs_commit_resize(
                         &self.dentry.path,
                         &self.dentry.fs_path,
@@ -880,6 +916,9 @@ impl File for OSInode {
             crate::fs::record_block_write_bytes(written);
             let new_size = (offset + written) as i64;
             self.update_cached_size(new_size);
+            let now_sec = Self::now_sec();
+            self.update_cached_times(None, Some(now_sec), Some(now_sec));
+            self.update_path_data_time(now_sec);
             vfs_tmpfs_commit_resize(
                 &self.dentry.path,
                 &self.dentry.fs_path,
@@ -950,6 +989,9 @@ impl File for OSInode {
                 st.st_blocks = ((st.st_size.max(0) as u64) + 511) / 512;
             }
             if total > 0 {
+                let now_sec = Self::now_sec();
+                Self::update_cached_data_time(&mut inner, now_sec);
+                self.update_path_data_time(now_sec);
                 crate::fs::record_block_write_bytes(total);
                 vfs_tmpfs_commit_resize(
                     &self.dentry.path,
@@ -972,6 +1014,9 @@ impl File for OSInode {
                     st.st_blocks = ((st.st_size.max(0) as u64) + 511) / 512;
                 }
                 if rw_count > 0 {
+                    let now_sec = Self::now_sec();
+                    Self::update_cached_data_time(&mut inner, now_sec);
+                    self.update_path_data_time(now_sec);
                     crate::fs::record_block_write_bytes(rw_count);
                     vfs_tmpfs_commit_resize(
                         &self.dentry.path,
@@ -1023,6 +1068,9 @@ impl File for OSInode {
             st.st_blocks = ((st.st_size.max(0) as u64) + 511) / 512;
         }
         if rw_count > 0 {
+            let now_sec = Self::now_sec();
+            Self::update_cached_data_time(&mut inner, now_sec);
+            self.update_path_data_time(now_sec);
             crate::fs::record_block_write_bytes(rw_count);
             vfs_tmpfs_commit_resize(
                 &self.dentry.path,

@@ -5,9 +5,8 @@
 use crate::{
     syscall::syscall,
     task::{
-        check_and_wake_up_tasks, check_itimers, check_signals_error_of_current,
-        current_add_signal, current_task, exit_current_and_run_next, force_exit_task_group,
-        handle_signals,
+        check_and_wake_up_tasks, check_itimers, check_signals_error_of_current, current_add_signal,
+        current_task, exit_current_and_run_next, force_exit_task_group, handle_signals,
         suspend_current_and_run_next, SignalFlags,
     },
 };
@@ -102,7 +101,9 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             let vaddr = polyhal::VirtAddr::from(bad_addr);
             let task = crate::task::current_task().unwrap();
             let mut inner = task.inner_exclusive_access();
-            let fault_result = inner.memory_set.handle_page_fault(vaddr, true);
+            let fault_result = inner
+                .memory_set
+                .handle_page_fault(vaddr, crate::mm::PageFaultAccess::Write);
             if fault_result.is_none() {
                 drop(inner);
                 exit_current_on_user_fault(11);
@@ -129,7 +130,9 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             let vaddr = polyhal::VirtAddr::from(bad_addr);
             let task = crate::task::current_task().unwrap();
             let mut inner = task.inner_exclusive_access();
-            let fault_result = inner.memory_set.handle_page_fault(vaddr, false);
+            let fault_result = inner
+                .memory_set
+                .handle_page_fault(vaddr, crate::mm::PageFaultAccess::Read);
             if fault_result.is_none() {
                 drop(inner);
                 exit_current_on_user_fault(11);
@@ -146,7 +149,9 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             let vaddr = polyhal::VirtAddr::from(bad_addr);
             let task = crate::task::current_task().unwrap();
             let mut inner = task.inner_exclusive_access();
-            let fault_result = inner.memory_set.handle_page_fault(vaddr, false);
+            let fault_result = inner
+                .memory_set
+                .handle_page_fault(vaddr, crate::mm::PageFaultAccess::Execute);
             if fault_result.is_none() {
                 drop(inner);
                 exit_current_on_user_fault(11);

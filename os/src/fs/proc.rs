@@ -532,11 +532,7 @@ impl SysBlockStatFile {
     pub fn new() -> Self {
         let sectors = crate::fs::block_written_sectors();
         let io_ticks = sectors.max(1);
-        let content = alloc::format!(
-            "0 0 0 0 0 0 {} 0 0 {} 0 0 0 0 0 0 0\n",
-            sectors,
-            io_ticks
-        );
+        let content = alloc::format!("0 0 0 0 0 0 {} 0 0 {} 0 0 0 0 0 0 0\n", sectors, io_ticks);
         Self {
             offset: unsafe { UPSafeCell::new(0) },
             content,

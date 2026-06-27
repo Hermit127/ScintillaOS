@@ -681,7 +681,8 @@ pub struct Mount {
 
 lazy_static! {
     pub static ref MOUNT_TABLE: UPSafeCell<Vec<Mount>> = unsafe { UPSafeCell::new(Vec::new()) };
-    static ref READONLY_MOUNT_PATHS: UPSafeCell<Vec<String>> = unsafe { UPSafeCell::new(Vec::new()) };
+    static ref READONLY_MOUNT_PATHS: UPSafeCell<Vec<String>> =
+        unsafe { UPSafeCell::new(Vec::new()) };
     static ref TMPFS_MOUNTS: UPSafeCell<Vec<TmpfsMount>> = unsafe { UPSafeCell::new(Vec::new()) };
 }
 

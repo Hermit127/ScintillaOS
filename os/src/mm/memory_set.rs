@@ -46,6 +46,13 @@ pub enum PageFaultResult {
     SharedMetadataChanged,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PageFaultAccess {
+    Read,
+    Write,
+    Execute,
+}
+
 pub fn get_elf_interp(elf_data: &[u8]) -> Option<String> {
     let elf = match xmas_elf::ElfFile::new(elf_data) {
         Ok(e) => e,
@@ -618,7 +625,7 @@ impl MemorySet {
     pub fn handle_page_fault(
         &mut self,
         vaddr: polyhal::VirtAddr,
-        write_fault: bool,
+        access: PageFaultAccess,
     ) -> Option<PageFaultResult> {
         if vaddr.raw() < crate::config::PAGE_SIZE {
             return None;
@@ -632,8 +639,25 @@ impl MemorySet {
             Some(a) => a,
             None => return None,
         };
-        if write_fault && !area.map_perm.contains(MapPermission::W) {
-            return None;
+        let write_fault = access == PageFaultAccess::Write;
+        match access {
+            PageFaultAccess::Read => {
+                if !area.map_perm.contains(MapPermission::R)
+                    && !area.map_perm.contains(MapPermission::W)
+                {
+                    return None;
+                }
+            }
+            PageFaultAccess::Write => {
+                if !area.map_perm.contains(MapPermission::W) {
+                    return None;
+                }
+            }
+            PageFaultAccess::Execute => {
+                if !area.map_perm.contains(MapPermission::X) {
+                    return None;
+                }
+            }
         }
         if self.shared_page_table {
             if let Some((paddr, flags)) = self
@@ -888,6 +912,37 @@ impl MemorySet {
         }
         true
     }
+
+    pub fn user_range_mapped(&self, start: usize, len: usize) -> bool {
+        if len == 0 {
+            return true;
+        }
+        let Some(last) = start.checked_add(len.saturating_sub(1)) else {
+            return false;
+        };
+        let mut vpn = start & !(crate::config::PAGE_SIZE - 1);
+        let Some(end) =
+            (last & !(crate::config::PAGE_SIZE - 1)).checked_add(crate::config::PAGE_SIZE)
+        else {
+            return false;
+        };
+        if end < vpn {
+            return false;
+        }
+        while vpn < end {
+            let vaddr = VirtAddr::from(vpn);
+            let Some(area) = self.areas.iter().find(|area| {
+                area.vaddr_range.get_start() <= vaddr && vaddr < area.vaddr_range.get_end()
+            }) else {
+                return false;
+            };
+            if !area.map_perm.contains(MapPermission::U) {
+                return false;
+            }
+            vpn += crate::config::PAGE_SIZE;
+        }
+        true
+    }
     pub fn recycle_data_pages(&mut self) {
         let old_root = self.page_table.0.root().raw();
         if !self.shared_page_table {
@@ -1080,6 +1135,81 @@ impl MemorySet {
             area.file_offset = file_offset;
         }
         Some(addr)
+    }
+
+    pub fn madvise_private_anonymous_dontneed(
+        &mut self,
+        start_addr: polyhal::VirtAddr,
+        len: usize,
+    ) -> isize {
+        if len == 0 {
+            return 0;
+        }
+        let end_addr = polyhal::VirtAddr::from(start_addr.raw().saturating_add(len)).ceil();
+        let start_vpn = start_addr.floor();
+        let mut cursor = start_vpn;
+        while cursor < end_addr {
+            let Some(area) = self.areas.iter().find(|area| {
+                area.vaddr_range.get_start() <= cursor && cursor < area.vaddr_range.get_end()
+            }) else {
+                return -12;
+            };
+            if area.file.is_some() || area.shared {
+                return -22;
+            }
+            cursor = area.vaddr_range.get_end().min(end_addr);
+        }
+
+        for area in self.areas.iter_mut() {
+            let area_start = area.vaddr_range.get_start();
+            let area_end = area.vaddr_range.get_end();
+            if area_start >= end_addr || area_end <= start_vpn {
+                continue;
+            }
+            let range_start = start_vpn.max(area_start);
+            let range_end = end_addr.min(area_end);
+            let vpns: alloc::vec::Vec<VirtAddr> = area
+                .data_frames
+                .range(range_start..range_end)
+                .map(|(&vpn, _)| vpn)
+                .collect();
+            for vpn in vpns {
+                let needs_private = area
+                    .data_frames
+                    .get(&vpn)
+                    .map(|frame| frame.is_shared())
+                    .unwrap_or(false);
+                if needs_private {
+                    let Some(frame) = frame_alloc() else {
+                        return -12;
+                    };
+                    if self.page_table.translate(vpn).is_some() {
+                        self.page_table.unmap_page(vpn);
+                    }
+                    self.page_table.map_page(
+                        vpn,
+                        frame.paddr,
+                        area.map_perm.into(),
+                        MappingSize::Page4KB,
+                    );
+                    area.data_frames.insert(vpn, frame);
+                } else if let Some(frame) = area.data_frames.get(&vpn) {
+                    if self.page_table.translate(vpn).is_none() {
+                        self.page_table.map_page(
+                            vpn,
+                            frame.paddr,
+                            area.map_perm.into(),
+                            MappingSize::Page4KB,
+                        );
+                    }
+                }
+                if let Some(frame) = area.data_frames.get(&vpn) {
+                    frame.paddr.slice_mut_with_len(PAGE_SIZE).fill(0);
+                }
+                area.dirty.remove(&vpn);
+            }
+        }
+        0
     }
 
     pub fn msync(&mut self, start_addr: polyhal::VirtAddr, len: usize, flags: usize) -> isize {
@@ -1354,8 +1484,11 @@ impl MemorySet {
                     self.areas[i].data_frames.remove(vaddr);
                     self.areas[i].dirty.remove(vaddr);
                 }
-                let dirty_keys: alloc::vec::Vec<VirtAddr> =
-                    self.areas[i].dirty.range(unmap_start..unmap_end).copied().collect();
+                let dirty_keys: alloc::vec::Vec<VirtAddr> = self.areas[i]
+                    .dirty
+                    .range(unmap_start..unmap_end)
+                    .copied()
+                    .collect();
                 for vaddr in dirty_keys {
                     self.areas[i].dirty.remove(&vaddr);
                 }
@@ -1382,8 +1515,11 @@ impl MemorySet {
                             right.data_frames.insert(key, frame);
                         }
                     }
-                    let right_dirty: alloc::vec::Vec<VirtAddr> =
-                        self.areas[i].dirty.range(unmap_end..area_end).copied().collect();
+                    let right_dirty: alloc::vec::Vec<VirtAddr> = self.areas[i]
+                        .dirty
+                        .range(unmap_end..area_end)
+                        .copied()
+                        .collect();
                     for key in right_dirty {
                         self.areas[i].dirty.remove(&key);
                         right.dirty.insert(key);

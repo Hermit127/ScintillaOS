@@ -6,8 +6,8 @@ use smoltcp::socket::udp::PacketMetadata as UdpPacketMetadata;
 use smoltcp::socket::udp::Socket as UdpSocket;
 use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
 
-use crate::fs::File;
 use crate::fs::stdio::stdout_release_if_owner;
+use crate::fs::File;
 use crate::mm::{translated_ref, translated_refmut};
 use crate::net::socket::{SocketFile, SocketType};
 use crate::sync::UPSafeCell;
@@ -1293,7 +1293,8 @@ pub fn sys_accept(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
     if new_fd >= inner.fd_table.len() {
         return -24;
     }
-    let file: Arc<dyn File + Send + Sync> = Arc::new(SocketFile::new(handle, SocketType::Tcp, nonblock));
+    let file: Arc<dyn File + Send + Sync> =
+        Arc::new(SocketFile::new(handle, SocketType::Tcp, nonblock));
     inner.fd_table[new_fd] = Some(file.clone());
     let tgid = inner.tgid;
     let cloexec = inner.fd_cloexec.get(new_fd).copied().unwrap_or(false);

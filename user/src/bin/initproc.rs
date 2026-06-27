@@ -41,34 +41,44 @@ const TEST_TIMEOUT_SECS: &str = "1800";
 const RUN_IPERF_SCRIPTS: bool = false;
 const RUN_NETPERF_SCRIPTS: bool = false;
 const LTP_SUBSET_CASES: &str = concat!(
-    "access03 access04 brk01 brk02 chdir04 chmod01 chmod03 chmod05 ",
-    "clock_getres01 clock_gettime01 clock_gettime02 close01 close02 close_range02 creat08 ",
-    "dup01 dup02 dup201 dup202 exit_group01 faccessat02 faccessat202 ",
-    "fallocate01 fallocate02 fallocate03 fchdir01 fchdir02 ",
+    "access02 access03 brk01 brk02 chdir04 chmod01 chmod03 chmod05 chmod07 ",
+    "chown01 chown02 chown03 chown05 ",
+    "clock_getres01 clock_gettime01 clock_gettime02 close01 close02 close_range02 creat01 creat03 creat04 creat08 ",
+    "dup01 dup02 dup04 dup05 dup07 dup201 dup202 dup203 dup204 dup206 dup207 exit_group01 faccessat01 faccessat02 faccessat201 faccessat202 copy_file_range03 ",
+    "fallocate01 fallocate02 fallocate03 fchdir01 fchdir02 fchdir03 fchmodat01 fchmodat02 ",
+    "fchown01 fchown02 fchown03 fchown05 fchownat01 fchownat02 ",
     "fchmod01 fchmod02 fchmod03 fchmod04 fchmod05 ",
-    "fcntl01 fcntl02 fcntl03 fcntl04 fcntl05 fcntl08 ",
+    "fcntl01 fcntl02 fcntl03 fcntl04 fcntl05 fcntl08 fcntl09 fcntl10 fcntl13 ",
     "fdatasync01 fdatasync02 flock01 flock02 fork01 fork03 ",
-    "fstat02 fstat03 fstatfs02 fsync02 fsync03 ftruncate01 ftruncate03 ",
-    "getcwd01 getcwd02 getegid01 getegid02 geteuid01 geteuid02 ",
-    "getgid01 getgid03 getgroups01 getgroups03 getpgid01 getpgid02 getpgrp01 ",
-    "getpid01 getpid02 getppid01 getppid02 ",
-    "getrandom01 getrandom02 getrandom03 getrandom04 ",
+    "fstat02 fstat03 fstatat01 fstatfs02 fsync02 fsync03 ftruncate01 ftruncate03 ",
+    "getcpu01 getcwd01 getcwd02 getcwd03 getdomainname01 getegid01 getegid02 geteuid01 geteuid02 ",
+    "getgid01 getgid03 getgroups01 getgroups03 getitimer01 getitimer02 getpgid01 getpgid02 getpgrp01 getpriority01 getpriority02 ",
+    "gethostname01 gethostname02 getpagesize01 getpid01 getpid02 getppid01 getppid02 ",
+    "getrandom01 getrandom02 getrandom03 getrandom04 getrandom05 ",
     "getresgid01 getresgid02 getresgid03 getresuid01 getresuid02 getresuid03 ",
     "getrlimit01 getrlimit02 getrlimit03 getrusage01 getrusage02 getrusage04 ",
     "getsid01 getsid02 gettid01 gettid02 gettimeofday01 gettimeofday02 getuid01 getuid03 ",
-    "kill02 kill03 lseek01 lseek02 mkdir02 mkdir04 mkdir05 mkdirat01 ",
-    "mmap01 mmap02 mprotect01 nanosleep01 nanosleep02 nanosleep04 ",
-    "open01 open02 open10 pipe01 pipe02 ",
-    "pread01 pread02 pwrite01 pwrite02 read01 read02 readahead01 readlink01 ",
-    "readv01 readv02 sched_yield01 ",
-    "setegid01 setegid02 setgid01 setgid03 setgroups01 setgroups02 setgroups04 ",
+    "kill02 kill03 link02 link04 lseek01 lseek02 lseek07 lstat02 mkdir02 mkdir04 mkdir05 mkdirat01 ",
+    "mknod01 mknod02 mknod03 mknod04 mknod05 mknod06 mknod08 mknod09 ",
+    "mknodat01 ",
+    "madvise02 madvise03 mmap01 mmap02 mmap03 mmap06 mlock01 mlock02 mlock04 mlockall01 mlockall02 mlock202 ",
+    "mprotect01 mprotect02 mprotect03 msync01 mincore01 mincore02 mincore03 munlock01 munlock02 nanosleep01 nanosleep02 nanosleep04 ",
+    "nice01 nice02 nice03 ",
+    "open01 open02 open03 open07 open08 open09 open10 openat01 pipe01 pipe02 ",
+    "posix_fadvise01 posix_fadvise02 posix_fadvise03 posix_fadvise04 ",
+    "pread01 pread02 preadv01 preadv02 preadv201 preadv202 ",
+    "pwrite01 pwrite02 pwrite03 pwritev01 pwritev02 pwritev201 pwritev202 ",
+    "read01 read02 read04 readahead01 readlink01 readlink03 readlinkat01 readlinkat02 ",
+    "readv01 readv02 rmdir01 sched_getaffinity01 sched_yield01 sendfile02 sendfile03 sendfile04 sendfile05 sendfile06 sendfile08 ",
+    "setegid01 setegid02 setgid01 setgid02 setgid03 setgroups01 setgroups02 setgroups03 setgroups04 ",
+    "setitimer02 setpriority01 setpriority02 ",
     "setpgid01 setpgid02 setregid01 setregid02 setregid03 setregid04 ",
     "setresgid01 setresgid02 setresgid03 setresgid04 ",
     "setresuid01 setresuid02 setresuid03 setresuid04 setresuid05 ",
     "setreuid01 setreuid02 setreuid03 setreuid04 setreuid05 setreuid06 setreuid07 ",
-    "setsid01 setuid01 setuid03 statfs02 statfs03 symlink01 symlink02 ",
+    "setsid01 setuid01 setuid03 setuid04 stat01 stat02 stat03 statfs02 statfs03 statx02 statx03 lstat01 symlink01 symlink02 symlink03 symlink04 symlinkat01 ",
     "sysinfo01 sysinfo02 times01 umask01 uname01 uname02 ",
-    "unlink05 unlink07 unlink08 wait01 wait02 write01 write02 writev01 writev02"
+    "unlink05 unlink07 unlink08 unlinkat01 wait01 wait02 waitpid03 waitpid04 write01 write02 write03 write06 writev01 writev02 writev05 writev06 writev07"
 );
 
 fn symlink_points_to(target: &str, linkpath: &str) -> bool {
@@ -461,11 +471,11 @@ fn script_priority(script: &str) -> u8 {
         3
     } else if script.starts_with("iozone_") {
         4
-    } else if script.starts_with("libctest_") {
-        5
-    } else if is_embedded_ltp(script) {
-        6
     } else if script.starts_with("libcbench_") {
+        5
+    } else if script.starts_with("libctest_") {
+        6
+    } else if is_embedded_ltp(script) {
         7
     } else if script.starts_with("netperf_") {
         8
@@ -895,7 +905,7 @@ fn run_ltp_case(dir: &str, chroot_root: &str, chroot_cwd: &str, case: &str) {
     println!("RUN LTP CASE {}", case);
 
     let bin_path = String::from("ltp/testcases/bin/") + case + "\0";
-    let envs: [*const u8; 8] = [
+    let envs: [*const u8; 9] = [
         b"PATH=/ltp/testcases/bin:/bin:/usr/bin:.\0".as_ptr(),
         b"LD_LIBRARY_PATH=/lib:/lib64:.\0".as_ptr(),
         b"HOME=/\0".as_ptr(),
@@ -903,6 +913,7 @@ fn run_ltp_case(dir: &str, chroot_root: &str, chroot_cwd: &str, case: &str) {
         b"LTP_DEV=/dev/vda\0".as_ptr(),
         b"LTP_SINGLE_FS_TYPE=tmpfs\0".as_ptr(),
         b"LTP_DEV_FS_TYPE=tmpfs\0".as_ptr(),
+        b"LTP_TIMEOUT_MUL=60\0".as_ptr(),
         core::ptr::null(),
     ];
 
@@ -926,11 +937,7 @@ fn run_ltp_case(dir: &str, chroot_root: &str, chroot_cwd: &str, case: &str) {
             let r = waitpid_nb(pid as usize, &mut status);
             if r == pid {
                 cleanup_process_group(pid as usize);
-                println!(
-                    "FINISH LTP CASE {} : {}",
-                    case,
-                    wait_status_to_code(status)
-                );
+                println!("FINISH LTP CASE {} : {}", case, wait_status_to_code(status));
                 break;
             }
             reap_zombies();

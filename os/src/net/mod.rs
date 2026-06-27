@@ -481,15 +481,17 @@ pub fn wake_net_blocked_tasks() {
                             let Some(file) = file else {
                                 return false;
                             };
-                            let Some(sock) =
-                                file.as_any().downcast_ref::<crate::net::socket::SocketFile>()
+                            let Some(sock) = file
+                                .as_any()
+                                .downcast_ref::<crate::net::socket::SocketFile>()
                             else {
                                 return false;
                             };
                             if sock.socket_type != crate::net::socket::SocketType::Tcp {
                                 return false;
                             }
-                            let sock_handle: usize = unsafe { core::mem::transmute(sock.get_handle()) };
+                            let sock_handle: usize =
+                                unsafe { core::mem::transmute(sock.get_handle()) };
                             if sock_handle != *h {
                                 return false;
                             }
