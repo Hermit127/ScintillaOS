@@ -468,18 +468,18 @@ fn script_priority(script: &str) -> u8 {
         2
     } else if script.starts_with("libctest_") {
         3
-    } else if script.starts_with("lmbench_") {
-        4
     } else if is_embedded_ltp(script) {
+        4
+    } else if script.starts_with("iozone_") {
         5
     } else if script.starts_with("libcbench_") {
         6
-    } else if script.starts_with("iozone_") {
-        7
     } else if script.starts_with("netperf_") {
-        8
+        7
     } else if script.starts_with("iperf_") {
-        9
+        8
+    } else if script.starts_with("lmbench_") {
+        49
     } else {
         50
     }
@@ -939,14 +939,14 @@ fn run_ltp_case(dir: &str, chroot_root: &str, chroot_cwd: &str, case: &str) {
             let r = waitpid_nb(pid as usize, &mut status);
             if r == pid {
                 cleanup_process_group(pid as usize);
-                println!("FINISH LTP CASE {} : {}", case, wait_status_to_code(status));
+                println!("FAIL LTP CASE {} : {}", case, wait_status_to_code(status));
                 break;
             }
             reap_zombies();
             sleep(20);
         }
     } else {
-        println!("FINISH LTP CASE {} : 127", case);
+        println!("FAIL LTP CASE {} : 127", case);
     }
 }
 

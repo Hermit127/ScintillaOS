@@ -114,7 +114,7 @@ fn run_test(base: &str, name: &str) {
         user_lib::exit(-1);
     }
     if pid < 0 {
-        println!("FINISH LTP CASE {} : -1", name);
+        println!("FAIL LTP CASE {} : -1", name);
         return;
     }
 
@@ -124,7 +124,7 @@ fn run_test(base: &str, name: &str) {
         let r = waitpid_nb(pid as usize, &mut exit_code);
         if r == pid {
             let status = exit_code >> 8;
-            println!("FINISH LTP CASE {} : {}", name, status);
+            println!("FAIL LTP CASE {} : {}", name, status);
             return;
         }
         if get_time() - start > CASE_TIMEOUT_MS {
@@ -135,7 +135,7 @@ fn run_test(base: &str, name: &str) {
                 }
                 sleep(10);
             }
-            println!("TIMEOUT LTP CASE {} : {}", name, CASE_TIMEOUT_MS);
+            println!("FAIL LTP CASE {} : 124", name);
             return;
         }
         sleep(10);
