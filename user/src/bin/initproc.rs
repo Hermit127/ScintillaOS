@@ -466,19 +466,19 @@ fn script_priority(script: &str) -> u8 {
         1
     } else if script.starts_with("lua_") {
         2
-    } else if script.starts_with("libctest_") {
+    } else if script.starts_with("lmbench_") {
         3
-    } else if is_embedded_ltp(script) {
+    } else if script.starts_with("libctest_") {
         4
-    } else if script.starts_with("iozone_") {
+    } else if is_embedded_ltp(script) {
         5
-    } else if script.starts_with("libcbench_") {
+    } else if script.starts_with("iozone_") {
         6
     } else if script.starts_with("netperf_") {
         7
     } else if script.starts_with("iperf_") {
         8
-    } else if script.starts_with("lmbench_") {
+    } else if script.starts_with("libcbench_") {
         49
     } else {
         50
@@ -498,9 +498,6 @@ fn should_run_script(script: &str) -> bool {
 
 fn should_run_script_in_dir(dir: &str, script: &str) -> bool {
     let dir = dir.trim_end_matches('\0').trim_end_matches('/');
-    if script.starts_with("libcbench_") {
-        return false;
-    }
     if script.starts_with("libctest_") && dir.ends_with("/glibc") {
         return false;
     }
