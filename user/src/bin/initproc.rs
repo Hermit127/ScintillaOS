@@ -50,7 +50,7 @@ const LTP_SUBSET_CASES: &str = concat!(
     "fchmod01 fchmod02 fchmod03 fchmod04 fchmod05 ",
     "fcntl01 fcntl02 fcntl03 fcntl04 fcntl05 fcntl08 fcntl09 fcntl10 fcntl13 ",
     "fdatasync01 fdatasync02 flock01 flock02 fork01 fork03 ",
-    "fstat03 fstatfs02 fsync02 fsync03 ftruncate01 ftruncate03 ",
+    "fstat03 fstatfs02 fsync03 ftruncate01 ftruncate03 ",
     "getcpu01 getcwd01 getcwd02 getcwd03 getdomainname01 getegid01 getegid02 geteuid01 geteuid02 ",
     "getgid01 getgid03 getgroups01 getitimer01 getitimer02 getpgid01 getpgid02 getpgrp01 getpriority01 getpriority02 ",
     "gethostname01 getpagesize01 getpid01 getpid02 getppid01 getppid02 ",

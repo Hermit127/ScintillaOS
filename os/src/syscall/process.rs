@@ -21,6 +21,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use lazy_static::lazy_static;
 use log::info;
+use polyhal::irq::IRQ;
 use polyhal::kcontext::{KContext, KContextArgs};
 use polyhal::time::Time;
 use polyhal_trap::trapframe::TrapFrameArgs;
@@ -47,6 +48,26 @@ lazy_static! {
         unsafe { UPSafeCell::new(Vec::new()) };
     static ref FUTEX_WAITERS: UPSafeCell<BTreeMap<FutexKey, Vec<Arc<TaskControlBlock>>>> =
         unsafe { UPSafeCell::new(BTreeMap::new()) };
+}
+
+struct IrqRestoreGuard {
+    enabled: bool,
+}
+
+impl IrqRestoreGuard {
+    fn disable() -> Self {
+        let enabled = IRQ::int_enabled();
+        IRQ::int_disable();
+        Self { enabled }
+    }
+}
+
+impl Drop for IrqRestoreGuard {
+    fn drop(&mut self) {
+        if self.enabled {
+            IRQ::int_enable();
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1119,22 +1140,26 @@ fn wait_block_current_or_retry(task: Arc<TaskControlBlock>, pid: isize) -> bool 
     stdout_release_if_owner();
     task.record_time_suspend();
     let task_cx_ptr = {
+        let _irq_guard = IrqRestoreGuard::disable();
         let mut inner = task.inner_exclusive_access();
         inner.task_status = TaskStatus::Blocked;
         inner.block_reason = None;
-        &mut inner.task_cx as *mut KContext
-    };
-    {
-        let mut queue = crate::task::WAITPID_QUEUE.exclusive_access();
-        if !queue.iter().any(|t| t.getpid() == task.getpid()) {
-            queue.push(task.clone());
+        let task_cx_ptr = &mut inner.task_cx as *mut KContext;
+        drop(inner);
+
+        {
+            let mut queue = crate::task::WAITPID_QUEUE.exclusive_access();
+            if !queue.iter().any(|t| t.getpid() == task.getpid()) {
+                queue.push(task.clone());
+            }
         }
-    }
-    if wait_child_event_pending(&task, pid) {
-        wait_cancel_block(&task);
-        return false;
-    }
-    take_current_task();
+        if wait_child_event_pending(&task, pid) {
+            wait_cancel_block(&task);
+            return false;
+        }
+        take_current_task();
+        task_cx_ptr
+    };
     schedule(task_cx_ptr);
     task.record_time_resume();
     crate::task::WAITPID_QUEUE
@@ -3954,7 +3979,7 @@ pub fn sys_futex(
             if mark_futex_owner_died(uaddr, shared, key) {
                 return 0;
             }
-            match futex_wait_current(key, futex_relative_timeout_ns(val2)) {
+            match futex_wait_current(key, uaddr, val as u32, futex_relative_timeout_ns(val2)) {
                 FutexWaitResult::Woken => 0,
                 FutexWaitResult::TimedOut => {
                     if mark_futex_owner_died(uaddr, shared, key) {
@@ -3964,6 +3989,7 @@ pub fn sys_futex(
                     }
                 }
                 FutexWaitResult::Interrupted => -4,
+                FutexWaitResult::ValueChanged => -11,
             }
         }
         9 => {
@@ -3973,7 +3999,7 @@ pub fn sys_futex(
             if mark_futex_owner_died(uaddr, shared, key) {
                 return 0;
             }
-            match futex_wait_current(key, futex_absolute_timeout_ns(val2)) {
+            match futex_wait_current(key, uaddr, val as u32, futex_absolute_timeout_ns(val2)) {
                 FutexWaitResult::Woken => 0,
                 FutexWaitResult::TimedOut => {
                     if mark_futex_owner_died(uaddr, shared, key) {
@@ -3983,6 +4009,7 @@ pub fn sys_futex(
                     }
                 }
                 FutexWaitResult::Interrupted => -4,
+                FutexWaitResult::ValueChanged => -11,
             }
         }
         1 | 10 => futex_wake_key(key, val),
@@ -4020,6 +4047,7 @@ enum FutexWaitResult {
     Woken,
     TimedOut,
     Interrupted,
+    ValueChanged,
 }
 
 fn futex_relative_timeout_ns(timeout_ptr: usize) -> Option<usize> {
@@ -4163,30 +4191,48 @@ fn futex_requeue_key(
     woke + moved as isize
 }
 
-fn futex_wait_current(key: FutexKey, deadline_ns: Option<usize>) -> FutexWaitResult {
+fn futex_wait_current(
+    key: FutexKey,
+    uaddr: *const u32,
+    expected: u32,
+    deadline_ns: Option<usize>,
+) -> FutexWaitResult {
     if let Some(deadline) = deadline_ns {
         if polyhal::time::Time::now().to_nsec() as usize >= deadline {
             return FutexWaitResult::TimedOut;
         }
     }
     stdout_release_if_owner();
+    let token = current_user_token();
     let task = current_task().unwrap();
     let pid = task.getpid();
     task.record_time_suspend();
-    let mut inner = task.inner_exclusive_access();
-    inner.task_status = TaskStatus::Blocked;
-    let task_cx_ptr = &mut inner.task_cx as *mut _;
-    drop(inner);
-    crate::task::take_current_task();
-    {
-        let mut waiters = FUTEX_WAITERS.exclusive_access();
-        let queue = waiters.entry(key).or_insert_with(Vec::new);
-        queue.retain(|queued| queued.getpid() != pid);
-        queue.push(task.clone());
-    }
-    if let Some(deadline) = deadline_ns {
-        crate::task::add_sleep_task(deadline, task.clone());
-    }
+
+    let task_cx_ptr = {
+        let _irq_guard = IrqRestoreGuard::disable();
+        if *translated_ref(token, uaddr) != expected {
+            task.record_time_resume();
+            return FutexWaitResult::ValueChanged;
+        }
+
+        let mut inner = task.inner_exclusive_access();
+        inner.task_status = TaskStatus::Blocked;
+        inner.block_reason = None;
+        let task_cx_ptr = &mut inner.task_cx as *mut _;
+        drop(inner);
+
+        {
+            let mut waiters = FUTEX_WAITERS.exclusive_access();
+            let queue = waiters.entry(key).or_insert_with(Vec::new);
+            queue.retain(|queued| queued.getpid() != pid);
+            queue.push(task.clone());
+        }
+        if let Some(deadline) = deadline_ns {
+            crate::task::add_sleep_task(deadline, task.clone());
+        }
+        crate::task::take_current_task();
+        task_cx_ptr
+    };
     crate::task::schedule(task_cx_ptr);
     task.record_time_resume();
     let mut still_waiting = false;

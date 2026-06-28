@@ -233,8 +233,34 @@ fn loongarch64_trap_handler(tf: &mut TrapFrame) -> TrapType {
         | Trap::Exception(Exception::MemoryAccessAddressError) => {
             TrapType::LoadPageFault(badv::read().vaddr())
         }
-        Trap::MachineError(_) => todo!(),
-        Trap::Unknown => todo!(),
+        Trap::MachineError(err) => {
+            panic!(
+                "Machine error {:?} @ {:#x} BADV: {:#x}",
+                err,
+                tf.era,
+                badv::read().vaddr()
+            );
+        }
+        Trap::Unknown => {
+            let ecode = estat.ecode();
+            let esubcode = estat.esubcode();
+            let pending = estat.is();
+            if ecode == 0 && pending == 0 {
+                TrapType::Unknown
+            } else if ecode == 0x8 {
+                TrapType::LoadPageFault(badv::read().vaddr())
+            } else {
+                log::warn!(
+                    "unknown loongarch trap ecode={:#x} esubcode={:#x} pending={:#x} era={:#x} badv={:#x}",
+                    ecode,
+                    esubcode,
+                    pending,
+                    tf.era,
+                    badv::read().vaddr()
+                );
+                TrapType::IllegalInstruction(tf.era)
+            }
+        }
         _ => {
             panic!(
                 "Unhandled trap {:?} @ {:#x} BADV: {:#x}:\n{:#x?}",
