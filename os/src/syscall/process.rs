@@ -457,6 +457,7 @@ const PROT_NONE: usize = 0;
 const PROT_READ: usize = 1;
 const PROT_WRITE: usize = 2;
 const PROT_EXEC: usize = 4;
+const VALID_MMAP_PROT: usize = PROT_NONE | PROT_READ | PROT_WRITE | PROT_EXEC;
 
 const MAP_SHARED: usize = 0x01;
 const MAP_PRIVATE: usize = 0x02;
@@ -1845,6 +1846,9 @@ pub fn sys_mmap(
     if start % crate::config::PAGE_SIZE != 0 || len == 0 {
         return -22;
     }
+    if prot & !VALID_MMAP_PROT != 0 {
+        return -22;
+    }
     let map_type = flags & MAP_TYPE_MASK;
     let map_shared = map_type == MAP_SHARED || map_type == MAP_SHARED_VALIDATE;
     let map_private = map_type == MAP_PRIVATE;
@@ -1853,6 +1857,9 @@ pub fn sys_mmap(
     }
     let map_fixed = (flags & MAP_FIXED) != 0;
     let map_fixed_noreplace = (flags & MAP_FIXED_NOREPLACE) != 0;
+    if (map_fixed || map_fixed_noreplace) && start == 0 {
+        return -22;
+    }
 
     let task = crate::task::current_task().unwrap();
     let pid = task.getpid();

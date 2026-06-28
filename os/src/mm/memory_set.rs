@@ -529,27 +529,23 @@ impl MemorySet {
         Some((entry, base))
     }
 
-    pub fn from_existed_user(user_space: &MemorySet) -> Option<MemorySet> {
+    fn pte_permission_for_frame(area: &MapArea, frame: &FrameTracker) -> MapPermission {
+        let mut perm = area.map_perm;
+        if !area.shared && perm.contains(MapPermission::W) && frame.is_shared() {
+            perm.remove(MapPermission::W);
+        }
+        perm
+    }
+
+    pub fn from_existed_user(user_space: &mut MemorySet) -> Option<MemorySet> {
         trace!("os::mm::MemorySet::from_existed_user");
         let mut memory_set = Self::new_bare();
-        for area in user_space.areas.iter() {
+        let parent_page_table = user_space.page_table.clone();
+        for area in user_space.areas.iter_mut() {
             let mut new_area = MapArea::from_another(area);
             for (&vpn, frame) in area.data_frames.iter() {
-                let child_perm = area.map_perm;
-
-                let new_frame = if area.shared {
-                    frame.shared_clone()
-                } else {
-                    let new_frame = frame_alloc()?;
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            frame.paddr.get_ptr::<u8>(),
-                            new_frame.paddr.get_mut_ptr(),
-                            PAGE_SIZE,
-                        );
-                    }
-                    new_frame
-                };
+                let new_frame = frame.shared_clone();
+                let child_perm = Self::pte_permission_for_frame(area, &new_frame);
 
                 memory_set.page_table.map_page(
                     vpn,
@@ -558,6 +554,22 @@ impl MemorySet {
                     MappingSize::Page4KB,
                 );
                 new_area.data_frames.insert(vpn, new_frame);
+
+                if !area.shared && area.map_perm.contains(MapPermission::W) {
+                    let parent_perm = Self::pte_permission_for_frame(area, frame);
+                    if parent_page_table
+                        .translate(vpn)
+                        .is_some_and(|(_, flags)| flags.contains(MappingFlags::P))
+                    {
+                        parent_page_table.unmap_page(vpn);
+                        parent_page_table.map_page(
+                            vpn,
+                            frame.paddr,
+                            parent_perm.into(),
+                            MappingSize::Page4KB,
+                        );
+                    }
+                }
             }
             memory_set.areas.push(new_area);
         }
@@ -707,32 +719,26 @@ impl MemorySet {
                 .map_page(vpn, old.paddr, area.map_perm.into(), MappingSize::Page4KB);
             return Some(PageFaultResult::Handled);
         }
-        // Read fault on already-mapped read-only page — re-establish PTE
-        if !write_fault && !area.map_perm.contains(MapPermission::W) {
-            let paddr = match area.data_frames.get(&vpn) {
-                Some(f) => f.paddr,
-                None => return None,
-            };
-            self.page_table.unmap_page(vpn);
-            self.page_table
-                .map_page(vpn, paddr, area.map_perm.into(), MappingSize::Page4KB);
-            return Some(PageFaultResult::Handled);
-        }
-        // COW or permission upgrade for writable pages
-        let (paddr, flags) = match self.page_table.translate(vpn) {
-            Some(x) => x,
-            None => return None,
-        };
         let old = match area.data_frames.get(&vpn) {
             Some(f) => f,
             None => return None,
         };
+        let (paddr, flags) = match self.page_table.translate(vpn) {
+            Some(x) => x,
+            None => {
+                let perm = Self::pte_permission_for_frame(area, old);
+                self.page_table
+                    .map_page(vpn, old.paddr, perm.into(), MappingSize::Page4KB);
+                return Some(PageFaultResult::Handled);
+            }
+        };
         if !flags.contains(MappingFlags::P) {
+            let perm = Self::pte_permission_for_frame(area, old);
             self.page_table
-                .map_page(vpn, old.paddr, area.map_perm.into(), MappingSize::Page4KB);
+                .map_page(vpn, old.paddr, perm.into(), MappingSize::Page4KB);
             return Some(PageFaultResult::Handled);
         }
-        if old.is_shared() {
+        if write_fault && !area.shared && old.is_shared() {
             let f = match frame_alloc() {
                 Some(f) => f,
                 None => return None,
@@ -749,9 +755,10 @@ impl MemorySet {
                 .map_page(vpn, f.paddr, area.map_perm.into(), MappingSize::Page4KB);
             area.data_frames.insert(vpn, f);
         } else {
+            let perm = Self::pte_permission_for_frame(area, old);
             self.page_table.unmap_page(vpn);
             self.page_table
-                .map_page(vpn, old.paddr, area.map_perm.into(), MappingSize::Page4KB);
+                .map_page(vpn, old.paddr, perm.into(), MappingSize::Page4KB);
         }
         Some(PageFaultResult::Handled)
     }
@@ -1315,12 +1322,9 @@ impl MemorySet {
                     .is_some_and(|(_, flags)| flags.contains(MappingFlags::P))
                 {
                     self.page_table.unmap_page(vpn);
-                    self.page_table.map_page(
-                        vpn,
-                        frame.paddr,
-                        permission.into(),
-                        MappingSize::Page4KB,
-                    );
+                    let pte_perm = Self::pte_permission_for_frame(&self.areas[i], frame);
+                    self.page_table
+                        .map_page(vpn, frame.paddr, pte_perm.into(), MappingSize::Page4KB);
                 }
             }
             i += 1;

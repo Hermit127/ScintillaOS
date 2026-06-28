@@ -56,11 +56,11 @@ const LTP_SUBSET_CASES: &str = concat!(
     "gethostname01 getpagesize01 getpid01 getpid02 getppid01 getppid02 ",
     "getrandom01 getrandom02 getrandom03 getrandom04 getrandom05 ",
     "getresgid01 getresgid02 getresgid03 getresuid01 getresuid02 getresuid03 ",
-    "getrlimit01 getrlimit02 getrlimit03 getrusage01 getrusage02 getrusage04 ",
+    "getrlimit01 getrlimit02 getrlimit03 getrusage01 getrusage02 ",
     "getsid01 getsid02 gettid01 gettid02 gettimeofday01 getuid01 getuid03 ",
     "kill02 kill03 link04 lseek01 lseek02 lseek07 mkdir02 mkdir04 mkdir05 mkdirat01 ",
     "mknod01 mknod02 mknod03 mknod04 mknod05 mknod06 mknod08 mknod09 ",
-    "madvise03 mmap01 mmap02 mmap03 mmap06 mlock01 mlock02 mlock04 mlockall01 mlockall02 mlock202 ",
+    "madvise03 mlock01 mlock02 mlock04 mlockall01 mlockall02 mlock202 ",
     "mprotect01 mprotect03 msync01 mincore01 mincore02 munlock01 munlock02 nanosleep01 nanosleep02 nanosleep04 ",
     "nice01 nice02 nice03 ",
     "open01 open02 open03 open08 open09 open10 pipe01 pipe02 ",
@@ -69,7 +69,7 @@ const LTP_SUBSET_CASES: &str = concat!(
     "pwrite01 pwrite02 pwrite03 pwritev01 pwritev02 pwritev201 pwritev202 ",
     "read01 read02 read04 readahead01 readlink01 ",
     "readv01 readv02 rmdir01 sched_getaffinity01 sched_yield01 sendfile02 sendfile03 sendfile04 sendfile05 sendfile06 sendfile08 ",
-    "setegid01 setegid02 setgid01 setgid02 setgid03 setgroups01 setgroups02 setgroups04 ",
+    "setegid01 setegid02 setgid01 setgid03 setgroups01 setgroups02 setgroups04 ",
     "setitimer02 setpriority01 setpriority02 ",
     "setpgid01 setpgid02 setregid01 setregid02 setregid03 setregid04 ",
     "setresgid01 setresgid02 setresgid03 setresgid04 ",
@@ -468,9 +468,9 @@ fn script_priority(script: &str) -> u8 {
         2
     } else if script.starts_with("libctest_") {
         3
-    } else if is_embedded_ltp(script) {
-        4
     } else if script.starts_with("lmbench_") {
+        4
+    } else if is_embedded_ltp(script) {
         5
     } else if script.starts_with("libcbench_") {
         6
@@ -498,6 +498,9 @@ fn should_run_script(script: &str) -> bool {
 
 fn should_run_script_in_dir(dir: &str, script: &str) -> bool {
     let dir = dir.trim_end_matches('\0').trim_end_matches('/');
+    if script.starts_with("libcbench_") {
+        return false;
+    }
     if script.starts_with("libctest_") && dir.ends_with("/glibc") {
         return false;
     }

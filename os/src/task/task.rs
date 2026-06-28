@@ -606,8 +606,8 @@ impl TaskControlBlock {
         trace!("os::task::TaskControlBlock::fork");
         // Copy the user address space before collecting the remaining task state.
         let memory_set = {
-            let parent_inner = self.inner_exclusive_access();
-            MemorySet::from_existed_user(&parent_inner.memory_set)?
+            let mut parent_inner = self.inner_exclusive_access();
+            MemorySet::from_existed_user(&mut parent_inner.memory_set)?
         };
 
         let (
