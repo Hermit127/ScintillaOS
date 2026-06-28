@@ -963,6 +963,7 @@ pub enum BlockReason {
     PollWait,
     PipeRead(usize),
     PipeWrite(usize),
+    SignalWait(SignalFlags),
 }
 
 #[derive(Copy, Clone, PartialEq)]

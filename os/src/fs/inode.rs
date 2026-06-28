@@ -143,8 +143,7 @@ impl OSInode {
     pub fn new(readable: bool, writable: bool, append: bool, dentry: Arc<Dentry>) -> Self {
         let offset = if append {
             dentry
-                .super_block
-                .get_inode_info(&dentry.fs_path)
+                .inode_info()
                 .map(|i| i.size as usize)
                 .unwrap_or(0)
         } else {
@@ -167,9 +166,6 @@ impl OSInode {
                 )
             },
         };
-        if !inode.dentry.is_dir {
-            inode.open_handle();
-        }
         inode
     }
     pub fn dentry(&self) -> &Arc<Dentry> {
@@ -213,8 +209,7 @@ impl OSInode {
         let mut inner = self.inner.exclusive_access();
         let size = self
             .dentry
-            .super_block
-            .get_inode_info(&self.dentry.fs_path)
+            .inode_info()
             .map(|i| i.size as usize)
             .unwrap_or(0);
         let mut out = if size > 0 {
@@ -246,11 +241,15 @@ impl OSInode {
                     st.st_size = (unsafe { ext4_fsize(file) as i64 }).max(inner.offset as i64);
                     st.st_blocks = ((st.st_size.max(0) as u64) + 511) / 512;
                     inner.cached_stat = Some(st);
+                    self.dentry.update_cached_size(st.st_size.max(0) as u64);
+                    return st;
                 }
-                return st;
+                if self.dentry.is_dir || (st.st_mode & S_IFREG) != S_IFREG {
+                    return st;
+                }
             }
         }
-        let info = self.dentry.super_block.get_inode_info(&self.dentry.fs_path);
+        let info = self.dentry.inode_info();
         let mut st = match info {
             Some(info) => {
                 let file_type = if self.dentry.is_dir || info.is_dir {
@@ -317,6 +316,7 @@ impl OSInode {
             st.st_size = size;
             st.st_blocks = ((size.max(0) as u64) + 511) / 512;
         }
+        self.dentry.update_cached_size(size.max(0) as u64);
     }
 
     pub fn refresh_after_truncate(&self, size: i64) {
@@ -330,6 +330,7 @@ impl OSInode {
             st.st_size = size;
             st.st_blocks = ((size.max(0) as u64) + 511) / 512;
         }
+        self.dentry.update_cached_size(size.max(0) as u64);
     }
 
     pub fn update_cached_mode(&self, mode: u32) {
@@ -337,6 +338,7 @@ impl OSInode {
         if let Some(ref mut st) = inner.cached_stat {
             st.st_mode = mode;
         }
+        self.dentry.update_cached_mode(mode);
     }
 
     pub fn update_cached_owner(&self, uid: u32, gid: u32, mode: u32, ctime: i64) {
@@ -347,6 +349,12 @@ impl OSInode {
             st.st_mode = mode;
             st.st_ctime_sec = ctime;
         }
+        self.dentry.update_cached_owner(
+            uid,
+            gid,
+            mode,
+            ctime.clamp(0, u32::MAX as i64) as u32,
+        );
     }
 
     pub fn update_cached_times(&self, atime: Option<i64>, mtime: Option<i64>, ctime: Option<i64>) {
@@ -362,6 +370,11 @@ impl OSInode {
                 st.st_ctime_sec = ctime;
             }
         }
+        self.dentry.update_cached_times(
+            atime.map(|v| v.clamp(0, u32::MAX as i64) as u32),
+            mtime.map(|v| v.clamp(0, u32::MAX as i64) as u32),
+            ctime.map(|v| v.clamp(0, u32::MAX as i64) as u32),
+        );
     }
 
     fn now_sec() -> i64 {
@@ -380,6 +393,8 @@ impl OSInode {
         self.dentry.super_block.set_mtime(&self.dentry.fs_path, now);
         self.dentry.super_block.set_ctime(&self.dentry.fs_path, now);
         update_path_cached_times(&self.dentry.fs_path, None, Some(now_sec), Some(now_sec));
+        self.dentry
+            .update_cached_times(None, Some(now), Some(now));
     }
 
     pub fn align_up(value: usize, align: usize) -> usize {
@@ -486,10 +501,11 @@ fn root_make_accessible(dentry: &Arc<Dentry>, bits: u32) {
     if !current_euid_is_root() {
         return;
     }
-    if let Some(info) = dentry.super_block.get_inode_info(&dentry.fs_path) {
+    if let Some(info) = dentry.inode_info() {
         let new_mode = info.mode | (bits & 0o777);
         if new_mode != info.mode {
             dentry.super_block.set_mode(&dentry.fs_path, new_mode);
+            dentry.update_cached_mode(new_mode);
         }
     }
 }
@@ -542,6 +558,7 @@ fn open_file_new(
                     if !truncated {
                         return None;
                     }
+                    dentry.update_cached_size(0);
                 }
                 let (readable, writable) = flags.read_write();
                 let append = flags.contains(OpenFlags::APPEND);
@@ -578,6 +595,7 @@ fn open_file_new(
         if !truncated {
             return None;
         }
+        dentry.update_cached_size(0);
     }
 
     let (readable, writable) = if dentry.is_dir {
@@ -603,7 +621,7 @@ pub fn follow_symlink(
     if !dentry.is_link {
         return Some(dentry);
     }
-    let info = dentry.super_block.get_inode_info(&dentry.fs_path)?;
+    let info = dentry.inode_info()?;
     if !info.is_link {
         return Some(dentry);
     }
@@ -701,14 +719,8 @@ impl File for OSInode {
     }
 
     fn read(&self, buf: &mut [u8]) -> isize {
-        if !self.writable {
-            let mut inner = self.inner.exclusive_access();
-            let rw_count = self
-                .dentry
-                .super_block
-                .read_at(&self.dentry.fs_path, inner.offset, buf);
-            inner.offset += rw_count;
-            return rw_count as isize;
+        if !self.readable {
+            return -1;
         }
         let need_open = {
             let inner = self.inner.exclusive_access();
@@ -747,15 +759,19 @@ impl File for OSInode {
             inner.offset = off + total;
             return total as isize;
         }
-        -1
+        drop(inner);
+        let mut inner = self.inner.exclusive_access();
+        let rw_count = self
+            .dentry
+            .super_block
+            .read_at(&self.dentry.fs_path, inner.offset, buf);
+        inner.offset += rw_count;
+        rw_count as isize
     }
 
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> isize {
-        if !self.writable {
-            return self
-                .dentry
-                .super_block
-                .read_at(&self.dentry.fs_path, offset, buf) as isize;
+        if !self.readable {
+            return -1;
         }
         let need_open = {
             let inner = self.inner.exclusive_access();
@@ -792,7 +808,10 @@ impl File for OSInode {
             }
             return total as isize;
         }
-        -1
+        drop(inner);
+        self.dentry
+            .super_block
+            .read_at(&self.dentry.fs_path, offset, buf) as isize
     }
 
     fn write_at(&self, offset: usize, buf: &mut [u8]) -> isize {
@@ -852,6 +871,7 @@ impl File for OSInode {
                 st.st_size = new_size;
                 st.st_blocks = ((st.st_size.max(0) as u64) + 511) / 512;
             }
+            self.dentry.update_cached_size(new_size.max(0) as u64);
             if total > 0 {
                 let now_sec = Self::now_sec();
                 Self::update_cached_data_time(&mut inner, now_sec);
@@ -891,8 +911,7 @@ impl File for OSInode {
         }
         let old_size = self
             .dentry
-            .super_block
-            .get_inode_info(&self.dentry.fs_path)
+            .inode_info()
             .map(|info| info.size as usize)
             .unwrap_or(0);
         let Some(requested_new_size) = offset.checked_add(buf.len()) else {
@@ -988,6 +1007,7 @@ impl File for OSInode {
                 st.st_size = new_size;
                 st.st_blocks = ((st.st_size.max(0) as u64) + 511) / 512;
             }
+            self.dentry.update_cached_size(new_size.max(0) as u64);
             if total > 0 {
                 let now_sec = Self::now_sec();
                 Self::update_cached_data_time(&mut inner, now_sec);
@@ -1013,6 +1033,7 @@ impl File for OSInode {
                     st.st_size = (off + rw_count) as i64;
                     st.st_blocks = ((st.st_size.max(0) as u64) + 511) / 512;
                 }
+                self.dentry.update_cached_size((off + rw_count) as u64);
                 if rw_count > 0 {
                     let now_sec = Self::now_sec();
                     Self::update_cached_data_time(&mut inner, now_sec);
@@ -1031,8 +1052,7 @@ impl File for OSInode {
         }
         let off = if inner.append {
             self.dentry
-                .super_block
-                .get_inode_info(&self.dentry.fs_path)
+                .inode_info()
                 .map(|i| i.size as usize)
                 .unwrap_or(inner.offset)
         } else {
@@ -1040,8 +1060,7 @@ impl File for OSInode {
         };
         let old_size = self
             .dentry
-            .super_block
-            .get_inode_info(&self.dentry.fs_path)
+            .inode_info()
             .map(|info| info.size as usize)
             .unwrap_or(0);
         let Some(requested_new_size) = off.checked_add(buf.len()) else {
@@ -1067,6 +1086,7 @@ impl File for OSInode {
             st.st_size = (off + rw_count) as i64;
             st.st_blocks = ((st.st_size.max(0) as u64) + 511) / 512;
         }
+        self.dentry.update_cached_size((off + rw_count) as u64);
         if rw_count > 0 {
             let now_sec = Self::now_sec();
             Self::update_cached_data_time(&mut inner, now_sec);

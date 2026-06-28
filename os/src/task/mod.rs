@@ -148,6 +148,38 @@ pub fn block_current_and_run_next(block_reason: BlockReason) {
     task.record_time_resume();
 }
 
+pub fn block_current_until(block_reason: BlockReason, wakeup_time: Option<usize>) {
+    crate::fs::stdio::stdout_release_if_owner();
+    let task = current_task().unwrap();
+    let pid = task.getpid();
+    task.record_time_suspend();
+    let mut task_inner = task.inner_exclusive_access();
+    task_inner.block_reason = Some(block_reason);
+    task_inner.task_status = TaskStatus::Blocked;
+    let task_cx_ptr = &mut task_inner.task_cx as *mut KContext;
+    drop(task_inner);
+    take_current_task();
+    {
+        let mut queue = NET_BLOCK_QUEUE.exclusive_access();
+        queue.retain(|queued| queued.getpid() != pid);
+        queue.push(task.clone());
+    }
+    if let Some(deadline) = wakeup_time {
+        add_sleep_task(deadline, task.clone());
+    }
+    schedule(task_cx_ptr);
+    task.record_time_resume();
+    {
+        let mut queue = NET_BLOCK_QUEUE.exclusive_access();
+        queue.retain(|queued| queued.getpid() != pid);
+    }
+    if wakeup_time.is_some() {
+        SLEEP_QUEUE
+            .exclusive_access()
+            .retain(|sleep_task| sleep_task.task.getpid() != pid);
+    }
+}
+
 pub fn wake_poll_wait_tasks() {
     let mut to_wake = Vec::new();
     {
@@ -212,6 +244,44 @@ fn wake_pipe_tasks(pipe_id: usize, read_waiters: bool) {
     }
 }
 
+pub fn wake_signal_wait_task(task: &Arc<TaskControlBlock>, signal: SignalFlags) -> bool {
+    let pid = task.getpid();
+    let mut removed = false;
+    {
+        let mut queue = NET_BLOCK_QUEUE.exclusive_access();
+        let mut i = 0;
+        while i < queue.len() {
+            let should_wake = queue[i].getpid() == pid
+                && queue[i]
+                    .try_inner_borrow()
+                    .map(|inner| match inner.block_reason {
+                        Some(BlockReason::SignalWait(mask)) => mask.contains(signal),
+                        _ => false,
+                    })
+                    .unwrap_or(false);
+            if should_wake {
+                queue.remove(i);
+                removed = true;
+                break;
+            }
+            i += 1;
+        }
+    }
+    if removed {
+        SLEEP_QUEUE
+            .exclusive_access()
+            .retain(|sleep_task| sleep_task.task.getpid() != pid);
+        let mut inner = task.inner_exclusive_access();
+        if inner.task_status != TaskStatus::Zombie {
+            inner.task_status = TaskStatus::Ready;
+            inner.block_reason = None;
+            drop(inner);
+            add_priority_task(task.clone());
+        }
+    }
+    removed
+}
+
 pub fn wake_blocked_task(task: &Arc<TaskControlBlock>) {
     let pid = task.getpid();
     let removed = remove_task_from_block_queues(pid);
@@ -262,7 +332,14 @@ fn notify_parent_sigchld(parent: &Arc<TaskControlBlock>) {
         let mut inner = parent.inner_exclusive_access();
         inner.signals.insert(SignalFlags::SIGCHLD);
     }
-    wake_blocked_task(parent);
+    let woke_signal_waiter = wake_signal_wait_task(parent, SignalFlags::SIGCHLD);
+    let should_interrupt = parent
+        .try_inner_borrow()
+        .map(|inner| has_interrupting_signal(&inner))
+        .unwrap_or(false);
+    if should_interrupt && !woke_signal_waiter {
+        wake_blocked_task(parent);
+    }
 }
 
 fn wake_parent_waiter(parent: &Arc<TaskControlBlock>) {
@@ -299,6 +376,12 @@ fn detach_child_from_parent(parent: &Arc<TaskControlBlock>, child_pid: usize) {
     }
 }
 
+fn is_thread_group_leader(task: &Arc<TaskControlBlock>) -> bool {
+    task.try_inner_borrow()
+        .map(|inner| inner.tgid == task.getpid())
+        .unwrap_or(false)
+}
+
 fn remove_task_from_block_queues(pid: usize) -> bool {
     let mut removed = false;
     if crate::syscall::process::remove_futex_waiter(pid) {
@@ -333,6 +416,8 @@ fn remove_task_from_block_queues(pid: usize) -> bool {
 
 pub fn force_exit_task(task: &Arc<TaskControlBlock>, exit_code: i32) {
     let pid = task.getpid();
+    let notify_parent = is_thread_group_leader(task);
+    crate::fs::stdio::stdout_release_pid(pid);
     remove_from_ready_queue(pid);
     remove_task_from_block_queues(pid);
     remove_from_pid2task(pid);
@@ -352,13 +437,15 @@ pub fn force_exit_task(task: &Arc<TaskControlBlock>, exit_code: i32) {
         (parent, orphan_children)
     };
 
-    if let Some(parent) = parent {
-        if parent_auto_reaps_sigchld(&parent) {
-            detach_child_from_parent(&parent, pid);
-            wake_parent_waiter(&parent);
-        } else {
-            notify_parent_sigchld(&parent);
-            wake_parent_waiter(&parent);
+    if notify_parent {
+        if let Some(parent) = parent {
+            if parent_auto_reaps_sigchld(&parent) {
+                detach_child_from_parent(&parent, pid);
+                wake_parent_waiter(&parent);
+            } else {
+                notify_parent_sigchld(&parent);
+                wake_parent_waiter(&parent);
+            }
         }
     }
 
@@ -462,6 +549,7 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
     }
 
     // remove from pid2task
+    let notify_parent = is_thread_group_leader(&task);
     remove_from_ready_queue(task.getpid());
     remove_from_pid2task(task.getpid());
     let (parent, orphan_children) = {
@@ -482,13 +570,15 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
     // **** release current PCB before touching parent/initproc
 
     // wake parent waiting in waitpid
-    if let Some(parent) = parent {
-        if parent_auto_reaps_sigchld(&parent) {
-            detach_child_from_parent(&parent, pid);
-            wake_parent_waiter(&parent);
-        } else {
-            notify_parent_sigchld(&parent);
-            wake_parent_waiter(&parent);
+    if notify_parent {
+        if let Some(parent) = parent {
+            if parent_auto_reaps_sigchld(&parent) {
+                detach_child_from_parent(&parent, pid);
+                wake_parent_waiter(&parent);
+            } else {
+                notify_parent_sigchld(&parent);
+                wake_parent_waiter(&parent);
+            }
         }
     }
 
@@ -534,6 +624,61 @@ pub fn check_signals_error_of_current() -> Option<(i32, &'static str)> {
     let task = current_task()?;
     let task_inner = task.try_inner_exclusive_access()?;
     task_inner.signals.check_error()
+}
+
+fn default_signal_interrupts(signal: SignalFlags) -> bool {
+    signal.intersects(
+        SignalFlags::SIGSEGV
+            | SignalFlags::SIGABRT
+            | SignalFlags::SIGILL
+            | SignalFlags::SIGFPE
+            | SignalFlags::SIGBUS
+            | SignalFlags::SIGSYS
+            | SignalFlags::SIGTRAP
+            | SignalFlags::SIGALRM
+            | SignalFlags::SIGVTALRM
+            | SignalFlags::SIGPROF
+            | SignalFlags::SIGTERM
+            | SignalFlags::SIGINT
+            | SignalFlags::SIGQUIT
+            | SignalFlags::SIGHUP
+            | SignalFlags::SIGPIPE
+            | SignalFlags::SIGUSR1
+            | SignalFlags::SIGUSR2
+            | SignalFlags::SIGXCPU
+            | SignalFlags::SIGXFSZ
+            | SignalFlags::SIGIO
+            | SignalFlags::SIGPWR
+            | SignalFlags::SIGKILL
+            | SignalFlags::SIGSTOP
+            | SignalFlags::SIGDEF,
+    )
+}
+
+pub fn has_interrupting_signal(inner: &TaskControlBlockInner) -> bool {
+    if inner.killed {
+        return true;
+    }
+    let pending = inner.signals & !inner.signal_mask;
+    if pending.is_empty() {
+        return false;
+    }
+    for sig in 1..=MAX_SIG {
+        let Some(signal) = SignalFlags::from_bits(1u64 << sig) else {
+            continue;
+        };
+        if !pending.contains(signal) {
+            continue;
+        }
+        let action = inner.signal_actions.table[sig];
+        if action.handler == SIG_IGN {
+            continue;
+        }
+        if action.handler != 0 || default_signal_interrupts(signal) {
+            return true;
+        }
+    }
+    false
 }
 
 pub fn current_add_signal(signal: SignalFlags) {

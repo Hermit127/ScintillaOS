@@ -535,12 +535,8 @@ impl MemorySet {
         for area in user_space.areas.iter() {
             let mut new_area = MapArea::from_another(area);
             for (&vpn, frame) in area.data_frames.iter() {
-                #[cfg(target_arch = "loongarch64")]
                 let child_perm = area.map_perm;
-                #[cfg(not(target_arch = "loongarch64"))]
-                let mut child_perm = area.map_perm;
 
-                #[cfg(target_arch = "loongarch64")]
                 let new_frame = if area.shared {
                     frame.shared_clone()
                 } else {
@@ -550,22 +546,6 @@ impl MemorySet {
                             frame.paddr.get_ptr::<u8>(),
                             new_frame.paddr.get_mut_ptr(),
                             PAGE_SIZE,
-                        );
-                    }
-                    new_frame
-                };
-
-                #[cfg(not(target_arch = "loongarch64"))]
-                let new_frame = {
-                    let new_frame = frame.shared_clone();
-                    if !area.shared && child_perm.contains(MapPermission::W) {
-                        child_perm.remove(MapPermission::W);
-                        user_space.page_table.unmap_page(vpn);
-                        user_space.page_table.map_page(
-                            vpn,
-                            frame.paddr,
-                            child_perm.into(),
-                            MappingSize::Page4KB,
                         );
                     }
                     new_frame
@@ -779,7 +759,7 @@ impl MemorySet {
     pub fn from_shared(user_space: &MemorySet) -> MemorySet {
         let mut areas = Vec::new();
         for area in user_space.areas.iter() {
-            areas.push(MapArea::from_another(area));
+            areas.push(MapArea::clone_shared_metadata(area));
         }
         MemorySet {
             page_table: user_space.page_table.clone(),

@@ -14,7 +14,6 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
 
 const AT_FDCWD: isize = -100;
 const O_NOATIME: u32 = 0x40000;
@@ -24,8 +23,6 @@ const FILE_TIME_NOW_GUARD_SEC: i64 = 5;
 const PATH_MAX: usize = 4096;
 const NAME_MAX: usize = 255;
 const EROFS: isize = -30;
-
-static TMPFILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn map_dev_shm_path(path: &str) -> String {
     if let Some(name) = path.strip_prefix("/dev/shm/") {
@@ -165,6 +162,25 @@ fn install_fd(
     }
     inner.fd_table[fd] = Some(file);
     inner.fd_cloexec[fd] = cloexec;
+    Ok(fd)
+}
+
+fn install_fd_shared(
+    task: &Arc<crate::task::TaskControlBlock>,
+    file: Arc<dyn File + Send + Sync>,
+    cloexec: bool,
+) -> Result<usize, isize> {
+    let (fd, tgid) = {
+        let mut inner = task.inner_exclusive_access();
+        let fd = inner.alloc_fd();
+        if fd >= inner.fd_table.len() {
+            return Err(-24);
+        }
+        inner.fd_table[fd] = Some(file.clone());
+        inner.fd_cloexec[fd] = cloexec;
+        (fd, inner.tgid)
+    };
+    install_fd_for_thread_group(task.getpid(), tgid, fd, file, cloexec);
     Ok(fd)
 }
 
@@ -453,11 +469,23 @@ fn open_existing_access(dentry: &Arc<Dentry>, flags: OpenFlags) -> isize {
     if euid == 0 {
         return 0;
     }
-    match dentry.super_block.get_inode_info(&dentry.fs_path) {
+    match dentry.inode_info() {
         Some(info) if inode_perm_allows(info.mode, info.uid, info.gid, euid, egid, need) => 0,
         Some(_) => -13,
         None => -2,
     }
+}
+
+fn is_libc_tmpfile_fallback(path: &str, open_flags: OpenFlags) -> bool {
+    if !open_flags.create_requested() || !open_flags.excl_requested() {
+        return false;
+    }
+    let (readable, writable) = open_flags.read_write();
+    if !readable || !writable {
+        return false;
+    }
+    let path = path.trim_matches('\0');
+    path.starts_with("/tmp/tmpfile_") || path.starts_with("/var/tmp/tmpfile_")
 }
 
 pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> isize {
@@ -548,8 +576,7 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> isize
                 inner.euid
             };
             let owner = existing
-                .super_block
-                .get_inode_info(&existing.fs_path)
+                .inode_info()
                 .map(|info| info.uid)
                 .unwrap_or(0);
             if euid != 0 && euid != owner {
@@ -570,27 +597,33 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> isize
             return -13;
         }
     }
+    let use_anon_tmpfile = is_libc_tmpfile_fallback(path.as_str(), open_flags);
     let inode = open_file_at(Some(base), path.as_str(), open_flags, mode as u32);
 
     if let Some(inode) = inode {
+        let file: Arc<dyn File + Send + Sync> = if use_anon_tmpfile {
+            Arc::new(crate::fs::TmpFile::new())
+        } else {
+            inode.clone()
+        };
         let (fd, tgid) = {
             let mut inner = task.inner_exclusive_access();
             let fd = inner.alloc_fd();
             if fd >= inner.fd_table.len() {
                 return -24;
             }
-            inner.fd_table[fd] = Some(inode.clone());
+            inner.fd_table[fd] = Some(file.clone());
             inner.fd_cloexec[fd] = cloexec;
             (fd, inner.tgid)
         };
-        install_fd_for_thread_group(task.getpid(), tgid, fd, inode, cloexec);
+        install_fd_for_thread_group(task.getpid(), tgid, fd, file, cloexec);
         fd as isize
     } else {
         -2
     }
 }
 
-fn sys_open_tmpfile(dirfd: isize, path: &str, mode: u32, cloexec: bool) -> isize {
+fn sys_open_tmpfile(dirfd: isize, path: &str, _mode: u32, cloexec: bool) -> isize {
     let base = match resolve_base_dir_for_path(dirfd, path) {
         Ok(base) => base,
         Err(errno) => return errno,
@@ -606,28 +639,14 @@ fn sys_open_tmpfile(dirfd: isize, path: &str, mode: u32, cloexec: bool) -> isize
         None => return -20,
     };
 
-    let perm = mode & 0o7777;
     if vfs_dentry_is_readonly(&dir) {
         return EROFS;
     }
-    let pid = current_task().map(|task| task.getpid()).unwrap_or(0);
-    for _ in 0..16 {
-        let id = TMPFILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let name = format!(".tmpfile.{}.{}", pid, id);
-        if let Some(dentry) = crate::fs::vfs::vfs_create(&dir, &name, false, perm) {
-            let inode = Arc::new(crate::fs::inode::OSInode::new(true, true, false, dentry));
-            let task = current_task().unwrap();
-            let mut inner = task.inner_exclusive_access();
-            let fd = inner.alloc_fd();
-            if fd >= inner.fd_table.len() {
-                return -24;
-            }
-            inner.fd_table[fd] = Some(inode);
-            inner.fd_cloexec[fd] = cloexec;
-            return fd as isize;
-        }
-    }
-    -17
+
+    let task = current_task().unwrap();
+    install_fd_shared(&task, Arc::new(crate::fs::TmpFile::new()), cloexec)
+        .map(|fd| fd as isize)
+        .unwrap_or_else(|e| e)
 }
 
 fn open_proc(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
@@ -1106,8 +1125,7 @@ pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const u8, _flags: us
     };
 
     if euid != 0 {
-        let fs_path = &dentry.fs_path;
-        let permitted = match dentry.super_block.get_inode_info(fs_path) {
+        let permitted = match dentry.inode_info() {
             Some(info) => {
                 if info.uid == euid {
                     true
@@ -1183,6 +1201,15 @@ pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const u8, _flags: us
         new_mtime,
         if changed { Some(now_sec) } else { None },
     );
+    dentry.update_cached_times(
+        new_atime.map(|v| v.clamp(0, u32::MAX as i64) as u32),
+        new_mtime.map(|v| v.clamp(0, u32::MAX as i64) as u32),
+        if changed {
+            Some(now_sec.clamp(0, u32::MAX as i64) as u32)
+        } else {
+            None
+        },
+    );
     if let Some(file) = &fd_file {
         if let Some(inode) = file.as_any().downcast_ref::<crate::fs::inode::OSInode>() {
             inode.update_cached_times(
@@ -1242,7 +1269,7 @@ fn can_modify_directory(dir: &Arc<Dentry>) -> bool {
     if euid == 0 {
         return true;
     }
-    match dir.super_block.get_inode_info(&dir.fs_path) {
+    match dir.inode_info() {
         Some(info) => inode_perm_allows(info.mode, info.uid, info.gid, euid, egid, 0o3),
         None => false,
     }
@@ -1259,7 +1286,7 @@ fn can_search_directory(dir: &Arc<Dentry>) -> bool {
     if euid == 0 {
         return true;
     }
-    match dir.super_block.get_inode_info(&dir.fs_path) {
+    match dir.inode_info() {
         Some(info) => inode_perm_allows(info.mode, info.uid, info.gid, euid, egid, 0o1),
         None => false,
     }
@@ -1312,7 +1339,7 @@ fn check_traverse_to_leaf(
             return Err(-20);
         }
         if check_uid != 0 {
-            let Some(info) = next.super_block.get_inode_info(&next.fs_path) else {
+            let Some(info) = next.inode_info() else {
                 return Err(-2);
             };
             if !inode_perm_allows(info.mode, info.uid, info.gid, check_uid, check_gid, 0o1) {
@@ -1402,8 +1429,7 @@ pub fn sys_faccessat2(dirfd: isize, path: *const u8, mode: usize, flags: usize) 
         return EROFS;
     }
 
-    let fs_path = &dentry.fs_path;
-    let allowed = match dentry.super_block.get_inode_info(fs_path) {
+    let allowed = match dentry.inode_info() {
         Some(info) => {
             if check_uid == 0 {
                 return if (mode & X_OK) != 0 && (info.mode & 0o111) == 0 {
@@ -1473,7 +1499,7 @@ pub fn sys_fchmodat(dirfd: isize, path: *const u8, mode: u32) -> isize {
 
     let fs_path = &dentry.fs_path;
     if euid != 0 {
-        let is_owner = match dentry.super_block.get_inode_info(fs_path) {
+        let is_owner = match dentry.inode_info() {
             Some(info) => info.uid == euid,
             None => return -2,
         };
@@ -1482,7 +1508,7 @@ pub fn sys_fchmodat(dirfd: isize, path: *const u8, mode: u32) -> isize {
         }
     }
 
-    let info = match dentry.super_block.get_inode_info(fs_path) {
+    let info = match dentry.inode_info() {
         Some(info) => info,
         None => return -2,
     };
@@ -1505,6 +1531,8 @@ pub fn sys_fchmodat(dirfd: isize, path: *const u8, mode: u32) -> isize {
 
     let now_sec = (polyhal::time::Time::now().to_msec() / 1000) as u32;
     dentry.super_block.set_ctime(fs_path, now_sec);
+    dentry.update_cached_mode(file_type | new_perm);
+    dentry.update_cached_times(None, None, Some(now_sec));
     0
 }
 
@@ -1543,7 +1571,7 @@ fn chown_dentry(dentry: &Arc<Dentry>, owner: u32, group: u32) -> isize {
         (inner.euid, inner.egid)
     };
     let fs_path = &dentry.fs_path;
-    let info = match dentry.super_block.get_inode_info(fs_path) {
+    let info = match dentry.inode_info() {
         Some(info) => info,
         None => return -2,
     };
@@ -1579,6 +1607,7 @@ fn chown_dentry(dentry: &Arc<Dentry>, owner: u32, group: u32) -> isize {
 
     let now_sec = (polyhal::time::Time::now().to_msec() / 1000) as u32;
     dentry.super_block.set_ctime(fs_path, now_sec);
+    dentry.update_cached_owner(new_uid, new_gid, new_mode, now_sec);
     0
 }
 
@@ -1610,7 +1639,7 @@ pub fn sys_fchmod(fd: usize, mode: u32) -> isize {
 
     let fs_path = &dentry.fs_path;
     if euid != 0 {
-        let is_owner = match dentry.super_block.get_inode_info(fs_path) {
+        let is_owner = match dentry.inode_info() {
             Some(info) => info.uid == euid,
             None => return -9,
         };
@@ -1619,7 +1648,7 @@ pub fn sys_fchmod(fd: usize, mode: u32) -> isize {
         }
     }
 
-    let info = match dentry.super_block.get_inode_info(fs_path) {
+    let info = match dentry.inode_info() {
         Some(info) => info,
         None => return -9,
     };
@@ -1643,6 +1672,7 @@ pub fn sys_fchmod(fd: usize, mode: u32) -> isize {
     let now_sec = (polyhal::time::Time::now().to_msec() / 1000) as u32;
     dentry.super_block.set_ctime(fs_path, now_sec);
     inode.update_cached_mode(new_mode);
+    inode.update_cached_times(None, None, Some(now_sec as i64));
     0
 }
 
@@ -1721,7 +1751,7 @@ pub fn sys_fchown(fd: usize, owner: u32, group: u32) -> isize {
 
     let ret = chown_dentry(&dentry, owner, group);
     if ret == 0 {
-        if let Some(info) = dentry.super_block.get_inode_info(&dentry.fs_path) {
+        if let Some(info) = dentry.inode_info() {
             inode.update_cached_owner(info.uid, info.gid, info.mode, info.ctime as i64);
         }
     }
@@ -2361,7 +2391,7 @@ pub fn sys_linkat(
 }
 
 fn read_symlink_target(dentry: &Arc<Dentry>, max_len: usize) -> Result<Vec<u8>, isize> {
-    let is_link = match dentry.super_block.get_inode_info(&dentry.fs_path) {
+    let is_link = match dentry.inode_info() {
         Some(info) => info.is_link,
         None => false,
     };
@@ -3475,8 +3505,7 @@ pub fn sys_ftruncate(fd: usize, length: u64) -> isize {
     match dentry {
         Some(d) => {
             let old_size = d
-                .super_block
-                .get_inode_info(&d.fs_path)
+                .inode_info()
                 .map(|info| info.size)
                 .unwrap_or(0);
             if !vfs_tmpfs_can_resize(&d.path, &d.fs_path, old_size, length) {

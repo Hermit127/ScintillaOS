@@ -523,7 +523,9 @@ pub fn wake_net_blocked_tasks() {
                         .unwrap_or(true)
                     }
                     Some(BlockReason::PollWait) => true,
-                    Some(BlockReason::PipeRead(_)) | Some(BlockReason::PipeWrite(_)) => false,
+                    Some(BlockReason::PipeRead(_))
+                    | Some(BlockReason::PipeWrite(_))
+                    | Some(BlockReason::SignalWait(_)) => false,
                     None => true, // block_reason cleared, should be woken
                 }
             };

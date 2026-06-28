@@ -212,6 +212,9 @@ fn loongarch64_trap_handler(tf: &mut TrapFrame) -> TrapType {
             }
         }
         Trap::Exception(Exception::Syscall) => TrapType::SysCall,
+        Trap::Exception(Exception::InstructionNotExist) => {
+            TrapType::IllegalInstruction(tf.era)
+        }
         Trap::Exception(Exception::StorePageFault) | Trap::Exception(Exception::PageModifyFault) => {
             TrapType::StorePageFault(badv::read().vaddr())
         }

@@ -5,8 +5,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::task::{
-    block_current_and_run_next, current_add_signal, current_task, wake_pipe_read_tasks,
-    wake_pipe_write_tasks, wake_poll_wait_tasks, BlockReason, SignalFlags,
+    block_current_and_run_next, current_add_signal, current_task, has_interrupting_signal,
+    wake_pipe_read_tasks, wake_pipe_write_tasks, wake_poll_wait_tasks, BlockReason, SignalFlags,
 };
 
 use crate::fs::stdio::stdout_release_if_owner;
@@ -17,10 +17,8 @@ const O_NONBLOCK: usize = 0x800;
 fn current_task_interrupted() -> bool {
     current_task()
         .and_then(|task| {
-            task.try_inner_borrow().map(|inner| {
-                let pending = inner.signals & !inner.signal_mask;
-                inner.killed || !pending.is_empty()
-            })
+            task.try_inner_borrow()
+                .map(|inner| has_interrupting_signal(&inner))
         })
         .unwrap_or(false)
 }

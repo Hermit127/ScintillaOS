@@ -50,6 +50,7 @@ impl DirEntry {
 
 // ==================== InodeInfo ====================
 
+#[derive(Clone, Copy)]
 pub struct InodeInfo {
     pub inode_num: u32,
     pub is_dir: bool,
@@ -322,7 +323,7 @@ impl VfsSuperBlock {
 
             let mut total = 0usize;
             while total < max_read {
-                let chunk_len = core::cmp::min(128, max_read - total);
+                let chunk_len = max_read - total;
                 let mut rw_count: usize = 0;
                 let read_rc = unsafe {
                     ext4_fread(
@@ -608,6 +609,7 @@ pub struct Dentry {
     pub parent: Option<Weak<Dentry>>,
     pub super_block: Arc<VfsSuperBlock>,
     pub children: UPSafeCell<Option<Vec<Arc<Dentry>>>>,
+    inode_info: UPSafeCell<Option<InodeInfo>>,
 }
 
 impl Dentry {
@@ -622,6 +624,7 @@ impl Dentry {
             parent: None,
             super_block: sb,
             children: unsafe { UPSafeCell::new(None) },
+            inode_info: unsafe { UPSafeCell::new(None) },
         })
     }
 
@@ -636,6 +639,7 @@ impl Dentry {
             parent: None,
             super_block: sb,
             children: unsafe { UPSafeCell::new(None) },
+            inode_info: unsafe { UPSafeCell::new(None) },
         })
     }
 
@@ -668,7 +672,70 @@ impl Dentry {
             parent: Some(Arc::downgrade(parent)),
             super_block: parent.super_block.clone(),
             children: unsafe { UPSafeCell::new(None) },
+            inode_info: unsafe { UPSafeCell::new(None) },
         })
+    }
+
+    pub fn inode_info(&self) -> Option<InodeInfo> {
+        if let Some(info) = *self.inode_info.exclusive_access() {
+            return Some(info);
+        }
+        let info = self.super_block.get_inode_info(&self.fs_path)?;
+        *self.inode_info.exclusive_access() = Some(info);
+        Some(info)
+    }
+
+    pub fn refresh_inode_info(&self) -> Option<InodeInfo> {
+        let info = self.super_block.get_inode_info(&self.fs_path)?;
+        *self.inode_info.exclusive_access() = Some(info);
+        Some(info)
+    }
+
+    pub fn set_cached_inode_info(&self, info: InodeInfo) {
+        *self.inode_info.exclusive_access() = Some(info);
+    }
+
+    pub fn invalidate_inode_info(&self) {
+        *self.inode_info.exclusive_access() = None;
+    }
+
+    pub fn update_cached_size(&self, size: u64) {
+        if let Some(ref mut info) = *self.inode_info.exclusive_access() {
+            info.size = size;
+            info.blocks_count = (size + 511) / 512;
+        }
+    }
+
+    pub fn update_cached_mode(&self, mode: u32) {
+        if let Some(ref mut info) = *self.inode_info.exclusive_access() {
+            info.mode = mode;
+            let file_type = mode & 0o170000;
+            info.is_dir = file_type == 0o040000;
+            info.is_link = file_type == 0o120000;
+        }
+    }
+
+    pub fn update_cached_owner(&self, uid: u32, gid: u32, mode: u32, ctime: u32) {
+        if let Some(ref mut info) = *self.inode_info.exclusive_access() {
+            info.uid = uid;
+            info.gid = gid;
+            info.mode = mode;
+            info.ctime = ctime;
+        }
+    }
+
+    pub fn update_cached_times(&self, atime: Option<u32>, mtime: Option<u32>, ctime: Option<u32>) {
+        if let Some(ref mut info) = *self.inode_info.exclusive_access() {
+            if let Some(atime) = atime {
+                info.atime = atime;
+            }
+            if let Some(mtime) = mtime {
+                info.mtime = mtime;
+            }
+            if let Some(ctime) = ctime {
+                info.ctime = ctime;
+            }
+        }
     }
 }
 
@@ -905,6 +972,7 @@ pub fn vfs_lookup(parent: &Arc<Dentry>, name: &str) -> Option<Arc<Dentry>> {
     let (child_inode, is_dir, is_link) = (info.inode_num, info.is_dir, info.is_link);
 
     let child = Dentry::new_child(parent, name, child_inode, is_dir, is_link);
+    child.set_cached_inode_info(info);
 
     cache_child(parent, child.clone());
 
@@ -1016,7 +1084,7 @@ pub fn vfs_create(
             (inner.euid, inner.egid, inner.umask)
         })
         .unwrap_or((0, 0, 0o22));
-    let parent_info = parent.super_block.get_inode_info(&parent.fs_path);
+    let parent_info = parent.inode_info();
     let parent_sgid = parent_info
         .as_ref()
         .map(|info| (info.mode & 0o2000) != 0)
@@ -1042,6 +1110,9 @@ pub fn vfs_create(
     let fs_path = child.fs_path.clone();
     child.super_block.set_owner(&fs_path, uid, gid);
     child.super_block.set_mode(&fs_path, effective_mode);
+    if let Some(info) = child.super_block.get_inode_info(&fs_path) {
+        child.set_cached_inode_info(info);
+    }
 
     cache_child(parent, child.clone());
 

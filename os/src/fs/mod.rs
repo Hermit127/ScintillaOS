@@ -131,5 +131,5 @@ pub use inode::{
     OpenFlags,
 };
 pub use pipe::make_pipe;
-pub use stdio::{DevBlock, DevNull, DevZero, NullSocket, Stdin, Stdout, Urandom};
+pub use stdio::{DevBlock, DevNull, DevZero, NullSocket, Stdin, Stdout, TmpFile, Urandom};
 pub use vfs::{list_apps, mount_root};

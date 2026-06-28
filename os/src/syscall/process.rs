@@ -6,10 +6,11 @@ use crate::mm::{
 };
 use crate::sync::UPSafeCell;
 use crate::task::{
-    add_priority_task, add_task, blank_kcontext, block_current_and_run_next, current_task,
-    current_user_token, exit_current_and_run_next, force_exit_task, force_exit_task_group,
-    pid2task, pid_alloc, sleep_current_and_run_next, suspend_current_and_run_next,
-    wake_blocked_task, BlockReason, KernelStack, SignalAction, SignalFlags, TaskControlBlock,
+    add_priority_task, add_task, blank_kcontext, block_current_and_run_next, block_current_until,
+    current_task, current_user_token, exit_current_and_run_next, force_exit_task,
+    force_exit_task_group, has_interrupting_signal, pid2task, pid_alloc,
+    schedule, suspend_current_and_run_next, take_current_task, wake_blocked_task,
+    wake_signal_wait_task, BlockReason, KernelStack, SignalAction, SignalFlags, TaskControlBlock,
     TaskControlBlockInner, TaskStatus, MAX_SIG, PID2TCB,
 };
 use alloc::collections::BTreeMap;
@@ -20,7 +21,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use lazy_static::lazy_static;
 use log::info;
-use polyhal::kcontext::KContextArgs;
+use polyhal::kcontext::{KContext, KContextArgs};
 use polyhal::time::Time;
 use polyhal_trap::trapframe::TrapFrameArgs;
 
@@ -1077,6 +1078,71 @@ pub fn sys_exec(path: *const u8, mut args: *const usize, mut envp: *const usize)
     }
 }
 
+fn wait_child_matches(pid: isize, child_pid: usize) -> bool {
+    pid <= 0 || pid as usize == child_pid
+}
+
+fn wait_child_event_pending(task: &Arc<TaskControlBlock>, pid: isize) -> bool {
+    let inner = task.inner_exclusive_access();
+    let mut has_child = false;
+    for child in inner.children.iter() {
+        if !wait_child_matches(pid, child.getpid()) {
+            continue;
+        }
+        has_child = true;
+        if child
+            .try_inner_borrow()
+            .map(|inner| inner.is_zombie())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    !has_child
+}
+
+fn wait_cancel_block(task: &Arc<TaskControlBlock>) {
+    crate::task::WAITPID_QUEUE
+        .exclusive_access()
+        .retain(|t| t.getpid() != task.getpid());
+    {
+        let mut inner = task.inner_exclusive_access();
+        if inner.task_status == TaskStatus::Blocked {
+            inner.task_status = TaskStatus::Running;
+        }
+        inner.block_reason = None;
+    }
+    task.record_time_resume();
+}
+
+fn wait_block_current_or_retry(task: Arc<TaskControlBlock>, pid: isize) -> bool {
+    stdout_release_if_owner();
+    task.record_time_suspend();
+    let task_cx_ptr = {
+        let mut inner = task.inner_exclusive_access();
+        inner.task_status = TaskStatus::Blocked;
+        inner.block_reason = None;
+        &mut inner.task_cx as *mut KContext
+    };
+    {
+        let mut queue = crate::task::WAITPID_QUEUE.exclusive_access();
+        if !queue.iter().any(|t| t.getpid() == task.getpid()) {
+            queue.push(task.clone());
+        }
+    }
+    if wait_child_event_pending(&task, pid) {
+        wait_cancel_block(&task);
+        return false;
+    }
+    take_current_task();
+    schedule(task_cx_ptr);
+    task.record_time_resume();
+    crate::task::WAITPID_QUEUE
+        .exclusive_access()
+        .retain(|t| t.getpid() != task.getpid());
+    true
+}
+
 /// If there is not a child process whose pid is same as given, return -ECHILD.
 /// Else if there is a child process but it is still running, return -2.
 pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: usize) -> isize {
@@ -1101,7 +1167,7 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: usize) -> isize
             let mut has_child = false;
             let mut zombie_idx = None;
             for (idx, child) in inner.children.iter().enumerate() {
-                if pid > 0 && pid as usize != child.getpid() {
+                if !wait_child_matches(pid, child.getpid()) {
                     continue;
                 }
                 has_child = true;
@@ -1147,13 +1213,7 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: usize) -> isize
         if options & WNOHANG != 0 {
             return 0;
         }
-        let mut queue = crate::task::WAITPID_QUEUE.exclusive_access();
-        if !queue.iter().any(|t| t.getpid() == task.getpid()) {
-            queue.push(task.clone());
-        }
-        drop(queue);
-        drop(task);
-        crate::task::sleep_current_and_run_next();
+        let _ = wait_block_current_or_retry(task, pid);
         // Loop back to check again
     }
 }
@@ -1245,7 +1305,7 @@ pub fn sys_waitid(
             let mut has_child = false;
             let mut zombie_idx = None;
             for (idx, child) in inner.children.iter().enumerate() {
-                if pid > 0 && pid as usize != child.getpid() {
+                if !wait_child_matches(pid, child.getpid()) {
                     continue;
                 }
                 has_child = true;
@@ -1298,13 +1358,7 @@ pub fn sys_waitid(
             write_wait_siginfo(info_ptr, 0, 0, 0);
             return 0;
         }
-        let mut queue = crate::task::WAITPID_QUEUE.exclusive_access();
-        if !queue.iter().any(|t| t.getpid() == task.getpid()) {
-            queue.push(task.clone());
-        }
-        drop(queue);
-        drop(task);
-        crate::task::sleep_current_and_run_next();
+        let _ = wait_block_current_or_retry(task, pid);
     }
 }
 
@@ -1363,9 +1417,14 @@ fn signal_task(task: &Arc<TaskControlBlock>, signum: i32) {
             }
         }
     };
+    let woke_signal_waiter = wake_signal_wait_task(task, flag);
+    let should_interrupt = task
+        .try_inner_borrow()
+        .map(|inner| has_interrupting_signal(&inner))
+        .unwrap_or(false);
     if target_ready && !is_current {
         add_priority_task(task.clone());
-    } else {
+    } else if should_interrupt && !woke_signal_waiter {
         wake_blocked_task(task);
     }
 }
@@ -1562,10 +1621,6 @@ fn flags_to_user_sigset(flags: SignalFlags) -> u64 {
     raw
 }
 
-fn has_unblocked_signal(signals: SignalFlags, mask: SignalFlags) -> bool {
-    !(signals & !mask).is_empty()
-}
-
 pub fn sys_sigprocmask(how: i32, set: *const u8, old_set: *mut u8, _sigsetsize: usize) -> isize {
     const SIG_BLOCK: i32 = 0;
     const SIG_UNBLOCK: i32 = 1;
@@ -1678,29 +1733,23 @@ pub fn sys_brk(brk_addr: usize) -> isize {
 
     let heap_bottom = inner.heap_bottom;
     if brk_addr < heap_bottom {
-        return -1;
+        return inner.program_brk as isize;
     }
 
     let old_brk = inner.program_brk;
 
     let old_brk_page = (old_brk + crate::config::PAGE_SIZE - 1) / crate::config::PAGE_SIZE;
     let new_brk_page = (brk_addr + crate::config::PAGE_SIZE - 1) / crate::config::PAGE_SIZE;
-    let mut new_frame_range = None;
-
     if new_brk_page > old_brk_page {
         let start_va = polyhal::VirtAddr::new(old_brk_page * crate::config::PAGE_SIZE);
         let end_va = polyhal::VirtAddr::new(new_brk_page * crate::config::PAGE_SIZE);
-
-        let map_area = crate::mm::MapArea::new(
+        if !inner.memory_set.insert_lazy_area(
             start_va,
             end_va,
-            crate::mm::MapType::Framed,
             crate::mm::MapPermission::R | crate::mm::MapPermission::W | crate::mm::MapPermission::U,
-        );
-        if !inner.memory_set.push(map_area, None, 0) {
-            return -1; // ENOMEM
+        ) {
+            return old_brk as isize;
         }
-        new_frame_range = Some((start_va, end_va));
     } else if new_brk_page < old_brk_page {
         let shrink_start = polyhal::VirtAddr::new(new_brk_page * crate::config::PAGE_SIZE);
         let shrink_end = polyhal::VirtAddr::new(old_brk_page * crate::config::PAGE_SIZE);
@@ -1714,18 +1763,10 @@ pub fn sys_brk(brk_addr: usize) -> isize {
     } else {
         None
     };
-    let frames = if may_sync {
-        new_frame_range
-            .map(|(start, end)| inner.memory_set.frame_metadata_range(start, end))
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
     drop(inner);
     if let Some(snapshot) = snapshot {
         if thread_group_has_peer(pid, tgid) {
             sync_thread_group_vm_metadata(pid, tgid, brk_addr, &snapshot);
-            sync_thread_group_vm_frames(pid, tgid, &frames);
         }
     }
     brk_addr as isize
@@ -1854,18 +1895,9 @@ pub fn sys_mmap(
                 polyhal::VirtAddr::from(start_addr.raw() + aligned_len)
             );
         }
-        if prot == PROT_NONE {
-            if !inner
-                .memory_set
-                .insert_lazy_area(start_addr, end_addr, permission)
-            {
-                return -12;
-            }
-            sync_and_return!(real_start as isize, start_addr, end_addr);
-        }
         if !inner
             .memory_set
-            .insert_framed_area(start_addr, end_addr, permission)
+            .insert_lazy_area(start_addr, end_addr, permission)
         {
             return -12;
         }
@@ -2278,8 +2310,7 @@ pub fn sys_nanosleep(req_ptr: usize, rem_ptr: usize) -> isize {
         }
         {
             let inner = task.inner_exclusive_access();
-            let pending = inner.signals & !inner.signal_mask;
-            if !pending.is_empty() {
+            if has_interrupting_signal(&inner) {
                 if rem_ptr != 0 {
                     let rem_ns = wakeup_time.saturating_sub(now) as usize;
                     let rem =
@@ -2487,7 +2518,7 @@ pub fn sys_ppoll(
         let mut ready = 0i32;
         let task = current_task().unwrap();
         let mut inner = task.inner_exclusive_access();
-        if has_unblocked_signal(inner.signals, inner.signal_mask) {
+        if has_interrupting_signal(&inner) {
             return -4;
         }
 
@@ -3094,7 +3125,7 @@ pub fn sys_rt_sigsuspend(mask: *const u8, _sigsize: usize) -> isize {
             inner2.signal_mask = saved_mask;
             return -4;
         }
-        if has_unblocked_signal(inner2.signals, inner2.signal_mask) {
+        if has_interrupting_signal(&inner2) {
             inner2.signal_mask = saved_mask;
             return -4;
         }
@@ -3183,6 +3214,7 @@ pub fn sys_rt_sigtimedwait(
         )
     };
     let start_ns = Time::now().to_nsec() as usize;
+    let deadline_ns = timeout_ns.map(|limit| start_ns.saturating_add(limit));
 
     loop {
         let task = current_task().unwrap();
@@ -3211,18 +3243,17 @@ pub fn sys_rt_sigtimedwait(
             return signum as isize;
         }
 
-        if let Some(limit_ns) = timeout_ns {
-            if limit_ns == 0 {
+        if let Some(deadline) = deadline_ns {
+            if timeout_ns == Some(0) {
                 return -11;
             }
             let now_ns = Time::now().to_nsec() as usize;
-            if now_ns.saturating_sub(start_ns) >= limit_ns {
+            if now_ns >= deadline {
                 return -11;
             }
         }
 
-        stdout_release_if_owner();
-        suspend_current_and_run_next();
+        block_current_until(BlockReason::SignalWait(wanted), deadline_ns);
     }
 }
 
@@ -3785,7 +3816,7 @@ pub fn sys_pselect6(
 
         let task = current_task().unwrap();
         let mut inner = task.inner_exclusive_access();
-        if has_unblocked_signal(inner.signals, inner.signal_mask) {
+        if has_interrupting_signal(&inner) {
             return -4;
         }
 
@@ -4176,7 +4207,7 @@ fn futex_wait_current(key: FutexKey, deadline_ns: Option<usize>) -> FutexWaitRes
             .retain(|sleep_task| sleep_task.task.getpid() != pid);
     }
     let inner = task.inner_exclusive_access();
-    let interrupted = inner.killed || has_unblocked_signal(inner.signals, inner.signal_mask);
+    let interrupted = has_interrupting_signal(&inner);
     drop(inner);
     if interrupted {
         FutexWaitResult::Interrupted
