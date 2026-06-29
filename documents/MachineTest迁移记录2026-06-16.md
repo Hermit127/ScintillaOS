@@ -1,3 +1,5 @@
+# MachineTest 迁移记录（2026-06-16）
+
 2026/6/16 hermit
 
 把 MachineTest 上已经被官网确认 Accepted 的修改迁移到 main。

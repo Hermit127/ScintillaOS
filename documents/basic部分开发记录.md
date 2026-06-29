@@ -18,7 +18,7 @@ Todo: 跑一边basic的样例，看看原操作系统实现的系统调用如何
 2026/04/27 Hermit
 修改fork和clone的调用号,使之适配于测试用例
 修复 panic 问题：未识别 syscall 从 panic 改为返回 -1
-查看basic 测试操作流程文档：documents/basic_test_operational_flow.md
+查看 basic 测试操作流程文档：documents/basic首轮测试结果2026-04-27.md
 加 SYSCALL_CHDIR=49 SYSCALL_GETCWD=17 常量 + sys_chdir sys_getcwd 函数
 
 2026/04/29 Hermit

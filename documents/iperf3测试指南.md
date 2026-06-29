@@ -232,7 +232,7 @@ QEMU SLIRP 用户态网络下单核 RISC-V：
 | 辅助 syscall | `os/src/syscall/process.rs` → `sys_getrandom/ppoll/futex/...` |
 | iperf3 源码 + 编译脚本 | `testsuits-for-oskernel/iperf/` |
 | 测试脚本 | `testsuits-for-oskernel/scripts/iperf/iperf_testcode.sh` |
-| 本文档 | `documents/iperf3_run_guide.md` |
+| 本文档 | `documents/iperf3测试指南.md` |
 
 # iperf3 测试指南
 
