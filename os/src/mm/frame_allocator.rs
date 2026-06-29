@@ -59,12 +59,11 @@ impl Drop for FrameTracker {
         let mut refs = FRAME_REFS.lock();
         let key = ref_key(self.paddr);
         if let Some(count) = refs.get_mut(&key) {
-            if *count > 2 {
+            if *count > 1 {
                 *count -= 1;
-            } else {
-                refs.remove(&key);
+                return;
             }
-            return;
+            refs.remove(&key);
         }
         drop(refs);
         frame_dealloc(self.paddr);

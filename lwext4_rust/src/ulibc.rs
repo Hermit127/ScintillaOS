@@ -84,7 +84,14 @@ const CTRL_BLK_SIZE: usize = core::mem::size_of::<MemoryControlBlock>();
 #[no_mangle]
 pub extern "C" fn malloc(size: c_size_t) -> *mut c_void {
     // Allocate `(actual length) + 8`. The lowest 8 Bytes are stored in the actual allocated space size.
-    let layout = Layout::from_size_align(size + CTRL_BLK_SIZE, 8).unwrap();
+    let Some(total) = size.checked_add(CTRL_BLK_SIZE) else {
+        warn!("malloc size overflow: {}", size);
+        return core::ptr::null_mut();
+    };
+    let Ok(layout) = Layout::from_size_align(total, 8) else {
+        warn!("malloc invalid layout: {}", total);
+        return core::ptr::null_mut();
+    };
     unsafe {
         let ptr = alloc(layout);
         assert!(!ptr.is_null(), "malloc failed");
@@ -109,7 +116,14 @@ pub extern "C" fn free(ptr: *mut c_void) {
     unsafe {
         let ptr = ptr.sub(1);
         let size = ptr.read().size;
-        let layout = Layout::from_size_align(size + CTRL_BLK_SIZE, 8).unwrap();
+        let Some(total) = size.checked_add(CTRL_BLK_SIZE) else {
+            warn!("free size overflow: {}", size);
+            return;
+        };
+        let Ok(layout) = Layout::from_size_align(total, 8) else {
+            warn!("free invalid layout: {}", total);
+            return;
+        };
         dealloc(ptr.cast(), layout)
     }
 }

@@ -1,8 +1,10 @@
 // 这里负责操作系统的文件管理和设备文件：实现 stdin/stdout 以及 /dev/null、/dev/zero、/dev/urandom 这类字符设备。
 use polyhal::debug_console::DebugConsole;
 
-use super::{File, Kstat, S_IFCHR};
-use crate::task::{current_task, suspend_current_and_run_next};
+use super::{File, Kstat, S_IFBLK, S_IFCHR, S_IFREG, S_IFSOCK};
+use crate::sync::UPSafeCell;
+use crate::task::{current_task, pid2task, suspend_current_and_run_next};
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 static STDOUT_BUSY: AtomicBool = AtomicBool::new(false);
@@ -17,11 +19,21 @@ fn stdout_acquire() {
         if owner == pid {
             return;
         }
+        if owner != 0
+            && pid2task(owner as usize).is_none()
+            && STDOUT_OWNER
+                .compare_exchange(owner, 0, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+        {
+            STDOUT_BUSY.store(false, Ordering::Release);
+            continue;
+        }
         if owner == 0
             && STDOUT_OWNER
                 .compare_exchange(0, pid, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
         {
+            STDOUT_BUSY.store(false, Ordering::Release);
             return;
         }
         suspend_current_and_run_next();
@@ -33,9 +45,25 @@ fn stdout_acquire() {
 pub fn stdout_release_if_owner() {
     if let Some(task) = current_task() {
         let pid = task.getpid() as i32;
-        STDOUT_OWNER
+        if STDOUT_OWNER
             .compare_exchange(pid, 0, Ordering::Release, Ordering::Relaxed)
-            .ok();
+            .is_ok()
+        {
+            STDOUT_BUSY.store(false, Ordering::Release);
+        } else if STDOUT_OWNER.load(Ordering::Acquire) == 0 {
+            STDOUT_BUSY.store(false, Ordering::Release);
+        }
+    }
+}
+
+pub fn stdout_release_pid(pid: usize) {
+    if STDOUT_OWNER
+        .compare_exchange(pid as i32, 0, Ordering::Release, Ordering::Relaxed)
+        .is_ok()
+    {
+        STDOUT_BUSY.store(false, Ordering::Release);
+    } else if STDOUT_OWNER.load(Ordering::Acquire) == 0 {
+        STDOUT_BUSY.store(false, Ordering::Release);
     }
 }
 
@@ -215,18 +243,27 @@ impl File for DevNull {
     }
 }
 
-pub struct DevZero;
+pub struct DevZero {
+    readable: bool,
+    writable: bool,
+}
+
+impl DevZero {
+    pub fn new(readable: bool, writable: bool) -> Self {
+        Self { readable, writable }
+    }
+}
 
 impl File for DevZero {
     // /dev/zero 可读。
     // 执行时直接返回 true，让 read 路径把用户缓冲区清零。
     fn readable(&self) -> bool {
-        true
+        self.readable
     }
     // /dev/zero 也允许写，写入内容会被丢掉。
     // 执行时直接返回 true，让 write 路径接受并丢弃所有字节。
     fn writable(&self) -> bool {
-        true
+        self.writable
     }
     // 从 /dev/zero 读取时把缓冲区填成 0。
     // 执行时遍历 buf 并写入 0，最后返回填充的字节数。
@@ -248,6 +285,194 @@ impl File for DevZero {
     }
     // 给 fd 层做具体类型判断。
     // 执行时直接把当前对象转成 Any trait 引用，方便文件描述符层做具体类型判断。
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+pub struct DevBlock {
+    index: usize,
+}
+
+impl DevBlock {
+    pub fn new(index: usize) -> Self {
+        Self { index }
+    }
+
+    pub fn capacity_bytes(&self) -> u64 {
+        crate::drivers::block::get_block_device(self.index)
+            .and_then(|dev| dev.capacity_bytes())
+            .unwrap_or(512 * 1024 * 1024)
+    }
+}
+
+impl File for DevBlock {
+    fn readable(&self) -> bool {
+        true
+    }
+    fn writable(&self) -> bool {
+        true
+    }
+    fn read(&self, _buf: &mut [u8]) -> isize {
+        -22
+    }
+    fn write(&self, _buf: &mut [u8]) -> isize {
+        -22
+    }
+    fn stat(&self) -> Kstat {
+        let mut st = Kstat::new(S_IFBLK | 0o660);
+        st.st_rdev = 0xfe00 + self.index as u64;
+        st.st_size = self.capacity_bytes() as i64;
+        st
+    }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+pub struct NullSocket;
+
+impl File for NullSocket {
+    fn readable(&self) -> bool {
+        true
+    }
+    fn writable(&self) -> bool {
+        true
+    }
+    fn read(&self, _buf: &mut [u8]) -> isize {
+        -107
+    }
+    fn write(&self, _buf: &mut [u8]) -> isize {
+        -107
+    }
+    fn stat(&self) -> Kstat {
+        Kstat::new(S_IFSOCK)
+    }
+    fn poll(&self) -> (bool, bool, bool) {
+        (false, false, true)
+    }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+struct TmpFileInner {
+    data: Vec<u8>,
+    offset: usize,
+    append: bool,
+}
+
+pub struct TmpFile {
+    inner: UPSafeCell<TmpFileInner>,
+}
+
+impl TmpFile {
+    pub fn new() -> Self {
+        Self {
+            inner: unsafe {
+                UPSafeCell::new(TmpFileInner {
+                    data: Vec::new(),
+                    offset: 0,
+                    append: false,
+                })
+            },
+        }
+    }
+
+    fn write_at_inner(inner: &mut TmpFileInner, offset: usize, buf: &[u8]) -> isize {
+        let Some(end) = offset.checked_add(buf.len()) else {
+            return -27;
+        };
+        if end > inner.data.len() {
+            inner.data.resize(end, 0);
+        }
+        inner.data[offset..end].copy_from_slice(buf);
+        buf.len() as isize
+    }
+}
+
+impl File for TmpFile {
+    fn readable(&self) -> bool {
+        true
+    }
+
+    fn writable(&self) -> bool {
+        true
+    }
+
+    fn read(&self, buf: &mut [u8]) -> isize {
+        let mut inner = self.inner.exclusive_access();
+        let available = inner.data.len().saturating_sub(inner.offset);
+        let n = available.min(buf.len());
+        if n > 0 {
+            let start = inner.offset;
+            let end = start + n;
+            buf[..n].copy_from_slice(&inner.data[start..end]);
+            inner.offset = end;
+        }
+        n as isize
+    }
+
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> isize {
+        let inner = self.inner.exclusive_access();
+        let available = inner.data.len().saturating_sub(offset);
+        let n = available.min(buf.len());
+        if n > 0 {
+            buf[..n].copy_from_slice(&inner.data[offset..offset + n]);
+        }
+        n as isize
+    }
+
+    fn write(&self, buf: &mut [u8]) -> isize {
+        let mut inner = self.inner.exclusive_access();
+        let offset = if inner.append {
+            inner.data.len()
+        } else {
+            inner.offset
+        };
+        let n = Self::write_at_inner(&mut inner, offset, buf);
+        if n > 0 {
+            inner.offset = offset + n as usize;
+        }
+        n
+    }
+
+    fn write_at(&self, offset: usize, buf: &mut [u8]) -> isize {
+        let mut inner = self.inner.exclusive_access();
+        Self::write_at_inner(&mut inner, offset, buf)
+    }
+
+    fn stat(&self) -> Kstat {
+        let inner = self.inner.exclusive_access();
+        let mut st = Kstat::new(S_IFREG | 0o600);
+        st.st_size = inner.data.len() as i64;
+        st.st_blksize = 4096;
+        st.st_blocks = ((inner.data.len() as u64) + 511) / 512;
+        st
+    }
+
+    fn seek(&self, offset: usize) {
+        self.inner.exclusive_access().offset = offset;
+    }
+
+    fn get_offset(&self) -> usize {
+        self.inner.exclusive_access().offset
+    }
+
+    fn get_flags(&self) -> usize {
+        let inner = self.inner.exclusive_access();
+        let mut flags = 0x8000usize | 0x2;
+        if inner.append {
+            flags |= 0x400;
+        }
+        flags
+    }
+
+    fn set_flags(&self, flags: usize) -> bool {
+        self.inner.exclusive_access().append = (flags & 0x400) != 0;
+        true
+    }
+
     fn as_any(&self) -> &dyn core::any::Any {
         self
     }

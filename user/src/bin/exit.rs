@@ -7,6 +7,10 @@ use user_lib::{exit, fork, wait, waitpid, yield_};
 
 const MAGIC: i32 = -0x10384;
 
+fn linux_wait_status(code: i32) -> i32 {
+    ((code as u8) as i32) << 8
+}
+
 #[no_mangle]
 pub fn main() -> i32 {
     println!("I am the parent. Forking the child...");
@@ -22,7 +26,10 @@ pub fn main() -> i32 {
     }
     println!("I am the parent, waiting now..");
     let mut xstate: i32 = 0;
-    assert!(waitpid(pid as usize, &mut xstate) == pid && xstate == MAGIC);
+    assert!(
+        waitpid(pid as usize, &mut xstate) == pid
+            && (xstate == MAGIC || xstate == linux_wait_status(MAGIC))
+    );
     assert!(waitpid(pid as usize, &mut xstate) < 0 && wait(&mut xstate) <= 0);
     println!("waitpid {} ok.", pid);
     println!("exit pass.");

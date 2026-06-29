@@ -1624,7 +1624,14 @@ static int ext4_ftruncate_no_lock(ext4_file *file, uint64_t size)
 
 	/*Sync file size*/
 	file->fsize = ext4_inode_get_size(&file->mp->fs.sb, ref.inode);
-	if (file->fsize <= size) {
+	if (file->fsize < size) {
+		ext4_inode_set_size(ref.inode, size);
+		ref.dirty = true;
+		file->fsize = size;
+		r = EOK;
+		goto Finish;
+	}
+	if (file->fsize == size) {
 		r = EOK;
 		goto Finish;
 	}
@@ -1686,8 +1693,6 @@ int ext4_fread(ext4_file *file, void *buf, size_t size, size_t *rcnt)
 	uint32_t block_size;
 
 	ext4_fsblk_t fblock;
-	ext4_fsblk_t fblock_start;
-	uint32_t fblock_count;
 
 	uint8_t *u8_buf = buf;
 	int r;
@@ -1778,40 +1783,26 @@ int ext4_fread(ext4_file *file, void *buf, size_t size, size_t *rcnt)
 		iblock_idx++;
 	}
 
-	fblock_start = 0;
-	fblock_count = 0;
 	while (size >= block_size) {
-		while (iblock_idx < iblock_last) {
-			r = ext4_fs_get_inode_dblk_idx(&ref, iblock_idx,
-						       &fblock, true);
-			if (r != EOK)
-				goto Finish;
-
-			iblock_idx++;
-
-			if (!fblock_start)
-				fblock_start = fblock;
-
-			if ((fblock_start + fblock_count) != fblock)
-				break;
-
-			fblock_count++;
-		}
-
-		r = ext4_blocks_get_direct(file->mp->fs.bdev, u8_buf, fblock_start,
-					   fblock_count);
+		r = ext4_fs_get_inode_dblk_idx(&ref, iblock_idx, &fblock, true);
 		if (r != EOK)
 			goto Finish;
 
-		size -= block_size * fblock_count;
-		u8_buf += block_size * fblock_count;
-		file->fpos += block_size * fblock_count;
+		if (fblock != 0) {
+			r = ext4_blocks_get_direct(file->mp->fs.bdev, u8_buf, fblock, 1);
+			if (r != EOK)
+				goto Finish;
+		} else {
+			memset(u8_buf, 0, block_size);
+		}
+
+		iblock_idx++;
+		size -= block_size;
+		u8_buf += block_size;
+		file->fpos += block_size;
 
 		if (rcnt)
-			*rcnt += block_size * fblock_count;
-
-		fblock_start = fblock;
-		fblock_count = 1;
+			*rcnt += block_size;
 	}
 
 	if (size) {
@@ -1820,10 +1811,14 @@ int ext4_fread(ext4_file *file, void *buf, size_t size, size_t *rcnt)
 		if (r != EOK)
 			goto Finish;
 
-		off = fblock * block_size;
-		r = ext4_block_readbytes(file->mp->fs.bdev, off, u8_buf, size);
-		if (r != EOK)
-			goto Finish;
+		if (fblock != 0) {
+			off = fblock * block_size;
+			r = ext4_block_readbytes(file->mp->fs.bdev, off, u8_buf, size);
+			if (r != EOK)
+				goto Finish;
+		} else {
+			memset(u8_buf, 0, size);
+		}
 
 		file->fpos += size;
 

@@ -5,6 +5,15 @@ use crate::task::PID2TCB;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+const DT_DIR: u8 = 4;
+const DT_REG: u8 = 8;
+const SYS_ROOT_ENTRIES: [(&str, u8); 2] = [("block", DT_DIR), ("dev", DT_DIR)];
+const SYS_BLOCK_ENTRIES: [(&str, u8); 2] = [("vda", DT_DIR), ("vdb", DT_DIR)];
+const SYS_BLOCK_DEVICE_ENTRIES: [(&str, u8); 2] = [("stat", DT_REG), ("uevent", DT_REG)];
+const SYS_DEV_ENTRIES: [(&str, u8); 1] = [("block", DT_DIR)];
+const SYS_DEV_BLOCK_ENTRIES: [(&str, u8); 2] = [("254:0", DT_DIR), ("254:1", DT_DIR)];
+const SYS_DEV_BLOCK_DEVICE_ENTRIES: [(&str, u8); 1] = [("uevent", DT_REG)];
+
 pub struct ProcDirFile {
     offset: UPSafeCell<usize>,
 }
@@ -145,8 +154,12 @@ impl ProcPidStatFile {
                 .and_then(|w| w.upgrade())
                 .map(|p| p.getpid())
                 .unwrap_or(0);
-            format!("{} ({}) {} {} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
-                self.pid, cmd, state, ppid)
+            let pgid = inner.pgid;
+            let sid = inner.sid;
+            let utime = inner.utime.max(1);
+            let stime = inner.stime;
+            format!("{} ({}) {} {} {} {} 0 0 0 0 0 0 0 {} {} 0 0 20 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+                self.pid, cmd, state, ppid, pgid, sid, utime, stime)
         } else {
             String::new()
         }
@@ -193,6 +206,88 @@ impl File for ProcPidStatFile {
     }
     // 给 fd 层做具体类型判断。
     // 执行时直接把当前对象转成 Any trait 引用，方便文件描述符层做具体类型判断。
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+pub struct ProcPidStatusFile {
+    pid: usize,
+    offset: UPSafeCell<usize>,
+}
+
+impl ProcPidStatusFile {
+    pub fn new(pid: usize) -> Self {
+        Self {
+            pid,
+            offset: unsafe { UPSafeCell::new(0) },
+        }
+    }
+
+    fn build_content(&self) -> String {
+        use alloc::format;
+        if let Some(task) = crate::task::pid2task(self.pid) {
+            let inner = task.inner_exclusive_access();
+            let state = match inner.task_status {
+                crate::task::TaskStatus::Running => "R (running)",
+                crate::task::TaskStatus::Zombie => "Z (zombie)",
+                _ => "S (sleeping)",
+            };
+            let ppid = inner
+                .parent
+                .as_ref()
+                .and_then(|w| w.upgrade())
+                .map(|p| p.getpid())
+                .unwrap_or(0);
+            format!(
+                "Name:\tinitproc\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t{} {} {} {}\nGid:\t{} {} {} {}\nVmLck:\t       0 kB\nVmSwap:\t       0 kB\nThreads:\t1\nCpus_allowed:\t1\nMems_allowed:\t1\n",
+                state,
+                inner.tgid,
+                self.pid,
+                ppid,
+                inner.uid,
+                inner.euid,
+                inner.suid,
+                inner.euid,
+                inner.gid,
+                inner.egid,
+                inner.sgid,
+                inner.egid
+            )
+        } else {
+            String::new()
+        }
+    }
+}
+
+impl File for ProcPidStatusFile {
+    fn readable(&self) -> bool {
+        true
+    }
+    fn writable(&self) -> bool {
+        false
+    }
+    fn read(&self, buf: &mut [u8]) -> isize {
+        let mut off = self.offset.exclusive_access();
+        let content = self.build_content();
+        let bytes = content.as_bytes();
+        if *off >= bytes.len() {
+            return 0;
+        }
+        let len = buf.len().min(bytes.len() - *off);
+        buf[..len].copy_from_slice(&bytes[*off..*off + len]);
+        *off += len;
+        len as isize
+    }
+    fn write(&self, _buf: &mut [u8]) -> isize {
+        -1
+    }
+    fn stat(&self) -> Kstat {
+        let mut st = Kstat::new(super::S_IFREG);
+        st.st_size = self.build_content().len() as i64;
+        st.st_mode = super::S_IFREG | 0o444;
+        st
+    }
     fn as_any(&self) -> &dyn core::any::Any {
         self
     }
@@ -334,6 +429,206 @@ impl File for ProcMeminfoFile {
     }
     // 给 fd 层做具体类型判断。
     // 执行时直接把当前对象转成 Any trait 引用，方便文件描述符层做具体类型判断。
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+pub struct ProcStaticFile {
+    offset: UPSafeCell<usize>,
+    content: &'static str,
+}
+
+impl ProcStaticFile {
+    pub fn new(content: &'static str) -> Self {
+        Self {
+            offset: unsafe { UPSafeCell::new(0) },
+            content,
+        }
+    }
+}
+
+impl File for ProcStaticFile {
+    fn readable(&self) -> bool {
+        true
+    }
+    fn writable(&self) -> bool {
+        false
+    }
+    fn read(&self, buf: &mut [u8]) -> isize {
+        let mut offset = self.offset.exclusive_access();
+        let bytes = self.content.as_bytes();
+        if *offset >= bytes.len() {
+            return 0;
+        }
+        let len = buf.len().min(bytes.len() - *offset);
+        buf[..len].copy_from_slice(&bytes[*offset..*offset + len]);
+        *offset += len;
+        len as isize
+    }
+    fn write(&self, _buf: &mut [u8]) -> isize {
+        -1
+    }
+    fn stat(&self) -> Kstat {
+        let mut st = Kstat::new(super::S_IFREG);
+        st.st_size = self.content.len() as i64;
+        st.st_mode = super::S_IFREG | 0o444;
+        st
+    }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+pub struct PseudoDirFile {
+    offset: UPSafeCell<usize>,
+    entries: &'static [(&'static str, u8)],
+}
+
+impl PseudoDirFile {
+    pub fn new(entries: &'static [(&'static str, u8)]) -> Self {
+        Self {
+            offset: unsafe { UPSafeCell::new(0) },
+            entries,
+        }
+    }
+
+    pub fn sys_root() -> Self {
+        Self::new(&SYS_ROOT_ENTRIES)
+    }
+
+    pub fn sys_block() -> Self {
+        Self::new(&SYS_BLOCK_ENTRIES)
+    }
+
+    pub fn sys_block_device() -> Self {
+        Self::new(&SYS_BLOCK_DEVICE_ENTRIES)
+    }
+
+    pub fn sys_dev() -> Self {
+        Self::new(&SYS_DEV_ENTRIES)
+    }
+
+    pub fn sys_dev_block() -> Self {
+        Self::new(&SYS_DEV_BLOCK_ENTRIES)
+    }
+
+    pub fn sys_dev_block_device() -> Self {
+        Self::new(&SYS_DEV_BLOCK_DEVICE_ENTRIES)
+    }
+}
+
+impl File for PseudoDirFile {
+    fn readable(&self) -> bool {
+        true
+    }
+    fn writable(&self) -> bool {
+        false
+    }
+    fn read(&self, _buf: &mut [u8]) -> isize {
+        -1
+    }
+    fn write(&self, _buf: &mut [u8]) -> isize {
+        -1
+    }
+    fn is_dir(&self) -> bool {
+        true
+    }
+    fn stat(&self) -> Kstat {
+        let mut st = Kstat::new(super::S_IFDIR | 0o555);
+        st.st_nlink = 2 + self.entries.len() as u32;
+        st
+    }
+    fn getdents64(&self, buf: &mut [u8]) -> isize {
+        const DIRENT64_FIXED_SIZE: usize = 8 + 8 + 2 + 1;
+        let mut entries: Vec<(&str, u8)> = Vec::new();
+        entries.push((".", DT_DIR));
+        entries.push(("..", DT_DIR));
+        for entry in self.entries {
+            entries.push(*entry);
+        }
+
+        let mut inner = self.offset.exclusive_access();
+        let mut written = 0usize;
+        let mut idx = *inner;
+
+        while idx < entries.len() {
+            let (name, de_type) = entries[idx];
+            let name_bytes = name.as_bytes();
+            let record_size =
+                crate::fs::inode::OSInode::align_up(DIRENT64_FIXED_SIZE + name_bytes.len() + 1, 8);
+            if written + record_size > buf.len() {
+                if written == 0 {
+                    return -1;
+                }
+                break;
+            }
+
+            let record = &mut buf[written..written + record_size];
+            record.fill(0);
+            record[0..8].copy_from_slice(&((idx + 1) as u64).to_le_bytes());
+            record[8..16].copy_from_slice(&((idx as i64) + 1).to_le_bytes());
+            record[16..18].copy_from_slice(&(record_size as u16).to_le_bytes());
+            record[18] = de_type;
+            record[DIRENT64_FIXED_SIZE..DIRENT64_FIXED_SIZE + name_bytes.len()]
+                .copy_from_slice(name_bytes);
+            record[DIRENT64_FIXED_SIZE + name_bytes.len()] = 0;
+
+            written += record_size;
+            idx += 1;
+        }
+
+        *inner = idx;
+        written as isize
+    }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+pub struct SysBlockStatFile {
+    offset: UPSafeCell<usize>,
+    content: String,
+}
+
+impl SysBlockStatFile {
+    pub fn new() -> Self {
+        let sectors = crate::fs::block_written_sectors();
+        let io_ticks = sectors.max(1);
+        let content = alloc::format!("0 0 0 0 0 0 {} 0 0 {} 0 0 0 0 0 0 0\n", sectors, io_ticks);
+        Self {
+            offset: unsafe { UPSafeCell::new(0) },
+            content,
+        }
+    }
+}
+
+impl File for SysBlockStatFile {
+    fn readable(&self) -> bool {
+        true
+    }
+    fn writable(&self) -> bool {
+        false
+    }
+    fn read(&self, buf: &mut [u8]) -> isize {
+        let mut offset = self.offset.exclusive_access();
+        let bytes = self.content.as_bytes();
+        if *offset >= bytes.len() {
+            return 0;
+        }
+        let len = buf.len().min(bytes.len() - *offset);
+        buf[..len].copy_from_slice(&bytes[*offset..*offset + len]);
+        *offset += len;
+        len as isize
+    }
+    fn write(&self, _buf: &mut [u8]) -> isize {
+        -1
+    }
+    fn stat(&self) -> Kstat {
+        let mut st = Kstat::new(super::S_IFREG | 0o444);
+        st.st_size = self.content.len() as i64;
+        st
+    }
     fn as_any(&self) -> &dyn core::any::Any {
         self
     }

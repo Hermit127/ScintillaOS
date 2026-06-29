@@ -42,6 +42,7 @@ const SYSCALL_NANOSLEEP: usize = 101;
 const SYSCALL_MOUNT: usize = 40;
 const SYSCALL_UMOUNT2: usize = 39;
 const SYSCALL_SYMLINKAT: usize = 36;
+const SYSCALL_READLINKAT: usize = 78;
 
 const SYSCALL_GETDENTS64: usize = 61;
 
@@ -239,6 +240,13 @@ pub fn sys_chroot(path: &str) -> isize {
     syscall(SYSCALL_CHROOT, [path.as_ptr() as usize, 0, 0, 0, 0, 0])
 }
 
+pub fn sys_readlinkat(dirfd: isize, path: *const u8, buf: *mut u8, bufsiz: usize) -> isize {
+    syscall(
+        SYSCALL_READLINKAT,
+        [dirfd as usize, path as usize, buf as usize, bufsiz, 0, 0],
+    )
+}
+
 pub fn sys_waitpid(pid: isize, exit_code: *mut i32) -> isize {
     syscall(
         SYSCALL_WAITPID,
@@ -319,6 +327,11 @@ pub fn sys_mount(source: &str, target: &str, fstype: &str, flags: usize, data: &
     let src = alloc::format!("{}\0", source);
     let tgt = alloc::format!("{}\0", target);
     let fst = alloc::format!("{}\0", fstype);
+    let data_ptr = if data.is_empty() {
+        0
+    } else {
+        data.as_ptr() as usize
+    };
     syscall(
         SYSCALL_MOUNT,
         [
@@ -326,7 +339,7 @@ pub fn sys_mount(source: &str, target: &str, fstype: &str, flags: usize, data: &
             tgt.as_ptr() as usize,
             fst.as_ptr() as usize,
             flags,
-            data.as_ptr() as usize,
+            data_ptr,
             0,
         ],
     )

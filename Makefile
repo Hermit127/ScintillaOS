@@ -371,11 +371,12 @@ QEMU_ARGS_SINGLE := -drive file=$(FS_IMG),if=none,format=raw,id=x0,file.locking=
 
 # Test disk path (user can override)
 TEST_DISK ?= fs-img.img
+ROOT_DISK ?= $(if $(filter loongarch64,$(ARCH)),disk-la.img,disk.img)
 
-# Dual-disk mode (test disk bus 0, disk.img bus 1, for contest)
+# Dual-disk mode (test disk bus 0, arch-matched root disk bus 1)
 QEMU_ARGS_DUAL := -drive file=$(TEST_DISK),if=none,format=raw,id=x0 \
 			-device $(VIRTIO_BLK_DEVICE),drive=x0$(if $(filter loongarch64,$(ARCH)),,$(COMMA)bus=$(VIRTIO_BLK_BUS)) \
-			-drive file=disk.img,if=none,format=raw,id=x1 \
+			-drive file=$(ROOT_DISK),if=none,format=raw,id=x1 \
 			-device $(VIRTIO_BLK_DEVICE),drive=x1$(if $(filter loongarch64,$(ARCH)),,$(COMMA)bus=$(VIRTIO_BLK_BUS2))
 
 # virtio-net network configuration (SLIRP user-mode, riscv64/aarch64)
@@ -395,7 +396,7 @@ run-inner: build
 	$(QEMU_EXEC) $(QEMU_ARGS_SINGLE) $(QEMU_NET_ARGS)
 
 run-dual: build disk.img
-	@echo "Running with dual-disk: $(TEST_DISK) + disk.img"
+	@echo "Running with dual-disk: $(TEST_DISK) + $(ROOT_DISK)"
 	$(QEMU_EXEC) $(QEMU_ARGS_DUAL) $(QEMU_NET_ARGS)
 
 run-dual-prebuilt:
@@ -404,9 +405,9 @@ run-dual-prebuilt:
 		echo "run make build ARCH=$(ARCH) first"; \
 		exit 1; \
 	}
-	@test -f disk.img || { echo "missing root disk: disk.img"; exit 1; }
+	@test -f $(ROOT_DISK) || { echo "missing root disk: $(ROOT_DISK)"; exit 1; }
 	@test -f $(TEST_DISK) || { echo "missing test disk: $(TEST_DISK)"; exit 1; }
-	@echo "Running with prebuilt dual-disk: $(TEST_DISK) + disk.img"
+	@echo "Running with prebuilt dual-disk: $(TEST_DISK) + $(ROOT_DISK)"
 	$(QEMU_EXEC) $(QEMU_ARGS_DUAL) $(QEMU_NET_ARGS)
 
 debug: build

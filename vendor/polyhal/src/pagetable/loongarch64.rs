@@ -56,6 +56,9 @@ impl From<MappingFlags> for PTEFlags {
 impl From<PTEFlags> for MappingFlags {
     fn from(val: PTEFlags) -> Self {
         let mut flags = MappingFlags::empty();
+        if val.contains(PTEFlags::V) {
+            flags |= MappingFlags::P;
+        }
         if val.contains(PTEFlags::W) {
             flags |= MappingFlags::W;
         }

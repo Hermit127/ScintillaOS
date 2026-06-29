@@ -1,11 +1,12 @@
-// 这里负责操作系统的内存管理：实现用户地址空间、ELF 装载、mmap/munmap 和按需缺页处理。
 use super::vpn_range::VAddrRange;
 use super::{frame_alloc, FrameTracker};
 use crate::config::{PAGE_SIZE, USER_STACK_SIZE};
+use crate::fs::File;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use lazy_static::lazy_static;
 use log::*;
 use polyhal::pagetable::{MappingFlags, MappingSize, PageTable, PageTableWrapper};
 use polyhal::{PhysAddr, VirtAddr};
@@ -13,6 +14,7 @@ use xmas_elf::header::Type as ElfType;
 pub struct MemorySet {
     page_table: Arc<PageTableWrapper>,
     areas: Vec<MapArea>,
+    shared_page_table: bool,
 }
 
 pub struct LoadedElf {
@@ -30,8 +32,27 @@ pub struct LoadedElf {
     pub program_entry: usize,
 }
 
-// 从 ELF 的 PT_INTERP 段里取动态链接器路径。
-// 执行时先解析 ELF 头，再遍历程序头表；遇到 PT_INTERP 后按段偏移取出字符串，去掉末尾的 '\0' 再返回。
+lazy_static! {
+    static ref RETIRED_USER_PAGE_TABLE: Arc<PageTableWrapper> = Arc::new(PageTableWrapper::alloc());
+}
+
+fn retired_user_page_table() -> Arc<PageTableWrapper> {
+    RETIRED_USER_PAGE_TABLE.clone()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PageFaultResult {
+    Handled,
+    SharedMetadataChanged,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PageFaultAccess {
+    Read,
+    Write,
+    Execute,
+}
+
 pub fn get_elf_interp(elf_data: &[u8]) -> Option<String> {
     let elf = match xmas_elf::ElfFile::new(elf_data) {
         Ok(e) => e,
@@ -56,22 +77,127 @@ pub fn get_elf_interp(elf_data: &[u8]) -> Option<String> {
     None
 }
 
+const ELF_HEADER_READ_SIZE: usize = 64;
+const MAX_ELF_HEADER_TABLE_SIZE: usize = 64 * 1024;
+const MAX_INTERP_PATH_LEN: usize = 4096;
+
+fn read_exact_at(file: &dyn File, mut offset: usize, buf: &mut [u8]) -> bool {
+    let mut done = 0usize;
+    while done < buf.len() {
+        let n = file.read_at(offset, &mut buf[done..]);
+        if n <= 0 {
+            return false;
+        }
+        let n = n as usize;
+        done += n;
+        offset += n;
+    }
+    true
+}
+
+fn read_elf_header_table(file: &dyn File) -> Option<Vec<u8>> {
+    let mut ident = [0u8; ELF_HEADER_READ_SIZE];
+    if !read_exact_at(file, 0, &mut ident) {
+        return None;
+    }
+    if ident[..4] != [0x7f, b'E', b'L', b'F'] {
+        return None;
+    }
+    let header = xmas_elf::ElfFile::new(&ident).ok()?.header;
+    let ph_offset = header.pt2.ph_offset() as usize;
+    let ph_entsize = header.pt2.ph_entry_size() as usize;
+    let ph_count = header.pt2.ph_count() as usize;
+    if ph_offset == 0 || ph_entsize == 0 || ph_count == 0 {
+        return None;
+    }
+    let ph_size = ph_entsize.checked_mul(ph_count)?;
+    let total = ph_offset.checked_add(ph_size)?;
+    if total < ELF_HEADER_READ_SIZE || total > MAX_ELF_HEADER_TABLE_SIZE {
+        return None;
+    }
+    let mut data = alloc::vec![0u8; total];
+    if !read_exact_at(file, 0, &mut data) {
+        return None;
+    }
+    Some(data)
+}
+
+fn read_small_file_region(file: &dyn File, offset: usize, size: usize) -> Option<Vec<u8>> {
+    if size > MAX_INTERP_PATH_LEN {
+        return None;
+    }
+    let mut data = alloc::vec![0u8; size];
+    if !read_exact_at(file, offset, &mut data) {
+        return None;
+    }
+    Some(data)
+}
+
+pub fn get_elf_interp_file(file: &dyn File) -> Option<String> {
+    let header_data = read_elf_header_table(file)?;
+    let elf = xmas_elf::ElfFile::new(&header_data).ok()?;
+    let ph_count = elf.header.pt2.ph_count();
+    for i in 0..ph_count {
+        let ph = elf.program_header(i).ok()?;
+        if ph.get_type().ok()? == xmas_elf::program::Type::Interp {
+            let offset = ph.offset() as usize;
+            let size = ph.file_size() as usize;
+            let raw = read_small_file_region(file, offset, size)?;
+            let end = raw.iter().position(|&b| b == 0).unwrap_or(size);
+            return core::str::from_utf8(&raw[..end]).ok().map(|s| s.into());
+        }
+    }
+    None
+}
+
 impl MemorySet {
-    // 创建一个空地址空间，只带新的页表。
-    // 执行时分配一份新的页表包装对象，并把映射区域列表初始化为空，供 exec 或 fork 后续继续填充。
     pub fn new_bare() -> Self {
         Self {
             page_table: Arc::new(PageTableWrapper::alloc()),
             areas: Vec::new(),
+            shared_page_table: false,
         }
     }
-    // 返回当前地址空间的页表 token。
-    // 执行时只取出内部页表句柄，调度切换和用户指针翻译会拿这个值访问当前地址空间。
     pub fn token(&self) -> PageTable {
         self.page_table.0
     }
-    // 插入一个映射区域，并可选地把 ELF 数据拷到新页里。
-    // 执行时先逐页建立映射；如果调用者带了初始数据，就按 page_off 写进新页，最后把区域记录到 areas 里。
+    pub fn mark_shared(&mut self) {
+        self.shared_page_table = true;
+    }
+
+    pub fn is_shared(&self) -> bool {
+        self.shared_page_table
+    }
+
+    pub fn shared_metadata_snapshot(&self) -> Vec<MapArea> {
+        self.areas.iter().map(MapArea::from_another).collect()
+    }
+
+    pub fn replace_shared_metadata(&mut self, areas: &[MapArea]) {
+        let old_areas = core::mem::take(&mut self.areas);
+        self.areas = areas
+            .iter()
+            .map(|incoming| {
+                let mut area = MapArea::from_another(incoming);
+                for (&vpn, frame) in incoming.data_frames.iter() {
+                    area.data_frames.insert(vpn, frame.shared_clone());
+                }
+                area
+            })
+            .collect();
+        for old in old_areas.iter() {
+            for (&vpn, frame) in old.data_frames.iter() {
+                if let Some(area) = self.areas.iter_mut().find(|area| {
+                    area.vaddr_range.get_start() <= vpn && vpn < area.vaddr_range.get_end()
+                }) {
+                    area.data_frames
+                        .entry(vpn)
+                        .or_insert_with(|| frame.shared_clone());
+                }
+            }
+        }
+        self.shared_page_table = true;
+    }
     pub fn push(&mut self, mut map_area: MapArea, data: Option<&[u8]>, page_off: usize) -> bool {
         if map_area.map(&self.page_table).is_err() {
             return false;
@@ -82,8 +208,25 @@ impl MemorySet {
         self.areas.push(map_area);
         true
     }
-    // 从 ELF 文件构造用户地址空间，同时建好用户栈和 program break。
-    // 执行时解析程序头，按 PT_LOAD 权限映射代码和数据段；同时记录 PHDR、TLS 和解释器路径，再补上用户栈。
+
+    fn push_file_segment(
+        &mut self,
+        mut map_area: MapArea,
+        file: &dyn File,
+        file_offset: usize,
+        file_size: usize,
+        page_off: usize,
+    ) -> bool {
+        if map_area.map(&self.page_table).is_err() {
+            return false;
+        }
+        if !map_area.copy_file_data(file, file_offset, file_size, page_off) {
+            map_area.unmap(&self.page_table);
+            return false;
+        }
+        self.areas.push(map_area);
+        true
+    }
     pub fn from_elf(elf_data: &[u8]) -> LoadedElf {
         trace!("os::mm::MemorySet::from_elf");
         let mut memory_set = Self::new_bare();
@@ -189,8 +332,111 @@ impl MemorySet {
         }
     }
 
-    // 把动态链接器 ELF 装到固定基址，返回它的入口和基址。
-    // 执行时按 base 平移解释器的每个 PT_LOAD 段，建立映射并拷入文件内容，入口地址也按同一个基址修正。
+    pub fn from_elf_file(file: &dyn File) -> Option<LoadedElf> {
+        trace!("os::mm::MemorySet::from_elf_file");
+        let header_data = read_elf_header_table(file)?;
+        let elf = xmas_elf::ElfFile::new(&header_data).ok()?;
+        let elf_header = elf.header;
+        if elf_header.pt1.magic != [0x7f, 0x45, 0x4c, 0x46] {
+            return None;
+        }
+        let ph_count = elf_header.pt2.ph_count();
+        let e_phoff = elf_header.pt2.ph_offset() as usize;
+        let e_phentsize = elf_header.pt2.ph_entry_size() as usize;
+        let is_pie = elf.header.pt2.type_().as_type() == ElfType::SharedObject;
+        let pie_base: usize = if is_pie { 0x1_0000 } else { 0 };
+        let mut memory_set = Self::new_bare();
+        let mut max_end_va = VirtAddr::new(0);
+        let mut ph_addr = 0usize;
+        let mut first_load = true;
+        let mut tls_base: usize = 0;
+        let mut tls_size: usize = 0;
+        let mut interp_path: Option<alloc::string::String> = None;
+        let program_entry = elf.header.pt2.entry_point() as usize + pie_base;
+
+        for i in 0..ph_count {
+            let ph = elf.program_header(i).ok()?;
+            let ph_type = ph.get_type().ok()?;
+            let va_offset = pie_base;
+            if ph_type == xmas_elf::program::Type::Load {
+                let start_va: VirtAddr = (ph.virtual_addr() as usize + va_offset).into();
+                let end_va: VirtAddr =
+                    ((ph.virtual_addr() + ph.mem_size()) as usize + va_offset).into();
+                if first_load {
+                    ph_addr = start_va.raw() + e_phoff;
+                    first_load = false;
+                }
+                let mut map_perm = MapPermission::U;
+                let ph_flags = ph.flags();
+                if ph_flags.is_read() {
+                    map_perm |= MapPermission::R;
+                }
+                if ph_flags.is_write() {
+                    map_perm |= MapPermission::W;
+                }
+                if ph_flags.is_execute() {
+                    map_perm |= MapPermission::X;
+                }
+                let page_off = start_va.raw() % PAGE_SIZE;
+                let aligned_start = start_va.raw() - page_off;
+                let map_area =
+                    MapArea::new(aligned_start.into(), end_va, MapType::Framed, map_perm);
+                max_end_va = max_end_va.max(map_area.vaddr_range.get_end());
+                if !memory_set.push_file_segment(
+                    map_area,
+                    file,
+                    ph.offset() as usize,
+                    ph.file_size() as usize,
+                    page_off,
+                ) {
+                    return None;
+                }
+            } else if ph_type == xmas_elf::program::Type::Tls {
+                tls_base = ph.virtual_addr() as usize + va_offset;
+                tls_size = ph.mem_size() as usize;
+            } else if ph_type == xmas_elf::program::Type::Interp {
+                let offset = ph.offset() as usize;
+                let size = ph.file_size() as usize;
+                let raw = read_small_file_region(file, offset, size)?;
+                let end = raw.iter().position(|&b| b == 0).unwrap_or(size);
+                interp_path = core::str::from_utf8(&raw[..end]).ok().map(|s| s.into());
+            }
+        }
+
+        let program_break = (max_end_va.raw() + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE;
+        let user_stack_top: usize = 0x8_0000_0000;
+        let user_stack_bottom = user_stack_top - USER_STACK_SIZE;
+        let user_stack_top = user_stack_bottom + USER_STACK_SIZE;
+        if !memory_set.push(
+            MapArea::new(
+                user_stack_bottom.into(),
+                user_stack_top.into(),
+                MapType::Framed,
+                MapPermission::R | MapPermission::W | MapPermission::U,
+            ),
+            None,
+            0,
+        ) {
+            return None;
+        }
+        Some(LoadedElf {
+            memory_set,
+            user_sp: user_stack_top,
+            entry_point: program_entry,
+            program_break,
+            ph_addr,
+            ph_entsize: e_phentsize,
+            ph_num: ph_count as usize,
+            tls_base,
+            tls_size,
+            interp_path,
+            interp_base: 0,
+            program_entry,
+        })
+    }
+
+    /// Load a dynamic linker/interpreter ELF at a fixed base address.
+    /// Returns (entry_point, base_addr).
     pub fn load_interp_elf(
         memory_set: &mut MemorySet,
         interp_data: &[u8],
@@ -240,26 +486,67 @@ impl MemorySet {
         (entry, base)
     }
 
-    // fork 时复制父进程地址空间，写映射页按 COW 方式共享。
-    // 执行时逐个复制 MapArea 元数据；普通可写页去掉父子页表的写权限并共享 FrameTracker，等写缺页时再复制。
-    pub fn from_existed_user(user_space: &MemorySet) -> Option<MemorySet> {
+    pub fn load_interp_file(
+        memory_set: &mut MemorySet,
+        file: &dyn File,
+        base: usize,
+    ) -> Option<(usize, usize)> {
+        let header_data = read_elf_header_table(file)?;
+        let elf = xmas_elf::ElfFile::new(&header_data).ok()?;
+        let entry = elf.header.pt2.entry_point() as usize + base;
+        let ph_count = elf.header.pt2.ph_count();
+        for i in 0..ph_count {
+            let ph = elf.program_header(i).ok()?;
+            if ph.get_type().ok()? == xmas_elf::program::Type::Load {
+                let start_va: VirtAddr = (ph.virtual_addr() as usize + base).into();
+                let end_va: VirtAddr = ((ph.virtual_addr() + ph.mem_size()) as usize + base).into();
+                let mut map_perm = MapPermission::U;
+                let ph_flags = ph.flags();
+                if ph_flags.is_read() {
+                    map_perm |= MapPermission::R;
+                }
+                if ph_flags.is_write() {
+                    map_perm |= MapPermission::W;
+                }
+                if ph_flags.is_execute() {
+                    map_perm |= MapPermission::X;
+                }
+                let page_off = start_va.raw() % PAGE_SIZE;
+                let aligned_start = start_va.raw() - page_off;
+                let map_area =
+                    MapArea::new(aligned_start.into(), end_va, MapType::Framed, map_perm);
+                if !memory_set.push_file_segment(
+                    map_area,
+                    file,
+                    ph.offset() as usize,
+                    ph.file_size() as usize,
+                    page_off,
+                ) {
+                    return None;
+                }
+            }
+        }
+        Some((entry, base))
+    }
+
+    fn pte_permission_for_frame(area: &MapArea, frame: &FrameTracker) -> MapPermission {
+        let mut perm = area.map_perm;
+        if !area.shared && perm.contains(MapPermission::W) && frame.is_shared() {
+            perm.remove(MapPermission::W);
+        }
+        perm
+    }
+
+    pub fn from_existed_user(user_space: &mut MemorySet) -> Option<MemorySet> {
         trace!("os::mm::MemorySet::from_existed_user");
         let mut memory_set = Self::new_bare();
-        for area in user_space.areas.iter() {
+        let parent_page_table = user_space.page_table.clone();
+        for area in user_space.areas.iter_mut() {
             let mut new_area = MapArea::from_another(area);
             for (&vpn, frame) in area.data_frames.iter() {
                 let new_frame = frame.shared_clone();
-                let mut child_perm = area.map_perm;
-                if !area.shared && child_perm.contains(MapPermission::W) {
-                    child_perm.remove(MapPermission::W);
-                    user_space.page_table.unmap_page(vpn);
-                    user_space.page_table.map_page(
-                        vpn,
-                        frame.paddr,
-                        child_perm.into(),
-                        MappingSize::Page4KB,
-                    );
-                }
+                let child_perm = Self::pte_permission_for_frame(area, &new_frame);
+
                 memory_set.page_table.map_page(
                     vpn,
                     new_frame.paddr,
@@ -267,31 +554,146 @@ impl MemorySet {
                     MappingSize::Page4KB,
                 );
                 new_area.data_frames.insert(vpn, new_frame);
+
+                if !area.shared && area.map_perm.contains(MapPermission::W) {
+                    let parent_perm = Self::pte_permission_for_frame(area, frame);
+                    if parent_page_table
+                        .translate(vpn)
+                        .is_some_and(|(_, flags)| flags.contains(MappingFlags::P))
+                    {
+                        parent_page_table.unmap_page(vpn);
+                        parent_page_table.map_page(
+                            vpn,
+                            frame.paddr,
+                            parent_perm.into(),
+                            MappingSize::Page4KB,
+                        );
+                    }
+                }
             }
             memory_set.areas.push(new_area);
         }
         Some(memory_set)
     }
 
-    // 处理用户缺页：按需分配、文件回填，或者完成 COW。
-    // 执行时先定位缺页地址对应的映射区域，再分配或复制物理页，最后更新页表。
-    pub fn handle_page_fault(&mut self, vaddr: polyhal::VirtAddr, write_fault: bool) -> bool {
+    pub fn prepare_shared_writable_pages(&mut self) -> bool {
+        let page_table = self.page_table.clone();
+        for area in self.areas.iter_mut() {
+            if !area.map_perm.contains(MapPermission::W) {
+                continue;
+            }
+            let vpns: alloc::vec::Vec<VirtAddr> = area.data_frames.keys().copied().collect();
+            for vpn in vpns {
+                let Some(old) = area.data_frames.get(&vpn) else {
+                    continue;
+                };
+                let Some((paddr, flags)) = page_table.translate(vpn) else {
+                    continue;
+                };
+                if old.is_shared() && !flags.contains(MappingFlags::W) {
+                    let f = match frame_alloc() {
+                        Some(f) => f,
+                        None => return false,
+                    };
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            paddr.get_ptr::<u8>(),
+                            f.paddr.get_mut_ptr(),
+                            PAGE_SIZE,
+                        );
+                    }
+                    page_table.unmap_page(vpn);
+                    page_table.map_page(vpn, f.paddr, area.map_perm.into(), MappingSize::Page4KB);
+                    area.data_frames.insert(vpn, f);
+                } else if !flags.contains(MappingFlags::W) {
+                    page_table.unmap_page(vpn);
+                    page_table.map_page(vpn, old.paddr, area.map_perm.into(), MappingSize::Page4KB);
+                }
+            }
+        }
+        true
+    }
+
+    pub fn handle_page_fault(
+        &mut self,
+        vaddr: polyhal::VirtAddr,
+        access: PageFaultAccess,
+    ) -> Option<PageFaultResult> {
+        if vaddr.raw() < crate::config::PAGE_SIZE {
+            return None;
+        }
         let vpn = vaddr.floor();
-        // 先找到缺页地址所属的 MapArea；没有对应区域就是非法访问。
         let area = match self
             .areas
             .iter_mut()
             .find(|a| a.vaddr_range.get_start() <= vpn && vpn < a.vaddr_range.get_end())
         {
             Some(a) => a,
-            None => return false,
+            None => return None,
         };
+        let write_fault = access == PageFaultAccess::Write;
+        match access {
+            PageFaultAccess::Read => {
+                if !area.map_perm.contains(MapPermission::R)
+                    && !area.map_perm.contains(MapPermission::W)
+                {
+                    return None;
+                }
+            }
+            PageFaultAccess::Write => {
+                if !area.map_perm.contains(MapPermission::W) {
+                    return None;
+                }
+            }
+            PageFaultAccess::Execute => {
+                if !area.map_perm.contains(MapPermission::X) {
+                    return None;
+                }
+            }
+        }
+        if self.shared_page_table {
+            if let Some((paddr, flags)) = self
+                .page_table
+                .translate(vpn)
+                .filter(|(_, flags)| flags.contains(MappingFlags::P))
+            {
+                if write_fault && !flags.contains(MappingFlags::W) {
+                    let f = match frame_alloc() {
+                        Some(f) => f,
+                        None => return None,
+                    };
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            paddr.get_ptr::<u8>(),
+                            f.paddr.get_mut_ptr(),
+                            PAGE_SIZE,
+                        );
+                    }
+                    self.page_table.unmap_page(vpn);
+                    self.page_table.map_page(
+                        vpn,
+                        f.paddr,
+                        area.map_perm.into(),
+                        MappingSize::Page4KB,
+                    );
+                    area.data_frames.insert(vpn, f);
+                    return Some(PageFaultResult::SharedMetadataChanged);
+                }
+                self.page_table.unmap_page(vpn);
+                self.page_table.map_page(
+                    vpn,
+                    paddr.into(),
+                    area.map_perm.into(),
+                    MappingSize::Page4KB,
+                );
+                return Some(PageFaultResult::Handled);
+            }
+        }
         let in_frames = area.data_frames.contains_key(&vpn);
         if !in_frames {
-            // 第一次访问这一页时才分配物理页，文件映射还要读入初始内容。
             let f = match frame_alloc() {
                 Some(f) => f,
-                None => return false,
+                None => return None,
             };
             if let Some(ref file) = area.file {
                 let off = area.file_offset + (vpn.raw() - area.vaddr_range.get_start().raw());
@@ -301,37 +703,45 @@ impl MemorySet {
             self.page_table
                 .map_page(vpn, f.paddr, area.map_perm.into(), MappingSize::Page4KB);
             area.data_frames.insert(vpn, f);
-            return true;
+            return Some(if self.shared_page_table {
+                PageFaultResult::SharedMetadataChanged
+            } else {
+                PageFaultResult::Handled
+            });
         }
-        // 只读区域上的写缺页应该交给上层转成 SIGSEGV。
-        if write_fault && !area.map_perm.contains(MapPermission::W) {
-            return false;
-        }
-        // 只读页已经有数据帧时，只需要把页表项补回来。
-        if !write_fault && !area.map_perm.contains(MapPermission::W) {
-            let paddr = match area.data_frames.get(&vpn) {
-                Some(f) => f.paddr,
-                None => return false,
+        if self.shared_page_table {
+            let old = match area.data_frames.get(&vpn) {
+                Some(f) => f,
+                None => return None,
             };
             self.page_table.unmap_page(vpn);
             self.page_table
-                .map_page(vpn, paddr, area.map_perm.into(), MappingSize::Page4KB);
-            return true;
+                .map_page(vpn, old.paddr, area.map_perm.into(), MappingSize::Page4KB);
+            return Some(PageFaultResult::Handled);
         }
-        // 可写页已经有数据帧时，后面只需要处理 COW 或恢复写权限。
-        let (paddr, _) = match self.page_table.translate(vpn) {
-            Some(x) => x,
-            None => return false,
-        };
         let old = match area.data_frames.get(&vpn) {
             Some(f) => f,
-            None => return false,
+            None => return None,
         };
-        if old.is_shared() {
-            // 共享页被写时复制一份新物理页，避免改到父子进程共同数据。
+        let (paddr, flags) = match self.page_table.translate(vpn) {
+            Some(x) => x,
+            None => {
+                let perm = Self::pte_permission_for_frame(area, old);
+                self.page_table
+                    .map_page(vpn, old.paddr, perm.into(), MappingSize::Page4KB);
+                return Some(PageFaultResult::Handled);
+            }
+        };
+        if !flags.contains(MappingFlags::P) {
+            let perm = Self::pte_permission_for_frame(area, old);
+            self.page_table
+                .map_page(vpn, old.paddr, perm.into(), MappingSize::Page4KB);
+            return Some(PageFaultResult::Handled);
+        }
+        if write_fault && !area.shared && old.is_shared() {
             let f = match frame_alloc() {
                 Some(f) => f,
-                None => return false,
+                None => return None,
             };
             unsafe {
                 core::ptr::copy_nonoverlapping(
@@ -345,38 +755,113 @@ impl MemorySet {
                 .map_page(vpn, f.paddr, area.map_perm.into(), MappingSize::Page4KB);
             area.data_frames.insert(vpn, f);
         } else {
-            // 页已经是独占的，只需要按当前权限重新建立页表项。
+            let perm = Self::pte_permission_for_frame(area, old);
             self.page_table.unmap_page(vpn);
             self.page_table
-                .map_page(vpn, old.paddr, area.map_perm.into(), MappingSize::Page4KB);
+                .map_page(vpn, old.paddr, perm.into(), MappingSize::Page4KB);
         }
-        true
+        Some(PageFaultResult::Handled)
     }
-    // 创建共享页表视图，clone(CLONE_VM) 会用到。
-    // 执行时直接复用原来的页表 Arc，不复制 areas；共享地址空间的线程因此看到同一份页表内容。
+
     pub fn from_shared(user_space: &MemorySet) -> MemorySet {
+        let mut areas = Vec::new();
+        for area in user_space.areas.iter() {
+            areas.push(MapArea::clone_shared_metadata(area));
+        }
         MemorySet {
             page_table: user_space.page_table.clone(),
-            areas: Vec::new(),
+            areas,
+            shared_page_table: true,
         }
     }
-    // 切换硬件页表到当前地址空间。
-    // 执行时调用底层页表包装对象的 change，让后续用户态访存走这份地址空间。
     pub fn activate(&self) {
         self.page_table.change();
     }
-    // 查询虚拟地址对应的物理地址和映射权限。
-    // 执行时委托页表做地址翻译，并把 polyhal 返回的物理地址转换成内核统一使用的 PhysAddr。
     pub fn translate(&self, vaddr: VirtAddr) -> Option<(PhysAddr, MappingFlags)> {
         self.page_table
             .translate(vaddr)
             .map(|(pa, flags)| (pa.into(), flags))
     }
-    // 检查一段用户缓冲区是否完整映射，且满足读写权限要求。
-    // 执行时先防止地址加法溢出，再逐页确认它属于用户映射、权限匹配，并且页表里确实有映射。
+    pub fn clone_frame_metadata(&self, vpn: VirtAddr) -> Option<FrameTracker> {
+        self.areas
+            .iter()
+            .find(|area| area.vaddr_range.get_start() <= vpn && vpn < area.vaddr_range.get_end())
+            .and_then(|area| area.data_frames.get(&vpn))
+            .map(FrameTracker::shared_clone)
+    }
+    pub fn replace_frame_metadata(&mut self, vpn: VirtAddr, frame: &FrameTracker) {
+        if let Some(area) = self
+            .areas
+            .iter_mut()
+            .find(|area| area.vaddr_range.get_start() <= vpn && vpn < area.vaddr_range.get_end())
+        {
+            area.data_frames.insert(vpn, frame.shared_clone());
+        }
+    }
+    pub fn frame_metadata_range(
+        &self,
+        start: VirtAddr,
+        end: VirtAddr,
+    ) -> Vec<(VirtAddr, FrameTracker)> {
+        let start = start.floor();
+        let end = end.ceil();
+        let mut frames = Vec::new();
+        for area in self.areas.iter() {
+            if area.vaddr_range.get_start() >= end || area.vaddr_range.get_end() <= start {
+                continue;
+            }
+            for (&vpn, frame) in area.data_frames.range(start..end) {
+                frames.push((vpn, frame.shared_clone()));
+            }
+        }
+        frames
+    }
+
+    pub fn area_metadata_range(&self, start: VirtAddr, end: VirtAddr) -> Vec<MapArea> {
+        let start = start.floor();
+        let end = end.ceil();
+        let mut areas = Vec::new();
+        for area in self.areas.iter() {
+            let area_start = area.vaddr_range.get_start();
+            let area_end = area.vaddr_range.get_end();
+            if area_start >= end || area_end <= start {
+                continue;
+            }
+            let range_start = start.max(area_start);
+            let range_end = end.min(area_end);
+            let mut metadata = MapArea::from_another(area);
+            metadata.vaddr_range = VAddrRange::new(range_start, range_end);
+            for (&vpn, frame) in area.data_frames.range(range_start..range_end) {
+                metadata.data_frames.insert(vpn, frame.shared_clone());
+            }
+            for &vpn in area.dirty.range(range_start..range_end) {
+                metadata.dirty.insert(vpn);
+            }
+            areas.push(metadata);
+        }
+        areas
+    }
+
+    pub fn insert_shared_metadata_areas(&mut self, areas: &[MapArea]) {
+        for incoming in areas {
+            let start = incoming.vaddr_range.get_start();
+            let end = incoming.vaddr_range.get_end();
+            self.munmap_metadata_only(start, end);
+            let mut area = MapArea::from_another(incoming);
+            for (&vpn, frame) in incoming.data_frames.iter() {
+                area.data_frames.insert(vpn, frame.shared_clone());
+            }
+            area.dirty = incoming.dirty.clone();
+            self.merge_or_push_metadata_area(area);
+        }
+        self.shared_page_table = true;
+    }
     pub fn valid_user_buf(&self, ptr: *const u8, len: usize, need_write: bool) -> bool {
         if len == 0 {
             return true;
+        }
+        if ptr.is_null() {
+            return false;
         }
         let addr = ptr as usize;
         let addr_end = addr.checked_add(len.saturating_sub(1));
@@ -410,21 +895,64 @@ impl MemorySet {
             } else if !area.map_perm.contains(MapPermission::R) {
                 return false;
             }
-            if self.translate(vaddr).is_none() {
+            vpn += crate::config::PAGE_SIZE;
+        }
+        true
+    }
+
+    pub fn user_range_mapped(&self, start: usize, len: usize) -> bool {
+        if len == 0 {
+            return true;
+        }
+        let Some(last) = start.checked_add(len.saturating_sub(1)) else {
+            return false;
+        };
+        let mut vpn = start & !(crate::config::PAGE_SIZE - 1);
+        let Some(end) =
+            (last & !(crate::config::PAGE_SIZE - 1)).checked_add(crate::config::PAGE_SIZE)
+        else {
+            return false;
+        };
+        if end < vpn {
+            return false;
+        }
+        while vpn < end {
+            let vaddr = VirtAddr::from(vpn);
+            let Some(area) = self.areas.iter().find(|area| {
+                area.vaddr_range.get_start() <= vaddr && vaddr < area.vaddr_range.get_end()
+            }) else {
+                return false;
+            };
+            if !area.map_perm.contains(MapPermission::U) {
                 return false;
             }
             vpn += crate::config::PAGE_SIZE;
         }
         true
     }
-    // 清空所有用户映射，让 FrameTracker 自动回收物理页。
-    // 执行时只清掉 areas，里面保存的 FrameTracker 会随之 drop；页表对象本身留给地址空间生命周期管理。
-    pub fn recycle_data_pages(&mut self) {
-        //*self = Self::new_bare();
+    fn recycle_data_pages_inner(&mut self, switch_current: bool) {
+        let old_root = self.page_table.0.root().raw();
+        if !self.shared_page_table {
+            for area in self.areas.iter_mut() {
+                area.unmap(&self.page_table);
+            }
+        }
         self.areas.clear();
+        let retired = retired_user_page_table();
+        if switch_current && PageTable::current().root().raw() == old_root {
+            retired.change();
+        }
+        self.page_table = retired;
+        self.shared_page_table = false;
     }
-    // 删除起点不低于 limit_va 的映射区域。
-    // 执行时遍历 areas，把高地址区域从页表里 unmap 后移除，低于 limit 的区域继续保留。
+
+    pub fn recycle_data_pages(&mut self) {
+        self.recycle_data_pages_inner(true);
+    }
+
+    pub fn recycle_data_pages_inactive(&mut self) {
+        self.recycle_data_pages_inner(false);
+    }
     pub fn shrink_to(&mut self, limit_va: VirtAddr) {
         self.areas.retain_mut(|area| {
             if area.vaddr_range.get_start() >= limit_va {
@@ -435,8 +963,6 @@ impl MemorySet {
             }
         });
     }
-    // 判断给定虚拟地址区间是否和已有映射重叠。
-    // 执行时遍历现有 MapArea，只要新区间和任意旧区间有交集就返回 true。
     pub fn is_overlap(&self, start_addr: polyhal::VirtAddr, end_addr: polyhal::VirtAddr) -> bool {
         for area in self.areas.iter() {
             if start_addr < area.vaddr_range.get_end() && end_addr > area.vaddr_range.get_start() {
@@ -446,8 +972,6 @@ impl MemorySet {
         false
     }
 
-    // 从低地址开始找一段足够大的空闲用户虚拟区间。
-    // 执行时先把现有映射按起点排序，再用 cursor 扫描相邻空洞，找到第一段能容纳 len 的页对齐区间。
     pub fn find_free_area(&self, len: usize) -> polyhal::VirtAddr {
         let len = (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         if self.areas.is_empty() {
@@ -475,19 +999,14 @@ impl MemorySet {
         polyhal::VirtAddr::from(cursor)
     }
 
-    // 返回页表包装对象，少数系统调用需要直接改页表。
-    // 执行时暴露内部 Arc 引用，调用者可以在不搬走 MemorySet 的情况下继续操作页表。
     pub fn page_table_mut(&mut self) -> &Arc<PageTableWrapper> {
         &self.page_table
     }
-    // 返回映射区域列表的可变引用。
-    // 执行时把 areas 交给 mmap、brk 等路径做局部调整，调用方需要自己保持区域不重叠。
     pub fn areas_mut(&mut self) -> &mut Vec<MapArea> {
         &mut self.areas
     }
 
-    // 插入匿名映射，并立即分配物理页。
-    // 执行时构造 MapArea、逐页分配物理页并写页表；成功后把区域挂进当前地址空间。
+    /// 插入匿名映射
     pub fn insert_framed_area(
         &mut self,
         start_addr: polyhal::VirtAddr,
@@ -502,8 +1021,48 @@ impl MemorySet {
         true
     }
 
-    // 插入文件映射，并把已有文件内容预读进映射页。
-    // 执行时先建匿名页，再记录文件对象和文件偏移；随后从文件当前内容读入每个已分配页面。
+    pub fn insert_lazy_area(
+        &mut self,
+        start_addr: polyhal::VirtAddr,
+        end_addr: polyhal::VirtAddr,
+        permission: MapPermission,
+    ) -> bool {
+        let start_addr = start_addr.floor();
+        let end_addr = end_addr.ceil();
+        if start_addr >= end_addr || self.is_overlap(start_addr, end_addr) {
+            return false;
+        }
+        let area = MapArea::new(start_addr, end_addr, MapType::Framed, permission);
+        self.merge_or_push_metadata_area(area);
+        true
+    }
+
+    fn merge_or_push_metadata_area(&mut self, mut area: MapArea) {
+        if !area.is_empty_metadata_mapping() {
+            self.areas.push(area);
+            return;
+        }
+
+        let mut start = area.vaddr_range.get_start();
+        let mut end = area.vaddr_range.get_end();
+        let mut i = 0;
+        while i < self.areas.len() {
+            if self.areas[i].can_merge_empty_metadata_mapping(&area) {
+                let area_start = self.areas[i].vaddr_range.get_start();
+                let area_end = self.areas[i].vaddr_range.get_end();
+                if area_end == start || end == area_start {
+                    start = start.min(area_start);
+                    end = end.max(area_end);
+                    self.areas.remove(i);
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        area.vaddr_range = VAddrRange::new(start, end);
+        self.areas.push(area);
+    }
+
     pub fn insert_file_area(
         &mut self,
         start_addr: polyhal::VirtAddr,
@@ -512,26 +1071,18 @@ impl MemorySet {
         file: alloc::sync::Arc<dyn crate::fs::File>,
         offset: usize,
     ) -> bool {
-        self.insert_framed_area(start_addr, end_addr, permission);
-        let area = self.areas.last_mut().unwrap();
+        let start_addr = start_addr.floor();
+        let end_addr = end_addr.ceil();
+        if start_addr >= end_addr || self.is_overlap(start_addr, end_addr) {
+            return false;
+        }
+        let mut area = MapArea::new(start_addr, end_addr, MapType::Framed, permission);
         area.file = Some(file.clone());
         area.file_offset = offset;
-        file.seek(offset);
-        for vaddr in area.vaddr_range.clone() {
-            let frame = match area.data_frames.get(&vaddr) {
-                Some(frame) => frame,
-                None => break,
-            };
-            let page = frame.paddr.slice_mut_with_len(crate::config::PAGE_SIZE);
-            if file.read(page) <= 0 {
-                break;
-            }
-        }
+        self.areas.push(area);
         true
     }
 
-    // 把一组已有物理页映射到当前地址空间，供 SysV shm 使用。
-    // 执行时校验长度和 frame 数量，必要时自动找空洞，然后把每个共享 FrameTracker 映射到连续虚拟页。
     pub fn insert_shared_frames(
         &mut self,
         start_addr: polyhal::VirtAddr,
@@ -564,8 +1115,98 @@ impl MemorySet {
         Some(start_addr)
     }
 
-    // 处理 msync；当前主要支持按需失效页表项。
-    // 执行时先检查起始地址页对齐，再找出和目标区间相交的区域；带 MS_INVALIDATE 时逐页撤掉页表项。
+    pub fn insert_shared_file_frames(
+        &mut self,
+        start_addr: polyhal::VirtAddr,
+        len: usize,
+        frames: &[FrameTracker],
+        permission: MapPermission,
+        file: alloc::sync::Arc<dyn crate::fs::File>,
+        file_offset: usize,
+    ) -> Option<polyhal::VirtAddr> {
+        let addr = self.insert_shared_frames(start_addr, len, frames, permission)?;
+        if let Some(area) = self.areas.last_mut() {
+            area.file = Some(file);
+            area.file_offset = file_offset;
+        }
+        Some(addr)
+    }
+
+    pub fn madvise_private_anonymous_dontneed(
+        &mut self,
+        start_addr: polyhal::VirtAddr,
+        len: usize,
+    ) -> isize {
+        if len == 0 {
+            return 0;
+        }
+        let end_addr = polyhal::VirtAddr::from(start_addr.raw().saturating_add(len)).ceil();
+        let start_vpn = start_addr.floor();
+        let mut cursor = start_vpn;
+        while cursor < end_addr {
+            let Some(area) = self.areas.iter().find(|area| {
+                area.vaddr_range.get_start() <= cursor && cursor < area.vaddr_range.get_end()
+            }) else {
+                return -12;
+            };
+            if area.file.is_some() || area.shared {
+                return -22;
+            }
+            cursor = area.vaddr_range.get_end().min(end_addr);
+        }
+
+        for area in self.areas.iter_mut() {
+            let area_start = area.vaddr_range.get_start();
+            let area_end = area.vaddr_range.get_end();
+            if area_start >= end_addr || area_end <= start_vpn {
+                continue;
+            }
+            let range_start = start_vpn.max(area_start);
+            let range_end = end_addr.min(area_end);
+            let vpns: alloc::vec::Vec<VirtAddr> = area
+                .data_frames
+                .range(range_start..range_end)
+                .map(|(&vpn, _)| vpn)
+                .collect();
+            for vpn in vpns {
+                let needs_private = area
+                    .data_frames
+                    .get(&vpn)
+                    .map(|frame| frame.is_shared())
+                    .unwrap_or(false);
+                if needs_private {
+                    let Some(frame) = frame_alloc() else {
+                        return -12;
+                    };
+                    if self.page_table.translate(vpn).is_some() {
+                        self.page_table.unmap_page(vpn);
+                    }
+                    self.page_table.map_page(
+                        vpn,
+                        frame.paddr,
+                        area.map_perm.into(),
+                        MappingSize::Page4KB,
+                    );
+                    area.data_frames.insert(vpn, frame);
+                } else if let Some(frame) = area.data_frames.get(&vpn) {
+                    if self.page_table.translate(vpn).is_none() {
+                        self.page_table.map_page(
+                            vpn,
+                            frame.paddr,
+                            area.map_perm.into(),
+                            MappingSize::Page4KB,
+                        );
+                    }
+                }
+                if let Some(frame) = area.data_frames.get(&vpn) {
+                    frame.paddr.slice_mut_with_len(PAGE_SIZE).fill(0);
+                }
+                area.dirty.remove(&vpn);
+            }
+        }
+        0
+    }
+
     pub fn msync(&mut self, start_addr: polyhal::VirtAddr, len: usize, flags: usize) -> isize {
         const MS_INVALIDATE: usize = 2;
         if start_addr.raw() % crate::config::PAGE_SIZE != 0 {
@@ -586,6 +1227,7 @@ impl MemorySet {
                 .filter(|&v| v >= ss && v < end_addr)
                 .collect();
             for vpn in vpns {
+                Self::sync_shared_file_page(area, vpn);
                 if flags & MS_INVALIDATE != 0 {
                     self.page_table.unmap_page(vpn);
                 }
@@ -594,8 +1236,110 @@ impl MemorySet {
         0
     }
 
-    // 返回所有映射里最大的结束地址。
-    // 执行时遍历 areas 的结束虚拟地址，取最大值；没有任何映射时返回 0。
+    pub fn mprotect(
+        &mut self,
+        start_addr: polyhal::VirtAddr,
+        len: usize,
+        permission: MapPermission,
+    ) -> isize {
+        if len == 0 {
+            return 0;
+        }
+        let end_addr = polyhal::VirtAddr::from(start_addr.raw().saturating_add(len)).ceil();
+
+        let mut cursor = start_addr;
+        while cursor < end_addr {
+            let Some(area) = self.areas.iter().find(|area| {
+                area.vaddr_range.get_start() <= cursor && cursor < area.vaddr_range.get_end()
+            }) else {
+                return -12;
+            };
+            if permission.contains(MapPermission::W)
+                && area.shared
+                && area.file.as_ref().is_some_and(|file| !file.writable())
+            {
+                return -13;
+            }
+            cursor = area.vaddr_range.get_end().min(end_addr);
+        }
+
+        let mut i = 0;
+        while i < self.areas.len() {
+            let area_start = self.areas[i].vaddr_range.get_start();
+            let area_end = self.areas[i].vaddr_range.get_end();
+            if area_start >= end_addr || area_end <= start_addr {
+                i += 1;
+                continue;
+            }
+
+            let protect_start = start_addr.max(area_start);
+            let protect_end = end_addr.min(area_end);
+
+            if protect_start > area_start {
+                let mut right = MapArea::from_another(&self.areas[i]);
+                right.vaddr_range = VAddrRange::new(protect_start, area_end);
+                let right_keys: alloc::vec::Vec<VirtAddr> = self.areas[i]
+                    .data_frames
+                    .range(protect_start..area_end)
+                    .map(|(&k, _)| k)
+                    .collect();
+                for key in right_keys {
+                    if let Some(frame) = self.areas[i].data_frames.remove(&key) {
+                        right.data_frames.insert(key, frame);
+                    }
+                    if self.areas[i].dirty.remove(&key) {
+                        right.dirty.insert(key);
+                    }
+                }
+                self.areas[i].vaddr_range = VAddrRange::new(area_start, protect_start);
+                self.areas.insert(i + 1, right);
+                i += 1;
+                continue;
+            }
+
+            if protect_end < area_end {
+                let mut right = MapArea::from_another(&self.areas[i]);
+                right.vaddr_range = VAddrRange::new(protect_end, area_end);
+                let right_keys: alloc::vec::Vec<VirtAddr> = self.areas[i]
+                    .data_frames
+                    .range(protect_end..area_end)
+                    .map(|(&k, _)| k)
+                    .collect();
+                for key in right_keys {
+                    if let Some(frame) = self.areas[i].data_frames.remove(&key) {
+                        right.data_frames.insert(key, frame);
+                    }
+                    if self.areas[i].dirty.remove(&key) {
+                        right.dirty.insert(key);
+                    }
+                }
+                self.areas[i].vaddr_range = VAddrRange::new(area_start, protect_end);
+                self.areas.insert(i + 1, right);
+            }
+
+            self.areas[i].set_perm(permission);
+            let vpns: alloc::vec::Vec<VirtAddr> =
+                self.areas[i].data_frames.keys().copied().collect();
+            for vpn in vpns {
+                let Some(frame) = self.areas[i].data_frames.get(&vpn) else {
+                    continue;
+                };
+                if self
+                    .page_table
+                    .translate(vpn)
+                    .is_some_and(|(_, flags)| flags.contains(MappingFlags::P))
+                {
+                    self.page_table.unmap_page(vpn);
+                    let pte_perm = Self::pte_permission_for_frame(&self.areas[i], frame);
+                    self.page_table
+                        .map_page(vpn, frame.paddr, pte_perm.into(), MappingSize::Page4KB);
+                }
+            }
+            i += 1;
+        }
+        0
+    }
+
     pub fn max_end_vaddr(&self) -> polyhal::VirtAddr {
         self.areas
             .iter()
@@ -604,8 +1348,6 @@ impl MemorySet {
             .unwrap_or_else(|| polyhal::VirtAddr::new(0))
     }
 
-    // 解除一段映射，必要时把原 MapArea 切成左右两段。
-    // 执行时先计算虚拟地址范围和权限，再修改页表与映射区域记录，最后返回映射处理结果。
     pub fn munmap(&mut self, start_addr: polyhal::VirtAddr, end_addr: polyhal::VirtAddr) -> bool {
         let start_vaddr = start_addr.floor();
         let end_vaddr = end_addr.ceil();
@@ -621,13 +1363,13 @@ impl MemorySet {
                 let unmap_start = start_vaddr.max(area_start);
                 let unmap_end = end_vaddr.min(area_end);
 
-                let vaddrs: alloc::vec::Vec<VirtAddr> = self.areas[i]
+                let frame_keys: alloc::vec::Vec<VirtAddr> = self.areas[i]
                     .data_frames
                     .range(unmap_start..unmap_end)
                     .map(|(&k, _)| k)
                     .collect();
-
-                for vaddr in &vaddrs {
+                for vaddr in &frame_keys {
+                    Self::sync_shared_file_page(&self.areas[i], *vaddr);
                     if self
                         .page_table
                         .translate(*vaddr)
@@ -636,8 +1378,17 @@ impl MemorySet {
                         self.page_table.unmap_page(*vaddr);
                     }
                 }
-                for vaddr in &vaddrs {
+                for vaddr in &frame_keys {
                     self.areas[i].data_frames.remove(vaddr);
+                    self.areas[i].dirty.remove(vaddr);
+                }
+                let dirty_keys: alloc::vec::Vec<VirtAddr> = self.areas[i]
+                    .dirty
+                    .range(unmap_start..unmap_end)
+                    .copied()
+                    .collect();
+                for vaddr in dirty_keys {
+                    self.areas[i].dirty.remove(&vaddr);
                 }
                 unmapped_any = true;
 
@@ -673,6 +1424,109 @@ impl MemorySet {
 
         unmapped_any
     }
+
+    fn sync_shared_file_page(area: &MapArea, vpn: VirtAddr) {
+        if !area.shared || !area.map_perm.contains(MapPermission::W) {
+            return;
+        }
+        let Some(file) = area.file.as_ref() else {
+            return;
+        };
+        if !file.writable() {
+            return;
+        }
+        let Some(frame) = area.data_frames.get(&vpn) else {
+            return;
+        };
+        let file_off = area.file_offset + (vpn.raw() - area.vaddr_range.get_start().raw());
+        let file_size = file.stat().st_size.max(0) as usize;
+        if file_off >= file_size {
+            return;
+        }
+        let write_len = crate::config::PAGE_SIZE.min(file_size - file_off);
+        let buf = frame.paddr.slice_mut_with_len(write_len);
+        let _ = file.write_at(file_off, buf);
+    }
+
+    pub fn munmap_metadata_only(
+        &mut self,
+        start_addr: polyhal::VirtAddr,
+        end_addr: polyhal::VirtAddr,
+    ) -> bool {
+        let start_vaddr = start_addr.floor();
+        let end_vaddr = end_addr.ceil();
+
+        let mut unmapped_any = false;
+        let mut i = 0;
+
+        while i < self.areas.len() {
+            let area_start = self.areas[i].vaddr_range.get_start();
+            let area_end = self.areas[i].vaddr_range.get_end();
+
+            if area_start < end_vaddr && area_end > start_vaddr {
+                let unmap_start = start_vaddr.max(area_start);
+                let unmap_end = end_vaddr.min(area_end);
+
+                let frame_keys: alloc::vec::Vec<VirtAddr> = self.areas[i]
+                    .data_frames
+                    .range(unmap_start..unmap_end)
+                    .map(|(&k, _)| k)
+                    .collect();
+                for vaddr in &frame_keys {
+                    self.areas[i].data_frames.remove(vaddr);
+                    self.areas[i].dirty.remove(vaddr);
+                }
+                let dirty_keys: alloc::vec::Vec<VirtAddr> = self.areas[i]
+                    .dirty
+                    .range(unmap_start..unmap_end)
+                    .copied()
+                    .collect();
+                for vaddr in dirty_keys {
+                    self.areas[i].dirty.remove(&vaddr);
+                }
+                unmapped_any = true;
+
+                if unmap_start <= area_start && unmap_end >= area_end {
+                    self.areas.remove(i);
+                } else if unmap_start <= area_start {
+                    self.areas[i].vaddr_range = VAddrRange::new(unmap_end, area_end);
+                    i += 1;
+                } else if unmap_end >= area_end {
+                    self.areas[i].vaddr_range = VAddrRange::new(area_start, unmap_start);
+                    i += 1;
+                } else {
+                    let mut right = MapArea::from_another(&self.areas[i]);
+                    right.vaddr_range = VAddrRange::new(unmap_end, area_end);
+                    let right_keys: alloc::vec::Vec<VirtAddr> = self.areas[i]
+                        .data_frames
+                        .range(unmap_end..area_end)
+                        .map(|(&k, _)| k)
+                        .collect();
+                    for key in right_keys {
+                        if let Some(frame) = self.areas[i].data_frames.remove(&key) {
+                            right.data_frames.insert(key, frame);
+                        }
+                    }
+                    let right_dirty: alloc::vec::Vec<VirtAddr> = self.areas[i]
+                        .dirty
+                        .range(unmap_end..area_end)
+                        .copied()
+                        .collect();
+                    for key in right_dirty {
+                        self.areas[i].dirty.remove(&key);
+                        right.dirty.insert(key);
+                    }
+                    self.areas[i].vaddr_range = VAddrRange::new(area_start, unmap_start);
+                    self.areas.insert(i + 1, right);
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+        }
+
+        unmapped_any
+    }
 }
 
 pub struct MapArea {
@@ -687,13 +1541,23 @@ pub struct MapArea {
 }
 
 impl MapArea {
-    // 更新这段映射的权限记录。
-    // 执行时只修改 MapArea 保存的权限位，真正的页表权限由调用路径在重建映射时同步。
     pub fn set_perm(&mut self, perm: MapPermission) {
         self.map_perm = perm;
     }
-    // 创建一段页对齐后的映射区域描述。
-    // 执行时把传入地址向页边界取整，初始化数据页表、文件来源和共享标记，暂时不分配物理页。
+
+    fn is_empty_metadata_mapping(&self) -> bool {
+        self.file.is_none() && self.data_frames.is_empty() && self.dirty.is_empty()
+    }
+
+    fn can_merge_empty_metadata_mapping(&self, other: &MapArea) -> bool {
+        self.is_empty_metadata_mapping()
+            && other.is_empty_metadata_mapping()
+            && self.map_type == other.map_type
+            && self.map_perm == other.map_perm
+            && self.shared == other.shared
+            && self.file_offset == other.file_offset
+    }
+
     pub fn new(
         start_va: VirtAddr,
         end_va: VirtAddr,
@@ -713,8 +1577,6 @@ impl MapArea {
             dirty: alloc::collections::BTreeSet::new(),
         }
     }
-    // 复制映射区域的元数据，但不复制物理页。
-    // 执行时保留地址范围、权限、文件来源和共享属性，data_frames 重新置空，供 fork 后重新挂共享页。
     pub fn from_another(another: &MapArea) -> Self {
         Self {
             vaddr_range: VAddrRange::new(
@@ -730,12 +1592,36 @@ impl MapArea {
             dirty: alloc::collections::BTreeSet::new(),
         }
     }
-    // 给这段区域逐页分配物理页并写入页表。
-    // 执行时先计算虚拟地址范围和权限，再修改页表与映射区域记录，最后返回映射处理结果。
+    pub fn clone_shared_metadata(another: &MapArea) -> Self {
+        Self {
+            vaddr_range: VAddrRange::new(
+                another.vaddr_range.get_start(),
+                another.vaddr_range.get_end(),
+            ),
+            data_frames: another
+                .data_frames
+                .iter()
+                .map(|(&vpn, frame)| (vpn, frame.shared_clone()))
+                .collect(),
+            map_type: another.map_type,
+            map_perm: another.map_perm,
+            file: another.file.clone(),
+            file_offset: another.file_offset,
+            shared: another.shared,
+            dirty: another.dirty.clone(),
+        }
+    }
     pub fn map(&mut self, page_table: &Arc<PageTableWrapper>) -> Result<(), ()> {
         trace!("os::mm::memory_set::MapArea::map");
         for vaddr in self.vaddr_range {
-            let p_tracker = frame_alloc().ok_or(())?;
+            let p_tracker = match frame_alloc() {
+                Some(frame) => frame,
+                None => {
+                    self.unmap(page_table);
+                    self.data_frames.clear();
+                    return Err(());
+                }
+            };
             page_table.map_page(
                 vaddr,
                 p_tracker.paddr,
@@ -747,18 +1633,23 @@ impl MapArea {
         Ok(())
     }
 
-    // 从页表中解除这段区域的映射。
+    /// Unmap page area
     #[allow(unused)]
-    // 执行时遍历区域内每个虚拟页，从传入页表删除对应页表项；物理页由 data_frames 的所有权负责释放。
     pub fn unmap(&mut self, page_table: &Arc<PageTableWrapper>) {
         trace!("os::mm::memory_set::MapArea::unmap");
         for vpn in self.vaddr_range {
-            page_table.unmap_page(vpn);
+            if page_table
+                .translate(vpn)
+                .is_some_and(|(_, flags)| flags.contains(MappingFlags::P))
+            {
+                page_table.unmap_page(vpn);
+            }
         }
     }
 
-    // 把文件或 ELF 段数据拷进已经清零的物理页，首个页内偏移由 page_off 指定。
-    // 执行时按页切分 data，第一页从 page_off 写起，后续页从页首继续写，直到把输入字节全部拷完。
+    /// data: start-aligned but maybe with shorter length
+    /// assume that all frames were cleared before
+    /// page_off: offset within the first page where data should start
     pub fn copy_data(&mut self, _page_table: &Arc<PageTableWrapper>, data: &[u8], page_off: usize) {
         trace!("os::mm::memory_set::MapArea::copy_data");
         assert_eq!(self.map_type, MapType::Framed);
@@ -778,11 +1669,41 @@ impl MapArea {
             page_off = 0;
         }
     }
+
+    fn copy_file_data(
+        &mut self,
+        file: &dyn File,
+        mut file_offset: usize,
+        file_size: usize,
+        page_off: usize,
+    ) -> bool {
+        trace!("os::mm::memory_set::MapArea::copy_file_data");
+        assert_eq!(self.map_type, MapType::Framed);
+        let mut copied = 0usize;
+        let mut curr_vaddr = self.vaddr_range.get_start();
+        let mut page_off = page_off;
+
+        while copied < file_size {
+            let chunk = (PAGE_SIZE - page_off).min(file_size - copied);
+            let Some(frame) = self.data_frames.get(&curr_vaddr) else {
+                return false;
+            };
+            let dst = &mut (frame.paddr + page_off).slice_mut_with_len(chunk);
+            if !read_exact_at(file, file_offset, dst) {
+                return false;
+            }
+            copied += chunk;
+            file_offset += chunk;
+            curr_vaddr = curr_vaddr + PAGE_SIZE;
+            page_off = 0;
+        }
+        true
+    }
 }
 
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub enum MapType {
-    // 普通页
+    //  Identical, not used now
     Framed,
 }
 
@@ -796,11 +1717,9 @@ bitflags! {
 }
 
 impl Into<MappingFlags> for MapPermission {
-    // 转成 polyhal 页表层使用的权限位。
-    // 执行时逐位检查 R/W/X/U 标记，并拼成底层 map_page 接口需要的 MappingFlags。
     fn into(self) -> MappingFlags {
         let mut flags = MappingFlags::empty();
-        if self.contains(MapPermission::R) {
+        if self.contains(MapPermission::R) || self.contains(MapPermission::W) {
             flags |= MappingFlags::R;
         }
         if self.contains(MapPermission::W) {

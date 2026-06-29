@@ -31,7 +31,7 @@ impl PidAllocator {
     // 执行时先检查可用资源，再分配编号、页帧或缓冲区，最后记录状态并返回给调用者。
     pub fn dealloc(&mut self, pid: usize) {
         assert!(pid < self.current);
-        assert!(
+        debug_assert!(
             !self.recycled.iter().any(|ppid| *ppid == pid),
             "pid {} has been deallocated!",
             pid

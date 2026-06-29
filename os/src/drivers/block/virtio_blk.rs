@@ -1,4 +1,3 @@
-// 这里负责操作系统的块设备驱动：实现 VirtIO 块设备驱动和 virtio-drivers 需要的 HAL 适配。
 use core::ptr::NonNull;
 
 use super::BlockDevice;
@@ -52,8 +51,6 @@ unsafe impl Sync for VirtIOBlock {}
 unsafe impl Send for VirtIOBlock {}
 
 impl BlockDevice for VirtIOBlock {
-    // 通过 VirtIO 块设备读取扇区，分块走 bounce buffer。
-    // 执行时先确认缓冲区按扇区对齐，再每次读一段到 bounce buffer，最后复制进调用者缓冲区。
     fn read_block(&self, block_id: usize, buf: &mut [u8]) {
         assert_eq!(buf.len() % SECTOR_SIZE, 0);
         let mut blk = self.0.exclusive_access();
@@ -67,8 +64,6 @@ impl BlockDevice for VirtIOBlock {
             done += chunk;
         }
     }
-    // 通过 VirtIO 块设备写入扇区，分块走 bounce buffer。
-    // 执行时先确认缓冲区按扇区对齐，再把每段数据复制进 bounce buffer 后提交给 VirtIO 设备。
     fn write_block(&self, block_id: usize, buf: &[u8]) {
         assert_eq!(buf.len() % SECTOR_SIZE, 0);
         let mut blk = self.0.exclusive_access();
@@ -83,8 +78,6 @@ impl BlockDevice for VirtIOBlock {
         }
     }
 
-    // 按扇区数换算成字节容量。
-    // 执行时读取 VirtIO 设备报告的扇区数，乘以扇区大小后返回字节容量。
     fn capacity_bytes(&self) -> Option<u64> {
         let blk = self.0.exclusive_access();
         Some((blk.capacity() as u64) * (SECTOR_SIZE as u64))
@@ -93,14 +86,10 @@ impl BlockDevice for VirtIOBlock {
 
 impl VirtIOBlock {
     #[allow(unused)]
-    // 创建默认地址上的 VirtIO 块设备。
-    // 执行时直接调用 new_at，把默认 VirtIO0 地址交给统一初始化路径。
     pub fn new() -> Self {
         Self::new_at(VIRTIO0)
     }
 
-    // 按指定 MMIO 地址或 LoongArch PCI 索引创建块设备。
-    // 执行时按架构选择 PCI 或 MMIO 初始化；MMIO 路径把物理地址转成 transport 后创建 VirtIOBlk。
     pub fn new_at(addr: PhysAddr) -> Self {
         #[cfg(target_arch = "loongarch64")]
         {
@@ -123,8 +112,6 @@ impl VirtIOBlock {
     }
 
     #[cfg(target_arch = "loongarch64")]
-    // LoongArch 下按 PCI 枚举顺序创建第 index 个 VirtIO 块设备。
-    // 执行时枚举 PCI 总线，跳过非块设备，命中目标序号后分配 BAR、打开总线主控并创建 VirtIOBlk。
     fn new_pci(index: usize) -> Self {
         let mut root = unsafe {
             PciRoot::new(
@@ -156,8 +143,6 @@ impl VirtIOBlock {
     }
 
     #[cfg(target_arch = "loongarch64")]
-    // 给 LoongArch PCI VirtIO 设备分配 BAR 地址。
-    // 执行时遍历 6 个 BAR，给还没分配地址的内存 BAR 按大小对齐分配到预留 PCI MMIO 区间。
     fn alloc_pci_bars(
         root: &mut PciRoot,
         device_function: virtio_drivers::transport::pci::bus::DeviceFunction,
@@ -193,18 +178,34 @@ impl VirtIOBlock {
 pub struct VirtioHal;
 
 unsafe impl Hal for VirtioHal {
-    // 为 VirtIO 队列分配连续 DMA 页。
-    // 执行时向物理页分配器申请连续页，把页帧保存到 QUEUE_FRAMES 防止释放，再返回设备可见物理地址。
     fn dma_alloc(pages: usize, _direction: BufferDirection) -> (usize, NonNull<u8>) {
-        let frames = frames_alloc(pages).unwrap();
-        let paddr = frames[0].paddr;
-        QUEUE_FRAMES.exclusive_access().extend(frames);
-        unsafe { (paddr.raw(), NonNull::new_unchecked(paddr.get_mut_ptr())) }
+        // let mut ppn_base = PhysPage::new(0);
+        // let mut paddr = PhysAddr::new(0);
+        // for i in 0..pages {
+        //     let frame = frame_alloc().unwrap();
+        //     debug!("alloc paddr: {:?}", frame);
+        //     if i == 0 {
+        //         paddr = frame.paddr;
+        //     };
+        //     assert_eq!(frame.paddr.raw(), paddr.raw() + PAGE_SIZE);
+        //     QUEUE_FRAMES.exclusive_access().push(frame);
+        // }
+        // unsafe { (paddr.raw(), NonNull::new_unchecked(paddr.get_mut_ptr())) }
+        for _ in 0..16 {
+            let Some(frames) = frames_alloc(pages) else {
+                return (0, NonNull::dangling());
+            };
+            let paddr = frames[0].paddr;
+            if paddr.raw() != 0 {
+                QUEUE_FRAMES.exclusive_access().extend(frames);
+                return unsafe { (paddr.raw(), NonNull::new_unchecked(paddr.get_mut_ptr())) };
+            }
+        }
+        (0, NonNull::dangling())
     }
 
-    // 释放 VirtIO 归还的 DMA 页。
-    // 执行时从起始物理地址开始逐页调用 frame_dealloc，按 virtio-drivers 约定返回 0 表示成功。
     unsafe fn dma_dealloc(paddr: usize, _vaddr: NonNull<u8>, pages: usize) -> i32 {
+        // trace!("dealloc DMA: paddr={:#x}, pages={}", paddr, pages);
         log::error!("dealloc paddr: {:?}", paddr);
         let mut pa = PhysAddr::new(paddr);
         for _ in 0..pages {
@@ -214,26 +215,25 @@ unsafe impl Hal for VirtioHal {
         0
     }
 
-    // 把 MMIO 物理地址转成内核高半区虚拟地址。
-    // 执行时给物理地址加上内核高半区偏移，并包装成 NonNull 指针交给 VirtIO 驱动访问寄存器。
     unsafe fn mmio_phys_to_virt(paddr: usize, _size: usize) -> NonNull<u8> {
         NonNull::new((usize::from(paddr) | VIRT_ADDR_START) as *mut u8).unwrap()
     }
 
-    // 把内核缓冲区地址转换成设备可见的物理地址。
-    // 执行时把高半区虚拟地址减去偏移得到物理地址，让设备能通过 DMA 访问同一段内存。
     unsafe fn share(buffer: NonNull<[u8]>, _direction: BufferDirection) -> usize {
         buffer.as_ptr() as *mut u8 as usize - VIRT_ADDR_START
+        // let pt = PageTable::current();
+        // let paddr = pt.translate(VirtAddr::new(buffer.as_ptr() as *const u8 as usize)).expect("can't find vaddr").0;
+        // paddr.addr()
     }
 
-    // 当前没有额外拷贝缓冲区，所以解除共享时无需动作。
-    // 执行时不做任何事情，因为 share 没有创建临时映射或 bounce buffer。
-    unsafe fn unshare(_paddr: usize, _buffer: NonNull<[u8]>, _direction: BufferDirection) {}
+    unsafe fn unshare(_paddr: usize, _buffer: NonNull<[u8]>, _direction: BufferDirection) {
+        // Nothing to do, as the host already has access to all memory and we didn't copy the buffer
+        // anywhere else.
+    }
 }
 
-// 探测所有 VirtIO-MMIO 地址，并按总线顺序返回块设备。
+/// Probe all virtio-mmio addresses (matching xiande-OS). Returns devices in bus order.
 #[cfg(not(target_arch = "loongarch64"))]
-// 执行时逐个读取候选 MMIO 地址的 magic 和 device_id，确认是块设备后创建 transport 与 VirtIOBlk。
 pub fn probe_all() -> Vec<Arc<dyn BlockDevice>> {
     const BASES: &[usize] = &[
         0x1000_1000,
@@ -247,7 +247,7 @@ pub fn probe_all() -> Vec<Arc<dyn BlockDevice>> {
     ];
     let mut out = Vec::new();
     for &base in BASES {
-        // MMIO 访问用物理地址加内核高半区偏移。
+        // Use virtual address (physical | VIRT_ADDR_START) for MMIO access
         let va = base | VIRT_ADDR_START;
         let magic = unsafe { core::ptr::read_volatile(va as *const u32) };
         crate::println!(
@@ -290,9 +290,8 @@ pub fn probe_all() -> Vec<Arc<dyn BlockDevice>> {
     out
 }
 
-// LoongArch 下探测所有 VirtIO PCI 块设备，并按 PCI 枚举顺序返回。
+/// Probe all virtio PCI block devices on LoongArch. Returns devices in PCI order.
 #[cfg(target_arch = "loongarch64")]
-// 执行时枚举 PCI 总线中的 VirtIO 块设备，分配 BAR 并创建块设备对象，最后返回全部结果。
 pub fn probe_all() -> Vec<Arc<dyn BlockDevice>> {
     let mut root = unsafe {
         PciRoot::new(

@@ -7,6 +7,20 @@ pub mod stdio;
 pub mod vfs;
 
 use alloc::string::String;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+static BLOCK_WRITTEN_BYTES: AtomicU64 = AtomicU64::new(0);
+
+pub fn record_block_write_bytes(bytes: usize) {
+    if bytes > 0 {
+        BLOCK_WRITTEN_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+}
+
+pub fn block_written_sectors() -> u64 {
+    let bytes = BLOCK_WRITTEN_BYTES.load(Ordering::Relaxed);
+    ((bytes + 511) / 512).max(1)
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -62,8 +76,11 @@ impl Kstat {
 
 pub const S_IFIFO: u32 = 0o010000;
 pub const S_IFCHR: u32 = 0o020000;
+pub const S_IFBLK: u32 = 0o060000;
 pub const S_IFDIR: u32 = 0o040000;
 pub const S_IFREG: u32 = 0o100000;
+pub const S_IFLNK: u32 = 0o120000;
+pub const S_IFSOCK: u32 = 0o140000;
 
 pub trait File: Send + Sync {
     // 这个 fd 是否支持读取。
@@ -149,8 +166,9 @@ pub trait File: Send + Sync {
 }
 
 pub use inode::{
-    follow_symlink, mkdir_at, open_file, open_file_at, rename_at, symlink_at, unlink_at, OpenFlags,
+    follow_symlink, link_at, mkdir_at, open_file, open_file_at, rename_at, symlink_at, unlink_at,
+    OpenFlags,
 };
 pub use pipe::make_pipe;
-pub use stdio::{DevNull, DevZero, Stdin, Stdout, Urandom};
+pub use stdio::{DevBlock, DevNull, DevZero, NullSocket, Stdin, Stdout, TmpFile, Urandom};
 pub use vfs::{list_apps, mount_root};

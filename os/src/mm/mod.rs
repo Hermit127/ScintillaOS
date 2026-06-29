@@ -11,5 +11,8 @@ pub use frame_allocator::{
     FrameTracker,
 };
 pub use heap_allocator::init_heap;
-pub use memory_set::{get_elf_interp, LoadedElf, MapArea, MapPermission, MapType, MemorySet};
+pub use memory_set::{
+    get_elf_interp, get_elf_interp_file, LoadedElf, MapArea, MapPermission, MapType, MemorySet,
+    PageFaultAccess, PageFaultResult,
+};
 pub use page_table::{translated_byte_buffer, translated_ref, translated_refmut, translated_str};
