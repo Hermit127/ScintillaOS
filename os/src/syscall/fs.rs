@@ -3504,18 +3504,17 @@ pub fn sys_ftruncate(fd: usize, length: u64) -> isize {
         .map(|inode| inode.dentry());
     match dentry {
         Some(d) => {
-            let old_size = d
-                .inode_info()
-                .map(|info| info.size)
-                .unwrap_or(0);
+            let old_size = file.stat().st_size.max(0) as u64;
             if !vfs_tmpfs_can_resize(&d.path, &d.fs_path, old_size, length) {
                 return -28;
             }
-            if d.super_block.truncate_file(&d.fs_path, length) {
+            let truncated = file
+                .as_any()
+                .downcast_ref::<crate::fs::inode::OSInode>()
+                .map(|inode| inode.truncate(length))
+                .unwrap_or(false);
+            if truncated {
                 crate::syscall::process::remove_shared_file_mappings(&d.fs_path);
-                if let Some(inode) = file.as_any().downcast_ref::<crate::fs::inode::OSInode>() {
-                    inode.refresh_after_truncate(length as i64);
-                }
                 vfs_tmpfs_commit_resize(&d.path, &d.fs_path, old_size, length);
                 0
             } else {

@@ -448,9 +448,31 @@ pub(crate) fn local_tcp_pending_on(port: u16) -> bool {
         .unwrap_or(false)
 }
 
-pub(crate) fn local_udp_pending_on(port: u16) -> bool {
+fn local_udp_packet_matches(
+    packet: &LocalUdpPacket,
+    local: IpEndpoint,
+    peer: Option<IpEndpoint>,
+) -> bool {
+    if packet.dst_port != local.port {
+        return false;
+    }
+    peer.map(|peer| peer == packet.src).unwrap_or(true)
+}
+
+pub(crate) fn local_udp_pending_on(local: IpEndpoint, peer: Option<IpEndpoint>) -> bool {
     let queue = LOCAL_UDP_QUEUE.exclusive_access();
-    queue.iter().any(|packet| packet.dst_port == port)
+    queue
+        .iter()
+        .any(|packet| local_udp_packet_matches(packet, local, peer))
+}
+
+pub(crate) fn local_udp_close(local: Option<IpEndpoint>, peer: Option<IpEndpoint>) {
+    let Some(local) = local else {
+        return;
+    };
+    LOCAL_UDP_QUEUE
+        .exclusive_access()
+        .retain(|packet| !local_udp_packet_matches(packet, local, peer));
 }
 
 fn local_tcp_connect(
@@ -705,10 +727,12 @@ fn ensure_udp_socket_local_endpoint(
 }
 
 fn enqueue_local_udp(src: IpEndpoint, data: &[u8], dest: IpEndpoint) -> isize {
+    let queue_was_full;
     {
         let mut queue = LOCAL_UDP_QUEUE.exclusive_access();
-        if queue.len() >= 256 {
-            return data.len() as isize;
+        queue_was_full = queue.len() >= 256;
+        if queue_was_full {
+            queue.pop_front();
         }
         queue.push_back(LocalUdpPacket {
             dst_port: dest.port,
@@ -718,6 +742,10 @@ fn enqueue_local_udp(src: IpEndpoint, data: &[u8], dest: IpEndpoint) -> isize {
     }
     wake_local_udp_receivers();
     crate::task::wake_poll_wait_tasks();
+    if queue_was_full {
+        stdout_release_if_owner();
+        suspend_current_and_run_next();
+    }
     data.len() as isize
 }
 
@@ -798,10 +826,11 @@ fn try_recv_local_udp(
     peek: bool,
 ) -> Option<isize> {
     let local = local_recv_endpoint(sockfd, handle)?;
+    let peer = get_socket_peer_endpoint(sockfd);
     let mut queue = LOCAL_UDP_QUEUE.exclusive_access();
     let pos = queue
         .iter()
-        .position(|packet| packet.dst_port == local.port)?;
+        .position(|packet| local_udp_packet_matches(packet, local, peer))?;
     let packet = if peek {
         queue[pos].clone()
     } else {
@@ -828,10 +857,11 @@ fn try_recv_local_udp_socket(
     peek: bool,
 ) -> Option<isize> {
     let local = local_recv_endpoint_socket(sock, handle)?;
+    let peer = sock.get_peer_endpoint();
     let mut queue = LOCAL_UDP_QUEUE.exclusive_access();
     let pos = queue
         .iter()
-        .position(|packet| packet.dst_port == local.port)?;
+        .position(|packet| local_udp_packet_matches(packet, local, peer))?;
     let packet = if peek {
         queue[pos].clone()
     } else {

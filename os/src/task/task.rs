@@ -55,6 +55,7 @@ pub struct TaskControlBlockInner {
     pub memory_set: MemorySet,
     pub kernel_stack: KernelStack,
     pub parent: Option<Weak<TaskControlBlock>>,
+    pub vfork_parent: Option<Weak<TaskControlBlock>>,
     pub children: Vec<Arc<TaskControlBlock>>,
     pub exit_code: i32,
     pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
@@ -268,6 +269,7 @@ impl TaskControlBlock {
                         task_status: TaskStatus::Ready,
                         memory_set,
                         parent: None,
+                        vfork_parent: None,
                         children: Vec::new(),
                         exit_code: 0,
                         fd_table: vec![
@@ -613,6 +615,11 @@ impl TaskControlBlock {
             }
         }
         *inner.get_trap_cx() = trap_cx;
+        let vfork_parent = inner.vfork_parent.take().and_then(|parent| parent.upgrade());
+        drop(inner);
+        if let Some(parent) = vfork_parent {
+            super::wake_blocked_task(&parent);
+        }
     }
     pub fn fork(self: &Arc<TaskControlBlock>) -> Option<Arc<TaskControlBlock>> {
         trace!("os::task::TaskControlBlock::fork");
@@ -709,6 +716,7 @@ impl TaskControlBlock {
                         task_status: TaskStatus::Ready,
                         memory_set,
                         parent: Some(Arc::downgrade(self)),
+                        vfork_parent: None,
                         children: Vec::new(),
                         exit_code: 0,
                         fd_table,
@@ -867,6 +875,7 @@ impl TaskControlBlock {
                         task_status: TaskStatus::Ready,
                         memory_set,
                         parent: Some(Arc::downgrade(self)),
+                        vfork_parent: None,
                         children: Vec::new(),
                         exit_code: 0,
                         fd_table,
@@ -967,6 +976,7 @@ impl TaskControlBlock {
 
 #[derive(Debug, Clone, Copy)]
 pub enum BlockReason {
+    Vfork,
     TcpRecv(usize),
     TcpSend(usize),
     TcpAccept(usize),

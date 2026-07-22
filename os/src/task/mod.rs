@@ -432,12 +432,13 @@ pub fn force_exit_task(task: &Arc<TaskControlBlock>, exit_code: i32) {
     let target_is_current = current_task()
         .map(|current| current.getpid() == pid)
         .unwrap_or(false);
-    let (parent, orphan_children, files_to_close) = {
+    let (parent, vfork_parent, orphan_children, files_to_close) = {
         let mut inner = task.inner_exclusive_access();
         inner.task_status = TaskStatus::Zombie;
         inner.exit_code = exit_code;
         inner.block_reason = None;
         let parent = inner.parent.as_ref().and_then(|w| w.upgrade());
+        let vfork_parent = inner.vfork_parent.take().and_then(|w| w.upgrade());
         let orphan_children = core::mem::take(&mut inner.children);
         if target_is_current {
             inner.memory_set.recycle_data_pages();
@@ -445,10 +446,13 @@ pub fn force_exit_task(task: &Arc<TaskControlBlock>, exit_code: i32) {
             inner.memory_set.recycle_data_pages_inactive();
         }
         let files_to_close = inner.drain_fd_table();
-        (parent, orphan_children, files_to_close)
+        (parent, vfork_parent, orphan_children, files_to_close)
     };
     for file in files_to_close {
         file.close_ref();
+    }
+    if let Some(parent) = vfork_parent {
+        wake_blocked_task(&parent);
     }
 
     if notify_parent {
@@ -468,6 +472,12 @@ pub fn force_exit_task(task: &Arc<TaskControlBlock>, exit_code: i32) {
         for child in orphan_children.iter() {
             child.inner_exclusive_access().parent = Some(Arc::downgrade(&INITPROC));
             initproc_inner.children.push(child.clone());
+        }
+        drop(initproc_inner);
+        for child in orphan_children.iter().rev() {
+            if child.inner_exclusive_access().task_status == TaskStatus::Ready {
+                add_priority_task(child.clone());
+            }
         }
     }
 }
@@ -567,7 +577,7 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
     crate::syscall::process::cleanup_task_exit_futexes(&task);
     remove_from_ready_queue(task.getpid());
     remove_from_pid2task(task.getpid());
-    let (parent, orphan_children, files_to_close) = {
+    let (parent, vfork_parent, orphan_children, files_to_close) = {
         // **** access current TCB exclusively
         let mut inner = task.inner_exclusive_access();
         // Change status to Zombie
@@ -575,16 +585,20 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
         // Record exit code
         inner.exit_code = exit_code;
         let parent = inner.parent.as_ref().and_then(|w| w.upgrade());
+        let vfork_parent = inner.vfork_parent.take().and_then(|w| w.upgrade());
         let orphan_children = core::mem::take(&mut inner.children);
         // deallocate user space
         inner.memory_set.recycle_data_pages();
         // drop file descriptors
         let files_to_close = inner.drain_fd_table();
-        (parent, orphan_children, files_to_close)
+        (parent, vfork_parent, orphan_children, files_to_close)
     };
     // **** release current PCB before touching parent/initproc
     for file in files_to_close {
         file.close_ref();
+    }
+    if let Some(parent) = vfork_parent {
+        wake_blocked_task(&parent);
     }
 
     // wake parent waiting in waitpid
@@ -606,6 +620,12 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
         for child in orphan_children.iter() {
             child.inner_exclusive_access().parent = Some(Arc::downgrade(&INITPROC));
             initproc_inner.children.push(child.clone());
+        }
+        drop(initproc_inner);
+        for child in orphan_children.iter().rev() {
+            if child.inner_exclusive_access().task_status == TaskStatus::Ready {
+                add_priority_task(child.clone());
+            }
         }
     }
     // ++++++ release parent PCB

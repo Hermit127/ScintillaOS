@@ -930,6 +930,7 @@ const CLONE_VM: usize = 0x100;
 const CLONE_FS: usize = 0x200;
 const CLONE_FILES: usize = 0x400;
 const CLONE_SIGHAND: usize = 0x800;
+const CLONE_VFORK: usize = 0x4000;
 const CLONE_THREAD: usize = 0x10000;
 const CLONE_SETTLS: usize = 0x80000;
 const CLONE_PARENT_SETTID: usize = 0x100000;
@@ -943,7 +944,8 @@ pub fn sys_clone(flags: usize, stack: usize, ptid: usize, tls: usize, ctid: usiz
         inner.tgid
     };
     let is_thread = flags & CLONE_THREAD != 0;
-    let new_task = if flags & CLONE_VM != 0 {
+    let is_vfork = flags & CLONE_VFORK != 0;
+    let new_task = if flags & CLONE_VM != 0 && !is_vfork {
         let Some(new_task) = current_task.clone_shared_vm() else {
             return -12;
         };
@@ -987,7 +989,13 @@ pub fn sys_clone(flags: usize, stack: usize, ptid: usize, tls: usize, ctid: usiz
             .children
             .retain(|child| child.getpid() != new_pid);
     }
+    if is_vfork {
+        new_task.inner_exclusive_access().vfork_parent = Some(Arc::downgrade(&current_task));
+    }
     add_task(new_task);
+    if is_vfork {
+        block_current_and_run_next(BlockReason::Vfork);
+    }
     new_pid as isize
 }
 

@@ -10,11 +10,24 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use bitflags::*;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::*;
 use lwext4_rust::bindings::*;
 
 const EXT4_BLOCK_SIZE: u32 = 4096;
 const PATH_TIME_CACHE_MAX_ENTRIES: usize = 1024;
+const UNLINKED_FILE_PREFIX: &str = ".os-unlinked-";
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct OpenInodeKey {
+    super_block: usize,
+    inode: u32,
+}
+
+struct OpenInodeState {
+    count: usize,
+    orphan_path: Option<String>,
+}
 
 #[derive(Clone, Copy, Default)]
 struct CachedTimes {
@@ -30,6 +43,91 @@ lazy_static! {
         unsafe { UPSafeCell::new(BTreeMap::new()) };
     static ref PATH_FS_FLAGS_CACHE: UPSafeCell<BTreeMap<String, usize>> =
         unsafe { UPSafeCell::new(BTreeMap::new()) };
+    static ref OPEN_INODES: UPSafeCell<BTreeMap<OpenInodeKey, OpenInodeState>> =
+        unsafe { UPSafeCell::new(BTreeMap::new()) };
+}
+
+static NEXT_UNLINKED_FILE: AtomicUsize = AtomicUsize::new(0);
+
+fn open_inode_key(dentry: &Arc<Dentry>) -> Option<OpenInodeKey> {
+    if dentry.is_dir || dentry.is_link {
+        return None;
+    }
+    let inode = dentry.inode_info()?.inode_num;
+    Some(OpenInodeKey {
+        super_block: Arc::as_ptr(&dentry.super_block) as usize,
+        inode,
+    })
+}
+
+fn register_open_inode(key: OpenInodeKey) {
+    let mut open = OPEN_INODES.exclusive_access();
+    let state = open.entry(key).or_insert(OpenInodeState {
+        count: 0,
+        orphan_path: None,
+    });
+    state.count += 1;
+}
+
+fn unregister_open_inode(key: OpenInodeKey) -> Option<String> {
+    let mut open = OPEN_INODES.exclusive_access();
+    let state = open.get_mut(&key)?;
+    state.count = state.count.saturating_sub(1);
+    if state.count != 0 {
+        return None;
+    }
+    let orphan_path = state.orphan_path.take();
+    open.remove(&key);
+    orphan_path
+}
+
+fn unlinked_file_path(dentry: &Dentry, inode: u32) -> String {
+    let sequence = NEXT_UNLINKED_FILE.fetch_add(1, Ordering::Relaxed);
+    let parent = dentry
+        .fs_path
+        .rfind('/')
+        .map(|index| &dentry.fs_path[..index])
+        .unwrap_or("");
+    if parent.is_empty() {
+        alloc::format!("/{}{}-{}", UNLINKED_FILE_PREFIX, inode, sequence)
+    } else {
+        alloc::format!("{}/{}{}-{}", parent, UNLINKED_FILE_PREFIX, inode, sequence)
+    }
+}
+
+fn defer_open_file_unlink(dentry: &Arc<Dentry>) -> Option<bool> {
+    let info = dentry.inode_info()?;
+    if info.links_count > 1 {
+        return None;
+    }
+    let key = open_inode_key(dentry)?;
+    {
+        let open = OPEN_INODES.exclusive_access();
+        let state = open.get(&key)?;
+        if state.count == 0 || state.orphan_path.is_some() {
+            return None;
+        }
+    }
+
+    let orphan_path = unlinked_file_path(dentry, info.inode_num);
+    let old_path = CString::new(dentry.fs_path.as_bytes()).ok()?;
+    let new_path = CString::new(orphan_path.as_bytes()).ok()?;
+    let renamed = unsafe {
+        ext4_frename(
+            old_path.as_ptr() as *const core::ffi::c_char,
+            new_path.as_ptr() as *const core::ffi::c_char,
+        ) == EOK as i32
+    };
+    if !renamed {
+        return Some(false);
+    }
+
+    if let Some(state) = OPEN_INODES.exclusive_access().get_mut(&key) {
+        state.orphan_path = Some(orphan_path);
+        Some(true)
+    } else {
+        Some(false)
+    }
 }
 
 pub fn record_special_path_mode(fs_path: &str, mode_type: u32) {
@@ -103,6 +201,7 @@ pub struct OSInode {
     writable: bool,
     dentry: Arc<Dentry>,
     inner: UPSafeCell<OSInodeInner>,
+    open_key: Option<OpenInodeKey>,
 }
 
 unsafe impl Send for OSInode {}
@@ -118,11 +217,16 @@ pub struct OSInodeInner {
 
 impl Drop for OSInode {
     fn drop(&mut self) {
-        let mut inner = self.inner.exclusive_access();
-        if let Some(ref mut f) = inner.file_handle {
-            unsafe {
-                ext4_fclose(f);
+        {
+            let mut inner = self.inner.exclusive_access();
+            if let Some(ref mut f) = inner.file_handle {
+                unsafe {
+                    ext4_fclose(f);
+                }
             }
+        }
+        if let Some(orphan_path) = self.open_key.and_then(unregister_open_inode) {
+            self.dentry.super_block.unlink_file(&orphan_path);
         }
     }
 }
@@ -149,7 +253,8 @@ impl OSInode {
         } else {
             0
         };
-        let inode = Self {
+        let key = open_inode_key(&dentry);
+        let mut inode = Self {
             readable,
             writable,
             dentry,
@@ -165,25 +270,36 @@ impl OSInode {
                     "OSInodeInner",
                 )
             },
+            open_key: None,
         };
+        if let Some(key) = key {
+            if inode.open_handle() {
+                register_open_inode(key);
+                inode.open_key = Some(key);
+                let _ = inode.stat_inner();
+            }
+        }
         inode
     }
     pub fn dentry(&self) -> &Arc<Dentry> {
         &self.dentry
     }
 
-    fn open_handle(&self) {
+    fn open_handle(&self) -> bool {
+        if self.inner.exclusive_access().file_handle.is_some() {
+            return true;
+        }
         let fs_path = &self.dentry.fs_path;
         let c_path = match CString::new(fs_path.as_bytes()) {
             Ok(s) => s,
-            Err(_) => return,
+            Err(_) => return false,
         };
         // File already exists (created by open_file_at/create_file).
         // Use "r+b" for writable files, "rb" for read-only.
         let flags = if self.writable { "r+b" } else { "rb" };
         let c_flags = match CString::new(flags) {
             Ok(s) => s,
-            Err(_) => return,
+            Err(_) => return false,
         };
 
         let mut file: ext4_file = unsafe { core::mem::zeroed() };
@@ -202,6 +318,9 @@ impl OSInode {
                 ext4_fseek(&mut file, offset as i64, SEEK_SET as u32);
             }
             inner.file_handle = Some(file);
+            true
+        } else {
+            false
         }
     }
 
@@ -319,18 +438,26 @@ impl OSInode {
         self.dentry.update_cached_size(size.max(0) as u64);
     }
 
-    pub fn refresh_after_truncate(&self, size: i64) {
+    pub fn truncate(&self, size: u64) -> bool {
+        if !self.writable {
+            return false;
+        }
+        if !self.open_handle() {
+            return false;
+        }
         let mut inner = self.inner.exclusive_access();
-        if let Some(mut file) = inner.file_handle.take() {
-            unsafe {
-                ext4_fclose(&mut file);
-            }
+        let Some(ref mut file) = inner.file_handle else {
+            return false;
+        };
+        if unsafe { ext4_ftruncate(file, size) } != EOK as i32 {
+            return false;
         }
         if let Some(ref mut st) = inner.cached_stat {
-            st.st_size = size;
-            st.st_blocks = ((size.max(0) as u64) + 511) / 512;
+            st.st_size = size as i64;
+            st.st_blocks = (size + 511) / 512;
         }
-        self.dentry.update_cached_size(size.max(0) as u64);
+        self.dentry.update_cached_size(size);
+        true
     }
 
     pub fn update_cached_mode(&self, mode: u32) {
@@ -694,6 +821,8 @@ pub fn unlink_at(base: Option<Arc<Dentry>>, path: &str, is_dir: bool) -> bool {
 
     let ok = if is_dir {
         dentry.super_block.unlink_dir(&dentry.fs_path)
+    } else if let Some(deferred) = defer_open_file_unlink(&dentry) {
+        deferred
     } else {
         dentry.super_block.unlink_file(&dentry.fs_path)
     };
@@ -1134,7 +1263,10 @@ impl File for OSInode {
             let entry = &entries[entry_index];
             let name = entry.get_name();
             let name_bytes = name.as_bytes();
-            if name_bytes.is_empty() || name.starts_with(".tmpfile.") {
+            if name_bytes.is_empty()
+                || name.starts_with(".tmpfile.")
+                || name.starts_with(UNLINKED_FILE_PREFIX)
+            {
                 entry_index += 1;
                 continue;
             }
