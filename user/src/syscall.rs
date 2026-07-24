@@ -15,6 +15,9 @@ const SYSCALL_WRITE: usize = 64;
 const SYSCALL_MKDIRAT: usize = 34;
 const SYSCALL_UNLINKAT: usize = 35;
 const SYSCALL_EXIT: usize = 93;
+const SYSCALL_FUTEX: usize = 98;
+const SYSCALL_SCHED_SETAFFINITY: usize = 122;
+const SYSCALL_SCHED_GETAFFINITY: usize = 123;
 const SYSCALL_YIELD: usize = 124;
 const SYSCALL_KILL: usize = 129;
 const SYSCALL_SIGACTION: usize = 134;
@@ -25,6 +28,10 @@ const SYSCALL_SETPGID: usize = 154;
 const SYSCALL_GETPGID: usize = 155;
 const SYSCALL_SETSID: usize = 157;
 const SYSCALL_GET_TIME: usize = 169;
+const SYSCALL_GETCPU: usize = 168;
+const SYSCALL_SHMGET: usize = 194;
+const SYSCALL_SHMAT: usize = 196;
+const SYSCALL_SHMDT: usize = 197;
 const SYSCALL_GETPID: usize = 172;
 const SYSCALL_GETUID: usize = 174;
 const SYSCALL_GETEUID: usize = 175;
@@ -34,8 +41,12 @@ const SYSCALL_GETTID: usize = 178;
 const SYSCALL_SETUID: usize = 146;
 const SYSCALL_SETGID: usize = 144;
 const SYSCALL_BRK: usize = 214;
+const SYSCALL_MUNMAP: usize = 215;
 const SYSCALL_FORK: usize = 401;
+const SYSCALL_CLONE: usize = 220;
 const SYSCALL_EXEC: usize = 221;
+const SYSCALL_MMAP: usize = 222;
+const SYSCALL_MPROTECT: usize = 226;
 const SYSCALL_WAITPID: usize = 260;
 const SYSCALL_NANOSLEEP: usize = 101;
 
@@ -194,6 +205,28 @@ pub fn sys_yield() -> isize {
     syscall(SYSCALL_YIELD, [0, 0, 0, 0, 0, 0])
 }
 
+pub fn sys_sched_setaffinity(pid: usize, mask: &[u8]) -> isize {
+    syscall(
+        SYSCALL_SCHED_SETAFFINITY,
+        [pid, mask.len(), mask.as_ptr() as usize, 0, 0, 0],
+    )
+}
+
+pub fn sys_sched_getaffinity(pid: usize, mask: &mut [u8]) -> isize {
+    syscall(
+        SYSCALL_SCHED_GETAFFINITY,
+        [pid, mask.len(), mask.as_mut_ptr() as usize, 0, 0, 0],
+    )
+}
+
+pub fn sys_getcpu(cpu: &mut u32, node: Option<&mut u32>) -> isize {
+    let node_ptr = node.map_or(core::ptr::null_mut(), |node| node as *mut u32);
+    syscall(
+        SYSCALL_GETCPU,
+        [cpu as *mut u32 as usize, node_ptr as usize, 0, 0, 0, 0],
+    )
+}
+
 pub fn sys_kill(pid: isize, signal: i32) -> isize {
     syscall(SYSCALL_KILL, [pid as usize, signal as usize, 0, 0, 0, 0])
 }
@@ -220,6 +253,21 @@ pub fn sys_getpid() -> isize {
 
 pub fn sys_fork() -> isize {
     syscall(SYSCALL_FORK, [0, 0, 0, 0, 0, 0])
+}
+
+/// Raw RISC-V clone ABI: flags, child_stack, parent_tid, tls, child_tid.
+/// Tests use this only with an explicitly allocated child stack.
+pub fn sys_clone(
+    flags: usize,
+    child_stack: usize,
+    parent_tid: usize,
+    tls: usize,
+    child_tid: usize,
+) -> isize {
+    syscall(
+        SYSCALL_CLONE,
+        [flags, child_stack, parent_tid, tls, child_tid, 0],
+    )
 }
 
 pub fn sys_exec(path: &str, args: &[*const u8], envs: &[*const u8]) -> isize {
@@ -291,6 +339,31 @@ pub fn sys_brk(brk_addr: usize) -> isize {
     syscall(SYSCALL_BRK, [brk_addr, 0, 0, 0, 0, 0])
 }
 
+/// Raw Linux-compatible virtual-memory syscalls used by the SMP regression
+/// binaries.  The user library intentionally leaves policy (flags and page
+/// alignment) to the caller, as the kernel ABI does.
+pub fn sys_mmap(
+    addr: usize,
+    len: usize,
+    prot: usize,
+    flags: usize,
+    fd: isize,
+    offset: usize,
+) -> isize {
+    syscall(
+        SYSCALL_MMAP,
+        [addr, len, prot, flags, fd as usize, offset],
+    )
+}
+
+pub fn sys_mprotect(addr: usize, len: usize, prot: usize) -> isize {
+    syscall(SYSCALL_MPROTECT, [addr, len, prot, 0, 0, 0])
+}
+
+pub fn sys_munmap(addr: usize, len: usize) -> isize {
+    syscall(SYSCALL_MUNMAP, [addr, len, 0, 0, 0, 0])
+}
+
 pub fn sys_times(tms: *mut Tms) -> isize {
     syscall(SYSCALL_TIMES, [tms as usize, 0, 0, 0, 0, 0])
 }
@@ -321,6 +394,44 @@ pub struct TimeSpec {
 
 pub fn sys_nanosleep(req: *const TimeSpec, rem: *mut TimeSpec) -> isize {
     syscall(SYSCALL_NANOSLEEP, [req as usize, rem as usize, 0, 0, 0, 0])
+}
+
+/// Invoke the legacy futex syscall used by the RISC-V kernel ABI.
+///
+/// The raw interface is intentionally exposed for kernel regression tests;
+/// higher-level user synchronization primitives should wrap it instead of
+/// open-coding operation numbers.
+pub fn sys_futex(
+    uaddr: *mut u32,
+    op: usize,
+    val: usize,
+    timeout_or_val2: usize,
+    uaddr2: *mut u32,
+    val3: usize,
+) -> isize {
+    syscall(
+        SYSCALL_FUTEX,
+        [
+            uaddr as usize,
+            op,
+            val,
+            timeout_or_val2,
+            uaddr2 as usize,
+            val3,
+        ],
+    )
+}
+
+pub fn sys_shmget(key: usize, size: usize, flags: usize) -> isize {
+    syscall(SYSCALL_SHMGET, [key, size, flags, 0, 0, 0])
+}
+
+pub fn sys_shmat(shmid: usize, addr: usize, flags: usize) -> isize {
+    syscall(SYSCALL_SHMAT, [shmid, addr, flags, 0, 0, 0])
+}
+
+pub fn sys_shmdt(addr: usize) -> isize {
+    syscall(SYSCALL_SHMDT, [addr, 0, 0, 0, 0, 0])
 }
 
 pub fn sys_mount(source: &str, target: &str, fstype: &str, flags: usize, data: &[u8]) -> isize {

@@ -6,7 +6,7 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
 use crate::drivers::block::VirtioHal;
-use crate::sync::UPSafeCell;
+use crate::sync::DeviceLock;
 use polyhal::PhysAddr;
 use virtio_drivers::device::net::VirtIONet;
 use virtio_drivers::transport::mmio::MmioTransport;
@@ -25,12 +25,14 @@ unsafe impl Send for VirtIONetInner {}
 unsafe impl Sync for VirtIONetInner {}
 
 pub struct VirtIONetAdapter {
-    inner: UPSafeCell<VirtIONetInner>,
+    // Hardware queue accesses are serialized independently from the smoltcp
+    // state lock, so an IRQ acknowledgement cannot race a transmit/receive.
+    inner: DeviceLock<VirtIONetInner>,
     rx_buf: [u8; NET_BUF_SIZE],
     rx_len: usize,
     tx_buf: [u8; NET_BUF_SIZE],
     // Software hairpin loopback queue for 127.0.0.1 traffic
-    loopback_queue: UPSafeCell<VecDeque<Vec<u8>>>,
+    loopback_queue: DeviceLock<VecDeque<Vec<u8>>>,
     mac_addr: [u8; 6],
 }
 
@@ -92,11 +94,17 @@ impl VirtIONetAdapter {
             mac
         );
         Some(Self {
-            inner: unsafe { UPSafeCell::new(VirtIONetInner { net }) },
+            inner: DeviceLock::new_named(VirtIONetInner { net }, "VirtIONet"),
             rx_buf: [0u8; NET_BUF_SIZE],
             rx_len: 0,
             tx_buf: [0u8; NET_BUF_SIZE],
-            loopback_queue: unsafe { UPSafeCell::new(VecDeque::new()) },
+            // Pre-allocate the ring storage at construction time.  Pushing a
+            // prepared frame while holding the queue lock then cannot grow the
+            // VecDeque and allocate from the kernel heap.
+            loopback_queue: DeviceLock::new_named(
+                VecDeque::with_capacity(2048),
+                "VirtIONet.loopback",
+            ),
             mac_addr: mac,
         })
     }
@@ -128,8 +136,8 @@ impl RxToken for VirtioRxToken<'_> {
 
 pub struct VirtioTxToken<'a> {
     buf: &'a mut [u8],
-    device: &'a UPSafeCell<VirtIONetInner>,
-    loopback_queue: &'a UPSafeCell<VecDeque<Vec<u8>>>,
+    device: &'a DeviceLock<VirtIONetInner>,
+    loopback_queue: &'a DeviceLock<VecDeque<Vec<u8>>>,
     mac_addr: [u8; 6],
 }
 
@@ -141,21 +149,22 @@ impl TxToken for VirtioTxToken<'_> {
         let result = f(&mut self.buf[..len]);
         let frame = &self.buf[..len];
 
-        let mut looped_back = false;
-
-        // Parse Ethernet frame header (dst MAC = first 6 bytes)
-        if len >= 14 {
+        // Parse Ethernet frame header (dst MAC = first 6 bytes).  Clone the
+        // frame before taking a DeviceLock: Vec allocation is never allowed
+        // inside a device critical section.
+        let loopback_frame = if len >= 14 {
             let dst_mac = &frame[0..6];
             let is_broadcast = dst_mac == [0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
             let is_self = dst_mac == self.mac_addr;
-
-            // ARP broadcasts or packets to our own MAC → push into loopback queue
-            if is_broadcast || is_self {
-                let mut queue = self.loopback_queue.exclusive_access();
-                if queue.len() < 2048 {
-                    queue.push_back(frame.to_vec());
-                }
-                looped_back = true;
+            (is_broadcast || is_self).then(|| frame.to_vec())
+        } else {
+            None
+        };
+        let looped_back = loopback_frame.is_some();
+        if let Some(loopback_frame) = loopback_frame {
+            let mut queue = self.loopback_queue.exclusive_access();
+            if queue.len() < 2048 {
+                queue.push_back(loopback_frame);
             }
         }
 

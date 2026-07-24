@@ -11,6 +11,10 @@ pub struct BlockDeviceStream {
     pub inner: Arc<dyn BlockDevice>,
     pub pos: usize,
     pub total_size: u64,
+    /// Reused for unaligned read-modify-write operations.  lwext4 invokes
+    /// these callbacks while its FsLock is held, so the callback must not
+    /// enter the heap/frame allocator.
+    pub scratch: alloc::vec::Vec<u8>,
 }
 
 pub struct BlockDeviceStreamOp;
@@ -43,17 +47,20 @@ impl KernelDevOp for BlockDeviceStreamOp {
             }
         } else {
             let total_sectors = end_sector - sector;
-            let mut raw = alloc::vec![0u8; total_sectors * SECTOR_SIZE];
+            let raw_len = total_sectors * SECTOR_SIZE;
+            if raw_len > dev.scratch.len() {
+                return Err(-1);
+            }
+            let inner = dev.inner.clone();
+            let raw = &mut dev.scratch[..raw_len];
             for i in 0..total_sectors {
                 let begin = i * SECTOR_SIZE;
-                dev.inner
-                    .read_block(sector + i, &mut raw[begin..begin + SECTOR_SIZE]);
+                inner.read_block(sector + i, &mut raw[begin..begin + SECTOR_SIZE]);
             }
             raw[offset..offset + buf.len()].copy_from_slice(buf);
             for i in 0..total_sectors {
                 let begin = i * SECTOR_SIZE;
-                dev.inner
-                    .write_block(sector + i, &raw[begin..begin + SECTOR_SIZE]);
+                inner.write_block(sector + i, &raw[begin..begin + SECTOR_SIZE]);
             }
         }
 
@@ -84,11 +91,15 @@ impl KernelDevOp for BlockDeviceStreamOp {
             let end = pos + buf.len();
             let end_sector = (end + SECTOR_SIZE - 1) / SECTOR_SIZE;
             let total_sectors = end_sector - sector;
-            let mut raw = alloc::vec![0u8; total_sectors * SECTOR_SIZE];
+            let raw_len = total_sectors * SECTOR_SIZE;
+            if raw_len > dev.scratch.len() {
+                return Err(-1);
+            }
+            let inner = dev.inner.clone();
+            let raw = &mut dev.scratch[..raw_len];
             for i in 0..total_sectors {
                 let begin = i * SECTOR_SIZE;
-                dev.inner
-                    .read_block(sector + i, &mut raw[begin..begin + SECTOR_SIZE]);
+                inner.read_block(sector + i, &mut raw[begin..begin + SECTOR_SIZE]);
             }
             let len = buf.len();
             buf.copy_from_slice(&raw[offset..offset + len]);

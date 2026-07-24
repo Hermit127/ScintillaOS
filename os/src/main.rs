@@ -13,6 +13,8 @@ use crate::{
 // use polyhal::api::ArchInterface;
 use log::*;
 use polyhal::{common::PageAlloc, irq::IRQ, mem::get_mem_areas, PhysAddr};
+#[cfg(target_arch = "riscv64")]
+use core::sync::atomic::{AtomicBool, Ordering};
 #[cfg(not(target_arch = "loongarch64"))]
 use polyhal_boot::define_entry;
 use polyhal_trap::{
@@ -39,6 +41,23 @@ mod task;
 
 pub struct ArchInterfaceImpl;
 
+/// The first SMP milestone recognises exactly the four QEMU virt harts.
+/// Secondary harts wait behind the global-init barrier.  After release they
+/// enter the same per-CPU idle/scheduler loop as hart 0.
+#[cfg(target_arch = "riscv64")]
+const RISCV_SMP_HARTS: usize = 4;
+#[cfg(target_arch = "riscv64")]
+static SMP_GLOBAL_INIT_DONE: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_arch = "riscv64")]
+fn park_secondary_hart() -> ! {
+    // Invalid harts are never published to the scheduler.  Keep their local
+    // interrupts disabled and park permanently rather than touching globals.
+    loop {
+        unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
+    }
+}
+
 fn sync_shared_vm_after_page_fault(
     task: &alloc::sync::Arc<task::TaskControlBlock>,
     vaddr: polyhal::VirtAddr,
@@ -60,6 +79,38 @@ fn sync_shared_vm_after_page_fault(
         snapshot.2,
         &snapshot.3,
     );
+}
+
+/// Resolve a user page fault and, for a shared page table, flush the changed
+/// PTE on any other hart that is currently using it.  Both the TCB lock and
+/// peer-metadata synchronization are finished before the SBI RFENCE call.
+fn handle_current_user_page_fault(vaddr: polyhal::VirtAddr, access: crate::mm::PageFaultAccess) {
+    let task = crate::task::current_task().unwrap();
+    let (fault_result, active_cpus) = {
+        let mut inner = task.inner_exclusive_access();
+        let fault_result = inner.memory_set.handle_page_fault(vaddr, access);
+        let active_cpus = fault_result
+            .is_some()
+            .then(|| inner.memory_set.is_shared())
+            .filter(|is_shared| *is_shared)
+            .map(|_| inner.memory_set.active_cpu_mask());
+        (fault_result, active_cpus)
+    };
+
+    let Some(fault_result) = fault_result else {
+        // A userspace access-permission fault is delivered through the normal
+        // signal path.  The previous unconditional exit bypassed an installed
+        // SIGSEGV handler, so `lat_sig prot` could never return to its faulting
+        // store and perform the next measurement iteration.
+        current_add_signal(SignalFlags::SIGSEGV);
+        return;
+    };
+    if fault_result == crate::mm::PageFaultResult::SharedMetadataChanged {
+        sync_shared_vm_after_page_fault(&task, vaddr);
+    }
+    if let Some(active_cpus) = active_cpus {
+        let _ = crate::task::flush_remote_tlb(active_cpus, vaddr.floor().raw(), crate::config::PAGE_SIZE);
+    }
 }
 
 fn exit_current_on_user_fault(signal: i32) -> ! {
@@ -98,23 +149,10 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             ctx[TrapFrameArgs::RET] = result as usize;
         }
         StorePageFault(bad_addr) => {
-            let vaddr = polyhal::VirtAddr::from(bad_addr);
-            let task = crate::task::current_task().unwrap();
-            let mut inner = task.inner_exclusive_access();
-            let fault_result = inner
-                .memory_set
-                .handle_page_fault(vaddr, crate::mm::PageFaultAccess::Write);
-            if fault_result.is_none() {
-                drop(inner);
-                exit_current_on_user_fault(11);
-            } else {
-                let should_sync =
-                    fault_result == Some(crate::mm::PageFaultResult::SharedMetadataChanged);
-                drop(inner);
-                if should_sync {
-                    sync_shared_vm_after_page_fault(&task, vaddr);
-                }
-            }
+            handle_current_user_page_fault(
+                polyhal::VirtAddr::from(bad_addr),
+                crate::mm::PageFaultAccess::Write,
+            );
         }
         InstructionPageFault(bad_addr)
             if bad_addr == task::SIGNAL_RETURN_TRAMPOLINE
@@ -127,55 +165,34 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             }
         }
         LoadPageFault(bad_addr) => {
-            let vaddr = polyhal::VirtAddr::from(bad_addr);
-            let task = crate::task::current_task().unwrap();
-            let mut inner = task.inner_exclusive_access();
-            let fault_result = inner
-                .memory_set
-                .handle_page_fault(vaddr, crate::mm::PageFaultAccess::Read);
-            if fault_result.is_none() {
-                drop(inner);
-                exit_current_on_user_fault(11);
-            } else {
-                let should_sync =
-                    fault_result == Some(crate::mm::PageFaultResult::SharedMetadataChanged);
-                drop(inner);
-                if should_sync {
-                    sync_shared_vm_after_page_fault(&task, vaddr);
-                }
-            }
+            handle_current_user_page_fault(
+                polyhal::VirtAddr::from(bad_addr),
+                crate::mm::PageFaultAccess::Read,
+            );
         }
         InstructionPageFault(bad_addr) => {
-            let vaddr = polyhal::VirtAddr::from(bad_addr);
-            let task = crate::task::current_task().unwrap();
-            let mut inner = task.inner_exclusive_access();
-            let fault_result = inner
-                .memory_set
-                .handle_page_fault(vaddr, crate::mm::PageFaultAccess::Execute);
-            if fault_result.is_none() {
-                drop(inner);
-                exit_current_on_user_fault(11);
-            } else {
-                let should_sync =
-                    fault_result == Some(crate::mm::PageFaultResult::SharedMetadataChanged);
-                drop(inner);
-                if should_sync {
-                    sync_shared_vm_after_page_fault(&task, vaddr);
-                }
-            }
+            handle_current_user_page_fault(
+                polyhal::VirtAddr::from(bad_addr),
+                crate::mm::PageFaultAccess::Execute,
+            );
         }
         IllegalInstruction(_) => {
             current_add_signal(SignalFlags::SIGILL);
         }
+        SupervisorSoft => {
+            // An IPI only wakes this hart to revisit scheduler work. Do not
+            // context-switch directly from the trap handler or while any
+            // interrupt-side subsystem may hold a lock.
+            let _ = task::handle_ipi();
+        }
         Timer => {
-            static mut TICK: usize = 0;
-            unsafe {
-                TICK += 1;
-            }
+            task::record_timer_tick();
             net::net_poll();
             net::wake_net_blocked_tasks();
             check_and_wake_up_tasks();
             check_itimers();
+            #[cfg(target_arch = "riscv64")]
+            task::diagnose_scheduler_stall();
             if current_task().is_some() {
                 suspend_current_and_run_next();
             }
@@ -205,6 +222,31 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
 
 fn main(hartid: usize) {
     trace!("ch7 main: hartid: {}", hartid);
+    #[cfg(target_arch = "riscv64")]
+    if hartid >= RISCV_SMP_HARTS {
+        IRQ::int_disable();
+        park_secondary_hart();
+    }
+    #[cfg(target_arch = "riscv64")]
+    if hartid != 0 {
+        // polyhal_boot already installed this hart's per-CPU pointer.  Do not
+        // touch heap, drivers, VFS, or the scheduler until hart 0 publishes
+        // their completed global initialization.
+        IRQ::int_disable();
+        task::init_current_cpu(hartid);
+        while !SMP_GLOBAL_INIT_DONE.load(Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+        task::register_online_cpu(hartid);
+        println!(
+            "[smp] hart {} online (scheduler={}, percpu={:#x})",
+            hartid,
+            task::current_hart_id(),
+            polyhal::percpu::get_percpu_ptr()
+        );
+        task::run_tasks();
+    }
+    #[cfg(not(target_arch = "riscv64"))]
     if hartid != 0 {
         return;
     }
@@ -212,10 +254,17 @@ fn main(hartid: usize) {
     mm::init_heap();
     logging::init(option_env!("LOG"));
     println!("init logging");
+    task::init_current_cpu(hartid);
+    println!(
+        "[smp] hart {} online (scheduler={}, percpu={:#x})",
+        hartid,
+        task::current_hart_id(),
+        polyhal::percpu::get_percpu_ptr()
+    );
     // polyhal::init_interrupt(); done in polyhal::CPU::rust_main()
 
     polyhal::common::init(&PageAllocImpl);
-    get_mem_areas().for_each(|(start, size)| {
+    get_mem_areas().iter().for_each(|(start, size)| {
         println!("init memory region {:#x} - {:#x}", start, start + size);
         mm::add_frames_range(*start, start + size);
     });
@@ -224,6 +273,8 @@ fn main(hartid: usize) {
     net::net_init();
     fs::list_apps();
     task::init_kernel_page();
+    #[cfg(target_arch = "riscv64")]
+    SMP_GLOBAL_INIT_DONE.store(true, Ordering::Release);
     task::add_initproc();
     task::run_tasks();
     panic!("Unreachable in main function of rCore Tutorial kernel!");

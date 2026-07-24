@@ -2,6 +2,9 @@
 export LOG ?= error
 ARCH ?= riscv64
 COMMA := ,
+# Keep the baseline runnable.  Set QEMU_SMP=4 only after the SMP lock audit
+# and regression suite have passed.
+QEMU_SMP ?= 1
 
 ifeq ($(ARCH), x86_64)
   TARGET := x86_64-unknown-none
@@ -70,8 +73,10 @@ endif
 KERNEL_ENTRY_PA := 0x80200000
 
 # Binutils
-OBJDUMP := rust-objdump --arch-name=riscv64
-OBJCOPY := rust-objcopy --binary-architecture=riscv64
+RUST_SYSROOT := $(shell rustc --print sysroot)
+LLVM_TOOLS_DIR := $(RUST_SYSROOT)/lib/rustlib/$(shell rustc -vV | sed -n 's/^host: //p')/bin
+OBJDUMP ?= $(if $(shell command -v rust-objdump 2>/dev/null),rust-objdump,$(LLVM_TOOLS_DIR)/llvm-objdump) --arch-name=riscv64
+OBJCOPY ?= $(if $(shell command -v rust-objcopy 2>/dev/null),rust-objcopy,$(LLVM_TOOLS_DIR)/llvm-objcopy) --binary-architecture=riscv64
 
 # Disassembly
 DISASM ?= -x
@@ -128,7 +133,9 @@ build: env fs-img $(KERNEL_BIN)
 
 env:
 	(rustup target list | grep "$(TARGET) (installed)") || rustup target add $(TARGET)
-	(command -v rust-objcopy >/dev/null 2>&1 && command -v rust-objdump >/dev/null 2>&1) || cargo install cargo-binutils
+	(command -v rust-objcopy >/dev/null 2>&1 && command -v rust-objdump >/dev/null 2>&1) || \
+		(test -x "$(LLVM_TOOLS_DIR)/llvm-objcopy" && test -x "$(LLVM_TOOLS_DIR)/llvm-objdump") || \
+		(rustup component add llvm-tools-preview)
 	rustup component add rust-src
 	rustup component add llvm-tools-preview
 
@@ -316,6 +323,7 @@ else
 		echo "  LTP script not found, skipped"; \
 	fi
 endif
+
 	@mkdir -p $(ROOTFS_DIR)/ltp/testcases/bin
 	@if [ -d "$(LTP_BIN_DIR)/ltp/testcases/bin" ]; then \
 		for f in $(LTP_BIN_DIR)/ltp/testcases/bin/*; do \
@@ -357,7 +365,7 @@ run: run-inner
 
 QEMU_EXEC += -nographic \
 				-m $(QEMU_MEM) \
-				-smp 1
+				-smp $(QEMU_SMP)
 
 # Uncomment for QEMU debug log:
 # 				-D qemu.log -d in_asm,int,pcall,cpu_reset,guest_errors

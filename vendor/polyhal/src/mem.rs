@@ -1,4 +1,5 @@
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use arrayvec::ArrayVec;
 use fdt_parser::{Fdt, FdtError};
@@ -14,6 +15,32 @@ use crate::{
 ///
 /// Memory Area with [MEM_VECTOR_CAPACITY].
 static mut MEM_AREA: ArrayVec<(usize, usize), MEM_VECTOR_CAPACITY> = ArrayVec::new_const();
+
+/// `set_local_thread_pointer` allocates a private per-CPU area from this
+/// bootstrap allocator on every hart. Secondary harts can reach that path at
+/// the same time, before the kernel's normal allocator and lock domains are
+/// available, so this early allocator needs its own minimal SMP guard.
+static MEM_ALLOC_LOCK: AtomicBool = AtomicBool::new(false);
+
+struct MemAllocGuard;
+
+impl MemAllocGuard {
+    fn acquire() -> Self {
+        while MEM_ALLOC_LOCK
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        Self
+    }
+}
+
+impl Drop for MemAllocGuard {
+    fn drop(&mut self) {
+        MEM_ALLOC_LOCK.store(false, Ordering::Release);
+    }
+}
 
 /// Device Tree Infomation
 ///
@@ -65,9 +92,10 @@ pub fn get_fdt() -> Result<Fdt<'static>, FdtError<'static>> {
 /// - Ensure call this function in the primary core when booting
 /// - Ensure no alignment required
 pub unsafe fn alloc(alloc_size: usize) -> *mut u8 {
+    let _guard = MemAllocGuard::acquire();
     unsafe {
         for (start, size) in MEM_AREA.iter_mut() {
-            if *size > alloc_size {
+            if *size >= alloc_size {
                 let ptr = *start;
                 *start += alloc_size;
                 *size -= alloc_size;
@@ -103,7 +131,7 @@ pub fn parse_system_info() {
             );
         });
     }
-    get_mem_areas().for_each(|(address, size)| {
+    get_mem_areas().into_iter().for_each(|(address, size)| {
         display_info!(
             "Platform Memory Available",
             "{:#018x} - {:#018x}",
@@ -113,21 +141,16 @@ pub fn parse_system_info() {
     });
 }
 
-/// Retrieves an iterator over the registered memory areas.
+/// Return a coherent copy of the registered memory areas.
 ///
-/// # Returns
-///
-/// An iterator yielding references to tuples `(start, end)`, where:
-/// - `start` is the starting address of a memory area.
-/// - `end` is the ending address of a memory area.
-///
-/// # Safety
-///
-/// - The caller must ensure that `MEM_AREA` is properly initialized before calling this function.
-/// - Since this function returns an iterator over a static memory region, concurrent modification  
-///   of `MEM_AREA` while iterating may lead to undefined behavior.
-pub fn get_mem_areas<'a>() -> impl Iterator<Item = &'a (usize, usize)> {
-    unsafe { MEM_AREA.iter() }
+/// The snapshot contains `(start, size)` tuples and is safe to iterate after
+/// the bootstrap allocator lock has been released.
+pub fn get_mem_areas() -> ArrayVec<(usize, usize), MEM_VECTOR_CAPACITY> {
+    // Secondary harts consume entries from this bootstrap allocator while
+    // constructing private per-CPU data. Return a copy under the same early
+    // lock rather than references into the mutable backing store.
+    let _guard = MemAllocGuard::acquire();
+    unsafe { (&*core::ptr::addr_of!(MEM_AREA)).clone() }
 }
 
 /// Adds a memory region to the memblock.

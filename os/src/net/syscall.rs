@@ -10,10 +10,10 @@ use crate::fs::stdio::stdout_release_if_owner;
 use crate::fs::File;
 use crate::mm::{translated_ref, translated_refmut};
 use crate::net::socket::{SocketFile, SocketType};
-use crate::sync::UPSafeCell;
+use crate::sync::DeviceLock;
 use crate::task::{
-    add_task, block_current_and_run_next, current_task, current_user_token,
-    suspend_current_and_run_next, BlockReason, TaskStatus, NET_BLOCK_QUEUE, PID2TCB,
+    block_current_and_run_next, current_task, current_user_token, net_blocked_snapshot,
+    suspend_current_and_run_next, task_snapshot, BlockReason,
 };
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
@@ -72,12 +72,15 @@ struct LocalTcpListener {
 }
 
 lazy_static! {
-    static ref LOCAL_UDP_QUEUE: UPSafeCell<VecDeque<LocalUdpPacket>> =
-        unsafe { UPSafeCell::new(VecDeque::new()) };
-    static ref LOCAL_TCP_CONNS: UPSafeCell<Vec<Option<LocalTcpConn>>> =
-        unsafe { UPSafeCell::new(Vec::new()) };
-    static ref LOCAL_TCP_LISTENERS: UPSafeCell<Vec<LocalTcpListener>> =
-        unsafe { UPSafeCell::new(Vec::new()) };
+    /// Loopback UDP is a software device queue.  Wakers run only after this
+    /// lock is released; no scheduler or user-memory operation nests inside.
+    static ref LOCAL_UDP_QUEUE: DeviceLock<VecDeque<LocalUdpPacket>> =
+        DeviceLock::new_named(VecDeque::new(), "Net.local_udp_queue");
+    /// The local TCP tables form one serialised loopback device domain.
+    static ref LOCAL_TCP_CONNS: DeviceLock<Vec<Option<LocalTcpConn>>> =
+        DeviceLock::new_named(Vec::new(), "Net.local_tcp_connections");
+    static ref LOCAL_TCP_LISTENERS: DeviceLock<Vec<LocalTcpListener>> =
+        DeviceLock::new_named(Vec::new(), "Net.local_tcp_listeners");
 }
 
 fn net_ready() -> bool {
@@ -133,16 +136,14 @@ fn install_fd_for_thread_group(
     file: Arc<dyn File + Send + Sync>,
     cloexec: bool,
 ) {
-    let tasks: Vec<_> = PID2TCB
-        .exclusive_access()
-        .values()
+    let tasks: Vec<_> = task_snapshot()
+        .into_iter()
         .filter(|task| task.getpid() != owner_pid)
         .filter(|task| {
             task.try_inner_borrow()
                 .map(|inner| inner.tgid == tgid)
                 .unwrap_or(false)
         })
-        .cloned()
         .collect();
     for task in tasks {
         if let Some(mut inner) = task.try_inner_exclusive_access() {
@@ -722,28 +723,16 @@ fn enqueue_local_udp(src: IpEndpoint, data: &[u8], dest: IpEndpoint) -> isize {
 }
 
 fn wake_local_udp_receivers() {
-    let mut to_wake = Vec::new();
-    {
-        let mut queue = NET_BLOCK_QUEUE.exclusive_access();
-        let mut i = 0;
-        while i < queue.len() {
-            let should_wake = {
-                let inner = queue[i].inner_exclusive_access();
-                matches!(inner.block_reason, Some(BlockReason::UdpRecv(_)))
-            };
-            if should_wake {
-                to_wake.push(queue.remove(i));
-            } else {
-                i += 1;
-            }
-        }
-    }
-    for task in to_wake {
-        let mut inner = task.inner_exclusive_access();
-        inner.task_status = TaskStatus::Ready;
-        inner.block_reason = None;
-        drop(inner);
-        add_task(task);
+    let tasks: Vec<_> = net_blocked_snapshot()
+        .into_iter()
+        .filter(|task| {
+            task.try_inner_borrow()
+                .map(|inner| matches!(inner.block_reason, Some(BlockReason::UdpRecv(_))))
+                .unwrap_or(false)
+        })
+        .collect();
+    for task in tasks {
+        let _ = crate::task::wake_task(task);
     }
 }
 

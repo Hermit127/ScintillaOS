@@ -8,9 +8,10 @@ mod signal;
 mod task;
 
 use crate::mm::{translated_ref, translated_refmut};
-use crate::sync::UPSafeCell;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::mem::size_of;
+use core::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use lazy_static::*;
 use log::*;
 use manager::fetch_task;
@@ -18,30 +19,36 @@ use manager::remove_from_pid2task;
 use manager::remove_from_ready_queue;
 use polyhal::instruction::shutdown;
 use polyhal::kcontext::KContext;
-use polyhal_trap::trapframe::TrapFrameArgs;
+use polyhal_trap::trapframe::{TrapFrame, TrapFrameArgs};
 
 pub const SIGNAL_RETURN_TRAMPOLINE: usize = 0x7ffeff000;
 const SA_SIGINFO: usize = 4;
+const SA_RESTORER: usize = 0x0400_0000;
 const SA_NOCLDWAIT: usize = 2;
 const SIG_IGN: usize = 1;
 const SIGCHLD_NUM: usize = 17;
 const SIGINFO_SIZE: usize = 128;
-const UCONTEXT_SIZE: usize = 512;
+// RISC-V ucontext: 168-byte header followed by sigcontext.  The latter
+// contains 32 integer words and the 528-byte maximum FP-state union.
+const UCONTEXT_SIZE: usize = 960;
 const UCONTEXT_SIGMASK_OFFSET: usize = 40;
-
-#[cfg(target_arch = "riscv64")]
-const UCONTEXT_PC_OFFSET: usize = 176;
-#[cfg(target_arch = "loongarch64")]
-const UCONTEXT_PC_OFFSET: usize = 176;
-#[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
-const UCONTEXT_PC_OFFSET: usize = 0;
+const UCONTEXT_MCONTEXT_OFFSET: usize = 168;
+const UCONTEXT_PC_OFFSET: usize = UCONTEXT_MCONTEXT_OFFSET;
+static SIGNAL_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
+const SIGNAL_TRACE_ENABLED: bool = false;
 
 pub use action::{SignalAction, SignalActions};
 pub use fp::UserFloatState;
-pub use manager::{add_priority_task, add_task, pid2task, ready_queue_len, PID2TCB};
+pub use manager::{
+    add_priority_task, add_task, begin_block, begin_exit, cancel_block_before_switch,
+    net_blocked_snapshot, online_cpu_mask, pid2task, register_online_cpu, remove_sleep,
+    take_waitpid, task_snapshot, update_task_affinity, wake_pipe_waiters, wake_task, BlockQueue,
+};
 pub use pid::{pid_alloc, PidHandle};
 pub use processor::{
-    current_task, current_user_token, init_kernel_page, run_tasks, schedule, take_current_task,
+    current_hart_id, current_task, current_user_token, flush_remote_tlb, handle_ipi,
+    init_current_cpu, init_kernel_page, record_timer_tick, request_reschedule, run_tasks,
+    schedule, take_current_task,
 };
 pub use signal::{SignalFlags, MAX_SIG};
 pub use task::{
@@ -55,39 +62,36 @@ pub struct TimeSpec {
     pub tv_nsec: usize,
 }
 
-pub struct SleepTask {
-    pub wakeup_time: usize,
-    pub task: Arc<TaskControlBlock>,
-}
-
-lazy_static! {
-    // public sleep queue for timer interrupt handler to access
-    pub static ref SLEEP_QUEUE: UPSafeCell<Vec<SleepTask>> = unsafe {
-        UPSafeCell::new_named(Vec::new(), "SleepQueue")
-    };
-    pub static ref NET_BLOCK_QUEUE: UPSafeCell<Vec<Arc<TaskControlBlock>>> = unsafe {
-        UPSafeCell::new_named(Vec::new(), "NetBlockQueue")
-    };
-pub static ref WAITPID_QUEUE: UPSafeCell<Vec<Arc<TaskControlBlock>>> = unsafe {
-        UPSafeCell::new_named(Vec::new(), "WaitpidQueue")
-    };
-    static ref EXITED_TASKS: UPSafeCell<Vec<Arc<TaskControlBlock>>> = unsafe {
-        UPSafeCell::new_named(Vec::new(), "ExitedTasks")
-    };
-}
-
 fn defer_drop_task(task: Arc<TaskControlBlock>) {
-    EXITED_TASKS.exclusive_access().push(task);
+    manager::defer_drop_task(task);
 }
 
 pub(super) fn reap_exited_tasks() {
-    EXITED_TASKS.exclusive_access().clear();
+    for task in manager::take_exited_tasks() {
+        processor::set_scheduler_phase(40);
+        let (parent, files_to_close) = {
+            let mut inner = task.inner_exclusive_access();
+            processor::set_scheduler_phase(41);
+            let parent = inner.parent.as_ref().and_then(|weak| weak.upgrade());
+            inner.memory_set.recycle_data_pages_inactive();
+            processor::set_scheduler_phase(42);
+            let files = inner.drain_fd_table();
+            (parent, files)
+        };
+        processor::set_scheduler_phase(43);
+        for file in files_to_close {
+            file.close_ref();
+        }
+        processor::set_scheduler_phase(44);
+        task.publish_exit_cleanup_done();
+        if let Some(parent) = parent {
+            wake_parent_waiter(&parent);
+        }
+    }
 }
 
 pub fn reap_exited_task(pid: usize) {
-    EXITED_TASKS
-        .exclusive_access()
-        .retain(|task| task.getpid() != pid);
+    manager::reap_exited_task(pid);
 }
 
 pub fn suspend_current_and_run_next() {
@@ -100,16 +104,16 @@ pub fn suspend_current_and_run_next() {
     // ---- access current TCB exclusively
     let mut task_inner = task.inner_exclusive_access();
     let task_cx_ptr = &mut task_inner.task_cx as *mut KContext;
-    // Change status to Ready
-    task_inner.task_status = TaskStatus::Ready;
+    // Do not publish this task as Ready until the context switch has returned
+    // to this CPU's idle loop.  Publishing it here would let a second hart
+    // run it before `context_switch_pt` saved `task_cx`.
+    task_inner.task_status = TaskStatus::Switching;
     drop(task_inner);
     // ---- release current PCB
 
-    // push back to ready queue BEFORE clearing processor
-    add_task(task.clone());
-    // now safe to clear processor (window from here to schedule is minimal)
-    take_current_task();
-    // jump to scheduling cycle
+    // Keep `current` and its running_cpu ownership until the switch has
+    // completed.  `run_tasks` takes it and publishes Ready from the idle
+    // context, after the task's context is valid for another hart to use.
     schedule(task_cx_ptr);
     //added fot reset time accounting
     task.record_time_resume();
@@ -119,90 +123,79 @@ pub fn sleep_current_and_run_next() {
     crate::fs::stdio::stdout_release_if_owner();
     let task = current_task().unwrap();
     task.record_time_suspend();
-    let mut task_inner = task.inner_exclusive_access();
-    task_inner.task_status = TaskStatus::Blocked;
-    let task_cx_ptr = &mut task_inner.task_cx as *mut KContext;
-    drop(task_inner);
-    take_current_task();
+    let task_cx_ptr = manager::begin_block(&task, None, manager::BlockQueue::None, None);
     schedule(task_cx_ptr);
     task.record_time_resume();
 }
 
 pub fn block_current_and_run_next(block_reason: BlockReason) {
-    static mut C: u64 = 0;
+    let _ = block_current_and_run_next_if(block_reason, || true);
+}
+
+/// Publish the current task as a waiter, recheck the blocking condition, and
+/// only then switch away.
+///
+/// A wakeup may happen between an object's initial condition check and
+/// `begin_block`.  Registering first and invoking `should_block` afterwards
+/// closes that lost-wakeup window.  If a waker races after the recheck,
+/// `wake_task` records `WakePending` and the idle handoff publishes the task
+/// after its context has been saved.
+pub fn block_current_and_run_next_if<F>(
+    block_reason: BlockReason,
+    should_block: F,
+) -> bool
+where
+    F: FnOnce() -> bool,
+{
     crate::fs::stdio::stdout_release_if_owner();
     let task = current_task().unwrap();
-    let pid = task.getpid();
     task.record_time_suspend();
-    let mut task_inner = task.inner_exclusive_access();
-    task_inner.block_reason = Some(block_reason);
-    task_inner.task_status = TaskStatus::Blocked;
-    let task_cx_ptr = &mut task_inner.task_cx as *mut KContext;
-    drop(task_inner);
-    take_current_task();
-    let mut queue = NET_BLOCK_QUEUE.exclusive_access();
-    queue.retain(|queued| queued.getpid() != pid);
-    queue.push(task.clone());
-    drop(queue);
+    let task_cx_ptr = manager::begin_block(
+        &task,
+        Some(block_reason),
+        manager::BlockQueue::Net,
+        None,
+    );
+    if !should_block() {
+        manager::cancel_block_before_switch(&task);
+        task.record_time_resume();
+        return false;
+    }
     schedule(task_cx_ptr);
     task.record_time_resume();
+    let _ = manager::remove_net_blocked(task.getpid());
+    true
 }
 
 pub fn block_current_until(block_reason: BlockReason, wakeup_time: Option<usize>) {
     crate::fs::stdio::stdout_release_if_owner();
     let task = current_task().unwrap();
-    let pid = task.getpid();
     task.record_time_suspend();
-    let mut task_inner = task.inner_exclusive_access();
-    task_inner.block_reason = Some(block_reason);
-    task_inner.task_status = TaskStatus::Blocked;
-    let task_cx_ptr = &mut task_inner.task_cx as *mut KContext;
-    drop(task_inner);
-    take_current_task();
-    {
-        let mut queue = NET_BLOCK_QUEUE.exclusive_access();
-        queue.retain(|queued| queued.getpid() != pid);
-        queue.push(task.clone());
-    }
-    if let Some(deadline) = wakeup_time {
-        add_sleep_task(deadline, task.clone());
-    }
+    let task_cx_ptr = manager::begin_block(
+        &task,
+        Some(block_reason),
+        manager::BlockQueue::Net,
+        wakeup_time,
+    );
     schedule(task_cx_ptr);
     task.record_time_resume();
-    {
-        let mut queue = NET_BLOCK_QUEUE.exclusive_access();
-        queue.retain(|queued| queued.getpid() != pid);
-    }
+    let _ = manager::remove_net_blocked(task.getpid());
     if wakeup_time.is_some() {
-        SLEEP_QUEUE
-            .exclusive_access()
-            .retain(|sleep_task| sleep_task.task.getpid() != pid);
+        let _ = manager::remove_sleep(task.getpid());
     }
 }
 
 pub fn wake_poll_wait_tasks() {
-    let mut to_wake = Vec::new();
-    {
-        let mut queue = NET_BLOCK_QUEUE.exclusive_access();
-        let mut i = 0;
-        while i < queue.len() {
-            let should_wake = {
-                let inner = queue[i].inner_exclusive_access();
-                matches!(inner.block_reason, Some(BlockReason::PollWait))
-            };
-            if should_wake {
-                to_wake.push(queue.remove(i));
-            } else {
-                i += 1;
-            }
-        }
-    }
-    for task in to_wake {
-        let mut inner = task.inner_exclusive_access();
-        inner.task_status = TaskStatus::Ready;
-        inner.block_reason = None;
-        drop(inner);
-        add_priority_task(task);
+    let tasks: Vec<_> = manager::net_blocked_snapshot()
+        .into_iter()
+        .filter(|task| {
+            task.try_inner_borrow()
+                .map(|inner| matches!(inner.block_reason, Some(BlockReason::PollWait)))
+                .unwrap_or(false)
+        })
+        .collect();
+    for task in tasks {
+        manager::wake_task(task);
     }
 }
 
@@ -215,92 +208,29 @@ pub fn wake_pipe_write_tasks(pipe_id: usize) {
 }
 
 fn wake_pipe_tasks(pipe_id: usize, read_waiters: bool) {
-    let mut to_wake = Vec::new();
-    {
-        let mut queue = NET_BLOCK_QUEUE.exclusive_access();
-        let mut i = 0;
-        while i < queue.len() {
-            let should_wake = {
-                let inner = queue[i].inner_exclusive_access();
-                match inner.block_reason {
-                    Some(BlockReason::PipeRead(id)) => read_waiters && id == pipe_id,
-                    Some(BlockReason::PipeWrite(id)) => !read_waiters && id == pipe_id,
-                    _ => false,
-                }
-            };
-            if should_wake {
-                to_wake.push(queue.remove(i));
-            } else {
-                i += 1;
-            }
-        }
-    }
-    for task in to_wake {
-        let mut inner = task.inner_exclusive_access();
-        inner.task_status = TaskStatus::Ready;
-        inner.block_reason = None;
-        drop(inner);
-        add_priority_task(task);
-    }
+    manager::wake_pipe_waiters(pipe_id, read_waiters);
 }
 
 pub fn wake_signal_wait_task(task: &Arc<TaskControlBlock>, signal: SignalFlags) -> bool {
-    let pid = task.getpid();
-    let mut removed = false;
-    {
-        let mut queue = NET_BLOCK_QUEUE.exclusive_access();
-        let mut i = 0;
-        while i < queue.len() {
-            let should_wake = queue[i].getpid() == pid
-                && queue[i]
-                    .try_inner_borrow()
-                    .map(|inner| match inner.block_reason {
-                        Some(BlockReason::SignalWait(mask)) => mask.contains(signal),
-                        _ => false,
-                    })
-                    .unwrap_or(false);
-            if should_wake {
-                queue.remove(i);
-                removed = true;
-                break;
-            }
-            i += 1;
-        }
-    }
-    if removed {
-        SLEEP_QUEUE
-            .exclusive_access()
-            .retain(|sleep_task| sleep_task.task.getpid() != pid);
-        let mut inner = task.inner_exclusive_access();
-        if inner.task_status != TaskStatus::Zombie {
-            inner.task_status = TaskStatus::Ready;
-            inner.block_reason = None;
-            drop(inner);
-            add_priority_task(task.clone());
-        }
-    }
-    removed
+    let should_wake = task
+        .try_inner_borrow()
+        .map(|inner| match inner.block_reason {
+            Some(BlockReason::SignalWait(mask)) => mask.contains(signal),
+            _ => false,
+        })
+        .unwrap_or(false);
+    should_wake && manager::wake_task(task.clone())
 }
 
 pub fn wake_blocked_task(task: &Arc<TaskControlBlock>) {
     let pid = task.getpid();
-    let removed = remove_task_from_block_queues(pid);
-    let mut inner = task.inner_exclusive_access();
-    let should_wake = inner.task_status == TaskStatus::Blocked || removed;
-    if should_wake && inner.task_status != TaskStatus::Zombie {
-        inner.task_status = TaskStatus::Ready;
-        inner.block_reason = None;
-        drop(inner);
-        add_priority_task(task.clone());
-    }
+    let _ = crate::syscall::process::remove_futex_waiter(pid);
+    let _ = manager::wake_task(task.clone());
 }
 
 pub fn check_itimers() {
     let now = polyhal::time::Time::now().to_usec() as u64;
-    let tasks: Vec<Arc<TaskControlBlock>> = {
-        let map = PID2TCB.exclusive_access();
-        map.values().cloned().collect()
-    };
+    let tasks = task_snapshot();
     for task in tasks {
         let expired = {
             let Some(mut inner) = task.try_inner_exclusive_access() else {
@@ -343,15 +273,21 @@ fn notify_parent_sigchld(parent: &Arc<TaskControlBlock>) {
 }
 
 fn wake_parent_waiter(parent: &Arc<TaskControlBlock>) {
-    let mut queue = WAITPID_QUEUE.exclusive_access();
-    if let Some(idx) = queue.iter().position(|t| t.getpid() == parent.getpid()) {
-        let parent_task = queue.remove(idx);
-        drop(queue);
-        let mut pinner = parent_task.inner_exclusive_access();
-        pinner.task_status = TaskStatus::Ready;
-        pinner.block_reason = None;
-        drop(pinner);
-        add_task(parent_task);
+    let before = parent
+        .try_inner_borrow()
+        .map(|inner| inner.task_status);
+    let woke = manager::wake_task(parent.clone());
+    if LIFECYCLE_TRACE_ENABLED {
+        let after = parent
+            .try_inner_borrow()
+            .map(|inner| inner.task_status);
+        println!(
+            "[lifecycle] wake parent={} before={:?} after={:?} woke={}",
+            parent.getpid(),
+            before,
+            after,
+            woke
+        );
     }
 }
 
@@ -383,60 +319,49 @@ fn is_thread_group_leader(task: &Arc<TaskControlBlock>) -> bool {
 }
 
 fn remove_task_from_block_queues(pid: usize) -> bool {
-    let mut removed = false;
-    if crate::syscall::process::remove_futex_waiter(pid) {
-        removed = true;
-    }
-    {
-        let mut queue = NET_BLOCK_QUEUE.exclusive_access();
-        let old_len = queue.len();
-        queue.retain(|t| t.getpid() != pid);
-        if queue.len() != old_len {
-            removed = true;
-        }
-    }
-    {
-        let mut queue = WAITPID_QUEUE.exclusive_access();
-        let old_len = queue.len();
-        queue.retain(|t| t.getpid() != pid);
-        if queue.len() != old_len {
-            removed = true;
-        }
-    }
-    {
-        let mut queue = SLEEP_QUEUE.exclusive_access();
-        let old_len = queue.len();
-        queue.retain(|sleep_task| sleep_task.task.getpid() != pid);
-        if queue.len() != old_len {
-            removed = true;
-        }
-    }
-    removed
+    crate::syscall::process::remove_futex_waiter(pid)
 }
 
 pub fn force_exit_task(task: &Arc<TaskControlBlock>, exit_code: i32) {
     let pid = task.getpid();
-    let (notify_parent, already_zombie) = {
-        let inner = task.inner_exclusive_access();
-        (inner.tgid == pid, inner.task_status == TaskStatus::Zombie)
-    };
-    if already_zombie {
-        return;
-    }
-    crate::fs::stdio::stdout_release_pid(pid);
-    crate::syscall::process::cleanup_task_exit_futexes(task);
-    remove_from_ready_queue(pid);
-    remove_task_from_block_queues(pid);
-    remove_from_pid2task(pid);
-
     let target_is_current = current_task()
         .map(|current| current.getpid() == pid)
         .unwrap_or(false);
+    // Never publish or tear down a non-current task as Zombie from the
+    // caller's hart.  A Ready/Blocked task can concurrently be in a wake or
+    // dispatch handoff just as a remotely Running task can still own its trap
+    // frame.  Publish SIGKILL, wake it if necessary, and let its local trap
+    // path perform the single authoritative begin_exit transition.
+    let running_cpu = task.running_cpu();
+    if !target_is_current {
+        let mut inner = task.inner_exclusive_access();
+        if inner.task_status != TaskStatus::Zombie {
+            inner.killed = true;
+            inner.exit_code = exit_code;
+            inner.exit_signal = exit_code;
+            inner.signals.insert(SignalFlags::SIGKILL);
+        }
+        drop(inner);
+        manager::wake_task(task.clone());
+        if running_cpu != task::NO_RUNNING_CPU {
+            processor::request_reschedule(running_cpu);
+        }
+        return;
+    }
+    let notify_parent = {
+        let inner = task.inner_exclusive_access();
+        inner.tgid == pid
+    };
+    crate::fs::stdio::stdout_release_pid(pid);
+    let _ = remove_task_from_block_queues(pid);
+    if !manager::begin_exit(task, exit_code) {
+        return;
+    }
+    crate::syscall::process::cleanup_task_exit_futexes(task);
+    remove_from_pid2task(pid);
+
     let (parent, orphan_children, files_to_close) = {
         let mut inner = task.inner_exclusive_access();
-        inner.task_status = TaskStatus::Zombie;
-        inner.exit_code = exit_code;
-        inner.block_reason = None;
         let parent = inner.parent.as_ref().and_then(|w| w.upgrade());
         let orphan_children = core::mem::take(&mut inner.children);
         if target_is_current {
@@ -450,6 +375,7 @@ pub fn force_exit_task(task: &Arc<TaskControlBlock>, exit_code: i32) {
     for file in files_to_close {
         file.close_ref();
     }
+    task.publish_exit_cleanup_done();
 
     if notify_parent {
         if let Some(parent) = parent {
@@ -477,19 +403,16 @@ pub fn force_exit_task_group(task: &Arc<TaskControlBlock>, exit_code: i32) {
         let inner = task.inner_exclusive_access();
         (task.getpid(), inner.tgid)
     };
-    let group_tasks: Vec<Arc<TaskControlBlock>> = {
-        let map = PID2TCB.exclusive_access();
-        map.values()
-            .filter(|other| {
-                other.getpid() != pid
-                    && other
-                        .try_inner_borrow()
-                        .map(|inner| inner.tgid == tgid)
-                        .unwrap_or(false)
-            })
-            .cloned()
-            .collect()
-    };
+    let group_tasks: Vec<Arc<TaskControlBlock>> = task_snapshot()
+        .into_iter()
+        .filter(|other| {
+            other.getpid() != pid
+                && other
+                    .try_inner_borrow()
+                    .map(|inner| inner.tgid == tgid)
+                    .unwrap_or(false)
+        })
+        .collect();
     for other in group_tasks {
         force_exit_task(&other, exit_code);
     }
@@ -499,18 +422,8 @@ pub fn dump_task_stats_for_oom(context: &str) {
     let (pid_count, pid_zombies) = manager::pid2task_counts().unwrap_or((usize::MAX, usize::MAX));
     let (ready_count, ready_zombies) =
         manager::ready_queue_counts().unwrap_or((usize::MAX, usize::MAX));
-    let net_blocked = NET_BLOCK_QUEUE
-        .try_borrow()
-        .map(|queue| queue.len())
-        .unwrap_or(usize::MAX);
-    let waitpid_blocked = WAITPID_QUEUE
-        .try_borrow()
-        .map(|queue| queue.len())
-        .unwrap_or(usize::MAX);
-    let sleeping = SLEEP_QUEUE
-        .try_borrow()
-        .map(|queue| queue.len())
-        .unwrap_or(usize::MAX);
+    let (net_blocked, waitpid_blocked, sleeping) =
+        manager::wait_queue_counts().unwrap_or((usize::MAX, usize::MAX, usize::MAX));
     let (init_children, init_zombies) = INITPROC
         .try_inner_borrow()
         .map(|inner| {
@@ -544,6 +457,94 @@ pub fn dump_task_stats_for_oom(context: &str) {
     );
 }
 
+#[cfg(target_arch = "riscv64")]
+static STALL_SNAPSHOT_PRINTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+#[cfg(target_arch = "riscv64")]
+static STALL_SNAPSHOT_TICKS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(target_arch = "riscv64")]
+const SCHED_STALL_DIAGNOSTICS: bool = false;
+const LIFECYCLE_TRACE_ENABLED: bool = false;
+
+/// Emit one read-only scheduler snapshot when all runnable work has vanished
+/// behind at least two wait registrations.  This is a low-frequency kernel
+/// diagnostic only: it neither wakes tasks nor changes benchmark timing.
+#[cfg(target_arch = "riscv64")]
+pub fn diagnose_scheduler_stall() {
+    use core::sync::atomic::Ordering;
+
+    if !SCHED_STALL_DIAGNOSTICS {
+        return;
+    }
+    let phases = processor::scheduler_phases();
+    // Exit cleanup runs from an idle hart.  If it spins while holding a lock,
+    // runnable work may still exist and the queue-based detector below will
+    // never arm.  Observe only the diagnostic phase atomics here, so another
+    // hart can report the stuck stage without acquiring the contested lock.
+    if phases
+        .iter()
+        .any(|phase| matches!(phase, 31 | 32 | 40..=43))
+    {
+        if STALL_SNAPSHOT_TICKS.fetch_add(1, Ordering::AcqRel) >= 200
+            && !STALL_SNAPSHOT_PRINTED.swap(true, Ordering::AcqRel)
+        {
+            println!(
+                "[cleanup-stall] phases={:?} scheduler_owner={}",
+                phases,
+                manager::scheduler_lock_owner()
+            );
+        }
+    }
+    let Some((ready, _)) = manager::ready_queue_counts() else {
+        return;
+    };
+    let Some((net, waitpid, sleeping)) = manager::wait_queue_counts() else {
+        return;
+    };
+    if ready != 0 || net + waitpid + sleeping < 2 {
+        STALL_SNAPSHOT_TICKS.store(0, Ordering::Release);
+        STALL_SNAPSHOT_PRINTED.store(false, Ordering::Release);
+        return;
+    }
+    let tasks = task_snapshot();
+    if tasks.len() < 4 {
+        STALL_SNAPSHOT_TICKS.store(0, Ordering::Release);
+        return;
+    }
+    if STALL_SNAPSHOT_TICKS.fetch_add(1, Ordering::AcqRel) < 100 {
+        return;
+    }
+    if STALL_SNAPSHOT_PRINTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    println!(
+        "[sched-stall] ready={} net={} waitpid={} sleeping={} phases={:?} scheduler_owner={} syscall={} pid={} args=({:#x},{:#x},{:#x})",
+        ready,
+        net,
+        waitpid,
+        sleeping,
+        processor::scheduler_phases(),
+        manager::scheduler_lock_owner(),
+        crate::syscall::LAST_SYSCALL_ID.load(Ordering::Relaxed),
+        crate::syscall::LAST_SYSCALL_PID.load(Ordering::Relaxed),
+        crate::syscall::LAST_SYSCALL_ARG0.load(Ordering::Relaxed),
+        crate::syscall::LAST_SYSCALL_ARG1.load(Ordering::Relaxed),
+        crate::syscall::LAST_SYSCALL_ARG2.load(Ordering::Relaxed),
+    );
+    for task in tasks {
+        if let Some(inner) = task.try_inner_borrow() {
+            println!(
+                "[sched-stall] pid={} owner={} state={:?} reason={:?} children={}",
+                task.getpid(),
+                task.running_cpu(),
+                inner.task_status,
+                inner.block_reason,
+                inner.children.len()
+            );
+        }
+    }
+}
+
 pub const IDLE_PID: usize = 0;
 
 /// Exit the current 'Running' task and run the next task in task list.
@@ -563,33 +564,47 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
     }
 
     // remove from pid2task
-    let notify_parent = is_thread_group_leader(&task);
-    crate::syscall::process::cleanup_task_exit_futexes(&task);
-    remove_from_ready_queue(task.getpid());
-    remove_from_pid2task(task.getpid());
-    let (parent, orphan_children, files_to_close) = {
-        // **** access current TCB exclusively
+    let _ = crate::syscall::process::remove_futex_waiter(task.getpid());
+    if !manager::begin_exit(&task, exit_code) {
+        panic!("current task {} exited twice", task.getpid());
+    }
+    // Publish the parent-visible zombie event before page-table and fd
+    // teardown, robust-list walking, or registry removal.  Those operations
+    // may wait on remote TLB/futex/VFS state; parent notification must depend
+    // only on the atomic Zombie/exit_code publication in `begin_exit`.
+    let (parent, orphan_children) = {
         let mut inner = task.inner_exclusive_access();
-        // Change status to Zombie
-        inner.task_status = TaskStatus::Zombie;
-        // Record exit code
-        inner.exit_code = exit_code;
         let parent = inner.parent.as_ref().and_then(|w| w.upgrade());
         let orphan_children = core::mem::take(&mut inner.children);
-        // deallocate user space
-        inner.memory_set.recycle_data_pages();
-        // drop file descriptors
-        let files_to_close = inner.drain_fd_table();
-        (parent, orphan_children, files_to_close)
+        (parent, orphan_children)
     };
-    // **** release current PCB before touching parent/initproc
-    for file in files_to_close {
-        file.close_ref();
+    // The parent's waitable-child list is the authority for SIGCHLD/waitpid
+    // visibility.  `tgid == pid` is only a derived property and can be stale
+    // across clone/exec combinations; CLONE_THREAD entries are already
+    // removed from `children`, so this test also excludes non-waitable peers.
+    let notify_parent = parent
+        .as_ref()
+        .map(|parent| {
+            parent
+                .inner_exclusive_access()
+                .children
+                .iter()
+                .any(|child| child.getpid() == pid)
+        })
+        .unwrap_or(false);
+    if LIFECYCLE_TRACE_ENABLED {
+        println!(
+            "[lifecycle] exit pid={} tgid={} parent={:?} notify={}",
+            pid,
+            task.inner_exclusive_access().tgid,
+            parent.as_ref().map(|parent| parent.getpid()),
+            notify_parent
+        );
     }
 
     // wake parent waiting in waitpid
     if notify_parent {
-        if let Some(parent) = parent {
+        if let Some(parent) = parent.as_ref() {
             if parent_auto_reaps_sigchld(&parent) {
                 detach_child_from_parent(&parent, pid);
                 wake_parent_waiter(&parent);
@@ -600,6 +615,9 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
         }
     }
 
+    crate::syscall::process::cleanup_task_exit_futexes(&task);
+    remove_from_pid2task(task.getpid());
+
     // ++++++ access initproc TCB exclusively
     if !orphan_children.is_empty() {
         let mut initproc_inner = INITPROC.inner_exclusive_access();
@@ -608,7 +626,9 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
             initproc_inner.children.push(child.clone());
         }
     }
-    // ++++++ release parent PCB
+    // Resource teardown is deferred until this hart has switched to its idle
+    // context and boot page table.  The idle reaper publishes cleanup_done and
+    // performs the final waitpid wake.
     if let Some(current) = take_current_task() {
         defer_drop_task(current);
     }
@@ -641,7 +661,24 @@ pub fn check_signals_error_of_current() -> Option<(i32, &'static str)> {
     trace!("os::task::check_signals_error_of_current");
     let task = current_task()?;
     let task_inner = task.try_inner_exclusive_access()?;
-    task_inner.signals.check_error()
+    // Only an unmasked signal with the default disposition is a fatal
+    // fallback here.  Looking at the raw pending bitmap killed processes
+    // which had a valid user SIGSEGV handler whenever delivery was deferred
+    // for one trap boundary (notably the repeated `lat_sig prot` fault).
+    let pending = task_inner.signals & !task_inner.signal_mask;
+    for sig in 1..=MAX_SIG {
+        let Some(signal) = SignalFlags::from_bits(1u64 << sig) else {
+            continue;
+        };
+        if pending.contains(signal)
+            && task_inner.signal_actions.table[sig].handler == 0
+        {
+            if let Some(error) = signal.check_error() {
+                return Some(error);
+            }
+        }
+    }
+    None
 }
 
 fn default_signal_interrupts(signal: SignalFlags) -> bool {
@@ -763,29 +800,42 @@ fn call_user_signal_handler(sig: usize, signal: SignalFlags) {
         task_inner.signal_mask_backup = Some(old_mask);
         task_inner.signal_mask |= action.mask | signal;
 
-        // backup trapframe
+        // Linux always builds an rt_sigframe, including for a one-argument
+        // handler.  Keeping the interrupted state in the user frame makes
+        // nested delivery a stack operation instead of overwriting one
+        // kernel-side Option.
+        let interrupted = task_inner.get_trap_cx().clone();
+        if SIGNAL_TRACE_ENABLED && signal == SignalFlags::SIGSEGV {
+            let n = SIGNAL_TRACE_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+            if n < 12 {
+                println!(
+                    "[signal-trace] deliver pid={} sig={} pc={:#x} sp={:#x} handler={:#x}",
+                    task.getpid(),
+                    sig,
+                    interrupted.sepc,
+                    interrupted.x[2],
+                    handler
+                );
+            }
+        }
+        let token = task_inner.get_user_token();
+        let frame_base = write_signal_frame(token, interrupted[TrapFrameArgs::SP], sig, old_mask, &interrupted);
+        let siginfo_addr = frame_base;
+        let ucontext_addr = frame_base + SIGINFO_SIZE;
         let trap_ctx = task_inner.get_trap_cx();
-        task_inner.trap_ctx_backup = Some(trap_ctx.clone());
-        task_inner.signal_ucontext = None;
+        trap_ctx[TrapFrameArgs::SP] = frame_base;
         if action.flags & SA_SIGINFO != 0 {
-            let token = task_inner.get_user_token();
-            let frame_base = write_signal_frame(
-                token,
-                trap_ctx[TrapFrameArgs::SP],
-                sig,
-                old_mask,
-                trap_ctx[TrapFrameArgs::SEPC],
-            );
-            let siginfo_addr = frame_base;
-            let ucontext_addr = frame_base + SIGINFO_SIZE;
-            task_inner.signal_ucontext = Some(ucontext_addr);
-            trap_ctx[TrapFrameArgs::SP] = frame_base;
             trap_ctx[TrapFrameArgs::ARG1] = siginfo_addr;
             trap_ctx[TrapFrameArgs::ARG2] = ucontext_addr;
         }
         // modify trapframe
         trap_ctx[TrapFrameArgs::SEPC] = handler;
-        trap_ctx[TrapFrameArgs::RA] = SIGNAL_RETURN_TRAMPOLINE;
+        trap_ctx[TrapFrameArgs::RA] =
+            if action.flags & SA_RESTORER != 0 && action.restorer != 0 {
+                action.restorer
+            } else {
+                SIGNAL_RETURN_TRAMPOLINE
+            };
 
         // put args (a0)
         trap_ctx[TrapFrameArgs::ARG0] = sig;
@@ -851,7 +901,7 @@ fn write_signal_frame(
     sp: usize,
     sig: usize,
     old_mask: SignalFlags,
-    interrupted_pc: usize,
+    interrupted: &TrapFrame,
 ) -> usize {
     let frame_size = SIGINFO_SIZE + UCONTEXT_SIZE;
     let frame_base = sp.saturating_sub(frame_size) & !15;
@@ -862,37 +912,63 @@ fn write_signal_frame(
     let ucontext_addr = frame_base + SIGINFO_SIZE;
     *translated_refmut(token, (ucontext_addr + UCONTEXT_SIGMASK_OFFSET) as *mut u64) =
         flags_to_user_sigset(old_mask);
-    *translated_refmut(token, (ucontext_addr + UCONTEXT_PC_OFFSET) as *mut usize) = interrupted_pc;
+    *translated_refmut(token, (ucontext_addr + UCONTEXT_PC_OFFSET) as *mut usize) =
+        interrupted.sepc;
+    for reg in 1..32 {
+        *translated_refmut(
+            token,
+            (ucontext_addr + UCONTEXT_MCONTEXT_OFFSET + reg * size_of::<usize>())
+                as *mut usize,
+        ) = interrupted.x[reg];
+    }
     frame_base
 }
 
 pub fn restore_current_signal_context() -> Option<isize> {
     let task = current_task()?;
     let mut inner = task.inner_exclusive_access();
-    inner.handling_sig = -1;
-    let backup_mask = inner.signal_mask_backup.take();
-    let signal_ucontext = inner.signal_ucontext.take();
-    if let Some(ucontext_addr) = signal_ucontext {
-        let token = inner.get_user_token();
-        let raw_mask = *translated_ref(
-            token,
-            (ucontext_addr + UCONTEXT_SIGMASK_OFFSET) as *const u64,
-        );
-        inner.signal_mask = user_sigset_to_flags(raw_mask);
-    } else if let Some(mask) = backup_mask {
-        inner.signal_mask = mask;
+    let frame_base = inner.get_trap_cx()[TrapFrameArgs::SP];
+    let ucontext_addr = frame_base.checked_add(SIGINFO_SIZE)?;
+    let token = inner.get_user_token();
+    let raw_mask = *translated_ref(
+        token,
+        (ucontext_addr + UCONTEXT_SIGMASK_OFFSET) as *const u64,
+    );
+    let pc = *translated_ref(
+        token,
+        (ucontext_addr + UCONTEXT_PC_OFFSET) as *const usize,
+    );
+    if pc == 0 {
+        return None;
     }
-    let mut backup = inner.trap_ctx_backup.take()?;
-    let ret = backup[TrapFrameArgs::RET] as isize;
-    if let Some(ucontext_addr) = signal_ucontext {
-        let token = inner.get_user_token();
-        let pc = *translated_ref(token, (ucontext_addr + UCONTEXT_PC_OFFSET) as *const usize);
-        if pc != 0 {
-            backup[TrapFrameArgs::SEPC] = pc;
+    let mut restored = inner.get_trap_cx().clone();
+    restored.sepc = pc;
+    for reg in 1..32 {
+        restored.x[reg] = *translated_ref(
+            token,
+            (ucontext_addr + UCONTEXT_MCONTEXT_OFFSET + reg * size_of::<usize>())
+                as *const usize,
+        );
+    }
+    let ret = restored.x[10] as isize;
+    if SIGNAL_TRACE_ENABLED {
+        let n = SIGNAL_TRACE_COUNT.load(AtomicOrdering::Relaxed);
+        if n > 0 && n <= 12 {
+            println!(
+                "[signal-trace] return pid={} pc={:#x} sp={:#x}",
+                task.getpid(),
+                restored.sepc,
+                restored.x[2]
+            );
         }
     }
+    inner.signal_mask = user_sigset_to_flags(raw_mask);
+    inner.handling_sig = -1;
+    inner.signal_mask_backup = None;
+    inner.signal_ucontext = None;
+    inner.trap_ctx_backup = None;
     let trap_ctx = inner.get_trap_cx();
-    *trap_ctx = backup;
+    *trap_ctx = restored;
     Some(ret)
 }
 
@@ -986,27 +1062,14 @@ pub fn handle_signals() {
 }
 
 pub fn add_sleep_task(wakeup_time: usize, task: Arc<TaskControlBlock>) {
-    SLEEP_QUEUE
-        .exclusive_access()
-        .push(SleepTask { wakeup_time, task });
+    manager::enqueue_sleep(wakeup_time, task);
 }
 
 pub fn check_and_wake_up_tasks() {
     let now = polyhal::time::Time::now().to_nsec() as usize;
-    let mut queue = SLEEP_QUEUE.exclusive_access();
-
-    let mut i = 0;
-    while i < queue.len() {
-        if queue[i].wakeup_time <= now {
-            let sleep_task = queue.remove(i);
-
-            //wake up the task by changing its status to Ready and adding it back to the scheduler
-            let mut inner = sleep_task.task.inner_exclusive_access();
-            inner.task_status = TaskStatus::Ready;
-            drop(inner);
-            add_task(sleep_task.task);
-        } else {
-            i += 1;
-        }
+    // Take due entries before inspecting a TCB or putting a task back on the
+    // ready queue.  This is the required two-phase wakeup pattern.
+    for sleep_task in manager::take_due_sleep_tasks(now) {
+        let _ = manager::wake_task(sleep_task.task);
     }
 }

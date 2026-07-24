@@ -2,7 +2,7 @@ use core::ptr::NonNull;
 
 use super::BlockDevice;
 use crate::mm::{frame_dealloc, frames_alloc, FrameTracker};
-use crate::sync::UPSafeCell;
+use crate::sync::DeviceLock;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use lazy_static::*;
@@ -39,12 +39,22 @@ const PCI_ECAM_BASE: PhysAddr = polyhal::pa!(0x20000000);
 const DMA_BOUNCE_SIZE: usize = 4096;
 
 #[cfg(not(target_arch = "loongarch64"))]
-pub struct VirtIOBlock(UPSafeCell<VirtIOBlk<VirtioHal, MmioTransport>>);
+pub struct VirtIOBlock(
+    DeviceLock<VirtIOBlk<VirtioHal, MmioTransport>>,
+    DeviceLock<[u8; DMA_BOUNCE_SIZE]>,
+);
 #[cfg(target_arch = "loongarch64")]
-pub struct VirtIOBlock(UPSafeCell<VirtIOBlk<VirtioHal, PciTransport>>);
+pub struct VirtIOBlock(
+    DeviceLock<VirtIOBlk<VirtioHal, PciTransport>>,
+    DeviceLock<[u8; DMA_BOUNCE_SIZE]>,
+);
 
 lazy_static! {
-    static ref QUEUE_FRAMES: UPSafeCell<Vec<FrameTracker>> = unsafe { UPSafeCell::new(Vec::new()) };
+    // DMA frames are global to the VirtIO HAL, so their bookkeeping needs its
+    // own device-domain lock as soon as more than one hart can initialize or
+    // drive a VirtIO queue.
+    static ref QUEUE_FRAMES: DeviceLock<Vec<FrameTracker>> =
+        DeviceLock::new_named(Vec::new(), "VirtIODmaFrames");
 }
 
 unsafe impl Sync for VirtIOBlock {}
@@ -53,26 +63,30 @@ unsafe impl Send for VirtIOBlock {}
 impl BlockDevice for VirtIOBlock {
     fn read_block(&self, block_id: usize, buf: &mut [u8]) {
         assert_eq!(buf.len() % SECTOR_SIZE, 0);
+        // Allocation is deliberately outside the device lock.  A future
+        // allocator implementation may take other locks or re-enter kernel
+        // code, both forbidden while a DeviceLock is held.
+        let mut bounce = self.1.exclusive_access();
         let mut blk = self.0.exclusive_access();
         let mut done = 0;
         while done < buf.len() {
             let chunk = (buf.len() - done).min(DMA_BOUNCE_SIZE);
-            let mut bounce = alloc::vec![0u8; chunk];
-            blk.read_blocks(block_id + done / SECTOR_SIZE, &mut bounce)
+            blk.read_blocks(block_id + done / SECTOR_SIZE, &mut bounce[..chunk])
                 .expect("Error when reading VirtIOBlk");
-            buf[done..done + chunk].copy_from_slice(&bounce);
+            buf[done..done + chunk].copy_from_slice(&bounce[..chunk]);
             done += chunk;
         }
     }
     fn write_block(&self, block_id: usize, buf: &[u8]) {
         assert_eq!(buf.len() % SECTOR_SIZE, 0);
+        // See read_block: never allocate while the device lock is held.
+        let mut bounce = self.1.exclusive_access();
         let mut blk = self.0.exclusive_access();
         let mut done = 0;
         while done < buf.len() {
             let chunk = (buf.len() - done).min(DMA_BOUNCE_SIZE);
-            let mut bounce = alloc::vec![0u8; chunk];
-            bounce.copy_from_slice(&buf[done..done + chunk]);
-            blk.write_blocks(block_id + done / SECTOR_SIZE, &bounce)
+            bounce[..chunk].copy_from_slice(&buf[done..done + chunk]);
+            blk.write_blocks(block_id + done / SECTOR_SIZE, &bounce[..chunk])
                 .expect("Error when writing VirtIOBlk");
             done += chunk;
         }
@@ -107,7 +121,10 @@ impl VirtIOBlock {
                 addr.raw(),
                 capacity
             );
-            Self(UPSafeCell::new(blk))
+            Self(
+                DeviceLock::new_named(blk, "VirtIOBlock"),
+                DeviceLock::new_named([0u8; DMA_BOUNCE_SIZE], "VirtIOBounce"),
+            )
         }
     }
 
@@ -133,9 +150,15 @@ impl VirtIOBlock {
                 );
                 let transport = PciTransport::new::<VirtioHal>(&mut root, device_function)
                     .expect("this is not a valid virtio pci block device");
-                return Self(unsafe {
-                    UPSafeCell::new(VirtIOBlk::<VirtioHal, PciTransport>::new(transport).unwrap())
-                });
+                return Self(
+                    unsafe {
+                        DeviceLock::new_named(
+                        VirtIOBlk::<VirtioHal, PciTransport>::new(transport).unwrap(),
+                        "VirtIOBlock",
+                        )
+                    },
+                    DeviceLock::new_named([0u8; DMA_BOUNCE_SIZE], "VirtIOBounce"),
+                );
             }
             block_index += 1;
         }
@@ -282,7 +305,11 @@ pub fn probe_all() -> Vec<Arc<dyn BlockDevice>> {
                 continue;
             }
         };
-        let dev: Arc<dyn BlockDevice> = Arc::new(VirtIOBlock(unsafe { UPSafeCell::new(blk) }));
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(VirtIOBlock(
+                DeviceLock::new_named(blk, "VirtIOBlock"),
+                DeviceLock::new_named([0u8; DMA_BOUNCE_SIZE], "VirtIOBounce"),
+            ));
         crate::println!("[virtio-blk] probe {:#x}: OK (device #{})", base, out.len());
         out.push(dev);
     }
@@ -334,7 +361,10 @@ pub fn probe_all() -> Vec<Arc<dyn BlockDevice>> {
             device_function,
             capacity
         );
-        out.push(Arc::new(VirtIOBlock(unsafe { UPSafeCell::new(blk) })) as Arc<dyn BlockDevice>);
+        out.push(
+            Arc::new(VirtIOBlock(DeviceLock::new_named(blk, "VirtIOBlock")))
+                as Arc<dyn BlockDevice>,
+        );
     }
     crate::println!("[virtio-blk] probe_all: found {} devices", out.len());
     out

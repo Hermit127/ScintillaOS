@@ -3,7 +3,7 @@ use super::vfs::{
     vfs_resolve_with_fallback, vfs_tmpfs_can_resize, vfs_tmpfs_commit_resize, Dentry, DirEntry,
 };
 use super::{File, Kstat, S_IFDIR, S_IFLNK, S_IFREG};
-use crate::sync::UPSafeCell;
+use crate::sync::VfsLock;
 use alloc::collections::BTreeMap;
 use alloc::ffi::CString;
 use alloc::string::String;
@@ -24,12 +24,14 @@ struct CachedTimes {
 }
 
 lazy_static! {
-    static ref PATH_TIME_CACHE: UPSafeCell<BTreeMap<String, CachedTimes>> =
-        unsafe { UPSafeCell::new(BTreeMap::new()) };
-    static ref PATH_SPECIAL_MODE_CACHE: UPSafeCell<BTreeMap<String, u32>> =
-        unsafe { UPSafeCell::new(BTreeMap::new()) };
-    static ref PATH_FS_FLAGS_CACHE: UPSafeCell<BTreeMap<String, usize>> =
-        unsafe { UPSafeCell::new(BTreeMap::new()) };
+    /// Path metadata is VFS state. It is always accessed before entering an
+    /// Ext4 operation so the global order remains `VfsLock -> FsLock`.
+    static ref PATH_TIME_CACHE: VfsLock<BTreeMap<String, CachedTimes>> =
+        VfsLock::new_named(BTreeMap::new(), "VfsPathTimeCache");
+    static ref PATH_SPECIAL_MODE_CACHE: VfsLock<BTreeMap<String, u32>> =
+        VfsLock::new_named(BTreeMap::new(), "VfsPathSpecialModeCache");
+    static ref PATH_FS_FLAGS_CACHE: VfsLock<BTreeMap<String, usize>> =
+        VfsLock::new_named(BTreeMap::new(), "VfsPathFsFlagsCache");
 }
 
 pub fn record_special_path_mode(fs_path: &str, mode_type: u32) {
@@ -102,7 +104,9 @@ pub struct OSInode {
     readable: bool,
     writable: bool,
     dentry: Arc<Dentry>,
-    inner: UPSafeCell<OSInodeInner>,
+    /// Per-open-file offset, cached stat and lwext4 handle.  It is acquired
+    /// before the owning superblock's FsLock whenever the handle is used.
+    inner: VfsLock<OSInodeInner>,
 }
 
 unsafe impl Send for OSInode {}
@@ -120,6 +124,7 @@ impl Drop for OSInode {
     fn drop(&mut self) {
         let mut inner = self.inner.exclusive_access();
         if let Some(ref mut f) = inner.file_handle {
+            let _fs_lock = self.dentry.super_block.lock_fs();
             unsafe {
                 ext4_fclose(f);
             }
@@ -153,18 +158,16 @@ impl OSInode {
             readable,
             writable,
             dentry,
-            inner: unsafe {
-                UPSafeCell::new_named(
-                    OSInodeInner {
-                        offset,
-                        file_handle: None,
-                        lock_type: 2,
-                        append,
-                        cached_stat: None,
-                    },
-                    "OSInodeInner",
-                )
-            },
+            inner: VfsLock::new_named(
+                OSInodeInner {
+                    offset,
+                    file_handle: None,
+                    lock_type: 2,
+                    append,
+                    cached_stat: None,
+                },
+                "VfsOpenFileState",
+            ),
         };
         inode
     }
@@ -186,21 +189,30 @@ impl OSInode {
             Err(_) => return,
         };
 
+        // The file-handle state is the outer VFS lock.  Keep it held while
+        // opening so two harts cannot create two handles for one open file;
+        // the superblock FsLock then serializes lwext4 itself.
+        let mut inner = self.inner.exclusive_access();
+        if inner.file_handle.is_some() {
+            return;
+        }
+        let offset = inner.offset;
         let mut file: ext4_file = unsafe { core::mem::zeroed() };
-        let rc = unsafe {
-            ext4_fopen(
-                &mut file,
-                c_path.as_ptr() as *const core::ffi::c_char,
-                c_flags.as_ptr() as *const core::ffi::c_char,
-            )
+        let rc = {
+            let _fs_lock = self.dentry.super_block.lock_fs();
+            unsafe {
+                let rc = ext4_fopen(
+                    &mut file,
+                    c_path.as_ptr() as *const core::ffi::c_char,
+                    c_flags.as_ptr() as *const core::ffi::c_char,
+                );
+                if rc == EOK as i32 {
+                    ext4_fseek(&mut file, offset as i64, SEEK_SET as u32);
+                }
+                rc
+            }
         };
         if rc == EOK as i32 {
-            let mut inner = self.inner.exclusive_access();
-            // seek to current offset
-            let offset = inner.offset;
-            unsafe {
-                ext4_fseek(&mut file, offset as i64, SEEK_SET as u32);
-            }
             inner.file_handle = Some(file);
         }
     }
@@ -235,6 +247,7 @@ impl OSInode {
     fn stat_inner(&self) -> Kstat {
         {
             let mut inner = self.inner.exclusive_access();
+            let _fs_lock = self.dentry.super_block.lock_fs();
             if let Some(mut st) = inner.cached_stat {
                 if let Some(ref mut file) = inner.file_handle {
                     st.st_ino = file.inode as u64;
@@ -322,6 +335,7 @@ impl OSInode {
     pub fn refresh_after_truncate(&self, size: i64) {
         let mut inner = self.inner.exclusive_access();
         if let Some(mut file) = inner.file_handle.take() {
+            let _fs_lock = self.dentry.super_block.lock_fs();
             unsafe {
                 ext4_fclose(&mut file);
             }
@@ -629,13 +643,16 @@ pub fn follow_symlink(
     let mut target_buf = [0u8; 512];
     let mut rcnt: usize = 0;
     let c_path = alloc::ffi::CString::new(dentry.fs_path.as_bytes()).ok()?;
-    let rc = unsafe {
-        lwext4_rust::bindings::ext4_readlink(
-            c_path.as_ptr() as *const core::ffi::c_char,
-            target_buf.as_mut_ptr() as *mut core::ffi::c_char,
-            target_buf.len(),
-            &mut rcnt,
-        )
+    let rc = {
+        let _fs_lock = dentry.super_block.lock_fs();
+        unsafe {
+            lwext4_rust::bindings::ext4_readlink(
+                c_path.as_ptr() as *const core::ffi::c_char,
+                target_buf.as_mut_ptr() as *mut core::ffi::c_char,
+                target_buf.len(),
+                &mut rcnt,
+            )
+        }
     };
     if rc != 0 || rcnt == 0 {
         return None;
@@ -732,6 +749,7 @@ impl File for OSInode {
         let mut inner = self.inner.exclusive_access();
         let off = inner.offset;
         if let Some(ref mut file) = inner.file_handle {
+            let _fs_lock = self.dentry.super_block.lock_fs();
             let size = unsafe { ext4_fsize(file) as usize };
             if off >= size {
                 return 0;
@@ -782,6 +800,7 @@ impl File for OSInode {
         }
         let mut inner = self.inner.exclusive_access();
         if let Some(ref mut file) = inner.file_handle {
+            let _fs_lock = self.dentry.super_block.lock_fs();
             let size = unsafe { ext4_fsize(file) as usize };
             if offset >= size {
                 return 0;
@@ -828,6 +847,7 @@ impl File for OSInode {
         let mut inner = self.inner.exclusive_access();
         let saved_offset = inner.offset;
         if let Some(ref mut file) = inner.file_handle {
+            let _fs_lock = self.dentry.super_block.lock_fs();
             let size = unsafe { ext4_fsize(file) as usize };
             let Some(requested_new_size) = offset.checked_add(buf.len()) else {
                 return -27;
@@ -867,6 +887,10 @@ impl File for OSInode {
                 ext4_fseek(file, saved_offset as i64, SEEK_SET as u32);
             }
             let new_size = unsafe { ext4_fsize(file) as i64 };
+            // The remaining cache and timestamp updates may call path-based
+            // VFS helpers, which acquire this same FsLock.  Release it before
+            // leaving the direct-handle transaction.
+            drop(_fs_lock);
             if let Some(ref mut st) = inner.cached_stat {
                 st.st_size = new_size;
                 st.st_blocks = ((st.st_size.max(0) as u64) + 511) / 512;
@@ -960,6 +984,7 @@ impl File for OSInode {
         let append = inner.append;
         let cur_offset = inner.offset;
         if let Some(ref mut file) = inner.file_handle {
+            let _fs_lock = self.dentry.super_block.lock_fs();
             let off = if append {
                 unsafe { ext4_fsize(file) as usize }
             } else {
@@ -1002,6 +1027,10 @@ impl File for OSInode {
                 total += rw_count;
             }
             let new_size = unsafe { ext4_fsize(file) as i64 };
+            // `update_path_data_time` takes the superblock FsLock itself.
+            // Do not recursively acquire it while this handle transaction is
+            // still protected by the same lock.
+            drop(_fs_lock);
             inner.offset = off + total;
             if let Some(ref mut st) = inner.cached_stat {
                 st.st_size = new_size;
@@ -1171,6 +1200,7 @@ impl File for OSInode {
         let mut inner = self.inner.exclusive_access();
         inner.offset = offset;
         if let Some(ref mut file) = inner.file_handle {
+            let _fs_lock = self.dentry.super_block.lock_fs();
             unsafe {
                 ext4_fseek(file, offset as i64, SEEK_SET as u32);
             }
@@ -1247,11 +1277,14 @@ pub fn rename_at(
         Err(_) => return false,
     };
 
-    let rc = unsafe {
-        ext4_frename(
-            old_cpath.as_ptr() as *const core::ffi::c_char,
-            new_cpath.as_ptr() as *const core::ffi::c_char,
-        )
+    let rc = {
+        let _fs_lock = old_dentry.super_block.lock_fs();
+        unsafe {
+            ext4_frename(
+                old_cpath.as_ptr() as *const core::ffi::c_char,
+                new_cpath.as_ptr() as *const core::ffi::c_char,
+            )
+        }
     };
 
     if rc == EOK as i32 {
@@ -1300,11 +1333,14 @@ pub fn symlink_at(base: Option<Arc<Dentry>>, target: &str, linkpath: &str) -> bo
         Err(_) => return false,
     };
 
-    let rc = unsafe {
-        ext4_fsymlink(
-            target_cpath.as_ptr() as *const core::ffi::c_char,
-            link_cpath.as_ptr() as *const core::ffi::c_char,
-        )
+    let rc = {
+        let _fs_lock = parent.super_block.lock_fs();
+        unsafe {
+            ext4_fsymlink(
+                target_cpath.as_ptr() as *const core::ffi::c_char,
+                link_cpath.as_ptr() as *const core::ffi::c_char,
+            )
+        }
     };
 
     rc == EOK as i32
@@ -1348,11 +1384,14 @@ pub fn link_at(
         Err(_) => return false,
     };
 
-    let rc = unsafe {
-        ext4_flink(
-            old_cpath.as_ptr() as *const core::ffi::c_char,
-            new_cpath.as_ptr() as *const core::ffi::c_char,
-        )
+    let rc = {
+        let _fs_lock = old_dentry.super_block.lock_fs();
+        unsafe {
+            ext4_flink(
+                old_cpath.as_ptr() as *const core::ffi::c_char,
+                new_cpath.as_ptr() as *const core::ffi::c_char,
+            )
+        }
     };
     if rc == EOK as i32 {
         let mut children = new_parent.children.exclusive_access();

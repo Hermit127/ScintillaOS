@@ -2,7 +2,7 @@
 use polyhal::debug_console::DebugConsole;
 
 use super::{File, Kstat, S_IFBLK, S_IFCHR, S_IFREG, S_IFSOCK};
-use crate::sync::UPSafeCell;
+use crate::sync::DeviceLock;
 use crate::task::{current_task, pid2task, suspend_current_and_run_next};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -363,19 +363,22 @@ struct TmpFileInner {
 }
 
 pub struct TmpFile {
-    inner: UPSafeCell<TmpFileInner>,
+    /// Anonymous temporary files are a self-contained in-memory device.  The
+    /// lock protects the cursor, append flag and byte storage together.
+    inner: DeviceLock<TmpFileInner>,
 }
 
 impl TmpFile {
     pub fn new() -> Self {
         Self {
-            inner: unsafe {
-                UPSafeCell::new(TmpFileInner {
+            inner: DeviceLock::new_named(
+                TmpFileInner {
                     data: Vec::new(),
                     offset: 0,
                     append: false,
-                })
-            },
+                },
+                "TmpFile.inner",
+            ),
         }
     }
 

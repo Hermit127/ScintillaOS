@@ -4,13 +4,13 @@ use crate::config::KERNEL_STACK_SIZE;
 use crate::fs::vfs::{Dentry, ROOT_DENTRY};
 use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{translated_refmut, LoadedElf, MapArea, MapPermission, MapType, MemorySet};
-use crate::sync::UPSafeCell;
+use crate::sync::{TaskGuard, TaskLock};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
-use core::cell::{Ref, RefMut};
 use core::mem::size_of;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use polyhal::kcontext::{read_current_tp, KContext, KContextArgs};
 use polyhal::pagetable::PageTable;
 use polyhal_trap::trap::run_user_task;
@@ -19,9 +19,53 @@ use polyhal_trap::trapframe::{TrapFrame, TrapFrameArgs};
 pub struct TaskControlBlock {
     // immutable
     pub pid: PidHandle,
+    /// Lock-free scheduler ownership metadata.
+    ///
+    /// `inner.task_status` remains the compatibility-facing task state during
+    /// this transition.  These atomics give the scheduler a separate source of
+    /// truth for CPU ownership and queue membership, so it can later perform a
+    /// Ready -> Running handoff while holding `SchedulerLock` without exposing
+    /// a partially moved task to another hart.
+    scheduling: TaskSchedulingMeta,
     // mutable
-    inner: UPSafeCell<TaskControlBlockInner>,
+    /// Mutable per-task state.  Scheduler queue membership remains owned by
+    /// `SchedulerLock`; callers must not retain this guard while scheduling,
+    /// translating user pointers, performing I/O, or invoking callbacks.
+    inner: TaskLock<TaskControlBlockInner>,
 }
+
+/// Sentinel used when a task is not executing on any CPU.
+pub const NO_RUNNING_CPU: usize = usize::MAX;
+
+/// Per-task data that must be observable without taking the broad TaskLock.
+///
+/// RISC-V/QEMU starts with the fixed four-hart topology enabled after boot.
+/// Other architectures retain the old single-CPU default. Shared-address-
+/// space clone groups may run on multiple harts: every page-table mutation
+/// records the active CPU mask and completes a remote TLB shootdown before
+/// recycled frames become available again.
+struct TaskSchedulingMeta {
+    running_cpu: AtomicUsize,
+    allowed_cpus: AtomicUsize,
+    enqueued: AtomicBool,
+    exit_cleanup_done: AtomicBool,
+}
+
+impl TaskSchedulingMeta {
+    const fn new() -> Self {
+        Self {
+            running_cpu: AtomicUsize::new(NO_RUNNING_CPU),
+            allowed_cpus: AtomicUsize::new(DEFAULT_TASK_CPU_MASK),
+            enqueued: AtomicBool::new(false),
+            exit_cleanup_done: AtomicBool::new(false),
+        }
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
+const DEFAULT_TASK_CPU_MASK: usize = 0b1111;
+#[cfg(not(target_arch = "riscv64"))]
+const DEFAULT_TASK_CPU_MASK: usize = 1;
 use log::*;
 impl Drop for TaskControlBlock {
     fn drop(&mut self) {
@@ -206,23 +250,24 @@ pub fn blank_kcontext(ksp: usize) -> KContext {
 
 impl TaskControlBlock {
     #[track_caller]
-    pub fn inner_exclusive_access(&self) -> RefMut<'_, TaskControlBlockInner> {
+    pub fn inner_exclusive_access(&self) -> TaskGuard<'_, TaskControlBlockInner> {
         self.inner.exclusive_access()
     }
     pub fn from_raw(pid: PidHandle, inner: TaskControlBlockInner) -> Self {
         Self {
             pid,
-            inner: unsafe { UPSafeCell::new(inner) },
+            scheduling: TaskSchedulingMeta::new(),
+            inner: TaskLock::new_named(inner, "TaskInner"),
         }
     }
     #[track_caller]
-    pub fn try_inner_exclusive_access(&self) -> Option<RefMut<'_, TaskControlBlockInner>> {
+    pub fn try_inner_exclusive_access(&self) -> Option<TaskGuard<'_, TaskControlBlockInner>> {
         match self.inner.try_borrow_mut() {
             Some(g) => Some(g),
             None => None,
         }
     }
-    pub fn try_inner_borrow(&self) -> Option<core::cell::Ref<'_, TaskControlBlockInner>> {
+    pub fn try_inner_borrow(&self) -> Option<TaskGuard<'_, TaskControlBlockInner>> {
         match self.inner.try_borrow() {
             Some(g) => Some(g),
             None => None,
@@ -252,15 +297,16 @@ impl TaskControlBlock {
         } = MemorySet::from_elf(elf_data);
 
         let heap_bottom = user_sp;
+        memory_set.set_program_brk(heap_bottom);
         // alloc a pid and a kernel stack in kernel space
         let pid_handle = pid_alloc();
         let pid_value = pid_handle.0;
         let kstack = KernelStack::new();
         let task_control_block = Self {
             pid: pid_handle,
-            inner: unsafe {
-                UPSafeCell::new_named(
-                    TaskControlBlockInner {
+            scheduling: TaskSchedulingMeta::new(),
+            inner: TaskLock::new_named(
+                TaskControlBlockInner {
                         trap_cx: TrapFrame::new(),
                         fp_state: UserFloatState::new(),
                         base_size: user_sp,
@@ -328,10 +374,9 @@ impl TaskControlBlock {
                         alt_stack_flags: 0,
                         in_syscall: false,
                         exit_signal: 0,
-                    },
-                    "TaskInner",
-                )
-            },
+                },
+                "TaskInner",
+            ),
         };
         // prepare TrapContext in user space
         let tp_val = {
@@ -430,6 +475,12 @@ impl TaskControlBlock {
         let interp_base = loaded.interp_base;
         let memory_set = loaded.memory_set;
 
+        memory_set.set_program_brk(heap_bottom);
+
+        // The new address space becomes active before its initial stack is
+        // populated. Mark it now so future shootdowns cannot overlook this
+        // hart during exec's page-table handoff.
+        memory_set.enter_cpu(crate::task::current_hart_id());
         memory_set.activate();
         let token = memory_set.token();
         let argc = args.len();
@@ -577,6 +628,12 @@ impl TaskControlBlock {
         let crt_sp = sp;
 
         let mut inner = self.inner_exclusive_access();
+        // The old page table is no longer installed after `activate()` above.
+        // Drop this hart from its activity mask before replacing the TCB's
+        // address-space owner.
+        inner
+            .memory_set
+            .leave_cpu(crate::task::current_hart_id());
         inner.close_cloexec_fds();
         inner.signal_actions.reset_for_exec();
         inner.handling_sig = -1;
@@ -617,10 +674,20 @@ impl TaskControlBlock {
     pub fn fork(self: &Arc<TaskControlBlock>) -> Option<Arc<TaskControlBlock>> {
         trace!("os::task::TaskControlBlock::fork");
         // Copy the user address space before collecting the remaining task state.
+        // `from_existed_user` write-protects the parent's present writable
+        // mappings for COW. A parent which is already a CLONE_VM group can be
+        // active on several harts, so retain its activity mask while the PTEs
+        // are changed and shoot those harts down after releasing Task/Vm.
+        let mut parent_active_cpus = 0;
         let memory_set = {
             let mut parent_inner = self.inner_exclusive_access();
+            parent_active_cpus = parent_inner.memory_set.active_cpu_mask();
             MemorySet::from_existed_user(&mut parent_inner.memory_set)?
         };
+        assert!(
+            super::processor::flush_remote_tlb(parent_active_cpus, 0, 0),
+            "fork COW remote TLB shootdown failed"
+        );
 
         let (
             trap_cx_clone,
@@ -699,9 +766,9 @@ impl TaskControlBlock {
         let kstack = KernelStack::new();
         let task_control_block = Arc::new(TaskControlBlock {
             pid: pid_handle,
-            inner: unsafe {
-                UPSafeCell::new_named(
-                    TaskControlBlockInner {
+            scheduling: TaskSchedulingMeta::new(),
+            inner: TaskLock::new_named(
+                TaskControlBlockInner {
                         trap_cx: trap_cx_clone,
                         fp_state,
                         base_size,
@@ -761,10 +828,9 @@ impl TaskControlBlock {
                         alt_stack_flags: 0,
                         in_syscall: false,
                         exit_signal: 0,
-                    },
-                    "TaskInner",
-                )
-            },
+                },
+                "TaskInner",
+            ),
         });
         // add child to parent's children list
         {
@@ -775,6 +841,11 @@ impl TaskControlBlock {
     }
     pub fn clone_shared_vm(self: &Arc<TaskControlBlock>) -> Option<Arc<TaskControlBlock>> {
         trace!("os::task::TaskControlBlock::clone_shared_vm");
+        // A later CLONE_VM can restore writable PTEs which a previous fork
+        // write-protected for COW. Capture the complete shared address-space
+        // activity set before that mutation; no lock is held when the remote
+        // fence is issued below.
+        let mut parent_active_cpus = 0;
         let (
             memory_set,
             trap_cx_clone,
@@ -806,6 +877,7 @@ impl TaskControlBlock {
             fp_state,
         ) = {
             let mut parent_inner = self.inner_exclusive_access();
+            parent_active_cpus = parent_inner.memory_set.active_cpu_mask();
             if !parent_inner.memory_set.prepare_shared_writable_pages() {
                 return None;
             }
@@ -852,14 +924,19 @@ impl TaskControlBlock {
             )
         };
 
+        assert!(
+            super::processor::flush_remote_tlb(parent_active_cpus, 0, 0),
+            "CLONE_VM remote TLB shootdown failed"
+        );
+
         let pid_handle = pid_alloc();
         let pid_value = pid_handle.0;
         let kstack = KernelStack::new();
         let task_control_block = Arc::new(TaskControlBlock {
             pid: pid_handle,
-            inner: unsafe {
-                UPSafeCell::new_named(
-                    TaskControlBlockInner {
+            scheduling: TaskSchedulingMeta::new(),
+            inner: TaskLock::new_named(
+                TaskControlBlockInner {
                         trap_cx: trap_cx_clone,
                         fp_state,
                         base_size,
@@ -919,10 +996,9 @@ impl TaskControlBlock {
                         alt_stack_flags: 0,
                         in_syscall: false,
                         exit_signal: 0,
-                    },
-                    "TaskInner",
-                )
-            },
+                },
+                "TaskInner",
+            ),
         });
         {
             let mut parent_inner = self.inner_exclusive_access();
@@ -932,6 +1008,90 @@ impl TaskControlBlock {
     }
     pub fn getpid(&self) -> usize {
         self.pid.0
+    }
+
+    /// The hart currently running this task, or [`NO_RUNNING_CPU`].
+    pub fn running_cpu(&self) -> usize {
+        self.scheduling.running_cpu.load(Ordering::Acquire)
+    }
+
+    pub fn exit_cleanup_done(&self) -> bool {
+        self.scheduling.exit_cleanup_done.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn publish_exit_cleanup_done(&self) {
+        self.scheduling
+            .exit_cleanup_done
+            .store(true, Ordering::Release);
+    }
+
+    /// Return the task's requested CPU mask.  The mask is not user-modifiable
+    /// until the four-hart scheduler is active.
+    pub fn allowed_cpus(&self) -> usize {
+        self.scheduling.allowed_cpus.load(Ordering::Acquire)
+    }
+
+    /// Store a previously validated affinity mask.  Callers that also need to
+    /// move a Ready task must do so through the scheduler, after this store.
+    pub(crate) fn set_allowed_cpus(&self, mask: usize) {
+        self.scheduling.allowed_cpus.store(mask, Ordering::Release);
+    }
+
+    /// Scheduler-only: record that the task has one ready-queue entry.
+    pub(crate) fn mark_enqueued(&self) {
+        assert!(
+            self.scheduling
+                .enqueued
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "pid {} was enqueued twice",
+            self.getpid()
+        );
+    }
+
+    /// Scheduler-only: record removal from the ready queue.
+    pub(crate) fn mark_dequeued(&self) {
+        assert!(
+            self.scheduling
+                .enqueued
+                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "pid {} was dequeued without a ready-queue entry",
+            self.getpid()
+        );
+    }
+
+    /// Scheduler-only: record the CPU which owns the task's execution.
+    pub(crate) fn mark_running_on(&self, cpu: usize) {
+        assert!(
+            self.scheduling
+                .running_cpu
+                .compare_exchange(
+                    NO_RUNNING_CPU,
+                    cpu,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok(),
+            "pid {} was dispatched while already owned by hart {}",
+            self.getpid(),
+            self.running_cpu(),
+        );
+    }
+
+    /// Scheduler-only: clear execution ownership after this CPU has removed
+    /// the task from its CpuLocal current slot.
+    pub(crate) fn clear_running_on(&self, cpu: usize) {
+        assert!(
+            self.scheduling
+                .running_cpu
+                .compare_exchange(cpu, NO_RUNNING_CPU, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "pid {} lost running ownership on hart {} (owner {})",
+            self.getpid(),
+            cpu,
+            self.running_cpu(),
+        );
     }
     pub fn record_time_user_to_kernel(&self) {
         let Some(mut inner) = self.try_inner_exclusive_access() else {
@@ -978,10 +1138,23 @@ pub enum BlockReason {
     SignalWait(SignalFlags),
 }
 
-#[derive(Copy, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 pub enum TaskStatus {
     Ready,
     Running,
+    /// The task has requested a yield, but its saved kernel context is not
+    /// publishable yet.  Only the owning CPU may turn this into `Ready`, and
+    /// it does so after `context_switch_pt` has returned to that CPU's idle
+    /// context.  Keeping this distinct from `Ready` closes the SMP window in
+    /// which another hart could otherwise execute an incompletely saved task.
+    Switching,
+    /// The task is registered in a scheduler wait queue but has not switched
+    /// out of its CPU context yet.  A concurrent wake changes this to
+    /// `WakePending`, never directly to `Ready`.
+    Blocking,
     Blocked,
+    /// A wake raced with the outgoing context switch.  The owning CPU turns
+    /// this into `Ready` only after it has reached the idle context.
+    WakePending,
     Zombie,
 }

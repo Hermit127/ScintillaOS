@@ -1,5 +1,6 @@
 // 这里负责操作系统的内存管理：实现物理页帧分配、释放和共享页引用计数。
 use crate::config::PAGE_SIZE;
+use crate::sync::VmLock;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use buddy_system_allocator::FrameAllocator;
@@ -8,10 +9,12 @@ use core::{
     mem::size_of,
     sync::atomic::{AtomicUsize, Ordering},
 };
-use polyhal::{pa, utils::MutexNoIrq, PhysAddr};
+use polyhal::{pa, PhysAddr};
 
 type RefMap = BTreeMap<usize, usize>;
-static FRAME_REFS: MutexNoIrq<RefMap> = MutexNoIrq::new(BTreeMap::new());
+/// Shared-frame reference counts.  This lock is acquired before the frame
+/// allocator when the final `FrameTracker` reference is dropped.
+static FRAME_REFS: VmLock<RefMap> = VmLock::new_named(BTreeMap::new(), "Vm.frame_refs");
 
 // 把物理地址折算成按页编号的引用计数 key。
 // 执行时用物理地址除以 PAGE_SIZE，得到 FRAME_REFS 里记录共享计数的页号。
@@ -78,7 +81,11 @@ impl Debug for FrameTracker {
     }
 }
 
-pub static FRAME_ALLOCATOR: MutexNoIrq<FrameAllocator> = MutexNoIrq::new(FrameAllocator::new());
+/// Buddy allocator state for physical pages.  Allocation never nests the
+/// reference-count table; final destruction follows the documented
+/// `frame_refs -> frame_allocator` order.
+pub static FRAME_ALLOCATOR: VmLock<FrameAllocator> =
+    VmLock::new_named(FrameAllocator::new(), "Vm.frame_allocator");
 static TOTAL_FRAMES: AtomicUsize = AtomicUsize::new(0);
 static ALLOCATED_FRAMES: AtomicUsize = AtomicUsize::new(0);
 

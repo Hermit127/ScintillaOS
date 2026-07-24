@@ -8,7 +8,7 @@ use crate::fs::{
     DevNull, DevZero, File, Kstat, OpenFlags, Urandom, S_IFDIR, S_IFREG,
 };
 use crate::mm::{translated_byte_buffer, translated_refmut, translated_str};
-use crate::task::{current_task, current_user_token, PID2TCB};
+use crate::task::{current_task, current_user_token, task_snapshot};
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -107,16 +107,14 @@ fn install_fd_for_thread_group(
     file: Arc<dyn File + Send + Sync>,
     cloexec: bool,
 ) {
-    let tasks: Vec<_> = PID2TCB
-        .exclusive_access()
-        .values()
+    let tasks: Vec<_> = task_snapshot()
+        .into_iter()
         .filter(|task| task.getpid() != owner_pid)
         .filter(|task| {
             task.try_inner_borrow()
                 .map(|inner| inner.tgid == tgid)
                 .unwrap_or(false)
         })
-        .cloned()
         .collect();
     for task in tasks {
         if let Some(mut inner) = task.try_inner_exclusive_access() {
@@ -132,16 +130,14 @@ fn install_fd_for_thread_group(
 }
 
 fn close_fd_for_thread_group(owner_pid: usize, tgid: usize, fd: usize) {
-    let tasks: Vec<_> = PID2TCB
-        .exclusive_access()
-        .values()
+    let tasks: Vec<_> = task_snapshot()
+        .into_iter()
         .filter(|task| task.getpid() != owner_pid)
         .filter(|task| {
             task.try_inner_borrow()
                 .map(|inner| inner.tgid == tgid)
                 .unwrap_or(false)
         })
-        .cloned()
         .collect();
     for task in tasks {
         if let Some(mut inner) = task.try_inner_exclusive_access() {
@@ -651,8 +647,8 @@ fn sys_open_tmpfile(dirfd: isize, path: &str, _mode: u32, cloexec: bool) -> isiz
 
 fn open_proc(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
     use crate::fs::proc::{
-        DevRtcFile, ProcDirFile, ProcMeminfoFile, ProcMountsFile, ProcPidStatFile,
-        ProcPidStatusFile, ProcStaticFile, PseudoDirFile, SysBlockStatFile,
+        DevRtcFile, ProcCpuinfoFile, ProcDirFile, ProcMeminfoFile, ProcMountsFile,
+        ProcPidStatFile, ProcPidStatusFile, ProcStaticFile, PseudoDirFile, SysBlockStatFile,
     };
     let path = if path.len() > 1 {
         path.trim_end_matches('/')
@@ -669,9 +665,7 @@ fn open_proc(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
         return Some(Arc::new(ProcMeminfoFile::new()));
     }
     if path == "/proc/cpuinfo" {
-        return Some(Arc::new(ProcStaticFile::new(
-            "processor\t: 0\nhart\t\t: 0\nisa\t\t: rv64imafdc\nmmu\t\t: sv39\n",
-        )));
+        return Some(Arc::new(ProcCpuinfoFile::new()));
     }
     if path == "/proc/sys/kernel/pid_max" {
         return Some(Arc::new(ProcStaticFile::new("4194304\n")));
@@ -936,7 +930,8 @@ pub fn sys_unlinkat(dirfd: isize, path: *const u8, flags: u32) -> isize {
     if !can_modify_directory(&parent) {
         return -13;
     }
-    if unlink_at(Some(base_dir.clone()), path.as_str(), is_dir) {
+    let unlinked = unlink_at(Some(base_dir.clone()), path.as_str(), is_dir);
+    if unlinked {
         if !is_dir {
             crate::syscall::process::remove_shared_file_mappings(&dentry.fs_path);
         }

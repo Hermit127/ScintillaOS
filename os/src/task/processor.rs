@@ -1,27 +1,37 @@
-// 这里负责操作系统的调度：保存当前 CPU 的运行任务，并实现从 idle 到用户任务的调度切换。
-use core::cell::LazyCell;
+// 这里负责操作系统的调度：保存每个 CPU 的运行任务，并实现从 idle 到用户任务的调度切换。
+use core::mem::MaybeUninit;
 
 use super::TaskControlBlock;
-use super::{fetch_task, reap_exited_tasks, TaskStatus};
-use crate::sync::UPSafeCell;
+use super::{fetch_task, reap_exited_tasks};
+use super::manager::complete_context_switch;
+use crate::sync::{assert_no_spin_locks_held, CpuLocalLock};
 use alloc::sync::Arc;
-use lazy_static::*;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use lazyinit::LazyInit;
 use log::*;
-use polyhal::kcontext::{context_switch_pt, KContext};
+use polyhal::irq::IRQ;
+use polyhal::kcontext::{context_switch_pt, read_current_tp, KContext, KContextArgs};
 use polyhal::pagetable::PageTable;
-pub struct Processor {
+/// State that belongs exclusively to the current hart.
+///
+/// The backing storage uses polyhal's `percpu` section, so every hart receives
+/// a distinct `current`, idle context and timer counter.  The short
+/// `CpuLocalLock` protects against local interrupt re-entry; it is never used
+/// as a global scheduler lock.
+pub struct CpuLocal {
     current: Option<Arc<TaskControlBlock>>,
     idle_task_cx: KContext,
+    ticks: usize,
 }
 
-impl Processor {
+impl CpuLocal {
     // 初始化当前 CPU 的 processor 状态。
     // 执行时把当前任务置空，并准备一份 idle 上下文作为之后切换回内核的落脚点。
     pub fn new() -> Self {
         Self {
             current: None,
             idle_task_cx: KContext::blank(),
+            ticks: 0,
         }
     }
     // 返回 idle 上下文指针，调度切换时作为内核落脚点。
@@ -41,8 +51,141 @@ impl Processor {
     }
 }
 
-lazy_static! {
-    pub static ref PROCESSOR: UPSafeCell<Processor> = unsafe { UPSafeCell::new(Processor::new()) };
+#[polyhal::percpu]
+static PROCESSOR: MaybeUninit<CpuLocalLock<CpuLocal>> = MaybeUninit::uninit();
+
+/// Map the boot protocol's stable hart ID to the unique polyhal per-CPU base.
+///
+/// The vendored RISC-V HAL currently reports CPU0 from `polyhal::hart_id()`
+/// on secondary harts after its `gp`-based per-CPU setup.  The boot entry's
+/// `hartid` argument is correct, and the per-CPU base remains unique across
+/// user/kernel transitions, so this small registration table is the scheduler
+/// authority for the fixed four-hart platform.
+static HART_BY_PERCPU_BASE: [AtomicUsize; super::manager::MAX_SCHEDULER_CPUS] =
+    [const { AtomicUsize::new(usize::MAX) }; super::manager::MAX_SCHEDULER_CPUS];
+
+/// Pending IPI work, indexed by the stable QEMU hart ID. The producer sets a
+/// bit before issuing SBI `send_ipi`; the receiving hart clears it after
+/// acknowledging SSIP. Keeping this state outside `CpuLocal` is necessary:
+/// a remote CPU must be able to publish its request without accessing another
+/// hart's per-CPU storage directly.
+const IPI_RESCHEDULE: usize = 1;
+static PENDING_IPI: [AtomicUsize; super::manager::MAX_SCHEDULER_CPUS] =
+    [const { AtomicUsize::new(0) }; super::manager::MAX_SCHEDULER_CPUS];
+static SCHEDULER_PHASE: [AtomicUsize; super::manager::MAX_SCHEDULER_CPUS] =
+    [const { AtomicUsize::new(0) }; super::manager::MAX_SCHEDULER_CPUS];
+
+pub fn scheduler_phases() -> [usize; super::manager::MAX_SCHEDULER_CPUS] {
+    core::array::from_fn(|cpu| SCHEDULER_PHASE[cpu].load(Ordering::Acquire))
+}
+
+pub(crate) fn set_scheduler_phase(phase: usize) {
+    SCHEDULER_PHASE[current_hart_id()].store(phase, Ordering::Release);
+}
+
+/// Initialize this hart's private processor state.
+///
+/// The boot loader sets polyhal's per-CPU pointer before entering `main`, so
+/// this writes only the slot belonging to the current hart.  Every enabled
+/// hart must call this exactly once before using scheduler APIs.
+pub fn init_current_cpu(hart_id: usize) {
+    assert!(
+        hart_id < super::manager::MAX_SCHEDULER_CPUS,
+        "unsupported hart {}",
+        hart_id
+    );
+    HART_BY_PERCPU_BASE[hart_id].store(polyhal::percpu::get_percpu_ptr(), Ordering::Release);
+    PROCESSOR
+        .ref_mut()
+        .write(CpuLocalLock::new_named(CpuLocal::new(), "CpuLocal"));
+}
+
+/// Return the boot-protocol hart ID of the current CPU.
+#[inline]
+pub fn current_hart_id() -> usize {
+    let base = polyhal::percpu::get_percpu_ptr();
+    HART_BY_PERCPU_BASE
+        .iter()
+        .position(|entry| entry.load(Ordering::Acquire) == base)
+        .expect("current hart has not registered its per-CPU base")
+}
+
+/// Wake a remote idle hart so it promptly rechecks its local ready queue.
+///
+/// This function must be called after releasing SchedulerLock and every other
+/// object lock. It intentionally does not force a running task to switch;
+/// first-generation SMP only needs a prompt wakeup for an idle CPU.
+pub fn request_reschedule(cpu: usize) {
+    if cpu >= super::manager::MAX_SCHEDULER_CPUS || cpu == current_hart_id() {
+        return;
+    }
+    if (super::manager::online_cpu_mask() & (1usize << cpu)) == 0 {
+        return;
+    }
+    PENDING_IPI[cpu].fetch_or(IPI_RESCHEDULE, Ordering::Release);
+    #[cfg(target_arch = "riscv64")]
+    {
+        // QEMU virt/OpenSBI implements the standard sPI extension. A failed
+        // request remains harmless: the target will still see the work on its
+        // next timer interrupt.
+        let _ = sbi_rt::send_ipi(1usize << cpu, 0);
+    }
+}
+
+/// Acknowledge a supervisor software interrupt on this hart and consume its
+/// pending work bits. The scheduler loop will recheck its queue immediately
+/// when this interrupt wakes it from `wfi`.
+pub fn handle_ipi() -> usize {
+    #[cfg(target_arch = "riscv64")]
+    // SSIP is the architectural acknowledgement for an SBI-delivered IPI.
+    // This function only runs from the RISC-V supervisor software-interrupt
+    // trap arm, so the CSR operation is valid for the current hart.
+    unsafe { riscv::register::sip::clear_ssoft() };
+    PENDING_IPI[current_hart_id()].swap(0, Ordering::AcqRel)
+}
+
+/// Invalidate a virtual-address range on the other harts that currently use
+/// the same user page table.
+///
+/// Callers must capture `active_cpus` while they still own the address-space
+/// metadata, then release every Task/Vm/VFS lock before calling this helper.
+/// The local hart is intentionally excluded: `PageTable::{map,unmap}_page`
+/// already executes the local `sfence.vma` for every changed PTE.  OpenSBI's
+/// RFENCE call completes the remote operation before it returns, which is the
+/// acknowledgement used by this first implementation. A firmware failure is
+/// fatal: callers may release retired frames immediately after this helper
+/// returns, so continuing with stale remote translations would corrupt memory.
+pub fn flush_remote_tlb(active_cpus: usize, start_addr: usize, size: usize) -> bool {
+    let current = current_hart_id();
+    let remote = active_cpus
+        & super::manager::online_cpu_mask()
+        & !(1usize << current);
+    if remote == 0 {
+        return true;
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        let result = sbi_rt::remote_sfence_vma(remote, 0, start_addr, size);
+        if result.is_err() {
+            panic!(
+                "remote sfence.vma failed: targets={:#x}, start={:#x}, size={:#x}, sbi={:?}",
+                remote, start_addr, size, result
+            );
+        }
+    }
+
+    #[cfg(not(target_arch = "riscv64"))]
+    let _ = (remote, start_addr, size);
+
+    true
+}
+
+#[inline]
+fn current_cpu() -> &'static CpuLocalLock<CpuLocal> {
+    // `init_current_cpu` runs before any task or interrupt path uses this
+    // accessor.  Each hart sees its own `percpu` copy of the MaybeUninit slot.
+    unsafe { (&*PROCESSOR.get_mut_ptr()).assume_init_ref() }
 }
 
 // 调度主循环：不断取 Ready 任务并从 idle 上下文切过去。
@@ -51,25 +194,68 @@ pub fn run_tasks() {
     trace!("os::task::processor::run_tasks");
     let mut first = true;
     loop {
+        let cpu_id = current_hart_id();
+        SCHEDULER_PHASE[cpu_id].store(1, Ordering::Release);
+        // When a task yields or blocks, control returns here only after its
+        // task context has been written by `context_switch_pt`.  Complete the
+        // state transition now, rather than before making the switch, so no
+        // other hart can run stale register/context data.
+        SCHEDULER_PHASE[cpu_id].store(2, Ordering::Release);
+        if let Some(task) = take_current_task() {
+            SCHEDULER_PHASE[cpu_id].store(3, Ordering::Release);
+            complete_context_switch(task);
+            SCHEDULER_PHASE[cpu_id].store(4, Ordering::Release);
+        }
         reap_exited_tasks();
-        let mut processor = PROCESSOR.exclusive_access();
+        SCHEDULER_PHASE[cpu_id].store(5, Ordering::Release);
         if let Some(task) = fetch_task() {
+            SCHEDULER_PHASE[cpu_id].store(6, Ordering::Release);
             if first {
-                println!("[kernel] run_tasks: first task pid={}", task.getpid());
+                println!(
+                    "[smp] hart {}: first dispatched pid={}",
+                    current_hart_id(),
+                    task.getpid()
+                );
                 first = false;
             }
-            let idle_task_cx_ptr = processor.get_idle_task_cx_ptr();
-            // 切换前要独占下一个任务，设置 Running 状态并取出它的页表。
+            // The scheduler already performed Ready -> Running under its
+            // lock.  Only snapshot the context and page table here.
             let mut task_inner = task.inner_exclusive_access();
+            // A task context includes the kernel thread pointer used by
+            // `current_task()` and all `#[percpu]` data.  It may have been
+            // created on a different hart, so refresh it immediately before
+            // dispatching rather than restoring the creator's CPU-local base.
+            task_inner.task_cx[KContextArgs::KTP] = read_current_tp();
+            task_inner.memory_set.enter_cpu(current_hart_id());
             let next_task_cx_ptr = &task_inner.task_cx as *const KContext;
-            task_inner.task_status = TaskStatus::Running;
             let token = task_inner.memory_set.token();
             drop(task_inner);
-            // processor.current 记录当前 CPU 正在运行的任务。
-            processor.current = Some(task);
-            drop(processor);
+            // Publishing `current` and entering its saved context form one
+            // ownership handoff.  A timer in between used to preempt the idle
+            // stack as though the selected task were already executing,
+            // clear `current`, and then let the outer switch enter that task
+            // with no CPU owner.  User return (or the idle path below)
+            // re-enables interrupts after the handoff is complete.
+            IRQ::int_disable();
+            SCHEDULER_PHASE[cpu_id].store(7, Ordering::Release);
+            // current 记录本 CPU 正在运行的任务。 这个局部锁在切换前
+            // 释放，绝不跨越 context switch。
+            let idle_task_cx_ptr = {
+                let mut cpu = current_cpu().exclusive_access();
+                cpu.current = Some(task);
+                cpu.get_idle_task_cx_ptr()
+            };
             // 从 idle 切到用户任务，同时切换到该任务的用户页表。
             unsafe { context_switch_pt(idle_task_cx_ptr, next_task_cx_ptr, token) }
+        } else {
+            SCHEDULER_PHASE[cpu_id].store(8, Ordering::Release);
+            // The idle context saved by a context switch does not carry the
+            // interrupted task's interrupt-enable state.  Explicitly enable
+            // local interrupts before waiting so timer deadlines can wake a
+            // fully blocked system (notably futex and signal timeouts).
+            assert_no_spin_locks_held("idle wait");
+            IRQ::int_enable();
+            unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
         }
     }
 }
@@ -77,19 +263,36 @@ pub fn run_tasks() {
 // 对外取走当前任务，通常在阻塞或退出时调用。
 // 执行时进入全局 Processor，把当前 CPU 上运行的任务移交给调用方。
 pub fn take_current_task() -> Option<Arc<TaskControlBlock>> {
-    PROCESSOR.exclusive_access().take_current()
+    let task = current_cpu().exclusive_access().take_current();
+    if let Some(task) = &task {
+        let cpu = current_hart_id();
+        // `schedule` restored BOOT_PAGE_TABLE before execution returned to
+        // this idle loop, so this CPU may no longer receive user-page-table
+        // shootdowns for the outgoing task.
+        task.inner_exclusive_access().memory_set.leave_cpu(cpu);
+        task.clear_running_on(cpu);
+    }
+    task
 }
 
 // 返回当前任务引用。
 // 执行时进入全局 Processor，克隆当前正在 CPU 上运行的任务引用。
 pub fn current_task() -> Option<Arc<TaskControlBlock>> {
-    PROCESSOR.exclusive_access().current()
+    current_cpu().exclusive_access().current()
+}
+
+/// Account a timer interrupt on the current hart.  The counter is deliberately
+/// per-CPU so the old global mutable tick cannot race once secondary harts run.
+pub fn record_timer_tick() {
+    let mut cpu = current_cpu().exclusive_access();
+    cpu.ticks = cpu.ticks.wrapping_add(1);
 }
 
 // 返回当前任务的用户页表 token。
 // 执行时从当前任务 inner 里取 memory_set 的页表 token，用户指针翻译会用到。
+#[track_caller]
 pub fn current_user_token() -> PageTable {
-    let task = current_task().unwrap();
+    let task = current_task().expect("current_user_token without a current task");
     let token = task.inner_exclusive_access().get_user_token();
     token
 }
@@ -99,9 +302,8 @@ static BOOT_PAGE_TABLE: LazyInit<PageTable> = LazyInit::new();
 // 从当前任务切回 idle 上下文，等待下一轮调度。
 // 执行时取出 idle 上下文指针，并用启动时记录的内核页表切回调度主循环。
 pub fn schedule(switched_task_cx_ptr: *mut KContext) {
-    let mut processor = PROCESSOR.exclusive_access();
-    let idle_task_cx_ptr = processor.get_idle_task_cx_ptr();
-    drop(processor);
+    assert_no_spin_locks_held("schedule");
+    let idle_task_cx_ptr = current_cpu().exclusive_access().get_idle_task_cx_ptr();
     // 当前任务主动让出或退出时，先切回 idle，并恢复启动时记录的内核页表。
     unsafe {
         context_switch_pt(switched_task_cx_ptr, idle_task_cx_ptr, *BOOT_PAGE_TABLE);

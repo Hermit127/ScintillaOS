@@ -3,7 +3,7 @@ use smoltcp::iface::SocketHandle;
 use smoltcp::wire::IpEndpoint;
 
 use crate::fs::{File, Kstat};
-use crate::sync::UPSafeCell;
+use crate::sync::DeviceLock;
 
 pub const S_IFSOCK: u32 = 0o140000;
 
@@ -14,37 +14,48 @@ pub enum SocketType {
     Unix,
 }
 
+struct SocketFileState {
+    handle: SocketHandle,
+    ref_count: usize,
+    peer_endpoint: Option<IpEndpoint>,
+    local_endpoint: Option<IpEndpoint>,
+    local_tcp: Option<(usize, bool)>,
+}
+
+/// Mutable socket metadata is one object-level device domain.  Never retain
+/// this lock while calling into smoltcp, blocking, or invoking a wakeup path.
 pub struct SocketFile {
-    pub handle: UPSafeCell<SocketHandle>,
+    inner: DeviceLock<SocketFileState>,
     pub socket_type: SocketType,
     pub nonblock: AtomicBool,
-    ref_count: UPSafeCell<usize>,
-    pub peer_endpoint: UPSafeCell<Option<IpEndpoint>>,
-    pub local_endpoint: UPSafeCell<Option<IpEndpoint>>,
-    pub local_tcp: UPSafeCell<Option<(usize, bool)>>,
     pub was_listening: AtomicBool,
 }
 
 impl SocketFile {
     pub fn new(handle: SocketHandle, socket_type: SocketType, nonblock: bool) -> Self {
         Self {
-            handle: unsafe { UPSafeCell::new(handle) },
+            inner: DeviceLock::new_named(
+                SocketFileState {
+                    handle,
+                    ref_count: 1,
+                    peer_endpoint: None,
+                    local_endpoint: None,
+                    local_tcp: None,
+                },
+                "SocketFile",
+            ),
             socket_type,
             nonblock: AtomicBool::new(nonblock),
-            ref_count: unsafe { UPSafeCell::new(1) },
-            peer_endpoint: unsafe { UPSafeCell::new(None) },
-            local_endpoint: unsafe { UPSafeCell::new(None) },
-            local_tcp: unsafe { UPSafeCell::new(None) },
             was_listening: AtomicBool::new(false),
         }
     }
 
     pub fn get_handle(&self) -> SocketHandle {
-        *self.handle.exclusive_access()
+        self.inner.exclusive_access().handle
     }
 
     pub fn set_handle(&self, handle: SocketHandle) {
-        *self.handle.exclusive_access() = handle;
+        self.inner.exclusive_access().handle = handle;
     }
 
     pub fn get_nonblock(&self) -> bool {
@@ -52,27 +63,27 @@ impl SocketFile {
     }
 
     pub fn get_peer_endpoint(&self) -> Option<IpEndpoint> {
-        *self.peer_endpoint.exclusive_access()
+        self.inner.exclusive_access().peer_endpoint
     }
 
     pub fn set_peer_endpoint(&self, ep: IpEndpoint) {
-        *self.peer_endpoint.exclusive_access() = Some(ep);
+        self.inner.exclusive_access().peer_endpoint = Some(ep);
     }
 
     pub fn get_local_endpoint(&self) -> Option<IpEndpoint> {
-        *self.local_endpoint.exclusive_access()
+        self.inner.exclusive_access().local_endpoint
     }
 
     pub fn set_local_endpoint(&self, ep: IpEndpoint) {
-        *self.local_endpoint.exclusive_access() = Some(ep);
+        self.inner.exclusive_access().local_endpoint = Some(ep);
     }
 
     pub fn get_local_tcp(&self) -> Option<(usize, bool)> {
-        *self.local_tcp.exclusive_access()
+        self.inner.exclusive_access().local_tcp
     }
 
     pub fn set_local_tcp(&self, conn_id: usize, server_side: bool) {
-        *self.local_tcp.exclusive_access() = Some((conn_id, server_side));
+        self.inner.exclusive_access().local_tcp = Some((conn_id, server_side));
     }
 }
 
@@ -149,7 +160,7 @@ impl File for SocketFile {
     }
 
     fn dup_ref(&self) {
-        *self.ref_count.exclusive_access() += 1;
+        self.inner.exclusive_access().ref_count += 1;
     }
 
     fn poll(&self) -> (bool, bool, bool) {
@@ -216,11 +227,11 @@ impl File for SocketFile {
 
     fn close_ref(&self) {
         let should_close = {
-            let mut ref_count = self.ref_count.exclusive_access();
-            if *ref_count > 0 {
-                *ref_count -= 1;
+            let mut inner = self.inner.exclusive_access();
+            if inner.ref_count > 0 {
+                inner.ref_count -= 1;
             }
-            *ref_count == 0
+            inner.ref_count == 0
         };
         if !should_close {
             return;
