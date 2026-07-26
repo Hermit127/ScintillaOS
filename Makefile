@@ -5,6 +5,12 @@ COMMA := ,
 # Keep the baseline runnable.  Set QEMU_SMP=4 only after the SMP lock audit
 # and regression suite have passed.
 QEMU_SMP ?= 1
+QEMU_CPU ?= max,v=true,vlen=128
+SMP_DIAGNOSTICS ?= 0
+
+ifeq ($(SMP_DIAGNOSTICS),1)
+  OS_FEATURES := --features smp-diagnostics
+endif
 
 ifeq ($(ARCH), x86_64)
   TARGET := x86_64-unknown-none
@@ -21,6 +27,7 @@ else ifeq ($(ARCH), riscv64)
   TARGET := riscv64gc-unknown-none-elf
   QEMU_EXEC += qemu-system-$(ARCH) \
 				-machine virt \
+				-cpu $(QEMU_CPU) \
 				-kernel $(KERNEL_BIN)
   VIRTIO_BLK_BUS := virtio-mmio-bus.0
   VIRTIO_BLK_BUS2 := virtio-mmio-bus.1
@@ -348,7 +355,7 @@ kernel:
 	@mkdir -p .cargo 2>/dev/null || true
 	@cp -f cargo_config/config.toml .cargo/config.toml 2>/dev/null || true
 	@cd user && make build TARGET=$(TARGET)
-	@cargo build --release --target $(TARGET)
+	@cargo build --release --target $(TARGET) $(OS_FEATURES)
 
 clean:
 	@cargo clean
@@ -362,6 +369,15 @@ disasm-vim: kernel
 	@rm $(DISASM_TMP)
 
 run: run-inner
+
+run-smp4:
+	@$(MAKE) run-inner ARCH=riscv64 QEMU_SMP=4 SMP_DIAGNOSTICS=$(SMP_DIAGNOSTICS)
+
+run-dual-smp4:
+	@$(MAKE) run-dual ARCH=riscv64 QEMU_SMP=4 SMP_DIAGNOSTICS=$(SMP_DIAGNOSTICS) TEST_DISK="$(TEST_DISK)" ROOT_DISK="$(ROOT_DISK)"
+
+run-dual-smp4-prebuilt:
+	@$(MAKE) run-dual-prebuilt ARCH=riscv64 QEMU_SMP=4 SMP_DIAGNOSTICS=$(SMP_DIAGNOSTICS) TEST_DISK="$(TEST_DISK)" ROOT_DISK="$(ROOT_DISK)"
 
 QEMU_EXEC += -nographic \
 				-m $(QEMU_MEM) \
@@ -431,4 +447,4 @@ gdbserver: build
 gdbclient:
 	@gdb -ex 'file $(KERNEL_ELF)' -ex 'set arch riscv:rv64' -ex 'target remote localhost:1234'
 
-.PHONY: all kernel-rv kernel-la disk.img disk-rv.img disk-la.img build env kernel clean disasm disasm-vim run-inner run-dual run-dual-prebuilt fs-img gdbserver gdbclient
+.PHONY: all kernel-rv kernel-la disk.img disk-rv.img disk-la.img build env kernel clean disasm disasm-vim run run-smp4 run-inner run-dual run-dual-smp4 run-dual-prebuilt run-dual-smp4-prebuilt fs-img gdbserver gdbclient

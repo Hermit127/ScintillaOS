@@ -32,12 +32,19 @@ kernel-la
 # Disk images and emulator logs
 *.img
 *.log
+*.qcow2
 fs-img.img
 disk.img
 disk-la.img
 test_disk.img
 virt.out
 qemu.log
+
+# SMP validation keeps only manifests and compact summaries in Git.
+# Per-round serial logs, QEMU commands, monitor dumps and writable overlays
+# are archived outside the repository.
+artifacts/smp4-validation*/round-*/
+artifacts/smp4-validation*/failure-*/
 
 # Local contest/test suites
 testsuits-for-oskernel

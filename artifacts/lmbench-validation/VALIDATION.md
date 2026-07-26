@@ -40,6 +40,25 @@ lmbench `SKIP` marker.
 - `affinitytest`: all four CPUs tested.
 - `run_pipe_test`: five large-pipe iterations passed.
 
+## BusyBox signal-frame follow-up
+
+The official BusyBox script exposed a demand-mapped signal-stack case that the
+lmbench runs above did not reach.  A short-lived `busybox echo` delivered
+`SIGCHLD` while its parent shell's next `rt_sigframe` crossed into an unmapped
+stack page.  The supervisor-mode frame write faulted while holding TaskLock,
+and the recursive page-fault path deadlocked on that same lock.
+
+The kernel now resolves every page covered by an `rt_sigframe` through
+`MemorySet` before writing the frame.  No testsuit source, command list, or
+test argument was changed.
+
+- Follow-up kernel image SHA-256: `3853b89da10a85948ccc7490fadadc55e1e980b741fe888ccf079a3e2c803e04`
+- Official musl BusyBox group: all commands reported `success`; natural `END`.
+- Official glibc BusyBox group, separate cold boot: all commands reported
+  `success`; natural `END`.
+- Official glibc lmbench group after the fix: complete through `lat_ctx 96`;
+  natural `END`.
+
 ## Reproduction command
 
 ```sh
@@ -53,3 +72,31 @@ make run-dual-prebuilt \
 Inside the guest, mount `/dev/vda` at `/mnt`, copy the selected libc directory
 to `/code/lmbench_src/bin/build`, provide `cp` on `PATH`, `cd` to `/mnt/musl`
 or `/mnt/glibc`, and execute the unchanged `lmbench_testcode.sh`.
+
+## Final SMP/futex/signal follow-up — 2026-07-25
+
+The final ordinary release kernel SHA-256 is
+`65d932015f85035edb905464387bba5eb55abd22bf21219ccce00e880a577c50`.
+The official combined BusyBox/lmbench disk SHA-256 is
+`fe72922a5c0b49ee10665e1a7b8ab81445cb4d6bf4b7bd6de3067e128a9b05ad`.
+The file-level script and ELF hashes above remain the baseline; every run used
+qcow2 overlays and did not modify that disk.
+
+After completing the RISC-V signal ABI, shared `CLONE_SIGHAND` dispositions,
+real `rt_sigreturn` trampoline, `ucontext` offset 176, clear-tid/robust futex
+exit handling, and removal of owner inference from ordinary `FUTEX_WAIT`, the
+unchanged official groups passed three independent four-hart cold boots each:
+
+- musl BusyBox:
+  `artifacts/smp4-validation-final-busybox-musl-20260725-r2/`
+- glibc BusyBox:
+  `artifacts/smp4-validation-final-busybox-glibc-20260725-r2/`
+- musl lmbench:
+  `artifacts/smp4-validation-final-lmbench-musl-20260725-r2/`
+- glibc lmbench:
+  `artifacts/smp4-validation-final-lmbench-glibc-20260725-r2/`
+
+All 12 final logs contain the natural group `END`. None contains an lmbench
+`SKIP`, scheduler-stall snapshot, panic, segmentation fault, or lockdep error.
+The complete Chinese implementation and deadlock record is
+`documents/四核SMP适配与死锁修复全记录.md`.

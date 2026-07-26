@@ -1,0 +1,20 @@
+[
+  {
+    "round": 1,
+    "passed": true,
+    "detail": "completed",
+    "log": "round-01/serial.log"
+  },
+  {
+    "round": 2,
+    "passed": true,
+    "detail": "completed",
+    "log": "round-02/serial.log"
+  },
+  {
+    "round": 3,
+    "passed": true,
+    "detail": "completed",
+    "log": "round-03/serial.log"
+  }
+]

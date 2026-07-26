@@ -1,0 +1,122 @@
+[
+  {
+    "round": 1,
+    "passed": true,
+    "detail": "completed",
+    "log": "round-01/serial.log"
+  },
+  {
+    "round": 2,
+    "passed": true,
+    "detail": "completed",
+    "log": "round-02/serial.log"
+  },
+  {
+    "round": 3,
+    "passed": true,
+    "detail": "completed",
+    "log": "round-03/serial.log"
+  },
+  {
+    "round": 4,
+    "passed": true,
+    "detail": "completed",
+    "log": "round-04/serial.log"
+  },
+  {
+    "round": 5,
+    "passed": true,
+    "detail": "completed",
+    "log": "round-05/serial.log"
+  },
+  {
+    "round": 6,
+    "passed": true,
+    "detail": "completed",
+    "log": "round-06/serial.log"
+  },
+  {
+    "round": 7,
+    "passed": true,
+    "detail": "completed",
+    "log": "round-07/serial.log"
+  },
+  {
+    "round": 8,
+    "passed": true,
+    "detail": "completed",
+    "log": "round-08/serial.log"
+  },
+  {
+    "round": 9,
+    "passed": true,
+    "detail": "completed",
+    "log": "round-09/serial.log"
+  },
+  {
+    "round": 10,
+    "passed": true,
+    "detail": "completed",
+    "log": "round-10/serial.log"
+  },
+  {
+    "round": 11,
+    "passed": true,
+    "detail": "completed",
+    "log": "round-11/serial.log"
+  },
+  {
+    "round": 12,
+    "passed": true,
+    "detail": "completed",
+    "log": "round-12/serial.log"
+  },
+  {
+    "round": 13,
+    "passed": true,
+    "detail": "completed",
+    "log": "round-13/serial.log"
+  },
+  {
+    "round": 14,
+    "passed": true,
+    "detail": "completed",
+    "log": "round-14/serial.log"
+  },
+  {
+    "round": 15,
+    "passed": true,
+    "detail": "completed",
+    "log": "round-15/serial.log"
+  },
+  {
+    "round": 16,
+    "passed": true,
+    "detail": "completed",
+    "log": "round-16/serial.log"
+  },
+  {
+    "round": 17,
+    "passed": true,
+    "detail": "completed",
+    "log": "round-17/serial.log"
+  },
+  {
+    "round": 18,
+    "passed": true,
+    "detail": "completed",
+    "log": "round-18/serial.log"
+  },
+  {
+    "round": 19,
+    "passed": true,
+    "detail": "completed",
+    "log": "round-19/serial.log"
+  },
+  {
+    "round": 20,
+    "passed": true,
+    "detail": "completed",
+    "log": "round-20/serial.log"
+  }
+]
