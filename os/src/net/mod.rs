@@ -536,7 +536,9 @@ pub fn wake_net_blocked_tasks() {
             Some(BlockReason::PollWait) => true,
             Some(BlockReason::PipeRead(_))
             | Some(BlockReason::PipeWrite(_))
-            | Some(BlockReason::SignalWait(_)) => false,
+            | Some(BlockReason::Futex(_, _))
+            | Some(BlockReason::SignalWait(_))
+            | Some(BlockReason::Vfork(_)) => false,
             None => true,
         };
         if should_wake {

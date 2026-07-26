@@ -10,15 +10,15 @@ use crate::task::{
     current_task, current_user_token, exit_current_and_run_next, force_exit_task,
     force_exit_task_group, has_interrupting_signal, online_cpu_mask, pid2task, pid_alloc, schedule,
     suspend_current_and_run_next, task_snapshot, flush_remote_tlb, wake_blocked_task,
-    wake_signal_wait_task, BlockReason, KernelStack, SignalAction, SignalFlags, TaskControlBlock,
-    TaskControlBlockInner, TaskStatus, MAX_SIG,
+    wake_signal_wait_task, BlockReason, KernelStack, PendingSignalInfo, SignalAction, SignalFlags,
+    TaskControlBlock, TaskControlBlockInner, TaskStatus, MAX_SIG,
 };
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use log::info;
 use polyhal::irq::IRQ;
@@ -97,6 +97,44 @@ const USER_CLOCK_TICK_US: u64 = 10_000;
 const USER_CLOCK_TICK_NS: usize = USER_CLOCK_TICK_US as usize * 1_000;
 const NSEC_PER_SEC: usize = 1_000_000_000;
 const NSEC_PER_USEC: usize = 1_000;
+
+#[cfg(feature = "smp-diagnostics")]
+const FUTEX_EVENT_CAPACITY: usize = 128;
+#[cfg(feature = "smp-diagnostics")]
+static FUTEX_EVENT_NEXT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "smp-diagnostics")]
+static FUTEX_EVENT_TID: [AtomicUsize; FUTEX_EVENT_CAPACITY] =
+    [const { AtomicUsize::new(0) }; FUTEX_EVENT_CAPACITY];
+#[cfg(feature = "smp-diagnostics")]
+static FUTEX_EVENT_OP: [AtomicUsize; FUTEX_EVENT_CAPACITY] =
+    [const { AtomicUsize::new(0) }; FUTEX_EVENT_CAPACITY];
+#[cfg(feature = "smp-diagnostics")]
+static FUTEX_EVENT_NAMESPACE: [AtomicUsize; FUTEX_EVENT_CAPACITY] =
+    [const { AtomicUsize::new(0) }; FUTEX_EVENT_CAPACITY];
+#[cfg(feature = "smp-diagnostics")]
+static FUTEX_EVENT_ADDR: [AtomicUsize; FUTEX_EVENT_CAPACITY] =
+    [const { AtomicUsize::new(0) }; FUTEX_EVENT_CAPACITY];
+#[cfg(feature = "smp-diagnostics")]
+static FUTEX_EVENT_VAL: [AtomicUsize; FUTEX_EVENT_CAPACITY] =
+    [const { AtomicUsize::new(0) }; FUTEX_EVENT_CAPACITY];
+#[cfg(feature = "smp-diagnostics")]
+static FUTEX_EVENT_RET: [AtomicUsize; FUTEX_EVENT_CAPACITY] =
+    [const { AtomicUsize::new(0) }; FUTEX_EVENT_CAPACITY];
+
+#[cfg(feature = "smp-diagnostics")]
+fn record_futex_event(op: usize, key: FutexKey, val: usize, ret: isize) {
+    let sequence = FUTEX_EVENT_NEXT.fetch_add(1, Ordering::AcqRel);
+    let slot = sequence % FUTEX_EVENT_CAPACITY;
+    FUTEX_EVENT_TID[slot].store(
+        current_task().map(|task| task.getpid()).unwrap_or(0),
+        Ordering::Relaxed,
+    );
+    FUTEX_EVENT_OP[slot].store(op, Ordering::Relaxed);
+    FUTEX_EVENT_NAMESPACE[slot].store(key.namespace, Ordering::Relaxed);
+    FUTEX_EVENT_ADDR[slot].store(key.addr, Ordering::Relaxed);
+    FUTEX_EVENT_VAL[slot].store(val, Ordering::Relaxed);
+    FUTEX_EVENT_RET[slot].store(ret as usize, Ordering::Relaxed);
+}
 
 fn page_align_up(len: usize) -> Option<usize> {
     len.checked_add(crate::config::PAGE_SIZE - 1)
@@ -629,7 +667,7 @@ const ROBUST_LIST_LIMIT: usize = 2048;
 const MUSL_KILLLOCK_OFFSET_FROM_ROBUST_HEAD: usize = 0x28;
 const MUSL_LOCKED_NO_WAITERS: u32 = 0x8000_0001;
 
-fn prepare_task_user_access(
+pub(crate) fn prepare_task_user_access(
     task: &Arc<TaskControlBlock>,
     addr: usize,
     len: usize,
@@ -806,54 +844,6 @@ fn clear_stale_musl_killlock(task: &Arc<TaskControlBlock>, robust_head: usize) {
     }
 }
 
-fn futex_owner_gone(owner: u32) -> bool {
-    if owner == 0 || owner == FUTEX_TID_MASK {
-        return false;
-    }
-    match pid2task(owner as usize) {
-        Some(task) => task
-            .try_inner_borrow()
-            .map(|inner| inner.task_status == TaskStatus::Zombie)
-            .unwrap_or(true),
-        None => true,
-    }
-}
-
-fn mark_futex_owner_died(uaddr: *mut u32, shared: bool, key: FutexKey) -> bool {
-    if !shared {
-        return false;
-    }
-    let Some(task) = current_task() else {
-        return false;
-    };
-    if !prepare_task_user_access(&task, uaddr as usize, core::mem::size_of::<u32>(), true) {
-        return false;
-    }
-    let token = {
-        let inner = task.inner_exclusive_access();
-        inner.memory_set.token()
-    };
-    let word = *translated_ref(token, uaddr);
-    if word & FUTEX_OWNER_DIED != 0 {
-        return false;
-    }
-    let owner = word & FUTEX_TID_MASK;
-    if !futex_owner_gone(owner) {
-        return false;
-    }
-    let new = (word & FUTEX_WAITERS_BIT) | FUTEX_OWNER_DIED;
-    let mut wake_keys = {
-        let inner = task.inner_exclusive_access();
-        futex_keys_for_addr(&inner, uaddr as usize, shared)
-    };
-    *translated_refmut(token, uaddr) = new;
-    if !wake_keys.contains(&key) {
-        wake_keys.push(key);
-    }
-    wake_futex_keys(&wake_keys);
-    true
-}
-
 fn process_robust_node(
     task: &Arc<TaskControlBlock>,
     node: usize,
@@ -939,11 +929,24 @@ fn clear_task_tid_ptr(task: &Arc<TaskControlBlock>) {
     if !prepare_task_user_access(task, tid, core::mem::size_of::<i32>(), true) {
         return;
     }
-    let (token, wake_keys) = {
+    let (token, wake_keys, _diagnostic_key) = {
         let inner = task.inner_exclusive_access();
-        (inner.memory_set.token(), futex_all_keys_for_addr(&inner, tid))
+        (
+            inner.memory_set.token(),
+            futex_all_keys_for_addr(&inner, tid),
+            futex_private_key(&inner, tid),
+        )
     };
+    #[cfg(feature = "smp-diagnostics")]
+    record_futex_event(
+        0x201,
+        _diagnostic_key,
+        *translated_ref(token, tid as *const u32) as usize,
+        tid as isize,
+    );
     *translated_refmut(token, tid as *mut i32) = 0;
+    #[cfg(feature = "smp-diagnostics")]
+    record_futex_event(0x202, _diagnostic_key, 0, tid as isize);
     {
         let mut inner = task.inner_exclusive_access();
         if inner.tid_ptr == tid {
@@ -1030,6 +1033,7 @@ pub fn sys_getppid() -> isize {
 }
 
 const CLONE_VM: usize = 0x100;
+const CLONE_VFORK: usize = 0x4000;
 const CLONE_FS: usize = 0x200;
 const CLONE_FILES: usize = 0x400;
 const CLONE_SIGHAND: usize = 0x800;
@@ -1041,13 +1045,37 @@ const CLONE_CHILD_SETTID: usize = 0x01000000;
 
 pub fn sys_clone(flags: usize, stack: usize, ptid: usize, tls: usize, ctid: usize) -> isize {
     let current_task = current_task().unwrap();
+    if flags & CLONE_PARENT_SETTID != 0
+        && ptid != 0
+        && !prepare_task_user_access(
+            &current_task,
+            ptid,
+            core::mem::size_of::<i32>(),
+            true,
+        )
+    {
+        return -14;
+    }
+    if flags & CLONE_CHILD_SETTID != 0
+        && ctid != 0
+        && !prepare_task_user_access(
+            &current_task,
+            ctid,
+            core::mem::size_of::<i32>(),
+            true,
+        )
+    {
+        return -14;
+    }
     let parent_tgid = {
         let inner = current_task.inner_exclusive_access();
         inner.tgid
     };
     let is_thread = flags & CLONE_THREAD != 0;
     let new_task = if flags & CLONE_VM != 0 {
-        let Some(new_task) = current_task.clone_shared_vm() else {
+        let Some(new_task) =
+            current_task.clone_shared_vm(flags & CLONE_SIGHAND != 0)
+        else {
             return -12;
         };
         new_task
@@ -1078,9 +1106,28 @@ pub fn sys_clone(flags: usize, stack: usize, ptid: usize, tls: usize, ctid: usiz
     };
 
     if flags & CLONE_CHILD_SETTID != 0 && ctid != 0 {
+        // A non-CLONE_VM child owns a COW copy.  Resolve the write in that
+        // address space explicitly rather than relying on a supervisor-mode
+        // page fault while the syscall is manipulating task state.
+        if !prepare_task_user_access(
+            &new_task,
+            ctid,
+            core::mem::size_of::<i32>(),
+            true,
+        ) {
+            return -14;
+        }
         *translated_refmut(child_token, ctid as *mut i32) = new_pid as i32;
     }
     if flags & CLONE_PARENT_SETTID != 0 && ptid != 0 {
+        if !prepare_task_user_access(
+            &current_task,
+            ptid,
+            core::mem::size_of::<i32>(),
+            true,
+        ) {
+            return -14;
+        }
         *translated_refmut(current_user_token(), ptid as *mut i32) = new_pid as i32;
     }
 
@@ -1090,7 +1137,21 @@ pub fn sys_clone(flags: usize, stack: usize, ptid: usize, tls: usize, ctid: usiz
             .children
             .retain(|child| child.getpid() != new_pid);
     }
-    add_task(new_task);
+    let is_vfork = flags & CLONE_VFORK != 0;
+    if is_vfork {
+        new_task.set_vfork_parent(current_task.getpid());
+    }
+    add_task(new_task.clone());
+    if is_vfork {
+        // CLONE_VM|CLONE_VFORK children run on the parent's address space and
+        // often reuse its user stack.  Letting both execute concurrently
+        // corrupts the parent's return PC (BusyBox ash reproducibly returned
+        // to address zero).  Linux suspends the parent until child exec/exit.
+        let _ = crate::task::block_current_and_run_next_if(
+            BlockReason::Vfork(new_pid),
+            || new_task.vfork_pending(),
+        );
+    }
     new_pid as isize
 }
 
@@ -1160,6 +1221,14 @@ pub fn sys_exec(path: *const u8, mut args: *const usize, mut envp: *const usize)
         let inner = task.inner_exclusive_access();
         (inner.cwd.clone(), inner.root.clone())
     };
+    #[cfg(feature = "smp-diagnostics")]
+    crate::println!(
+        "[exec-diag] request tid={} path='{}' argc={} envc={}",
+        exec_task.getpid(),
+        path,
+        args_vec.len(),
+        env_vec.len(),
+    );
     let open_exec = |path: &str| {
         if let Some(stripped) = path.strip_prefix('/') {
             open_file_at(Some(root.clone()), stripped, OpenFlags::RDONLY, 0)
@@ -1211,6 +1280,7 @@ pub fn sys_exec(path: *const u8, mut args: *const usize, mut envp: *const usize)
                         new_args,
                         env_vec,
                     ) {
+                        crate::task::complete_vfork(&exec_task);
                         return 0;
                     }
                     return -1;
@@ -1245,6 +1315,7 @@ pub fn sys_exec(path: *const u8, mut args: *const usize, mut envp: *const usize)
                             sh_args,
                             env_vec,
                         ) {
+                            crate::task::complete_vfork(&exec_task);
                             return 0;
                         }
                     }
@@ -1265,6 +1336,7 @@ pub fn sys_exec(path: *const u8, mut args: *const usize, mut envp: *const usize)
                     args_vec,
                     env_vec,
                 ) {
+                    crate::task::complete_vfork(&exec_task);
                     return 0;
                 }
                 return -1;
@@ -1272,6 +1344,7 @@ pub fn sys_exec(path: *const u8, mut args: *const usize, mut envp: *const usize)
             return -1;
         }
         if task.exec_file_with_interp(app_inode.as_ref(), None, args_vec, env_vec) {
+            crate::task::complete_vfork(&exec_task);
             0
         } else {
             -1
@@ -1368,25 +1441,34 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: usize) -> isize
                 // its Linux-style ECHILD result independently.
                 return -1;
             }
-            zombie_idx.map(|idx| {
-                let child = inner.children.remove(idx);
-                let found_pid = child.getpid();
-                let child_inner = child.inner_exclusive_access();
-                let exit_code = child_inner.exit_code;
-                let exit_signal = child_inner.exit_signal;
-                inner.cutime = inner
-                    .cutime
-                    .saturating_add(child_inner.utime)
-                    .saturating_add(child_inner.cutime);
-                inner.cstime = inner
-                    .cstime
-                    .saturating_add(child_inner.stime)
-                    .saturating_add(child_inner.cstime);
-                (found_pid, exit_code, exit_signal, inner.memory_set.token())
-            })
+            zombie_idx.map(|idx| inner.children.remove(idx))
         };
 
-        if let Some((found_pid, exit_code, exit_signal, token)) = zombie {
+        if let Some(child) = zombie {
+            let found_pid = child.getpid();
+            let (exit_code, exit_signal, child_utime, child_cutime, child_stime, child_cstime) = {
+                let child_inner = child.inner_exclusive_access();
+                (
+                    child_inner.exit_code,
+                    child_inner.exit_signal,
+                    child_inner.utime,
+                    child_inner.cutime,
+                    child_inner.stime,
+                    child_inner.cstime,
+                )
+            };
+            let token = {
+                let mut inner = task.inner_exclusive_access();
+                inner.cutime = inner
+                    .cutime
+                    .saturating_add(child_utime)
+                    .saturating_add(child_cutime);
+                inner.cstime = inner
+                    .cstime
+                    .saturating_add(child_stime)
+                    .saturating_add(child_cstime);
+                inner.memory_set.token()
+            };
             crate::task::reap_exited_task(found_pid);
             if !exit_code_ptr.is_null() {
                 *translated_refmut(token, exit_code_ptr) =
@@ -1513,21 +1595,28 @@ pub fn sys_waitid(
 
         if let Some(child) = zombie {
             let found_pid = child.getpid();
-            let (exit_code, exit_signal) = {
+            let (exit_code, exit_signal, child_utime, child_cutime, child_stime, child_cstime) = {
                 let child_inner = child.inner_exclusive_access();
-                let exit_code = child_inner.exit_code;
-                let exit_signal = child_inner.exit_signal;
+                (
+                    child_inner.exit_code,
+                    child_inner.exit_signal,
+                    child_inner.utime,
+                    child_inner.cutime,
+                    child_inner.stime,
+                    child_inner.cstime,
+                )
+            };
+            if options & WNOWAIT == 0 {
                 let mut parent_inner = task.inner_exclusive_access();
                 parent_inner.cutime = parent_inner
                     .cutime
-                    .saturating_add(child_inner.utime)
-                    .saturating_add(child_inner.cutime);
+                    .saturating_add(child_utime)
+                    .saturating_add(child_cutime);
                 parent_inner.cstime = parent_inner
                     .cstime
-                    .saturating_add(child_inner.stime)
-                    .saturating_add(child_inner.cstime);
-                (exit_code, exit_signal)
-            };
+                    .saturating_add(child_stime)
+                    .saturating_add(child_cstime);
+            }
             write_wait_siginfo(info_ptr, found_pid as i32, exit_code, exit_signal);
             if options & WNOWAIT == 0 {
                 crate::task::reap_exited_task(found_pid);
@@ -1543,7 +1632,11 @@ pub fn sys_waitid(
     }
 }
 
-fn signal_task(task: &Arc<TaskControlBlock>, signum: i32) {
+fn signal_task(
+    task: &Arc<TaskControlBlock>,
+    signum: i32,
+    signal_info: PendingSignalInfo,
+) {
     let target = task.getpid();
     if signum == 9 && current_task().map(|t| t.getpid() != target).unwrap_or(true) {
         force_exit_task_group(task, -9);
@@ -1560,15 +1653,29 @@ fn signal_task(task: &Arc<TaskControlBlock>, signum: i32) {
         .unwrap_or(false);
     {
         let mut task_ref = task.inner_exclusive_access();
+        #[cfg(feature = "smp-diagnostics")]
+        if signum == 32 || signum == 33 {
+            println!(
+                "[signal-diag] queue tid={} tgid={} sig={} status={:?} mask={:#x} handling={} handler={:#x}",
+                target,
+                task_ref.tgid,
+                signum,
+                task_ref.task_status,
+                task_ref.signal_mask.bits(),
+                task_ref.handling_sig,
+                task_ref.signal_actions.lock().table[signum as usize].handler,
+            );
+        }
         if task_ref.signals.contains(flag) {
             return;
         }
+        task_ref.pending_signal_info[signum as usize] = signal_info;
         task_ref.signals.insert(flag);
         target_ready = task_ref.task_status == TaskStatus::Ready;
         if flag == SignalFlags::SIGTERM || flag == SignalFlags::SIGKILL {
             task_ref.killed = true;
             task_ref.exit_signal = -(signum as i32);
-        } else if task_ref.signal_actions.table[signum as usize].handler == 0 {
+        } else if task_ref.signal_actions.lock().table[signum as usize].handler == 0 {
             let fatal = flag.intersects(
                 SignalFlags::SIGSEGV
                     | SignalFlags::SIGABRT
@@ -1608,6 +1715,23 @@ fn signal_task(task: &Arc<TaskControlBlock>, signum: i32) {
     } else if should_interrupt && !woke_signal_waiter {
         wake_blocked_task(task);
     }
+}
+
+fn current_signal_sender(code: i32) -> PendingSignalInfo {
+    current_task()
+        .map(|task| {
+            let inner = task.inner_exclusive_access();
+            PendingSignalInfo {
+                code,
+                sender_pid: inner.tgid as i32,
+                sender_uid: inner.euid,
+            }
+        })
+        .unwrap_or(PendingSignalInfo {
+            code,
+            sender_pid: 0,
+            sender_uid: 0,
+        })
 }
 
 pub fn sys_kill(pid: isize, signum: i32) -> isize {
@@ -1651,8 +1775,9 @@ pub fn sys_kill(pid: isize, signum: i32) -> isize {
     if signum as usize > MAX_SIG {
         return 0;
     }
+    let signal_info = current_signal_sender(0); // SI_USER
     for task in targets {
-        signal_task(&task, signum);
+        signal_task(&task, signum, signal_info);
     }
     0
 }
@@ -1668,7 +1793,7 @@ pub fn sys_tkill(tid: usize, signum: i32) -> isize {
     if signum == 0 || signum as usize > MAX_SIG {
         return 0;
     }
-    signal_task(&task, signum);
+    signal_task(&task, signum, current_signal_sender(-6)); // SI_TKILL
     0
 }
 
@@ -1687,7 +1812,7 @@ pub fn sys_tgkill(tgid: usize, tid: usize, signum: i32) -> isize {
     if signum == 0 || signum as usize > MAX_SIG {
         return 0;
     }
-    signal_task(&task, signum);
+    signal_task(&task, signum, current_signal_sender(-6)); // SI_TKILL
     0
 }
 
@@ -1831,6 +1956,20 @@ pub fn sys_sigprocmask(how: i32, set: *const u8, old_set: *mut u8, _sigsetsize: 
             SIG_SETMASK => new_mask,
             _ => return -22,
         };
+        #[cfg(feature = "smp-diagnostics")]
+        if (raw_mask & ((1u64 << 31) | (1u64 << 32))) != 0
+            || old_mask.contains(SignalFlags::SIGRTMIN)
+            || inner.signal_mask.contains(SignalFlags::SIGRTMIN)
+        {
+            println!(
+                "[signal-diag] mask tid={} how={} raw={:#x} old={:#x} new={:#x}",
+                task.getpid(),
+                how,
+                raw_mask,
+                old_mask.bits(),
+                inner.signal_mask.bits(),
+            );
+        }
         0
     } else {
         -3
@@ -1845,59 +1984,82 @@ fn check_sigaction_error(signal: SignalFlags, _action: usize, _old_action: usize
     signal == SignalFlags::SIGKILL || signal == SignalFlags::SIGSTOP
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct UserSignalAction {
+    handler: usize,
+    flags: usize,
+    restorer: usize,
+    mask: u64,
+}
+
 pub fn sys_sigaction(
     signum: i32,
-    action: *const SignalAction,
-    old_action: *mut SignalAction,
+    action: *const u8,
+    old_action: *mut u8,
     sigsetsize: usize,
 ) -> isize {
-    const MAX_USER_SIG: usize = 64;
-    let token = current_user_token();
-    let task = current_task().unwrap();
-    let mut inner = task.inner_exclusive_access();
     if sigsetsize != 0 && sigsetsize != 8 {
         return -22;
     }
-    if signum <= 0 || signum as usize > MAX_USER_SIG {
+    if signum <= 0 || signum as usize > MAX_SIG {
         return -22;
     }
-    if signum as usize > MAX_SIG {
-        if !old_action.is_null() {
-            *translated_refmut(token, old_action) = SignalAction::default();
-        }
-        return 0;
+    let Some(flag) = SignalFlags::from_bits(1u64 << signum) else {
+        return -22;
+    };
+    if check_sigaction_error(flag, action as usize, old_action as usize) {
+        return -22;
     }
-    if let Some(flag) = SignalFlags::from_bits(1u64 << signum) {
-        if check_sigaction_error(flag, action as usize, old_action as usize) {
-            return -22;
-        }
-        if !old_action.is_null() {
-            *translated_refmut(token, old_action) = inner.signal_actions.table[signum as usize];
-        }
-        if !action.is_null() {
-            let new_action = *translated_ref(token, action);
-            let tgid = inner.tgid;
-            inner.signal_actions.table[signum as usize] = new_action;
-            drop(inner);
-            let tasks: Vec<Arc<TaskControlBlock>> = task_snapshot()
-                .into_iter()
-                .filter(|task| {
-                    task.try_inner_borrow()
-                        .map(|inner| inner.tgid == tgid)
-                        .unwrap_or(false)
-                })
-                .collect();
-            for task in tasks {
-                if let Some(mut task_inner) = task.try_inner_exclusive_access() {
-                    task_inner.signal_actions.table[signum as usize] = new_action;
-                }
-            }
-            return 0;
-        }
-        0
+
+    // User pointers may demand-fault.  Snapshot them before TaskLock so the
+    // synchronous fault handler never re-enters the same task lock.
+    let token = current_user_token();
+    let new_action = if action.is_null() {
+        None
     } else {
-        -1
+        let raw = *translated_ref(token, action as *const UserSignalAction);
+        Some(SignalAction {
+            handler: raw.handler,
+            flags: raw.flags,
+            restorer: raw.restorer,
+            mask: user_sigset_to_flags(raw.mask),
+        })
+    };
+    let task = current_task().unwrap();
+    let actions = {
+        let inner = task.inner_exclusive_access();
+        inner.signal_actions.clone()
+    };
+    let previous = {
+        let mut table = actions.lock();
+        let previous = table.table[signum as usize];
+        if let Some(new_action) = new_action {
+            table.table[signum as usize] = new_action;
+        }
+        previous
+    };
+    #[cfg(feature = "smp-diagnostics")]
+    if signum == 32 || signum == 33 {
+        println!(
+            "[signal-diag] action tid={} sig={} handler={:#x} flags={:#x} mask={:#x} shared={}",
+            task.getpid(),
+            signum,
+            new_action.map(|value| value.handler).unwrap_or(previous.handler),
+            new_action.map(|value| value.flags).unwrap_or(previous.flags),
+            new_action.map(|value| value.mask.bits()).unwrap_or(previous.mask.bits()),
+            Arc::strong_count(&actions),
+        );
     }
+    if !old_action.is_null() {
+        *translated_refmut(token, old_action as *mut UserSignalAction) = UserSignalAction {
+            handler: previous.handler,
+            flags: previous.flags,
+            restorer: previous.restorer,
+            mask: flags_to_user_sigset(previous.mask),
+        };
+    }
+    0
 }
 
 pub fn sys_brk(brk_addr: usize) -> isize {
@@ -4292,23 +4454,16 @@ pub fn sys_futex(
         let inner = task.inner_exclusive_access();
         futex_keys_for_addr(&inner, uaddr as usize, shared)[0]
     };
-    match op {
+    #[cfg(feature = "smp-diagnostics")]
+    record_futex_event(0x100 | futex_op, key, val, cur as isize);
+    let result = match op {
         0 => {
             if cur != val as u32 {
                 return -11;
             }
-            if mark_futex_owner_died(uaddr, shared, key) {
-                return 0;
-            }
             match futex_wait_current(key, uaddr, val as u32, futex_relative_timeout_ns(val2)) {
                 FutexWaitResult::Woken => 0,
-                FutexWaitResult::TimedOut => {
-                    if mark_futex_owner_died(uaddr, shared, key) {
-                        0
-                    } else {
-                        -110
-                    }
-                }
+                FutexWaitResult::TimedOut => -110,
                 FutexWaitResult::Interrupted => -4,
                 FutexWaitResult::ValueChanged => -11,
             }
@@ -4317,18 +4472,9 @@ pub fn sys_futex(
             if cur != val as u32 {
                 return -11;
             }
-            if mark_futex_owner_died(uaddr, shared, key) {
-                return 0;
-            }
             match futex_wait_current(key, uaddr, val as u32, futex_absolute_timeout_ns(val2)) {
                 FutexWaitResult::Woken => 0,
-                FutexWaitResult::TimedOut => {
-                    if mark_futex_owner_died(uaddr, shared, key) {
-                        0
-                    } else {
-                        -110
-                    }
-                }
+                FutexWaitResult::TimedOut => -110,
                 FutexWaitResult::Interrupted => -4,
                 FutexWaitResult::ValueChanged => -11,
             }
@@ -4361,7 +4507,10 @@ pub fn sys_futex(
         }
         6..=8 | 11..=13 => 0,
         _ => -38,
-    }
+    };
+    #[cfg(feature = "smp-diagnostics")]
+    record_futex_event(op, key, val, result);
+    result
 }
 
 enum FutexWaitResult {
@@ -4426,6 +4575,46 @@ pub(crate) fn remove_futex_waiter(pid: usize) -> bool {
         !queue.is_empty()
     });
     removed
+}
+
+#[cfg(feature = "smp-diagnostics")]
+pub(crate) fn dump_futex_waiters() {
+    let snapshot: Vec<(usize, usize, Vec<usize>)> = {
+        let waiters = FUTEX_WAITERS.exclusive_access();
+        waiters
+            .iter()
+            .map(|(key, queue)| {
+                (
+                    key.namespace,
+                    key.addr,
+                    queue.iter().map(|task| task.getpid()).collect(),
+                )
+            })
+            .collect()
+    };
+    for (namespace, addr, tids) in snapshot {
+        crate::println!(
+            "[futex-stall] namespace={:#x} addr={:#x} tids={:?}",
+            namespace,
+            addr,
+            tids,
+        );
+    }
+    let end = FUTEX_EVENT_NEXT.load(Ordering::Acquire);
+    let start = end.saturating_sub(FUTEX_EVENT_CAPACITY);
+    for sequence in start..end {
+        let slot = sequence % FUTEX_EVENT_CAPACITY;
+        crate::println!(
+            "[futex-event] seq={} tid={} op={} namespace={:#x} addr={:#x} val={} ret={}",
+            sequence,
+            FUTEX_EVENT_TID[slot].load(Ordering::Relaxed),
+            FUTEX_EVENT_OP[slot].load(Ordering::Relaxed),
+            FUTEX_EVENT_NAMESPACE[slot].load(Ordering::Relaxed),
+            FUTEX_EVENT_ADDR[slot].load(Ordering::Relaxed),
+            FUTEX_EVENT_VAL[slot].load(Ordering::Relaxed),
+            FUTEX_EVENT_RET[slot].load(Ordering::Relaxed) as isize,
+        );
+    }
 }
 
 fn futex_wake_key(key: FutexKey, count: usize) -> isize {
@@ -4523,7 +4712,7 @@ fn futex_wait_current(
         queue.push(task.clone());
         crate::task::begin_block(
             &task,
-            None,
+            Some(BlockReason::Futex(key.namespace, key.addr)),
             crate::task::BlockQueue::None,
             deadline_ns,
         )

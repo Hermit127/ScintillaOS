@@ -1,10 +1,10 @@
 use super::{current_task, SignalActions, UserFloatState};
-use super::{pid_alloc, PidHandle, SignalFlags};
+use super::{pid_alloc, PendingSignalInfo, PidHandle, SignalFlags};
 use crate::config::KERNEL_STACK_SIZE;
 use crate::fs::vfs::{Dentry, ROOT_DENTRY};
 use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{translated_refmut, LoadedElf, MapArea, MapPermission, MapType, MemorySet};
-use crate::sync::{TaskGuard, TaskLock};
+use crate::sync::{SignalActionsLock, TaskGuard, TaskLock};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
@@ -49,6 +49,10 @@ struct TaskSchedulingMeta {
     allowed_cpus: AtomicUsize,
     enqueued: AtomicBool,
     exit_cleanup_done: AtomicBool,
+    /// Non-zero while this task is a vfork child whose parent must remain
+    /// suspended.  The value is the parent's TID, allowing exec/exit to
+    /// complete the handoff without taking either task's broad inner lock.
+    vfork_parent: AtomicUsize,
 }
 
 impl TaskSchedulingMeta {
@@ -58,12 +62,13 @@ impl TaskSchedulingMeta {
             allowed_cpus: AtomicUsize::new(DEFAULT_TASK_CPU_MASK),
             enqueued: AtomicBool::new(false),
             exit_cleanup_done: AtomicBool::new(false),
+            vfork_parent: AtomicUsize::new(0),
         }
     }
 }
 
 #[cfg(target_arch = "riscv64")]
-const DEFAULT_TASK_CPU_MASK: usize = 0b1111;
+const DEFAULT_TASK_CPU_MASK: usize = (1usize << crate::config::MAX_CPUS) - 1;
 #[cfg(not(target_arch = "riscv64"))]
 const DEFAULT_TASK_CPU_MASK: usize = 1;
 use log::*;
@@ -123,12 +128,18 @@ pub struct TaskControlBlockInner {
     pub umask: u32,
     pub nice: i32,
     pub signals: SignalFlags,
+    pub pending_signal_info: [PendingSignalInfo; super::MAX_SIG + 1],
     pub signal_mask: SignalFlags,
     pub signal_mask_backup: Option<SignalFlags>,
     // the signal which is being handling
     pub handling_sig: isize,
     // Signal actions
-    pub signal_actions: SignalActions,
+    /// Signal dispositions are process-wide when CLONE_SIGHAND is used.
+    ///
+    /// Keeping the table behind a separately locked Arc avoids the former
+    /// best-effort per-thread propagation, which could silently miss a thread
+    /// running on another hart.
+    pub signal_actions: Arc<SignalActionsLock<SignalActions>>,
     // if the task is killed
     pub killed: bool,
     // if the task is frozen by a signal
@@ -187,21 +198,11 @@ impl TaskControlBlockInner {
             max_fd
         }
     }
-    pub fn close_fd(&mut self, fd: usize) -> bool {
+    pub fn take_fd_for_close(&mut self, fd: usize) -> Option<Arc<dyn File + Send + Sync>> {
         if fd < self.fd_table.len() {
-            if let Some(file) = self.fd_table[fd].take() {
-                file.close_ref();
-                return true;
-            }
+            return self.fd_table[fd].take();
         }
-        false
-    }
-    pub fn clear_fd_table(&mut self) {
-        for fd in 0..self.fd_table.len() {
-            self.close_fd(fd);
-        }
-        self.fd_table.clear();
-        self.fd_cloexec.clear();
+        None
     }
 
     pub fn drain_fd_table(&mut self) -> Vec<Arc<dyn File + Send + Sync>> {
@@ -216,13 +217,17 @@ impl TaskControlBlockInner {
         files
     }
 
-    pub fn close_cloexec_fds(&mut self) {
+    pub fn take_cloexec_fds(&mut self) -> Vec<Arc<dyn File + Send + Sync>> {
+        let mut files = Vec::new();
         let len = self.fd_table.len().min(self.fd_cloexec.len());
         for fd in 0..len {
             if self.fd_cloexec[fd] {
-                self.close_fd(fd);
+                if let Some(file) = self.fd_table[fd].take() {
+                    files.push(file);
+                }
             }
         }
+        files
     }
 }
 
@@ -345,10 +350,17 @@ impl TaskControlBlock {
                         umask: 0o022,
                         nice: 0,
                         signals: SignalFlags::empty(),
+                        pending_signal_info: [
+                            PendingSignalInfo::default();
+                            super::MAX_SIG + 1
+                        ],
                         signal_mask: SignalFlags::empty(),
                         signal_mask_backup: None,
                         handling_sig: -1,
-                        signal_actions: SignalActions::default(),
+                        signal_actions: Arc::new(SignalActionsLock::new_named(
+                            SignalActions::default(),
+                            "SignalActions",
+                        )),
                         killed: false,
                         frozen: false,
                         trap_ctx_backup: None,
@@ -476,6 +488,24 @@ impl TaskControlBlock {
         let memory_set = loaded.memory_set;
 
         memory_set.set_program_brk(heap_bottom);
+        #[cfg(feature = "smp-diagnostics")]
+        crate::println!(
+            "[exec-diag] tid={} tgid={} entry={:#x} program_entry={:#x} phdr={:#x} phent={} phnum={} stack_top={:#x} brk={:#x} tls={:#x}+{:#x} interp_base={:#x} argc={} envc={}",
+            self.getpid(),
+            self.inner_exclusive_access().tgid,
+            entry_point,
+            program_entry,
+            ph_addr,
+            ph_entsize,
+            ph_num,
+            stack_top,
+            heap_bottom,
+            tls_base,
+            tls_size,
+            interp_base,
+            args.len(),
+            envs.len(),
+        );
 
         // The new address space becomes active before its initial stack is
         // populated. Mark it now so future shootdowns cannot overlook this
@@ -634,8 +664,13 @@ impl TaskControlBlock {
         inner
             .memory_set
             .leave_cpu(crate::task::current_hart_id());
-        inner.close_cloexec_fds();
-        inner.signal_actions.reset_for_exec();
+        let cloexec_files = inner.take_cloexec_fds();
+        let mut exec_actions = inner.signal_actions.lock().clone();
+        exec_actions.reset_for_exec();
+        inner.signal_actions = Arc::new(SignalActionsLock::new_named(
+            exec_actions,
+            "SignalActions",
+        ));
         inner.handling_sig = -1;
         inner.signal_mask_backup = None;
         inner.trap_ctx_backup = None;
@@ -669,7 +704,23 @@ impl TaskControlBlock {
                 trap_cx[TrapFrameArgs::TLS] = tls_va + crate::config::PAGE_SIZE;
             }
         }
+        #[cfg(feature = "smp-diagnostics")]
+        let committed_tp = trap_cx[TrapFrameArgs::TLS];
         *inner.get_trap_cx() = trap_cx;
+        #[cfg(feature = "smp-diagnostics")]
+        crate::println!(
+            "[exec-diag] tid={} committed sepc={:#x} sp={:#x} argv={:#x} envp={:#x} tp={:#x}",
+            self.getpid(),
+            entry_point,
+            crt_sp,
+            argv_base,
+            envp_base,
+            committed_tp,
+        );
+        drop(inner);
+        for file in cloexec_files {
+            file.close_ref();
+        }
     }
     pub fn fork(self: &Arc<TaskControlBlock>) -> Option<Arc<TaskControlBlock>> {
         trace!("os::task::TaskControlBlock::fork");
@@ -720,6 +771,10 @@ impl TaskControlBlock {
             fp_state,
         ) = {
             let parent_inner = self.inner_exclusive_access();
+            let fork_signal_actions = Arc::new(SignalActionsLock::new_named(
+                parent_inner.signal_actions.lock().clone(),
+                "SignalActions",
+            ));
             (
                 parent_inner.trap_cx.clone(),
                 parent_inner.base_size,
@@ -754,7 +809,7 @@ impl TaskControlBlock {
                 parent_inner.umask,
                 parent_inner.nice,
                 parent_inner.signal_mask,
-                parent_inner.signal_actions.clone(),
+                fork_signal_actions,
                 parent_inner.heap_bottom,
                 parent_inner.program_brk,
                 parent_inner.fp_state,
@@ -800,6 +855,10 @@ impl TaskControlBlock {
                         umask,
                         nice,
                         signals: SignalFlags::empty(),
+                        pending_signal_info: [
+                            PendingSignalInfo::default();
+                            super::MAX_SIG + 1
+                        ],
                         signal_mask,
                         signal_mask_backup: None,
                         handling_sig: -1,
@@ -839,7 +898,10 @@ impl TaskControlBlock {
         }
         Some(task_control_block)
     }
-    pub fn clone_shared_vm(self: &Arc<TaskControlBlock>) -> Option<Arc<TaskControlBlock>> {
+    pub fn clone_shared_vm(
+        self: &Arc<TaskControlBlock>,
+        share_signal_actions: bool,
+    ) -> Option<Arc<TaskControlBlock>> {
         trace!("os::task::TaskControlBlock::clone_shared_vm");
         // A later CLONE_VM can restore writable PTEs which a previous fork
         // write-protected for COW. Capture the complete shared address-space
@@ -883,6 +945,14 @@ impl TaskControlBlock {
             }
             parent_inner.memory_set.mark_shared();
             let memory_set = MemorySet::from_shared(&parent_inner.memory_set);
+            let child_signal_actions = if share_signal_actions {
+                parent_inner.signal_actions.clone()
+            } else {
+                Arc::new(SignalActionsLock::new_named(
+                    parent_inner.signal_actions.lock().clone(),
+                    "SignalActions",
+                ))
+            };
             (
                 memory_set,
                 parent_inner.trap_cx.clone(),
@@ -917,7 +987,7 @@ impl TaskControlBlock {
                 parent_inner.umask,
                 parent_inner.nice,
                 parent_inner.signal_mask,
-                parent_inner.signal_actions.clone(),
+                child_signal_actions,
                 parent_inner.heap_bottom,
                 parent_inner.program_brk,
                 parent_inner.fp_state,
@@ -968,6 +1038,10 @@ impl TaskControlBlock {
                         umask,
                         nice,
                         signals: SignalFlags::empty(),
+                        pending_signal_info: [
+                            PendingSignalInfo::default();
+                            super::MAX_SIG + 1
+                        ],
                         signal_mask,
                         signal_mask_backup: None,
                         handling_sig: -1,
@@ -1015,8 +1089,35 @@ impl TaskControlBlock {
         self.scheduling.running_cpu.load(Ordering::Acquire)
     }
 
+    pub fn is_enqueued(&self) -> bool {
+        self.scheduling.enqueued.load(Ordering::Acquire)
+    }
+
     pub fn exit_cleanup_done(&self) -> bool {
         self.scheduling.exit_cleanup_done.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_vfork_parent(&self, parent_tid: usize) {
+        assert_ne!(parent_tid, 0, "vfork parent TID must be non-zero");
+        assert!(
+            self.scheduling
+                .vfork_parent
+                .compare_exchange(0, parent_tid, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "pid {} acquired two vfork parents",
+            self.getpid()
+        );
+    }
+
+    pub(crate) fn vfork_pending(&self) -> bool {
+        self.scheduling.vfork_parent.load(Ordering::Acquire) != 0
+    }
+
+    pub(crate) fn take_vfork_parent(&self) -> Option<usize> {
+        match self.scheduling.vfork_parent.swap(0, Ordering::AcqRel) {
+            0 => None,
+            tid => Some(tid),
+        }
     }
 
     pub(crate) fn publish_exit_cleanup_done(&self) {
@@ -1135,7 +1236,9 @@ pub enum BlockReason {
     PollWait,
     PipeRead(usize),
     PipeWrite(usize),
+    Futex(usize, usize),
     SignalWait(SignalFlags),
+    Vfork(usize),
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
