@@ -4,6 +4,13 @@ version = "0.1.0"
 authors = ["Yifan Wu <shinbokuow@163.com>"]
 edition = "2021"
 
+[features]
+default = []
+# Keep lock dependency checking and scheduler-stall snapshots available in an
+# optimized kernel. This feature adds diagnostics only and does not change the
+# userspace ABI or test programs.
+smp-diagnostics = []
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]

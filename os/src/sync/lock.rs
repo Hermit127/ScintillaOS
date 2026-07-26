@@ -11,10 +11,16 @@
 //! 2. [`FutexLock`] -- futex wait-table registration only.
 //! 3. [`SchedulerLock`] -- ready and wait queues.
 //! 4. [`TaskLock`] -- one task's mutable state.
-//! 5. [`VmLock`] -- global shared-memory, VM cache and physical-frame metadata.
-//! 6. [`VfsLock`] -- mount, dentry and inode metadata.
-//! 7. [`FsLock`] -- an Ext4 instance.
-//! 8. [`DeviceLock`] -- one device or pipe ring.
+//! 5. [`SignalActionsLock`] -- one process' shared signal dispositions.
+//! 6. [`VmLock`] -- address-space and shared-memory metadata.
+//! 7. [`FrameRefLock`] -- shared physical-frame reference counts.
+//! 8. [`FrameAllocatorLock`] -- physical-frame buddy allocator.
+//! 9. [`VfsLock`] -- open-file, mount and path-owner metadata.
+//! 10. [`FsGlobalLock`] -- process-global lwext4 state.
+//! 11. [`FsLock`] -- one Ext4 instance.
+//! 12. [`DentryLock`] -- dentry child and inode caches.
+//! 13. [`FsAuxLock`] -- post-filesystem quota/accounting metadata.
+//! 14. [`DeviceLock`] -- one device or pipe ring.
 //!
 //! No lock may be held across scheduling, blocking I/O, user-address
 //! translation, page-table changes, SBI calls, allocation which can re-enter
@@ -25,12 +31,13 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use polyhal::utils::{MutexNoIrq, MutexNoIrqGuard};
 
 const NO_OWNER: usize = usize::MAX;
+const LOCKDEP_ENABLED: bool = cfg!(any(debug_assertions, feature = "smp-diagnostics"));
 
 /// The global ordering class for a kernel lock.
 ///
-/// Equal classes are allowed by the checker because object identity is not
-/// available to a generic lock.  Callers that need two objects of the same
-/// class must acquire them in stable order (PID, then address/device ID).
+/// Locks in the same class are ordered by their stable in-memory identity.
+/// Callers which need a semantic order such as PID order must arrange that
+/// order before acquiring either object.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 #[repr(usize)]
 pub enum LockClass {
@@ -41,10 +48,16 @@ pub enum LockClass {
     Futex = 2,
     Scheduler = 3,
     Task = 4,
-    Vm = 5,
-    Vfs = 6,
-    Fs = 7,
-    Device = 8,
+    SignalActions = 5,
+    Vm = 6,
+    FrameRef = 7,
+    FrameAllocator = 8,
+    Vfs = 9,
+    FsGlobal = 10,
+    Fs = 11,
+    Dentry = 12,
+    FsAux = 13,
+    Device = 14,
 }
 
 impl LockClass {
@@ -53,7 +66,7 @@ impl LockClass {
     }
 }
 
-const LOCK_DEBUG_CPUS: usize = 4;
+const LOCK_DEBUG_CPUS: usize = crate::config::MAX_CPUS;
 const LOCK_DEBUG_DEPTH: usize = 16;
 
 // The project currently targets four RISC-V harts.  CPUs outside this range
@@ -63,11 +76,22 @@ static LOCK_DEPTH: [AtomicUsize; LOCK_DEBUG_CPUS] =
     [const { AtomicUsize::new(0) }; LOCK_DEBUG_CPUS];
 static LOCK_RANKS: [AtomicUsize; LOCK_DEBUG_CPUS * LOCK_DEBUG_DEPTH] =
     [const { AtomicUsize::new(0) }; LOCK_DEBUG_CPUS * LOCK_DEBUG_DEPTH];
+static LOCK_KEYS: [AtomicUsize; LOCK_DEBUG_CPUS * LOCK_DEBUG_DEPTH] =
+    [const { AtomicUsize::new(0) }; LOCK_DEBUG_CPUS * LOCK_DEBUG_DEPTH];
+static LOCK_NAME_PTRS: [AtomicUsize; LOCK_DEBUG_CPUS * LOCK_DEBUG_DEPTH] =
+    [const { AtomicUsize::new(0) }; LOCK_DEBUG_CPUS * LOCK_DEBUG_DEPTH];
+static LOCK_NAME_LENS: [AtomicUsize; LOCK_DEBUG_CPUS * LOCK_DEBUG_DEPTH] =
+    [const { AtomicUsize::new(0) }; LOCK_DEBUG_CPUS * LOCK_DEBUG_DEPTH];
+static LOCK_FILE_PTRS: [AtomicUsize; LOCK_DEBUG_CPUS * LOCK_DEBUG_DEPTH] =
+    [const { AtomicUsize::new(0) }; LOCK_DEBUG_CPUS * LOCK_DEBUG_DEPTH];
+static LOCK_FILE_LENS: [AtomicUsize; LOCK_DEBUG_CPUS * LOCK_DEBUG_DEPTH] =
+    [const { AtomicUsize::new(0) }; LOCK_DEBUG_CPUS * LOCK_DEBUG_DEPTH];
+static LOCK_LINES: [AtomicUsize; LOCK_DEBUG_CPUS * LOCK_DEBUG_DEPTH] =
+    [const { AtomicUsize::new(0) }; LOCK_DEBUG_CPUS * LOCK_DEBUG_DEPTH];
 
 #[inline]
 fn debug_cpu() -> Option<usize> {
-    let cpu = crate::task::current_hart_id();
-    (cpu < LOCK_DEBUG_CPUS).then_some(cpu)
+    crate::task::try_current_hart_id().filter(|cpu| *cpu < LOCK_DEBUG_CPUS)
 }
 
 #[inline]
@@ -75,32 +99,102 @@ fn rank_slot(cpu: usize, depth: usize) -> usize {
     cpu * LOCK_DEBUG_DEPTH + depth
 }
 
-#[cfg(debug_assertions)]
-fn lockdep_before_acquire(class: LockClass, name: &'static str) {
+fn recorded_lock_name(slot: usize) -> &'static str {
+    let name_ptr = LOCK_NAME_PTRS[slot].load(Ordering::Acquire);
+    let name_len = LOCK_NAME_LENS[slot].load(Ordering::Acquire);
+    if name_ptr == 0 || name_len == 0 {
+        return "<updating>";
+    }
+    unsafe {
+        core::str::from_utf8_unchecked(core::slice::from_raw_parts(
+            name_ptr as *const u8,
+            name_len,
+        ))
+    }
+}
+
+fn recorded_lock_file(slot: usize) -> &'static str {
+    let file_ptr = LOCK_FILE_PTRS[slot].load(Ordering::Acquire);
+    let file_len = LOCK_FILE_LENS[slot].load(Ordering::Acquire);
+    if file_ptr == 0 || file_len == 0 {
+        return "<updating>";
+    }
+    unsafe {
+        core::str::from_utf8_unchecked(core::slice::from_raw_parts(
+            file_ptr as *const u8,
+            file_len,
+        ))
+    }
+}
+
+#[track_caller]
+fn lockdep_before_acquire(class: LockClass, name: &'static str, key: usize) {
+    if !LOCKDEP_ENABLED {
+        return;
+    }
     let Some(cpu) = debug_cpu() else {
         return;
     };
     let depth = LOCK_DEPTH[cpu].load(Ordering::Relaxed);
-    if depth == 0 {
+    if depth == 0 || class == LockClass::CpuLocal {
+        // CpuLocalLock is a per-hart, local-IRQ-protected accessor rather than
+        // a shared-resource dependency.  It is safe to snapshot the current
+        // task while another domain lock is held.  Recursion is still rejected
+        // by SpinNoIrq::check_not_recursive.
         return;
     }
-    let held = LOCK_RANKS[rank_slot(cpu, depth - 1)].load(Ordering::Relaxed);
-    assert!(
-        class.rank() >= held,
-        "lock-order inversion on hart {}: acquire '{}' (rank {}) while holding rank {}",
-        cpu,
-        name,
-        class.rank(),
-        held,
-    );
+    let caller = core::panic::Location::caller();
+    // Check the complete held stack because CpuLocalLock is deliberately
+    // rank-neutral and may temporarily sit above a shared lock.
+    for index in 0..depth {
+        let slot = rank_slot(cpu, index);
+        let held = LOCK_RANKS[slot].load(Ordering::Relaxed);
+        if held == LockClass::CpuLocal.rank() {
+            continue;
+        }
+        let held_key = LOCK_KEYS[slot].load(Ordering::Relaxed);
+        let held_name = recorded_lock_name(slot);
+        let held_file = recorded_lock_file(slot);
+        let held_line = LOCK_LINES[slot].load(Ordering::Relaxed);
+        assert!(
+            class.rank() >= held,
+            "lock-order inversion on hart {} at {}:{}: acquire '{}' (rank {}) while holding '{}' at rank {}, acquired at {}:{}",
+            cpu,
+            caller.file(),
+            caller.line(),
+            name,
+            class.rank(),
+            held_name,
+            held,
+            held_file,
+            held_line,
+        );
+        assert!(
+            class.rank() != held || key > held_key,
+            "same-class lock inversion on hart {} at {}:{}: acquire '{}' ({:#x}) after '{}' ({:#x}) at rank {}, acquired at {}:{}",
+            cpu,
+            caller.file(),
+            caller.line(),
+            name,
+            key,
+            held_name,
+            held_key,
+            held,
+            held_file,
+            held_line,
+        );
+    }
 }
 
-#[cfg(not(debug_assertions))]
-#[inline]
-fn lockdep_before_acquire(_: LockClass, _: &'static str) {}
-
-#[cfg(debug_assertions)]
-fn lockdep_acquired(class: LockClass, name: &'static str) {
+fn lockdep_acquired(
+    class: LockClass,
+    name: &'static str,
+    key: usize,
+    caller: &'static core::panic::Location<'static>,
+) {
+    if !LOCKDEP_ENABLED {
+        return;
+    }
     let Some(cpu) = debug_cpu() else {
         return;
     };
@@ -111,16 +205,21 @@ fn lockdep_acquired(class: LockClass, name: &'static str) {
         cpu,
         name,
     );
-    LOCK_RANKS[rank_slot(cpu, depth)].store(class.rank(), Ordering::Relaxed);
+    let slot = rank_slot(cpu, depth);
+    LOCK_RANKS[slot].store(class.rank(), Ordering::Relaxed);
+    LOCK_KEYS[slot].store(key, Ordering::Relaxed);
+    LOCK_NAME_PTRS[slot].store(name.as_ptr() as usize, Ordering::Relaxed);
+    LOCK_NAME_LENS[slot].store(name.len(), Ordering::Relaxed);
+    LOCK_FILE_PTRS[slot].store(caller.file().as_ptr() as usize, Ordering::Relaxed);
+    LOCK_FILE_LENS[slot].store(caller.file().len(), Ordering::Relaxed);
+    LOCK_LINES[slot].store(caller.line() as usize, Ordering::Relaxed);
     LOCK_DEPTH[cpu].store(depth + 1, Ordering::Relaxed);
 }
 
-#[cfg(not(debug_assertions))]
-#[inline]
-fn lockdep_acquired(_: LockClass, _: &'static str) {}
-
-#[cfg(debug_assertions)]
-fn lockdep_released(class: LockClass, name: &'static str) {
+fn lockdep_released(class: LockClass, name: &'static str, key: usize) {
+    if !LOCKDEP_ENABLED {
+        return;
+    }
     let Some(cpu) = debug_cpu() else {
         return;
     };
@@ -133,21 +232,26 @@ fn lockdep_released(class: LockClass, name: &'static str) {
     );
     let slot = rank_slot(cpu, depth - 1);
     let held = LOCK_RANKS[slot].load(Ordering::Relaxed);
+    let held_key = LOCK_KEYS[slot].load(Ordering::Relaxed);
     assert!(
-        held == class.rank(),
-        "lock '{}' released out of order on hart {} (top rank {}, releasing {})",
+        held == class.rank() && held_key == key,
+        "lock '{}' released out of order on hart {} (top rank/key {}/{:#x}, releasing {}/{:#x})",
         name,
         cpu,
         held,
+        held_key,
         class.rank(),
+        key,
     );
     LOCK_RANKS[slot].store(0, Ordering::Relaxed);
+    LOCK_KEYS[slot].store(0, Ordering::Relaxed);
+    LOCK_NAME_PTRS[slot].store(0, Ordering::Relaxed);
+    LOCK_NAME_LENS[slot].store(0, Ordering::Relaxed);
+    LOCK_FILE_PTRS[slot].store(0, Ordering::Relaxed);
+    LOCK_FILE_LENS[slot].store(0, Ordering::Relaxed);
+    LOCK_LINES[slot].store(0, Ordering::Relaxed);
     LOCK_DEPTH[cpu].store(depth - 1, Ordering::Relaxed);
 }
-
-#[cfg(not(debug_assertions))]
-#[inline]
-fn lockdep_released(_: LockClass, _: &'static str) {}
 
 /// Panic in a debug build if the current CPU still holds a domain lock.
 ///
@@ -155,7 +259,9 @@ fn lockdep_released(_: LockClass, _: &'static str) {}
 /// guard rail, not a replacement for releasing the guard lexically.
 #[track_caller]
 pub fn assert_no_spin_locks_held(context: &'static str) {
-    #[cfg(debug_assertions)]
+    if !LOCKDEP_ENABLED {
+        return;
+    }
     if let Some(cpu) = debug_cpu() {
         let depth = LOCK_DEPTH[cpu].load(Ordering::Relaxed);
         assert!(
@@ -165,6 +271,33 @@ pub fn assert_no_spin_locks_held(context: &'static str) {
             cpu,
             depth,
         );
+    }
+}
+
+/// Print each hart's held-lock stack without acquiring another kernel lock.
+///
+/// Names stored here are all `&'static str`, so reconstructing them from their
+/// recorded address remains valid even when another hart owns the lock.
+pub fn dump_lockdep_state() {
+    if !LOCKDEP_ENABLED {
+        return;
+    }
+    for cpu in 0..LOCK_DEBUG_CPUS {
+        let depth = LOCK_DEPTH[cpu]
+            .load(Ordering::Acquire)
+            .min(LOCK_DEBUG_DEPTH);
+        for index in 0..depth {
+            let slot = rank_slot(cpu, index);
+            let rank = LOCK_RANKS[slot].load(Ordering::Acquire);
+            let key = LOCK_KEYS[slot].load(Ordering::Acquire);
+            let name = recorded_lock_name(slot);
+            let file = recorded_lock_file(slot);
+            let line = LOCK_LINES[slot].load(Ordering::Acquire);
+            println!(
+                "[lockdep] hart={} depth={} rank={} key={:#x} name={} acquired_at={}:{}",
+                cpu, index, rank, key, name, file, line
+            );
+        }
     }
 }
 
@@ -193,34 +326,53 @@ impl<T> SpinNoIrq<T> {
     }
 
     #[inline]
+    #[track_caller]
     fn check_not_recursive(&self) {
-        #[cfg(debug_assertions)]
+        if !LOCKDEP_ENABLED {
+            return;
+        }
         if let Some(cpu) = debug_cpu() {
-            assert!(
-                self.owner.load(Ordering::Acquire) != cpu,
-                "recursive acquisition of '{}' on hart {}",
-                self.name,
-                cpu,
-            );
+            if self.owner.load(Ordering::Acquire) == cpu {
+                let caller = core::panic::Location::caller();
+                dump_lockdep_state();
+                panic!(
+                    "recursive acquisition of '{}' on hart {} requested at {}:{}",
+                    self.name,
+                    cpu,
+                    caller.file(),
+                    caller.line()
+                );
+            }
         }
     }
 
     #[inline]
-    fn acquired(&self) {
+    fn acquired(&self, caller: &'static core::panic::Location<'static>) {
         if let Some(cpu) = debug_cpu() {
-            let previous = self.owner.swap(cpu, Ordering::AcqRel);
-            debug_assert_eq!(previous, NO_OWNER, "lock '{}' owner corruption", self.name);
+            // The underlying spin::Mutex is the ownership authority.  This
+            // atomic is deliberately snapshot-only: checking its previous
+            // value after acquiring the real mutex races with the preceding
+            // guard's diagnostic teardown and produced false SMP failures.
+            // Recursive and ABBA acquisition are checked by the per-hart
+            // lockdep stack before the mutex is entered.
+            self.owner.store(cpu, Ordering::Release);
         }
-        lockdep_acquired(self.class, self.name);
+        lockdep_acquired(
+            self.class,
+            self.name,
+            self as *const Self as usize,
+            caller,
+        );
     }
 
     /// Acquire the lock, disabling local interrupts while it is held.
     #[track_caller]
     pub fn lock(&self) -> SpinNoIrqGuard<'_, T> {
+        let caller = core::panic::Location::caller();
         self.check_not_recursive();
-        lockdep_before_acquire(self.class, self.name);
+        lockdep_before_acquire(self.class, self.name, self as *const Self as usize);
         let guard = self.inner.lock();
-        self.acquired();
+        self.acquired(caller);
         SpinNoIrqGuard {
             lock: self,
             guard: Some(guard),
@@ -228,16 +380,19 @@ impl<T> SpinNoIrq<T> {
     }
 
     /// Try to acquire the lock without waiting.
+    #[track_caller]
     pub fn try_lock(&self) -> Option<SpinNoIrqGuard<'_, T>> {
-        #[cfg(debug_assertions)]
-        if let Some(cpu) = debug_cpu() {
-            if self.owner.load(Ordering::Acquire) == cpu {
-                return None;
-            }
+        let caller = core::panic::Location::caller();
+        if LOCKDEP_ENABLED
+            && debug_cpu()
+                .map(|cpu| self.owner.load(Ordering::Acquire) == cpu)
+                .unwrap_or(false)
+        {
+            return None;
         }
-        lockdep_before_acquire(self.class, self.name);
+        lockdep_before_acquire(self.class, self.name, self as *const Self as usize);
         let guard = self.inner.try_lock()?;
-        self.acquired();
+        self.acquired(caller);
         Some(SpinNoIrqGuard {
             lock: self,
             guard: Some(guard),
@@ -275,7 +430,11 @@ impl<T> DerefMut for SpinNoIrqGuard<'_, T> {
 
 impl<T> Drop for SpinNoIrqGuard<'_, T> {
     fn drop(&mut self) {
-        lockdep_released(self.lock.class, self.lock.name);
+        lockdep_released(
+            self.lock.class,
+            self.lock.name,
+            self.lock as *const SpinNoIrq<T> as usize,
+        );
         if debug_cpu().is_some() {
             self.lock.owner.store(NO_OWNER, Ordering::Release);
         }
@@ -308,14 +467,17 @@ macro_rules! define_domain_lock {
                 self.lock()
             }
 
+            #[track_caller]
             pub fn try_lock(&self) -> Option<$guard_name<'_, T>> {
                 self.0.try_lock()
             }
 
+            #[track_caller]
             pub fn try_borrow(&self) -> Option<$guard_name<'_, T>> {
                 self.try_lock()
             }
 
+            #[track_caller]
             pub fn try_borrow_mut(&self) -> Option<$guard_name<'_, T>> {
                 self.try_lock()
             }
@@ -334,7 +496,21 @@ define_domain_lock!(CpuLocalLock, CpuLocalGuard, LockClass::CpuLocal);
 define_domain_lock!(FutexLock, FutexGuard, LockClass::Futex);
 define_domain_lock!(SchedulerLock, SchedulerGuard, LockClass::Scheduler);
 define_domain_lock!(TaskLock, TaskGuard, LockClass::Task);
+define_domain_lock!(
+    SignalActionsLock,
+    SignalActionsGuard,
+    LockClass::SignalActions
+);
 define_domain_lock!(VmLock, VmGuard, LockClass::Vm);
+define_domain_lock!(FrameRefLock, FrameRefGuard, LockClass::FrameRef);
+define_domain_lock!(
+    FrameAllocatorLock,
+    FrameAllocatorGuard,
+    LockClass::FrameAllocator
+);
 define_domain_lock!(VfsLock, VfsGuard, LockClass::Vfs);
+define_domain_lock!(DentryLock, DentryGuard, LockClass::Dentry);
+define_domain_lock!(FsGlobalLock, FsGlobalGuard, LockClass::FsGlobal);
 define_domain_lock!(FsLock, FsGuard, LockClass::Fs);
+define_domain_lock!(FsAuxLock, FsAuxGuard, LockClass::FsAux);
 define_domain_lock!(DeviceLock, DeviceGuard, LockClass::Device);

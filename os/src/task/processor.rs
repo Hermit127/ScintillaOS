@@ -4,6 +4,7 @@ use core::mem::MaybeUninit;
 use super::TaskControlBlock;
 use super::{fetch_task, reap_exited_tasks};
 use super::manager::complete_context_switch;
+use crate::config::MAX_CPUS;
 use crate::sync::{assert_no_spin_locks_held, CpuLocalLock};
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -61,8 +62,8 @@ static PROCESSOR: MaybeUninit<CpuLocalLock<CpuLocal>> = MaybeUninit::uninit();
 /// `hartid` argument is correct, and the per-CPU base remains unique across
 /// user/kernel transitions, so this small registration table is the scheduler
 /// authority for the fixed four-hart platform.
-static HART_BY_PERCPU_BASE: [AtomicUsize; super::manager::MAX_SCHEDULER_CPUS] =
-    [const { AtomicUsize::new(usize::MAX) }; super::manager::MAX_SCHEDULER_CPUS];
+static HART_BY_PERCPU_BASE: [AtomicUsize; MAX_CPUS] =
+    [const { AtomicUsize::new(usize::MAX) }; MAX_CPUS];
 
 /// Pending IPI work, indexed by the stable QEMU hart ID. The producer sets a
 /// bit before issuing SBI `send_ipi`; the receiving hart clears it after
@@ -70,12 +71,37 @@ static HART_BY_PERCPU_BASE: [AtomicUsize; super::manager::MAX_SCHEDULER_CPUS] =
 /// a remote CPU must be able to publish its request without accessing another
 /// hart's per-CPU storage directly.
 const IPI_RESCHEDULE: usize = 1;
-static PENDING_IPI: [AtomicUsize; super::manager::MAX_SCHEDULER_CPUS] =
-    [const { AtomicUsize::new(0) }; super::manager::MAX_SCHEDULER_CPUS];
-static SCHEDULER_PHASE: [AtomicUsize; super::manager::MAX_SCHEDULER_CPUS] =
-    [const { AtomicUsize::new(0) }; super::manager::MAX_SCHEDULER_CPUS];
+static PENDING_IPI: [AtomicUsize; MAX_CPUS] =
+    [const { AtomicUsize::new(0) }; MAX_CPUS];
+static SCHEDULER_PHASE: [AtomicUsize; MAX_CPUS] =
+    [const { AtomicUsize::new(0) }; MAX_CPUS];
+static CURRENT_PID: [AtomicUsize; MAX_CPUS] =
+    [const { AtomicUsize::new(0) }; MAX_CPUS];
+static CURRENT_TGID: [AtomicUsize; MAX_CPUS] =
+    [const { AtomicUsize::new(0) }; MAX_CPUS];
+static CURRENT_TCB: [AtomicUsize; MAX_CPUS] =
+    [const { AtomicUsize::new(0) }; MAX_CPUS];
 
-pub fn scheduler_phases() -> [usize; super::manager::MAX_SCHEDULER_CPUS] {
+#[derive(Clone, Copy, Debug)]
+pub struct CpuSchedulerSnapshot {
+    pub phase: usize,
+    pub pid: usize,
+    pub tgid: usize,
+    pub tcb: usize,
+    pub pending_ipi: usize,
+}
+
+pub fn scheduler_cpu_snapshots() -> [CpuSchedulerSnapshot; MAX_CPUS] {
+    core::array::from_fn(|cpu| CpuSchedulerSnapshot {
+        phase: SCHEDULER_PHASE[cpu].load(Ordering::Acquire),
+        pid: CURRENT_PID[cpu].load(Ordering::Acquire),
+        tgid: CURRENT_TGID[cpu].load(Ordering::Acquire),
+        tcb: CURRENT_TCB[cpu].load(Ordering::Acquire),
+        pending_ipi: PENDING_IPI[cpu].load(Ordering::Acquire),
+    })
+}
+
+pub fn scheduler_phases() -> [usize; MAX_CPUS] {
     core::array::from_fn(|cpu| SCHEDULER_PHASE[cpu].load(Ordering::Acquire))
 }
 
@@ -90,7 +116,7 @@ pub(crate) fn set_scheduler_phase(phase: usize) {
 /// hart must call this exactly once before using scheduler APIs.
 pub fn init_current_cpu(hart_id: usize) {
     assert!(
-        hart_id < super::manager::MAX_SCHEDULER_CPUS,
+        hart_id < MAX_CPUS,
         "unsupported hart {}",
         hart_id
     );
@@ -102,11 +128,17 @@ pub fn init_current_cpu(hart_id: usize) {
 
 /// Return the boot-protocol hart ID of the current CPU.
 #[inline]
-pub fn current_hart_id() -> usize {
+pub fn try_current_hart_id() -> Option<usize> {
     let base = polyhal::percpu::get_percpu_ptr();
     HART_BY_PERCPU_BASE
         .iter()
         .position(|entry| entry.load(Ordering::Acquire) == base)
+}
+
+/// Return the boot-protocol hart ID of the current CPU.
+#[inline]
+pub fn current_hart_id() -> usize {
+    try_current_hart_id()
         .expect("current hart has not registered its per-CPU base")
 }
 
@@ -116,7 +148,7 @@ pub fn current_hart_id() -> usize {
 /// object lock. It intentionally does not force a running task to switch;
 /// first-generation SMP only needs a prompt wakeup for an idle CPU.
 pub fn request_reschedule(cpu: usize) {
-    if cpu >= super::manager::MAX_SCHEDULER_CPUS || cpu == current_hart_id() {
+    if cpu >= MAX_CPUS || cpu == current_hart_id() {
         return;
     }
     if (super::manager::online_cpu_mask() & (1usize << cpu)) == 0 {
@@ -210,14 +242,6 @@ pub fn run_tasks() {
         SCHEDULER_PHASE[cpu_id].store(5, Ordering::Release);
         if let Some(task) = fetch_task() {
             SCHEDULER_PHASE[cpu_id].store(6, Ordering::Release);
-            if first {
-                println!(
-                    "[smp] hart {}: first dispatched pid={}",
-                    current_hart_id(),
-                    task.getpid()
-                );
-                first = false;
-            }
             // The scheduler already performed Ready -> Running under its
             // lock.  Only snapshot the context and page table here.
             let mut task_inner = task.inner_exclusive_access();
@@ -227,6 +251,22 @@ pub fn run_tasks() {
             // dispatching rather than restoring the creator's CPU-local base.
             task_inner.task_cx[KContextArgs::KTP] = read_current_tp();
             task_inner.memory_set.enter_cpu(current_hart_id());
+            let pid = task.getpid();
+            let tgid = task_inner.tgid;
+            let tcb = Arc::as_ptr(&task) as usize;
+            CURRENT_PID[cpu_id].store(pid, Ordering::Release);
+            CURRENT_TGID[cpu_id].store(tgid, Ordering::Release);
+            CURRENT_TCB[cpu_id].store(tcb, Ordering::Release);
+            if first {
+                println!(
+                    "[smp] hart {}: first dispatched tid={} tgid={} tcb={:#x}",
+                    current_hart_id(),
+                    pid,
+                    tgid,
+                    tcb
+                );
+                first = false;
+            }
             let next_task_cx_ptr = &task_inner.task_cx as *const KContext;
             let token = task_inner.memory_set.token();
             drop(task_inner);
@@ -266,6 +306,9 @@ pub fn take_current_task() -> Option<Arc<TaskControlBlock>> {
     let task = current_cpu().exclusive_access().take_current();
     if let Some(task) = &task {
         let cpu = current_hart_id();
+        CURRENT_PID[cpu].store(0, Ordering::Release);
+        CURRENT_TGID[cpu].store(0, Ordering::Release);
+        CURRENT_TCB[cpu].store(0, Ordering::Release);
         // `schedule` restored BOOT_PAGE_TABLE before execution returned to
         // this idle loop, so this CPU may no longer receive user-page-table
         // shootdowns for the outgoing task.

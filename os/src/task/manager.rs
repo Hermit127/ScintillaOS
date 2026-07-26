@@ -1,4 +1,5 @@
 use super::{BlockReason, TaskControlBlock, TaskStatus};
+use crate::config::MAX_CPUS;
 use crate::sync::{PidRegistryLock, SchedulerLock};
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
@@ -10,7 +11,6 @@ use log::*;
 /// Fixed first-generation RISC-V SMP topology.  CPU0 is online during early
 /// boot; each secondary hart registers itself only after completing its local
 /// scheduler initialization.
-pub const MAX_SCHEDULER_CPUS: usize = 4;
 static ONLINE_CPU_MASK: AtomicUsize = AtomicUsize::new(1);
 
 pub fn online_cpu_mask() -> usize {
@@ -21,9 +21,9 @@ pub fn online_cpu_mask() -> usize {
 ///
 /// Do not infer this from the fixed topology: the default `QEMU_SMP=1` must
 /// not enqueue work for harts which QEMU did not create.
-pub fn register_online_cpu(cpu: usize) {
-    assert!(cpu < MAX_SCHEDULER_CPUS, "invalid scheduler CPU {}", cpu);
-    ONLINE_CPU_MASK.fetch_or(1usize << cpu, Ordering::Release);
+pub fn register_online_cpu(cpu: usize) -> usize {
+    assert!(cpu < MAX_CPUS, "invalid scheduler CPU {}", cpu);
+    ONLINE_CPU_MASK.fetch_or(1usize << cpu, Ordering::AcqRel) | (1usize << cpu)
 }
 /// A timer waiter owned by the scheduler.
 ///
@@ -55,8 +55,8 @@ pub enum BlockQueue {
 /// scheduler lock must never be held across a network/VFS callback or a call
 /// which can schedule.
 pub struct SchedulerState {
-    ready_queues: [VecDeque<Arc<TaskControlBlock>>; MAX_SCHEDULER_CPUS],
-    running: [usize; MAX_SCHEDULER_CPUS],
+    ready_queues: [VecDeque<Arc<TaskControlBlock>>; MAX_CPUS],
+    running: [usize; MAX_CPUS],
     net_blocked: Vec<Arc<TaskControlBlock>>,
     waitpid_blocked: Vec<Arc<TaskControlBlock>>,
     sleeping: Vec<SleepTask>,
@@ -67,7 +67,7 @@ impl SchedulerState {
     pub fn new() -> Self {
         Self {
             ready_queues: core::array::from_fn(|_| VecDeque::new()),
-            running: [0; MAX_SCHEDULER_CPUS],
+            running: [0; MAX_CPUS],
             net_blocked: Vec::new(),
             waitpid_blocked: Vec::new(),
             sleeping: Vec::new(),
@@ -85,7 +85,7 @@ impl SchedulerState {
         }
         let mut selected = 0;
         let mut selected_len = usize::MAX;
-        for cpu in 0..MAX_SCHEDULER_CPUS {
+        for cpu in 0..MAX_CPUS {
             if (allowed & (1 << cpu)) == 0 {
                 continue;
             }
@@ -459,7 +459,7 @@ pub fn wake_pipe_waiters(pipe_id: usize, read_waiters: bool) {
         }
         core::hint::spin_loop();
     }
-    for cpu in 0..MAX_SCHEDULER_CPUS {
+    for cpu in 0..MAX_CPUS {
         if all_targets & (1usize << cpu) != 0 {
             super::processor::request_reschedule(cpu);
         }
@@ -492,7 +492,7 @@ pub fn begin_exit(task: &Arc<TaskControlBlock>, exit_code: i32) -> bool {
     if inner.task_status == TaskStatus::Zombie {
         return false;
     }
-    if was_running && running_cpu < MAX_SCHEDULER_CPUS {
+    if was_running && running_cpu < MAX_CPUS {
         scheduler.complete_running(running_cpu);
     }
     inner.task_status = TaskStatus::Zombie;
@@ -528,6 +528,10 @@ pub fn ready_queue_counts() -> Option<(usize, usize)> {
         }
     }
     Some((tasks, zombies))
+}
+
+pub fn running_counts() -> Option<[usize; MAX_CPUS]> {
+    Some(SCHEDULER.try_borrow()?.running)
 }
 
 pub fn remove_from_ready_queue(pid: usize) -> bool {
