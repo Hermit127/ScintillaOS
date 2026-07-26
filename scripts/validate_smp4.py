@@ -357,6 +357,8 @@ def main() -> int:
             "busybox-glibc",
             "lmbench-musl",
             "lmbench-glibc",
+            "iperf-musl",
+            "iperf-glibc",
             "libctest-musl",
             "libctest-glibc",
             "matrix",
@@ -482,6 +484,13 @@ def main() -> int:
                 line.startswith("FAIL ") for line in serial.splitlines()
             ):
                 raise RuntimeError("official musl libc-test reported FAIL")
+            if args.suite.startswith("iperf-"):
+                if serial.count(" end: success ======") != 6:
+                    raise RuntimeError(
+                        "official iperf did not report all six successful cases"
+                    )
+                if " end: fail ======" in serial:
+                    raise RuntimeError("official iperf reported a failed case")
             passed = True
         except Exception as error:  # preserve all evidence before continuing
             detail = str(error)

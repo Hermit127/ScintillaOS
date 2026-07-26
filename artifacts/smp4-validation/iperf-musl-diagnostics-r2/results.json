@@ -1,0 +1,16 @@
+[
+  {
+    "round": 1,
+    "passed": true,
+    "detail": "completed",
+    "log": "round-01/serial.log",
+    "metrics": {
+      "group_end": 1,
+      "case_start": 0,
+      "case_end": 0,
+      "pass": 0,
+      "fail": 0,
+      "skip": 0
+    }
+  }
+]

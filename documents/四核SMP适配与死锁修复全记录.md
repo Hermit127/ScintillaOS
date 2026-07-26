@@ -319,8 +319,9 @@ TLS 和取消点在 glibc 上并不保证相同结果。因此本记录只把“
    要求传 19。内核返回 EINVAL；未修改该测试，也未加入私有兼容。
 2. LoongArch 交叉检查仍因宿主缺 `loongarch64-linux-gnu-gcc` 无法完成；这是
    环境缺口，不能据此声称 LoongArch 已回归。
-3. stdin、poll 和若干网络路径仍采用重新轮询式 yield。现有矩阵未复现 lost wake，
-   但它们尚未全部迁移为事件 wait queue，性能和未来扩展风险保留。
+3. stdin 和若干物理网卡路径仍采用重新轮询式 yield。pipe、poll 和本地 UDP 已使用
+   统一的登记等待者—二次检查—提交/取消协议；尚未迁移的路径仍保留性能和未来扩展
+   风险。
 4. “没有任何问题”只能解释为本文固定的 RISC-V QEMU 四核、256 MiB、双盘矩阵
    未发现未处理内核故障，不是对未覆盖硬件、网络负载或 LoongArch 的无限保证。
 
@@ -384,3 +385,108 @@ SHA-256 后为：
 
 `.gitignore` 排除后续生成的 `round-*`、串口日志和 qcow2 overlay，防止大型
 运行产物再次进入提交。
+
+## 10. 2026-07-26：适配 main 的 iperf 改动
+
+### 10.1 上游增量审计与取舍
+
+本轮审计的上游提交是
+`c4d1dfef16cec8b590200b9a6d585781f5525e1f`（“iperf修复实现，本地干净镜像
+可以通过”）。它基于单核 `main`，不能直接合并到已经重构调度、阻塞、vfork、
+VFS 锁和任务生命周期的 `smp-riscv4`。实际采用“按语义移植，再用四核不变量
+补强”的方式：
+
+| 上游改动 | 当前四核分支处理 |
+|---|---|
+| open 后 unlink、live fd truncate | 移植语义；注册表使用 `VfsLock`，进入 lwext4 前释放元数据锁，保持 `VfsLock → FsLock` 锁序 |
+| TCP listener poll、UDP peer 过滤、socket close 清理 | 移植，并补充本地无 VirtIO 网卡时的 UDP 可写语义 |
+| UDP 本地队列满时丢最旧包并让出 | 移植；保留队列容量和官方负载参数 |
+| 单核快照式 UDP/poll 唤醒 | 不直接移植；改用 `SchedulerLock` 内的原子 waiter 状态转换 |
+| 单核 `vfork_parent` weak pointer | 不移植；当前分支已有原子 vfork owner、统一阻塞和退出发布协议 |
+| 网络定时唤醒 vfork | 不移植；vfork 只由 exec/exit 的真实完成事件唤醒 |
+
+因此这不是把 `main` 的八个文件机械覆盖到当前系统，也没有回退四核调度或覆盖
+既有未提交修改。
+
+### 10.2 实际发现的四核 iperf 故障
+
+最初官方 TCP 三项可以通过，UDP 三项在握手后报 `Broken pipe`。诊断链最终定位
+到四个相互关联的问题：
+
+1. 本地 loopback UDP socket 在没有物理 VirtIO net 后端时被报告为不可写；
+2. nonblocking server 在本地 UDP 队列暂时为空时继续进入不存在的物理后端，
+   返回 `-1`，而 Linux 语义应为 `-EAGAIN`；
+3. UDP/poll 唤醒通过任务快照和 `try_inner_borrow` 实现，TaskLock 短暂竞争会
+   跳过 waiter，且“检查为空—登记阻塞”之间存在丢失唤醒窗口；
+4. 用户时钟为每一次全局读取强制至少加一微秒/一个 tick，多 hart 和多进程共同
+   读取会人为加速时间，poll 还额外注入 10 ms，破坏 iperf 的真实两秒测量。
+
+修复后的状态转换与 pipe 使用同一协议：
+
+```text
+检查条件
+  → SchedulerLock 内登记 waiter（Running → Blocking）
+  → 释放调度锁后二次检查
+  → 条件已满足：取消阻塞并继续
+  → 条件仍不满足：切换；并发 wake 记录 WakePending
+  → idle handoff 保存完上下文后发布 Ready
+```
+
+`wake_udp_waiters()` 和 `wake_poll_waiters()` 现在直接在调度器事务内识别
+`BlockReason` 并完成唤醒，UDP blocking read 在登记后同时复查本地队列和物理
+socket。nonblocking 本地空队列返回 `-EAGAIN`；本地队列写满时丢最旧 datagram，
+不把成功发送伪装成错误。`clock_gettime/gettimeofday/times` 使用硬件时间的
+非递减最大值，相同瞬间允许返回相同值，不再跨 hart 人工推进全局时间。
+
+### 10.3 四核所有权日志说明
+
+启动日志中 hart 0 和 hart 1 可能先后打印相同的 init `tid=1/tcb`。这是 init
+任务让出后发生的合法迁移；“first dispatched”是每个 hart 的首次调度日志，不
+表示两行发生在同一时刻。实际调度由同一个 `SchedulerLock` 完成
+`Ready → Running`，随后
+`compare_exchange(NO_RUNNING_CPU, cpu)` 声明唯一 TCB owner；如果第二个 hart
+并发取得同一 TCB，内核会立即触发所有权断言。保留的 20 轮定向测试均无该断言、
+队列重复、lockdep 或 panic，并且每轮都有
+`smpstress passed: online=0xf, observed=0xf`。
+
+### 10.4 官方输入与不可变性
+
+官方脚本来自
+`testsuits-for-oskernel/scripts/iperf/iperf_testcode.sh`，SHA-256 为
+`81f782cdfd777cda3e0a588a1b27984e89939c2d9467beba0e0709f3dfc425ac`。
+musl/glibc 静态 iperf3 均使用赛事镜像
+`docker.educg.net/cg/os-contest:20250624` 的官方工具链从同一上游源码构建：
+
+| 输入 | SHA-256 |
+|---|---|
+| musl iperf3 ELF | `ee6107f6012cf38e0f15a3126ff348b205f6aef0959b9e1a74e4d4bced7c34f7` |
+| glibc iperf3 ELF | `746bb191be37a3576d38aa80c52b590f89c2b90fe3090cee63c8af51bdd89535` |
+| 官方双 ABI iperf 测试盘 | `b57fba410d89ea6b651ceff33fee6f9c573b71cb9b40fa9244c0a3c68cc866a4` |
+| 本轮普通 release `kernel-rv` | `f2a591bef08e26b9357f5915c798ca9d387fe0aeb7922e9aa893cab251d29951` |
+| root fs | `ae7dfd63cf838a0e19c24ac4ff9e8ee45c99020e2df7a6d07964f93457ce5b43` |
+
+测试脚本没有注释、删减、修改参数或插入 guest timeout。每轮原样执行
+BASIC/PARALLEL/REVERSE 的 UDP/TCP 六项，`-t 2`、UDP `-b 1000G` 保持不变。
+
+### 10.5 最终结果与回归
+
+| 测试 | 结果 | 仓库摘要 |
+|---|---:|---|
+| musl 官方 iperf | 3/3 冷启动；18/18 case success；每轮 END | `artifacts/smp4-validation/iperf-musl-final-r2/` |
+| glibc 官方 iperf | 3/3 冷启动；18/18 case success；每轮 END | `artifacts/smp4-validation/iperf-glibc-final-r2/` |
+| diagnostics musl iperf | 1/1；6/6 case success；END | `artifacts/smp4-validation/iperf-musl-diagnostics-r2/` |
+| 四核定向 | 20/20；online/observed 均为 `0xf` | `artifacts/smp4-validation/directed-after-iperf-r2/` |
+| BusyBox musl/glibc 回归 | 各 1/1 END | `artifacts/smp4-validation/busybox-*-after-iperf-r2/` |
+| lmbench musl/glibc 回归 | 各 1/1 END | `artifacts/smp4-validation/lmbench-*-after-iperf-r2/` |
+| libc-test musl/glibc 回归 | 各 1/1 END | `artifacts/smp4-validation/libctest-*-after-iperf-r2/` |
+
+构建侧通过 `git diff --check`、RISC-V 普通 release 和
+`smp-diagnostics` release `cargo check`，以及普通 release 完整构建。新增
+validator suite 会强制每轮恰好出现六个 iperf success、不得出现 case fail，并
+继续要求自然组 `END`。
+
+完整串口、QEMU 命令和 qcow2 overlay 已移到
+`/home/lyz/OS/oskernel2026test-validation-raw-20260726/`。加入本轮证据后归档
+共有 112 个冷启动轮次、488 个文件、311,418,095 字节；按相对路径排序的逐文件
+SHA-256 清单再做 SHA-256 的结果为
+`c7fce4a7126a1ca2e584b82d2463949db5ba696f1628f8826a4a0a705f41451d`。
