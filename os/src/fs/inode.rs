@@ -10,11 +10,25 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use bitflags::*;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::*;
 use lwext4_rust::bindings::*;
 
 const EXT4_BLOCK_SIZE: u32 = 4096;
 const PATH_TIME_CACHE_MAX_ENTRIES: usize = 1024;
+const UNLINKED_FILE_PREFIX: &str = ".os-unlinked-";
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct OpenInodeKey {
+    super_block: usize,
+    inode: u32,
+}
+
+struct OpenInodeState {
+    count: usize,
+    orphan_path: Option<String>,
+    unlink_in_progress: bool,
+}
 
 #[derive(Clone, Copy, Default)]
 struct CachedTimes {
@@ -32,6 +46,131 @@ lazy_static! {
         VfsLock::new_named(BTreeMap::new(), "VfsPathSpecialModeCache");
     static ref PATH_FS_FLAGS_CACHE: VfsLock<BTreeMap<String, usize>> =
         VfsLock::new_named(BTreeMap::new(), "VfsPathFsFlagsCache");
+    /// Tracks live lwext4 handles so unlink can preserve Linux's
+    /// "open file survives directory removal" semantics.
+    ///
+    /// The table is VFS metadata and is never held while entering lwext4.
+    static ref OPEN_INODES: VfsLock<BTreeMap<OpenInodeKey, OpenInodeState>> =
+        VfsLock::new_named(BTreeMap::new(), "VfsOpenInodes");
+}
+
+static NEXT_UNLINKED_FILE: AtomicUsize = AtomicUsize::new(0);
+
+fn open_inode_key(dentry: &Arc<Dentry>) -> Option<OpenInodeKey> {
+    if dentry.is_dir || dentry.is_link {
+        return None;
+    }
+    let inode = dentry.inode_info()?.inode_num;
+    Some(OpenInodeKey {
+        super_block: Arc::as_ptr(&dentry.super_block) as usize,
+        inode,
+    })
+}
+
+fn register_open_inode(key: OpenInodeKey) {
+    let mut open = OPEN_INODES.exclusive_access();
+    let state = open.entry(key).or_insert(OpenInodeState {
+        count: 0,
+        orphan_path: None,
+        unlink_in_progress: false,
+    });
+    state.count += 1;
+}
+
+fn unregister_open_inode(key: OpenInodeKey) -> Option<String> {
+    let mut open = OPEN_INODES.exclusive_access();
+    let state = open.get_mut(&key)?;
+    if state.count == 0 {
+        return None;
+    }
+    state.count -= 1;
+    if state.count != 0 || state.unlink_in_progress {
+        return None;
+    }
+    let orphan_path = state.orphan_path.take();
+    open.remove(&key);
+    orphan_path
+}
+
+fn unlinked_file_path(dentry: &Dentry, inode: u32) -> String {
+    let sequence = NEXT_UNLINKED_FILE.fetch_add(1, Ordering::Relaxed);
+    let parent = dentry
+        .fs_path
+        .rfind('/')
+        .map(|index| &dentry.fs_path[..index])
+        .unwrap_or("");
+    if parent.is_empty() {
+        alloc::format!("/{}{}-{}", UNLINKED_FILE_PREFIX, inode, sequence)
+    } else {
+        alloc::format!("{}/{}{}-{}", parent, UNLINKED_FILE_PREFIX, inode, sequence)
+    }
+}
+
+/// Rename an open file to a hidden orphan and defer physical removal until
+/// the last open handle closes.
+///
+/// Reservation and completion are separate VFS critical sections.  lwext4 is
+/// entered between them with no VFS metadata lock held, preserving the global
+/// `VfsLock -> FsLock` order and allowing a concurrent close to publish count
+/// zero without losing the final cleanup.
+fn defer_open_file_unlink(dentry: &Arc<Dentry>) -> Option<bool> {
+    let info = dentry.inode_info()?;
+    if info.links_count > 1 {
+        return None;
+    }
+    let key = OpenInodeKey {
+        super_block: Arc::as_ptr(&dentry.super_block) as usize,
+        inode: info.inode_num,
+    };
+    let orphan_path = unlinked_file_path(dentry, info.inode_num);
+    let old_path = CString::new(dentry.fs_path.as_bytes()).ok()?;
+    let new_path = CString::new(orphan_path.as_bytes()).ok()?;
+    {
+        let mut open = OPEN_INODES.exclusive_access();
+        let state = open.get_mut(&key)?;
+        if state.count == 0 || state.orphan_path.is_some() || state.unlink_in_progress {
+            return None;
+        }
+        state.unlink_in_progress = true;
+    }
+
+    let renamed = {
+        let _fs_lock = dentry.super_block.lock_fs();
+        unsafe {
+            ext4_frename(
+                old_path.as_ptr() as *const core::ffi::c_char,
+                new_path.as_ptr() as *const core::ffi::c_char,
+            ) == EOK as i32
+        }
+    };
+
+    let cleanup_path = {
+        let mut open = OPEN_INODES.exclusive_access();
+        let mut remove_state = false;
+        let mut cleanup = None;
+        if let Some(state) = open.get_mut(&key) {
+            state.unlink_in_progress = false;
+            if renamed {
+                state.orphan_path = Some(orphan_path.clone());
+            }
+            if state.count == 0 {
+                cleanup = state.orphan_path.take();
+                remove_state = true;
+            }
+        } else if renamed {
+            // A defensive fallback for a corrupted/missing registry entry:
+            // do not leave the hidden file behind indefinitely.
+            cleanup = Some(orphan_path.clone());
+        }
+        if remove_state {
+            open.remove(&key);
+        }
+        cleanup
+    };
+    if let Some(path) = cleanup_path {
+        let _ = dentry.super_block.unlink_file(&path);
+    }
+    Some(renamed)
 }
 
 pub fn record_special_path_mode(fs_path: &str, mode_type: u32) {
@@ -107,6 +246,7 @@ pub struct OSInode {
     /// Per-open-file offset, cached stat and lwext4 handle.  It is acquired
     /// before the owning superblock's FsLock whenever the handle is used.
     inner: VfsLock<OSInodeInner>,
+    open_key: Option<OpenInodeKey>,
 }
 
 unsafe impl Send for OSInode {}
@@ -122,12 +262,17 @@ pub struct OSInodeInner {
 
 impl Drop for OSInode {
     fn drop(&mut self) {
-        let mut inner = self.inner.exclusive_access();
-        if let Some(ref mut f) = inner.file_handle {
-            let _fs_lock = self.dentry.super_block.lock_fs();
-            unsafe {
-                ext4_fclose(f);
+        {
+            let mut inner = self.inner.exclusive_access();
+            if let Some(ref mut f) = inner.file_handle {
+                let _fs_lock = self.dentry.super_block.lock_fs();
+                unsafe {
+                    ext4_fclose(f);
+                }
             }
+        }
+        if let Some(orphan_path) = self.open_key.and_then(unregister_open_inode) {
+            let _ = self.dentry.super_block.unlink_file(&orphan_path);
         }
     }
 }
@@ -154,7 +299,8 @@ impl OSInode {
         } else {
             0
         };
-        let inode = Self {
+        let key = open_inode_key(&dentry);
+        let mut inode = Self {
             readable,
             writable,
             dentry,
@@ -168,25 +314,33 @@ impl OSInode {
                 },
                 "VfsOpenFileState",
             ),
+            open_key: None,
         };
+        if let Some(key) = key {
+            if inode.open_handle() {
+                register_open_inode(key);
+                inode.open_key = Some(key);
+                let _ = inode.stat_inner();
+            }
+        }
         inode
     }
     pub fn dentry(&self) -> &Arc<Dentry> {
         &self.dentry
     }
 
-    fn open_handle(&self) {
+    fn open_handle(&self) -> bool {
         let fs_path = &self.dentry.fs_path;
         let c_path = match CString::new(fs_path.as_bytes()) {
             Ok(s) => s,
-            Err(_) => return,
+            Err(_) => return false,
         };
         // File already exists (created by open_file_at/create_file).
         // Use "r+b" for writable files, "rb" for read-only.
         let flags = if self.writable { "r+b" } else { "rb" };
         let c_flags = match CString::new(flags) {
             Ok(s) => s,
-            Err(_) => return,
+            Err(_) => return false,
         };
 
         // The file-handle state is the outer VFS lock.  Keep it held while
@@ -194,7 +348,7 @@ impl OSInode {
         // the superblock FsLock then serializes lwext4 itself.
         let mut inner = self.inner.exclusive_access();
         if inner.file_handle.is_some() {
-            return;
+            return true;
         }
         let offset = inner.offset;
         let mut file: ext4_file = unsafe { core::mem::zeroed() };
@@ -214,6 +368,9 @@ impl OSInode {
         };
         if rc == EOK as i32 {
             inner.file_handle = Some(file);
+            true
+        } else {
+            false
         }
     }
 
@@ -345,6 +502,29 @@ impl OSInode {
             st.st_blocks = ((size.max(0) as u64) + 511) / 512;
         }
         self.dentry.update_cached_size(size.max(0) as u64);
+    }
+
+    pub fn truncate(&self, size: u64) -> bool {
+        if !self.writable || !self.open_handle() {
+            return false;
+        }
+        let mut inner = self.inner.exclusive_access();
+        let Some(ref mut file) = inner.file_handle else {
+            return false;
+        };
+        let truncated = {
+            let _fs_lock = self.dentry.super_block.lock_fs();
+            unsafe { ext4_ftruncate(file, size) == EOK as i32 }
+        };
+        if !truncated {
+            return false;
+        }
+        if let Some(ref mut st) = inner.cached_stat {
+            st.st_size = size as i64;
+            st.st_blocks = (size + 511) / 512;
+        }
+        self.dentry.update_cached_size(size);
+        true
     }
 
     pub fn update_cached_mode(&self, mode: u32) {
@@ -711,6 +891,8 @@ pub fn unlink_at(base: Option<Arc<Dentry>>, path: &str, is_dir: bool) -> bool {
 
     let ok = if is_dir {
         dentry.super_block.unlink_dir(&dentry.fs_path)
+    } else if let Some(deferred) = defer_open_file_unlink(&dentry) {
+        deferred
     } else {
         dentry.super_block.unlink_file(&dentry.fs_path)
     };
@@ -1169,7 +1351,10 @@ impl File for OSInode {
             let entry = &entries[entry_index];
             let name = entry.get_name();
             let name_bytes = name.as_bytes();
-            if name_bytes.is_empty() || name.starts_with(".tmpfile.") {
+            if name_bytes.is_empty()
+                || name.starts_with(".tmpfile.")
+                || name.starts_with(UNLINKED_FILE_PREFIX)
+            {
                 entry_index += 1;
                 continue;
             }
