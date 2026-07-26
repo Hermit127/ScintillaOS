@@ -168,22 +168,25 @@ impl File for SocketFile {
             return super::syscall::local_tcp_poll(conn_id, server_side);
         }
         if self.was_listening.load(Ordering::Relaxed) {
-            if let Some(local) = self.get_local_endpoint() {
-                if super::syscall::local_tcp_pending_on(local.port) {
-                    return (true, true, false);
-                }
-            }
+            let pending = self
+                .get_local_endpoint()
+                .map(|local| super::syscall::local_tcp_pending_on(local.port))
+                .unwrap_or(false);
+            return (pending, true, false);
         }
         if self.socket_type == SocketType::Udp {
-            if let Some(peer) = self.get_peer_endpoint() {
-                if super::syscall::is_local_endpoint(peer) {
-                    crate::syscall::process::advance_user_time_us(10_000);
+            let mut local_pending = false;
+            if let Some(local) = self.get_local_endpoint() {
+                if super::syscall::local_udp_pending_on(local, self.get_peer_endpoint()) {
+                    local_pending = true;
                 }
             }
-            if let Some(local) = self.get_local_endpoint() {
-                if super::syscall::local_udp_pending_on(local.port) {
-                    return (true, true, false);
-                }
+            let local_peer = self
+                .get_peer_endpoint()
+                .map(super::syscall::is_local_endpoint)
+                .unwrap_or(false);
+            if local_peer || !crate::net::net_available_fast() {
+                return (local_pending, true, false);
             }
         }
         #[cfg(any(
@@ -244,6 +247,9 @@ impl File for SocketFile {
             if let Some(local) = self.get_local_endpoint() {
                 super::syscall::local_tcp_unlisten(local.port);
             }
+        }
+        if self.socket_type == SocketType::Udp {
+            super::syscall::local_udp_close(self.get_local_endpoint(), self.get_peer_endpoint());
         }
 
         let handle = self.get_handle();

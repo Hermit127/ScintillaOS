@@ -92,7 +92,6 @@ struct FutexKey {
 
 static LAST_USER_TIME_US: AtomicU64 = AtomicU64::new(0);
 static LAST_USER_TIMES_TICK: AtomicU64 = AtomicU64::new(0);
-const USER_TIME_MIN_STEP_US: u64 = 1;
 const USER_CLOCK_TICK_US: u64 = 10_000;
 const USER_CLOCK_TICK_NS: usize = USER_CLOCK_TICK_US as usize * 1_000;
 const NSEC_PER_SEC: usize = 1_000_000_000;
@@ -477,28 +476,14 @@ fn monotonic_user_time_us() -> u64 {
     let hw_us = (Time::now().to_nsec() / 1000) as u64;
     loop {
         let last = LAST_USER_TIME_US.load(Ordering::Relaxed);
-        let next = hw_us.max(last.saturating_add(USER_TIME_MIN_STEP_US));
-        if LAST_USER_TIME_US
-            .compare_exchange(last, next, Ordering::AcqRel, Ordering::Relaxed)
-            .is_ok()
-        {
-            return next;
+        if hw_us <= last {
+            return last;
         }
-    }
-}
-
-pub(crate) fn advance_user_time_us(delta: u64) {
-    if delta == 0 {
-        return;
-    }
-    loop {
-        let last = LAST_USER_TIME_US.load(Ordering::Relaxed);
-        let next = last.saturating_add(delta);
         if LAST_USER_TIME_US
-            .compare_exchange(last, next, Ordering::AcqRel, Ordering::Relaxed)
+            .compare_exchange(last, hw_us, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
         {
-            return;
+            return hw_us;
         }
     }
 }
@@ -507,12 +492,14 @@ fn monotonic_user_times_tick() -> u64 {
     let hw_tick = monotonic_user_time_us() / USER_CLOCK_TICK_US;
     loop {
         let last = LAST_USER_TIMES_TICK.load(Ordering::Relaxed);
-        let next = hw_tick.max(last.saturating_add(1));
+        if hw_tick <= last {
+            return last;
+        }
         if LAST_USER_TIMES_TICK
-            .compare_exchange(last, next, Ordering::AcqRel, Ordering::Relaxed)
+            .compare_exchange(last, hw_tick, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
         {
-            return next;
+            return hw_tick;
         }
     }
 }

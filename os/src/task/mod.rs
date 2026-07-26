@@ -44,7 +44,8 @@ pub use fp::UserFloatState;
 pub use manager::{
     add_priority_task, add_task, begin_block, begin_exit, cancel_block_before_switch,
     net_blocked_snapshot, online_cpu_mask, pid2task, register_online_cpu, remove_sleep,
-    take_waitpid, task_snapshot, update_task_affinity, wake_pipe_waiters, wake_task, BlockQueue,
+    take_waitpid, task_snapshot, update_task_affinity, wake_pipe_waiters, wake_task,
+    wake_udp_waiters, BlockQueue,
 };
 pub use pid::{pid_alloc, PidHandle};
 pub use processor::{
@@ -203,17 +204,7 @@ pub fn block_current_until(block_reason: BlockReason, wakeup_time: Option<usize>
 }
 
 pub fn wake_poll_wait_tasks() {
-    let tasks: Vec<_> = manager::net_blocked_snapshot()
-        .into_iter()
-        .filter(|task| {
-            task.try_inner_borrow()
-                .map(|inner| matches!(inner.block_reason, Some(BlockReason::PollWait)))
-                .unwrap_or(false)
-        })
-        .collect();
-    for task in tasks {
-        manager::wake_task(task);
-    }
+    manager::wake_poll_waiters();
 }
 
 pub fn wake_pipe_read_tasks(pipe_id: usize) {

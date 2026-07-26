@@ -409,7 +409,7 @@ pub fn wake_task(task: Arc<TaskControlBlock>) -> bool {
 /// transaction.  The old snapshot/`try_inner_borrow` implementation could
 /// silently skip a waiter whose TaskLock was briefly held by another hart,
 /// permanently losing the only wakeup for a one-byte ping-pong.
-pub fn wake_pipe_waiters(pipe_id: usize, read_waiters: bool) {
+fn wake_net_waiters_matching(mut matches_reason: impl FnMut(BlockReason) -> bool) {
     let mut all_targets = 0usize;
     loop {
         let mut contended = false;
@@ -421,11 +421,7 @@ pub fn wake_pipe_waiters(pipe_id: usize, read_waiters: bool) {
                 contended = true;
                 break;
             };
-            let matches = match inner.block_reason {
-                Some(BlockReason::PipeRead(id)) => read_waiters && id == pipe_id,
-                Some(BlockReason::PipeWrite(id)) => !read_waiters && id == pipe_id,
-                _ => false,
-            };
+            let matches = inner.block_reason.map(&mut matches_reason).unwrap_or(false);
             if !matches {
                 index += 1;
                 continue;
@@ -464,6 +460,22 @@ pub fn wake_pipe_waiters(pipe_id: usize, read_waiters: bool) {
             super::processor::request_reschedule(cpu);
         }
     }
+}
+
+pub fn wake_pipe_waiters(pipe_id: usize, read_waiters: bool) {
+    wake_net_waiters_matching(|reason| match reason {
+        BlockReason::PipeRead(id) => read_waiters && id == pipe_id,
+        BlockReason::PipeWrite(id) => !read_waiters && id == pipe_id,
+        _ => false,
+    });
+}
+
+pub fn wake_udp_waiters() {
+    wake_net_waiters_matching(|reason| matches!(reason, BlockReason::UdpRecv(_)));
+}
+
+pub fn wake_poll_waiters() {
+    wake_net_waiters_matching(|reason| matches!(reason, BlockReason::PollWait));
 }
 
 /// Remove scheduler membership and publish a terminal task state together.
