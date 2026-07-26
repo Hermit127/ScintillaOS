@@ -47,6 +47,11 @@ macro_rules! includes_trap_macros {
         .macro LOAD_GENERAL_REGS
             LOAD    t0, 32
             LOAD    t1, 33
+            # Keep RISC-V V state enabled across both user and supervisor
+            # returns.  Trap frames created before the vector-capable CPU
+            # setup may carry VS=Off; restoring that value makes the first
+            # vector-state save trap recursively inside TaskLock.
+            ori     t0, t0, 0x600
             csrw    sstatus, t0
             csrw    sepc, t1
 

@@ -2,6 +2,14 @@ use bitflags::*;
 
 pub const MAX_SIG: usize = 34;
 
+/// Metadata retained with a coalesced standard signal until delivery.
+#[derive(Clone, Copy, Default)]
+pub struct PendingSignalInfo {
+    pub code: i32,
+    pub sender_pid: i32,
+    pub sender_uid: u32,
+}
+
 bitflags! {
     pub struct SignalFlags: u64 {
         const SIGDEF = 1; // Default signal handling

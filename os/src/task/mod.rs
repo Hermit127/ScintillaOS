@@ -21,18 +21,20 @@ use polyhal::instruction::shutdown;
 use polyhal::kcontext::KContext;
 use polyhal_trap::trapframe::{TrapFrame, TrapFrameArgs};
 
-pub const SIGNAL_RETURN_TRAMPOLINE: usize = 0x7ffeff000;
+pub use crate::config::SIGNAL_RETURN_TRAMPOLINE;
 const SA_SIGINFO: usize = 4;
 const SA_RESTORER: usize = 0x0400_0000;
 const SA_NOCLDWAIT: usize = 2;
 const SIG_IGN: usize = 1;
+const SIGSEGV_NUM: usize = 11;
 const SIGCHLD_NUM: usize = 17;
 const SIGINFO_SIZE: usize = 128;
-// RISC-V ucontext: 168-byte header followed by sigcontext.  The latter
-// contains 32 integer words and the 528-byte maximum FP-state union.
+// RISC-V ucontext: the 168-byte flags/link/stack/sigmask prefix is padded to
+// the sigcontext's 16-byte alignment, so mcontext begins at byte 176.  Its
+// first word is PC, followed by x1..x31.
 const UCONTEXT_SIZE: usize = 960;
 const UCONTEXT_SIGMASK_OFFSET: usize = 40;
-const UCONTEXT_MCONTEXT_OFFSET: usize = 168;
+const UCONTEXT_MCONTEXT_OFFSET: usize = 176;
 const UCONTEXT_PC_OFFSET: usize = UCONTEXT_MCONTEXT_OFFSET;
 static SIGNAL_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
 const SIGNAL_TRACE_ENABLED: bool = false;
@@ -48,9 +50,9 @@ pub use pid::{pid_alloc, PidHandle};
 pub use processor::{
     current_hart_id, current_task, current_user_token, flush_remote_tlb, handle_ipi,
     init_current_cpu, init_kernel_page, record_timer_tick, request_reschedule, run_tasks,
-    schedule, take_current_task,
+    schedule, scheduler_cpu_snapshots, take_current_task, try_current_hart_id,
 };
-pub use signal::{SignalFlags, MAX_SIG};
+pub use signal::{PendingSignalInfo, SignalFlags, MAX_SIG};
 pub use task::{
     blank_kcontext, BlockReason, KernelStack, TaskControlBlock, TaskControlBlockInner, TaskStatus,
 };
@@ -64,6 +66,21 @@ pub struct TimeSpec {
 
 fn defer_drop_task(task: Arc<TaskControlBlock>) {
     manager::defer_drop_task(task);
+}
+
+/// Finish Linux's vfork parent suspension after the child has either
+/// committed a new image or begun exiting.
+///
+/// `take_vfork_parent` is the one-shot publication point.  Waking through the
+/// normal scheduler state machine makes completion safe whether it races
+/// before block registration, during `Blocking`, or after the context switch.
+pub fn complete_vfork(task: &Arc<TaskControlBlock>) {
+    let Some(parent_tid) = task.take_vfork_parent() else {
+        return;
+    };
+    if let Some(parent) = pid2task(parent_tid) {
+        manager::wake_task(parent);
+    }
 }
 
 pub(super) fn reap_exited_tasks() {
@@ -295,21 +312,22 @@ fn parent_auto_reaps_sigchld(parent: &Arc<TaskControlBlock>) -> bool {
     parent
         .try_inner_borrow()
         .map(|inner| {
-            let action = inner.signal_actions.table[SIGCHLD_NUM];
+            let action = inner.signal_actions.lock().table[SIGCHLD_NUM];
             action.handler == SIG_IGN || (action.flags & SA_NOCLDWAIT) != 0
         })
         .unwrap_or(false)
 }
 
 fn detach_child_from_parent(parent: &Arc<TaskControlBlock>, child_pid: usize) {
-    let mut parent_inner = parent.inner_exclusive_access();
-    if let Some(idx) = parent_inner
-        .children
-        .iter()
-        .position(|child| child.getpid() == child_pid)
-    {
-        parent_inner.children.remove(idx);
-    }
+    let removed = {
+        let mut parent_inner = parent.inner_exclusive_access();
+        parent_inner
+            .children
+            .iter()
+            .position(|child| child.getpid() == child_pid)
+            .map(|idx| parent_inner.children.remove(idx))
+    };
+    drop(removed);
 }
 
 fn is_thread_group_leader(task: &Arc<TaskControlBlock>) -> bool {
@@ -463,7 +481,10 @@ static STALL_SNAPSHOT_PRINTED: core::sync::atomic::AtomicBool =
 #[cfg(target_arch = "riscv64")]
 static STALL_SNAPSHOT_TICKS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(target_arch = "riscv64")]
-const SCHED_STALL_DIAGNOSTICS: bool = false;
+const SCHED_STALL_DIAGNOSTICS: bool = cfg!(feature = "smp-diagnostics");
+// Lifecycle state remains available through the diagnostic snapshot.  Per
+// exit logging is disabled during acceptance so independent harts cannot
+// splice text into official test markers.
 const LIFECYCLE_TRACE_ENABLED: bool = false;
 
 /// Emit one read-only scheduler snapshot when all runnable work has vanished
@@ -493,6 +514,7 @@ pub fn diagnose_scheduler_stall() {
                 phases,
                 manager::scheduler_lock_owner()
             );
+            crate::sync::dump_lockdep_state();
         }
     }
     let Some((ready, _)) = manager::ready_queue_counts() else {
@@ -502,6 +524,19 @@ pub fn diagnose_scheduler_stall() {
         return;
     };
     if ready != 0 || net + waitpid + sleeping < 2 {
+        STALL_SNAPSHOT_TICKS.store(0, Ordering::Release);
+        STALL_SNAPSHOT_PRINTED.store(false, Ordering::Release);
+        return;
+    }
+    let Some(running) = manager::running_counts() else {
+        return;
+    };
+    // A quiet, CPU-bound or block-I/O-heavy process can legitimately be the
+    // only runnable task while several ancestor shells waitpid.  The old
+    // queue-only heuristic labelled that normal state a deadlock.  Running
+    // hangs are covered by lockdep and the host no-output watchdog; this
+    // queue detector is specifically for work lost with no CPU owner.
+    if running.iter().copied().sum::<usize>() != 0 {
         STALL_SNAPSHOT_TICKS.store(0, Ordering::Release);
         STALL_SNAPSHOT_PRINTED.store(false, Ordering::Release);
         return;
@@ -531,18 +566,36 @@ pub fn diagnose_scheduler_stall() {
         crate::syscall::LAST_SYSCALL_ARG1.load(Ordering::Relaxed),
         crate::syscall::LAST_SYSCALL_ARG2.load(Ordering::Relaxed),
     );
+    for (cpu, snapshot) in processor::scheduler_cpu_snapshots().iter().enumerate() {
+        println!(
+            "[sched-stall] hart={} phase={} tid={} tgid={} tcb={:#x} pending_ipi={:#x}",
+            cpu,
+            snapshot.phase,
+            snapshot.pid,
+            snapshot.tgid,
+            snapshot.tcb,
+            snapshot.pending_ipi
+        );
+    }
+    println!("[sched-stall] running-counts={:?}", running);
+    crate::sync::dump_lockdep_state();
     for task in tasks {
         if let Some(inner) = task.try_inner_borrow() {
             println!(
-                "[sched-stall] pid={} owner={} state={:?} reason={:?} children={}",
+                "[sched-stall] tid={} tgid={} tcb={:#x} owner={} queued={} state={:?} reason={:?} children={}",
                 task.getpid(),
+                inner.tgid,
+                Arc::as_ptr(&task) as usize,
                 task.running_cpu(),
+                task.is_enqueued(),
                 inner.task_status,
                 inner.block_reason,
                 inner.children.len()
             );
         }
     }
+    #[cfg(feature = "smp-diagnostics")]
+    crate::syscall::process::dump_futex_waiters();
 }
 
 pub const IDLE_PID: usize = 0;
@@ -555,6 +608,10 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
     let task = current_task().unwrap();
 
     let pid = task.getpid();
+    complete_vfork(&task);
+    if LIFECYCLE_TRACE_ENABLED {
+        println!("[lifecycle] exit-enter pid={} code={}", pid, exit_code);
+    }
     if pid == IDLE_PID {
         println!(
             "[kernel] Idle process exit with exit_code {} ...",
@@ -567,6 +624,9 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
     let _ = crate::syscall::process::remove_futex_waiter(task.getpid());
     if !manager::begin_exit(&task, exit_code) {
         panic!("current task {} exited twice", task.getpid());
+    }
+    if LIFECYCLE_TRACE_ENABLED {
+        println!("[lifecycle] exit-zombie pid={}", pid);
     }
     // Publish the parent-visible zombie event before page-table and fd
     // teardown, robust-list walking, or registry removal.  Those operations
@@ -614,23 +674,37 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
             }
         }
     }
+    if LIFECYCLE_TRACE_ENABLED {
+        println!("[lifecycle] exit-parent-notified pid={}", pid);
+    }
 
     crate::syscall::process::cleanup_task_exit_futexes(&task);
     remove_from_pid2task(task.getpid());
+    if LIFECYCLE_TRACE_ENABLED {
+        println!("[lifecycle] exit-registry-removed pid={}", pid);
+    }
 
     // ++++++ access initproc TCB exclusively
     if !orphan_children.is_empty() {
-        let mut initproc_inner = INITPROC.inner_exclusive_access();
         for child in orphan_children.iter() {
             child.inner_exclusive_access().parent = Some(Arc::downgrade(&INITPROC));
-            initproc_inner.children.push(child.clone());
         }
+        // Never nest TaskInner locks: child TCB addresses have no semantic
+        // relationship to INITPROC's address.  Publish each parent pointer,
+        // release it, and only then append the already-owned Arc snapshots.
+        INITPROC
+            .inner_exclusive_access()
+            .children
+            .extend(orphan_children.iter().cloned());
     }
     // Resource teardown is deferred until this hart has switched to its idle
     // context and boot page table.  The idle reaper publishes cleanup_done and
     // performs the final waitpid wake.
     if let Some(current) = take_current_task() {
         defer_drop_task(current);
+    }
+    if LIFECYCLE_TRACE_ENABLED {
+        println!("[lifecycle] exit-deferred pid={}", pid);
     }
     drop(task);
     loop {
@@ -671,7 +745,7 @@ pub fn check_signals_error_of_current() -> Option<(i32, &'static str)> {
             continue;
         };
         if pending.contains(signal)
-            && task_inner.signal_actions.table[sig].handler == 0
+            && task_inner.signal_actions.lock().table[sig].handler == 0
         {
             if let Some(error) = signal.check_error() {
                 return Some(error);
@@ -725,7 +799,7 @@ pub fn has_interrupting_signal(inner: &TaskControlBlockInner) -> bool {
         if !pending.contains(signal) {
             continue;
         }
-        let action = inner.signal_actions.table[sig];
+        let action = inner.signal_actions.lock().table[sig];
         if action.handler == SIG_IGN {
             continue;
         }
@@ -786,25 +860,51 @@ fn call_user_signal_handler(sig: usize, signal: SignalFlags) {
     let task = current_task().unwrap();
     let mut task_inner = task.inner_exclusive_access();
 
-    let handler = task_inner.signal_actions.table[sig].handler;
+    let handler = task_inner.signal_actions.lock().table[sig].handler;
+    #[cfg(feature = "smp-diagnostics")]
+    if sig == 32 || sig == 33 {
+        println!(
+            "[signal-diag] deliver-attempt tid={} sig={} pending={:#x} mask={:#x} handling={} handler={:#x}",
+            task.getpid(),
+            sig,
+            task_inner.signals.bits(),
+            task_inner.signal_mask.bits(),
+            task_inner.handling_sig,
+            handler,
+        );
+    }
     if handler == 1 {
         task_inner.signals ^= signal;
+        task_inner.pending_signal_info[sig] = PendingSignalInfo::default();
         return;
     }
     if handler != 0 {
-        let action = task_inner.signal_actions.table[sig];
-        // handle flag
+        let action = task_inner.signal_actions.lock().table[sig];
         let old_mask = task_inner.signal_mask;
-        task_inner.signals ^= signal;
-        task_inner.handling_sig = sig as isize;
-        task_inner.signal_mask_backup = Some(old_mask);
-        task_inner.signal_mask |= action.mask | signal;
-
+        let signal_info = task_inner.pending_signal_info[sig];
         // Linux always builds an rt_sigframe, including for a one-argument
         // handler.  Keeping the interrupted state in the user frame makes
         // nested delivery a stack operation instead of overwriting one
         // kernel-side Option.
         let interrupted = task_inner.get_trap_cx().clone();
+        // Signal delivery writes the frame from supervisor mode.  If the
+        // destination is a demand-mapped stack page, taking the fault while
+        // holding TaskLock would recursively enter the page-fault handler and
+        // deadlock on the same lock.  Resolve every page in the frame through
+        // MemorySet before performing any translated user writes.
+        if prepare_signal_frame_pages(&mut task_inner, interrupted[TrapFrameArgs::SP]).is_none() {
+            task_inner.signals ^= signal;
+            task_inner.killed = true;
+            task_inner.exit_signal = -(SIGSEGV_NUM as i32);
+            return;
+        }
+        // handle flag
+        task_inner.signals ^= signal;
+        task_inner.pending_signal_info[sig] = PendingSignalInfo::default();
+        task_inner.handling_sig = sig as isize;
+        task_inner.signal_mask_backup = Some(old_mask);
+        task_inner.signal_mask |= action.mask | signal;
+
         if SIGNAL_TRACE_ENABLED && signal == SignalFlags::SIGSEGV {
             let n = SIGNAL_TRACE_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
             if n < 12 {
@@ -819,7 +919,14 @@ fn call_user_signal_handler(sig: usize, signal: SignalFlags) {
             }
         }
         let token = task_inner.get_user_token();
-        let frame_base = write_signal_frame(token, interrupted[TrapFrameArgs::SP], sig, old_mask, &interrupted);
+        let frame_base = write_signal_frame(
+            token,
+            interrupted[TrapFrameArgs::SP],
+            sig,
+            signal_info,
+            old_mask,
+            &interrupted,
+        );
         let siginfo_addr = frame_base;
         let ucontext_addr = frame_base + SIGINFO_SIZE;
         let trap_ctx = task_inner.get_trap_cx();
@@ -869,7 +976,26 @@ fn call_user_signal_handler(sig: usize, signal: SignalFlags) {
             task_inner.exit_signal = -(sig as i32);
         }
         task_inner.signals ^= signal;
+        task_inner.pending_signal_info[sig] = PendingSignalInfo::default();
     }
+}
+
+fn prepare_signal_frame_pages(
+    task_inner: &mut TaskControlBlockInner,
+    sp: usize,
+) -> Option<usize> {
+    let frame_size = SIGINFO_SIZE + UCONTEXT_SIZE;
+    let frame_base = sp.checked_sub(frame_size)? & !15;
+    let frame_end = frame_base.checked_add(frame_size)?;
+    let mut page = frame_base & !(crate::config::PAGE_SIZE - 1);
+    while page < frame_end {
+        task_inner.memory_set.handle_page_fault(
+            polyhal::VirtAddr::from(page),
+            crate::mm::PageFaultAccess::Write,
+        )?;
+        page = page.checked_add(crate::config::PAGE_SIZE)?;
+    }
+    Some(frame_base)
 }
 
 fn flags_to_user_sigset(flags: SignalFlags) -> u64 {
@@ -900,6 +1026,7 @@ fn write_signal_frame(
     token: polyhal::pagetable::PageTable,
     sp: usize,
     sig: usize,
+    info: PendingSignalInfo,
     old_mask: SignalFlags,
     interrupted: &TrapFrame,
 ) -> usize {
@@ -909,6 +1036,10 @@ fn write_signal_frame(
         *translated_refmut(token, (frame_base + i) as *mut u8) = 0;
     }
     *translated_refmut(token, frame_base as *mut i32) = sig as i32;
+    // Linux generic 64-bit siginfo_t header followed by the _kill payload.
+    *translated_refmut(token, (frame_base + 8) as *mut i32) = info.code;
+    *translated_refmut(token, (frame_base + 16) as *mut i32) = info.sender_pid;
+    *translated_refmut(token, (frame_base + 20) as *mut u32) = info.sender_uid;
     let ucontext_addr = frame_base + SIGINFO_SIZE;
     *translated_refmut(token, (ucontext_addr + UCONTEXT_SIGMASK_OFFSET) as *mut u64) =
         flags_to_user_sigset(old_mask);
@@ -992,7 +1123,10 @@ fn check_pending_signals() {
                 m = false;
             } else {
                 let hs = task_inner.handling_sig as usize;
-                if !task_inner.signal_actions.table[hs].mask.contains(signal) {
+                if !task_inner.signal_actions.lock().table[hs]
+                    .mask
+                    .contains(signal)
+                {
                     m = false;
                 }
             }
