@@ -899,6 +899,7 @@ impl File for OSInode {
             if total > 0 {
                 let now_sec = Self::now_sec();
                 Self::update_cached_data_time(&mut inner, now_sec);
+                drop(inner);
                 self.update_path_data_time(now_sec);
                 crate::fs::record_block_write_bytes(total);
                 vfs_tmpfs_commit_resize(
@@ -907,6 +908,7 @@ impl File for OSInode {
                     size as u64,
                     new_size.max(0) as u64,
                 );
+                return total as isize;
             }
             if total == 0 && !buf.is_empty() {
                 inner.file_handle = None;
@@ -1040,6 +1042,7 @@ impl File for OSInode {
             if total > 0 {
                 let now_sec = Self::now_sec();
                 Self::update_cached_data_time(&mut inner, now_sec);
+                drop(inner);
                 self.update_path_data_time(now_sec);
                 crate::fs::record_block_write_bytes(total);
                 vfs_tmpfs_commit_resize(
@@ -1048,6 +1051,7 @@ impl File for OSInode {
                     size as u64,
                     new_size.max(0) as u64,
                 );
+                return total as isize;
             }
             if total == 0 && !buf.is_empty() {
                 inner.file_handle = None;
@@ -1066,6 +1070,7 @@ impl File for OSInode {
                 if rw_count > 0 {
                     let now_sec = Self::now_sec();
                     Self::update_cached_data_time(&mut inner, now_sec);
+                    drop(inner);
                     self.update_path_data_time(now_sec);
                     crate::fs::record_block_write_bytes(rw_count);
                     vfs_tmpfs_commit_resize(
@@ -1119,6 +1124,7 @@ impl File for OSInode {
         if rw_count > 0 {
             let now_sec = Self::now_sec();
             Self::update_cached_data_time(&mut inner, now_sec);
+            drop(inner);
             self.update_path_data_time(now_sec);
             crate::fs::record_block_write_bytes(rw_count);
             vfs_tmpfs_commit_resize(

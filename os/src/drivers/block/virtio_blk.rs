@@ -39,11 +39,13 @@ const PCI_ECAM_BASE: PhysAddr = polyhal::pa!(0x20000000);
 const DMA_BOUNCE_SIZE: usize = 4096;
 
 #[cfg(not(target_arch = "loongarch64"))]
+#[repr(C)]
 pub struct VirtIOBlock(
     DeviceLock<VirtIOBlk<VirtioHal, MmioTransport>>,
     DeviceLock<[u8; DMA_BOUNCE_SIZE]>,
 );
 #[cfg(target_arch = "loongarch64")]
+#[repr(C)]
 pub struct VirtIOBlock(
     DeviceLock<VirtIOBlk<VirtioHal, PciTransport>>,
     DeviceLock<[u8; DMA_BOUNCE_SIZE]>,
@@ -66,8 +68,8 @@ impl BlockDevice for VirtIOBlock {
         // Allocation is deliberately outside the device lock.  A future
         // allocator implementation may take other locks or re-enter kernel
         // code, both forbidden while a DeviceLock is held.
-        let mut bounce = self.1.exclusive_access();
         let mut blk = self.0.exclusive_access();
+        let mut bounce = self.1.exclusive_access();
         let mut done = 0;
         while done < buf.len() {
             let chunk = (buf.len() - done).min(DMA_BOUNCE_SIZE);
@@ -80,8 +82,8 @@ impl BlockDevice for VirtIOBlock {
     fn write_block(&self, block_id: usize, buf: &[u8]) {
         assert_eq!(buf.len() % SECTOR_SIZE, 0);
         // See read_block: never allocate while the device lock is held.
-        let mut bounce = self.1.exclusive_access();
         let mut blk = self.0.exclusive_access();
+        let mut bounce = self.1.exclusive_access();
         let mut done = 0;
         while done < buf.len() {
             let chunk = (buf.len() - done).min(DMA_BOUNCE_SIZE);

@@ -140,8 +140,11 @@ fn close_fd_for_thread_group(owner_pid: usize, tgid: usize, fd: usize) {
         })
         .collect();
     for task in tasks {
-        if let Some(mut inner) = task.try_inner_exclusive_access() {
-            inner.close_fd(fd);
+        let file = task
+            .try_inner_exclusive_access()
+            .and_then(|mut inner| inner.take_fd_for_close(fd));
+        if let Some(file) = file {
+            file.close_ref();
         }
     }
 }
@@ -402,10 +405,13 @@ pub fn sys_write(fd: usize, buf: *mut u8, len: usize) -> isize {
                 return EROFS;
             }
         }
-        if !inner.memory_set.valid_user_buf(buf, len, false) {
+        drop(inner);
+        // File/device implementations keep VFS, lwext4 and VirtIO locks while
+        // consuming the buffer.  Materialize every user page first so a lazy
+        // page fault cannot re-enter TaskLock from inside those lock domains.
+        if !super::process::prepare_task_user_access(&task, buf as usize, len, false) {
             return -14;
         }
-        drop(inner);
         file.write(translated_byte_buffer(token, buf, len))
     } else {
         -1
@@ -427,11 +433,10 @@ pub fn sys_read(fd: usize, buf: *mut u8, len: usize) -> isize {
         if !file.readable() {
             return -9;
         }
-        if !inner.memory_set.valid_user_buf(buf, len, true) {
+        drop(inner);
+        if !super::process::prepare_task_user_access(&task, buf as usize, len, true) {
             return -14;
         }
-        drop(inner);
-
         file.read(translated_byte_buffer(token, buf, len))
     } else {
         -9
@@ -1073,6 +1078,7 @@ pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const u8, _flags: us
     const UTIME_OMIT: i64 = (1i64 << 30) - 2;
 
     #[repr(C)]
+    #[derive(Clone, Copy)]
     struct TimeSpec {
         tv_sec: i64,
         tv_nsec: i64,
@@ -1086,15 +1092,25 @@ pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const u8, _flags: us
         if fd >= inner.fd_table.len() {
             return -9;
         }
-        inner.fd_table[fd].as_ref().cloned()
+        let Some(file) = inner.fd_table[fd].as_ref().cloned() else {
+            return -9;
+        };
+        Some(file)
     } else {
         None
     };
     let dentry = if let Some(file) = &fd_file {
-        let Some(inode) = file.as_any().downcast_ref::<crate::fs::inode::OSInode>() else {
+        if let Some(inode) = file.as_any().downcast_ref::<crate::fs::inode::OSInode>() {
+            Some(inode.get_dentry().clone())
+        } else if file
+            .as_any()
+            .downcast_ref::<crate::fs::stdio::TmpFile>()
+            .is_some()
+        {
+            None
+        } else {
             return -9;
-        };
-        inode.get_dentry().clone()
+        }
     } else {
         let path_str = translated_str(token, path);
         if special_device_as_parent(path_str.as_str()) {
@@ -1108,7 +1124,7 @@ pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const u8, _flags: us
             None => return -2,
         };
         match vfs_resolve_with_fallback(&base, &path_str) {
-            Some(d) => d,
+            Some(d) => Some(d),
             None => return -2,
         }
     };
@@ -1119,7 +1135,8 @@ pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const u8, _flags: us
         (inner.euid, inner.egid)
     };
 
-    if euid != 0 {
+    if euid != 0 && dentry.is_some() {
+        let dentry = dentry.as_ref().unwrap();
         let permitted = match dentry.inode_info() {
             Some(info) => {
                 if info.uid == euid {
@@ -1142,32 +1159,49 @@ pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const u8, _flags: us
 
     let now_sec = super::process::user_realtime_sec_ceil().saturating_add(FILE_TIME_NOW_GUARD_SEC);
     let now_sec_u32 = now_sec.clamp(0, u32::MAX as i64) as u32;
+    let now = (now_sec, 0i64);
 
     let (new_atime, new_mtime, changed) = if times.is_null() {
-        (Some(now_sec), Some(now_sec), true)
+        (Some(now), Some(now), true)
     } else {
-        let ts0 = unsafe { &*(times as *const TimeSpec) };
-        let ts1 = unsafe { &*((times as *const TimeSpec).add(1)) };
+        if !super::process::prepare_task_user_access(
+            &task,
+            times as usize,
+            2 * core::mem::size_of::<TimeSpec>(),
+            false,
+        ) {
+            return -14;
+        }
+        let ts0 = unsafe { *(times as *const TimeSpec) };
+        let ts1 = unsafe { *((times as *const TimeSpec).add(1)) };
+        for ts in [ts0, ts1] {
+            if ts.tv_nsec != UTIME_NOW
+                && ts.tv_nsec != UTIME_OMIT
+                && !(0..1_000_000_000).contains(&ts.tv_nsec)
+            {
+                return -22;
+            }
+        }
         let mut ch = false;
 
         let at = if ts0.tv_nsec == UTIME_OMIT {
             None
         } else if ts0.tv_nsec == UTIME_NOW {
             ch = true;
-            Some(now_sec)
+            Some(now)
         } else {
             ch = true;
-            Some(ts0.tv_sec)
+            Some((ts0.tv_sec, ts0.tv_nsec))
         };
 
         let mt = if ts1.tv_nsec == UTIME_OMIT {
             None
         } else if ts1.tv_nsec == UTIME_NOW {
             ch = true;
-            Some(now_sec)
+            Some(now)
         } else {
             ch = true;
-            Some(ts1.tv_sec)
+            Some((ts1.tv_sec, ts1.tv_nsec))
         };
 
         if !ch {
@@ -1176,13 +1210,30 @@ pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const u8, _flags: us
         (at, mt, true)
     };
 
+    if let Some(file) = &fd_file {
+        if let Some(tmpfile) = file
+            .as_any()
+            .downcast_ref::<crate::fs::stdio::TmpFile>()
+        {
+            tmpfile.update_times(
+                new_atime,
+                new_mtime,
+                if changed { Some(now) } else { None },
+            );
+            return 0;
+        }
+    }
+
+    let dentry = dentry.unwrap();
+    let new_atime_sec = new_atime.map(|(sec, _)| sec);
+    let new_mtime_sec = new_mtime.map(|(sec, _)| sec);
     let fs_path = &dentry.fs_path;
-    if let Some(a) = new_atime {
+    if let Some(a) = new_atime_sec {
         dentry
             .super_block
             .set_atime(fs_path, a.clamp(0, u32::MAX as i64) as u32);
     }
-    if let Some(m) = new_mtime {
+    if let Some(m) = new_mtime_sec {
         dentry
             .super_block
             .set_mtime(fs_path, m.clamp(0, u32::MAX as i64) as u32);
@@ -1192,13 +1243,13 @@ pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const u8, _flags: us
     }
     crate::fs::inode::update_path_cached_times(
         fs_path,
-        new_atime,
-        new_mtime,
+        new_atime_sec,
+        new_mtime_sec,
         if changed { Some(now_sec) } else { None },
     );
     dentry.update_cached_times(
-        new_atime.map(|v| v.clamp(0, u32::MAX as i64) as u32),
-        new_mtime.map(|v| v.clamp(0, u32::MAX as i64) as u32),
+        new_atime_sec.map(|v| v.clamp(0, u32::MAX as i64) as u32),
+        new_mtime_sec.map(|v| v.clamp(0, u32::MAX as i64) as u32),
         if changed {
             Some(now_sec.clamp(0, u32::MAX as i64) as u32)
         } else {
@@ -1208,8 +1259,8 @@ pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const u8, _flags: us
     if let Some(file) = &fd_file {
         if let Some(inode) = file.as_any().downcast_ref::<crate::fs::inode::OSInode>() {
             inode.update_cached_times(
-                new_atime,
-                new_mtime,
+                new_atime_sec,
+                new_mtime_sec,
                 if changed { Some(now_sec) } else { None },
             );
         }
@@ -2078,8 +2129,10 @@ pub fn sys_close(fd: usize) -> isize {
     let task = current_task().unwrap();
     let mut inner = task.inner_exclusive_access();
     let tgid = inner.tgid;
-    if inner.close_fd(fd) {
-        drop(inner);
+    let file = inner.take_fd_for_close(fd);
+    drop(inner);
+    if let Some(file) = file {
+        file.close_ref();
         close_fd_for_thread_group(task.getpid(), tgid, fd);
         return 0;
     }
@@ -2115,7 +2168,11 @@ pub fn sys_pipe2(pipe: *mut usize, flags: usize) -> isize {
         inner.fd_table[read_fd] = Some(pipe_read);
         let write_fd = inner.alloc_fd();
         if write_fd >= inner.fd_table.len() {
-            inner.close_fd(read_fd);
+            let rollback = inner.take_fd_for_close(read_fd);
+            drop(inner);
+            if let Some(file) = rollback {
+                file.close_ref();
+            }
             return -24;
         }
         inner.fd_table[write_fd] = Some(pipe_write);
@@ -2179,9 +2236,13 @@ pub fn sys_dup3(fd: usize, new_fd: usize, flags: usize) -> isize {
         inner.fd_table.push(None);
         inner.fd_cloexec.push(false);
     }
-    inner.close_fd(new_fd);
+    let replaced = inner.take_fd_for_close(new_fd);
     inner.fd_table[new_fd] = Some(file);
     inner.fd_cloexec[new_fd] = (flags & O_CLOEXEC) != 0;
+    drop(inner);
+    if let Some(file) = replaced {
+        file.close_ref();
+    }
     new_fd as isize
 }
 
@@ -2755,6 +2816,9 @@ pub fn sys_getdents64(fd: usize, dirp: *mut u8, len: usize) -> isize {
     if let Some(file) = &inner.fd_table[fd] {
         let file = file.clone();
         drop(inner);
+        if !super::process::prepare_task_user_access(&task, dirp as usize, len, true) {
+            return -14;
+        }
         let user_buf = translated_byte_buffer(token, dirp, len);
         file.getdents64(user_buf)
     } else {
@@ -3097,7 +3161,7 @@ pub fn sys_pread64(fd: usize, buf: *mut u8, len: usize, offset: usize) -> isize 
         return -9;
     }
     drop(inner);
-    if !valid_user_write_buf(buf, len) {
+    if !super::process::prepare_task_user_access(&task, buf as usize, len, true) {
         return -14;
     }
     let user_buf = translated_byte_buffer(token, buf, len);
@@ -3126,7 +3190,7 @@ pub fn sys_pwrite64(fd: usize, buf: *mut u8, len: usize, offset: usize) -> isize
         return -9;
     }
     drop(inner);
-    if !valid_user_read_buf(buf as *const u8, len) {
+    if !super::process::prepare_task_user_access(&task, buf as usize, len, false) {
         return -14;
     }
     let user_buf = translated_byte_buffer(token, buf, len);
@@ -3798,10 +3862,16 @@ pub fn sys_close_range(first: usize, last: usize, flags: usize) -> isize {
         }
     } else {
         let tgid = inner.tgid;
+        let mut files = alloc::vec::Vec::new();
         for fd in first..=last {
-            inner.close_fd(fd);
+            if let Some(file) = inner.take_fd_for_close(fd) {
+                files.push(file);
+            }
         }
         drop(inner);
+        for file in files {
+            file.close_ref();
+        }
         for fd in first..=last {
             close_fd_for_thread_group(task.getpid(), tgid, fd);
         }

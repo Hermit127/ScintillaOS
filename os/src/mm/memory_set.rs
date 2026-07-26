@@ -320,6 +320,28 @@ impl MemorySet {
         true
     }
 
+    fn install_signal_return_trampoline(&mut self) -> bool {
+        #[cfg(target_arch = "riscv64")]
+        const CODE: [u8; 8] = [
+            0x93, 0x08, 0xb0, 0x08, // addi a7, zero, __NR_rt_sigreturn (139)
+            0x73, 0x00, 0x00, 0x00, // ecall
+        ];
+        #[cfg(not(target_arch = "riscv64"))]
+        const CODE: [u8; 0] = [];
+
+        let start = crate::config::SIGNAL_RETURN_TRAMPOLINE;
+        self.push(
+            MapArea::new(
+                start.into(),
+                (start + PAGE_SIZE).into(),
+                MapType::Framed,
+                MapPermission::R | MapPermission::X | MapPermission::U,
+            ),
+            Some(&CODE),
+            0,
+        )
+    }
+
     fn push_file_segment(
         &mut self,
         mut map_area: MapArea,
@@ -427,6 +449,10 @@ impl MemorySet {
             None,
             0,
         );
+        assert!(
+            memory_set.install_signal_return_trampoline(),
+            "failed to map rt_sigreturn trampoline"
+        );
         memory_set.set_program_brk(program_break);
         LoadedElf {
             memory_set,
@@ -529,6 +555,9 @@ impl MemorySet {
             None,
             0,
         ) {
+            return None;
+        }
+        if !memory_set.install_signal_return_trampoline() {
             return None;
         }
         memory_set.set_program_brk(program_break);
@@ -655,7 +684,10 @@ impl MemorySet {
         let mut memory_set = Self::new_bare();
         let parent_page_table = user_space.page_table.clone();
         let mut parent_areas = user_space.areas.exclusive_access();
-        let mut child_areas = memory_set.areas.exclusive_access();
+        // Build the child's metadata off-lock.  Holding the parent and child
+        // Vm locks together has no atomicity benefit (the child is not yet
+        // published) and creates an address-dependent same-class lock order.
+        let mut new_areas = Vec::with_capacity(parent_areas.len());
         for area in parent_areas.iter_mut() {
             let mut new_area = MapArea::from_another(area);
             for (&vpn, frame) in area.data_frames.iter() {
@@ -686,10 +718,10 @@ impl MemorySet {
                     }
                 }
             }
-            child_areas.push(new_area);
+            new_areas.push(new_area);
         }
-        drop(child_areas);
         drop(parent_areas);
+        memory_set.areas.exclusive_access().extend(new_areas);
         memory_set.set_program_brk(user_space.program_brk());
         Some(memory_set)
     }

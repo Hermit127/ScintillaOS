@@ -1,4 +1,6 @@
-use crate::sync::{FsGuard, FsLock, VfsLock};
+use crate::sync::{
+    DentryLock, FsAuxLock, FsGlobalGuard, FsGlobalLock, FsGuard, FsLock, VfsLock,
+};
 use alloc::collections::BTreeMap;
 use alloc::ffi::CString;
 use alloc::format;
@@ -23,15 +25,18 @@ lazy_static! {
     // lwext4 keeps process-global mount/cache state internally.  Per-volume
     // locks are insufficient in the dual-disk SMP configuration: operations
     // on rootfs and the test disk must not enter lwext4 concurrently.
-    static ref LWEXT4_GLOBAL: FsLock<()> =
-        FsLock::new_named((), "LwExt4Global");
+    static ref LWEXT4_GLOBAL: FsGlobalLock<()> =
+        FsGlobalLock::new_named((), "LwExt4Global");
     static ref PATH_OWNER_CACHE: VfsLock<BTreeMap<String, (u32, u32)>> =
         VfsLock::new_named(BTreeMap::new(), "VfsPathOwnerCache");
 }
 
 pub(crate) struct VfsFsGuard<'a> {
-    _global: FsGuard<'a, ()>,
+    // Struct fields are dropped in declaration order. The local Ext4 lock was
+    // acquired after the global lwext4 lock and therefore must be declared
+    // first so it is released first.
     local: FsGuard<'a, FsInner>,
+    _global: FsGlobalGuard<'a, ()>,
 }
 
 impl Deref for VfsFsGuard<'_> {
@@ -117,8 +122,8 @@ impl VfsSuperBlock {
         let global = LWEXT4_GLOBAL.exclusive_access();
         let local = self.fs_data.exclusive_access();
         VfsFsGuard {
-            _global: global,
             local,
+            _global: global,
         }
     }
 
@@ -609,17 +614,19 @@ impl VfsSuperBlock {
     }
 
     pub fn set_owner(&self, fs_path: &str, uid: u32, gid: u32) -> i32 {
-        self.with_fs(|_fs| {
+        let result = self.with_fs(|_fs| {
             if let Ok(c_path) = CString::new(fs_path) {
-                let r = unsafe { ext4_owner_set(c_path.as_ptr() as *const c_char, uid, gid) };
-                if r == EOK as i32 {
-                    record_path_owner(fs_path, uid, gid);
-                }
-                r
+                unsafe { ext4_owner_set(c_path.as_ptr() as *const c_char, uid, gid) }
             } else {
                 -1
             }
-        })
+        });
+        // The owner cache is VFS metadata (rank 8), so update it only after
+        // with_fs has released the lwext4 global and per-volume locks.
+        if result == EOK as i32 {
+            record_path_owner(fs_path, uid, gid);
+        }
+        result
     }
 
     pub fn fsync(&self, fs_path: &str) -> i32 {
@@ -657,10 +664,10 @@ pub struct Dentry {
     pub super_block: Arc<VfsSuperBlock>,
     /// Cache updates use a two-phase protocol: create/reserve a replacement
     /// list before acquiring this lock, and never call Ext4 while it is held.
-    pub children: VfsLock<Option<Vec<Arc<Dentry>>>>,
+    pub children: DentryLock<Option<Vec<Arc<Dentry>>>>,
     /// This is only an in-memory metadata cache.  Ext4 lookup happens after
     /// dropping the lock, then the result is stored in a second short phase.
-    inode_info: VfsLock<Option<InodeInfo>>,
+    inode_info: DentryLock<Option<InodeInfo>>,
 }
 
 impl Dentry {
@@ -674,8 +681,8 @@ impl Dentry {
             is_link: false,
             parent: None,
             super_block: sb,
-            children: VfsLock::new_named(None, "DentryChildren"),
-            inode_info: VfsLock::new_named(None, "DentryInodeInfo"),
+            children: DentryLock::new_named(None, "DentryChildren"),
+            inode_info: DentryLock::new_named(None, "DentryInodeInfo"),
         })
     }
 
@@ -689,8 +696,8 @@ impl Dentry {
             is_link: false,
             parent: None,
             super_block: sb,
-            children: VfsLock::new_named(None, "DentryChildren"),
-            inode_info: VfsLock::new_named(None, "DentryInodeInfo"),
+            children: DentryLock::new_named(None, "DentryChildren"),
+            inode_info: DentryLock::new_named(None, "DentryInodeInfo"),
         })
     }
 
@@ -722,8 +729,8 @@ impl Dentry {
             is_link,
             parent: Some(Arc::downgrade(parent)),
             super_block: parent.super_block.clone(),
-            children: VfsLock::new_named(None, "DentryChildren"),
-            inode_info: VfsLock::new_named(None, "DentryInodeInfo"),
+            children: DentryLock::new_named(None, "DentryChildren"),
+            inode_info: DentryLock::new_named(None, "DentryInodeInfo"),
         })
     }
 
@@ -803,8 +810,11 @@ lazy_static! {
         VfsLock::new_named(Vec::with_capacity(MOUNT_TABLE_CAPACITY), "VfsMountTable");
     static ref READONLY_MOUNT_PATHS: VfsLock<Vec<String>> =
         VfsLock::new_named(Vec::with_capacity(MOUNT_TABLE_CAPACITY), "VfsReadonlyMounts");
-    static ref TMPFS_MOUNTS: VfsLock<Vec<TmpfsMount>> =
-        VfsLock::new_named(Vec::with_capacity(MOUNT_TABLE_CAPACITY), "VfsTmpfsMounts");
+    // Quota accounting is updated both before and after direct lwext4
+    // transactions.  It never calls back into VFS/Fs, so give it a dedicated
+    // post-Fs class instead of pretending it is ordinary dentry metadata.
+    static ref TMPFS_MOUNTS: FsAuxLock<Vec<TmpfsMount>> =
+        FsAuxLock::new_named(Vec::with_capacity(MOUNT_TABLE_CAPACITY), "VfsTmpfsMounts");
 }
 
 struct TmpfsMount {
