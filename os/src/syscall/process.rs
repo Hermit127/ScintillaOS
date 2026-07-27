@@ -2142,6 +2142,7 @@ pub fn sys_sleep(duration: u64) -> isize {
 }
 
 pub fn sys_shutdown() -> isize {
+    crate::fs::vfs::shutdown_filesystems();
     polyhal::instruction::shutdown();
     0
 }

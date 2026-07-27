@@ -7,13 +7,15 @@ mod arch {
     pub struct UserFloatState {
         regs: [u64; 32],
         fcsr: usize,
-        // The official glibc test binaries are built for RISC-V V 1.0 with
-        // Zvl128b.  QEMU is fixed to VLEN=128 for validation, so each vector
-        // register occupies exactly 16 bytes.
+        #[cfg(feature = "riscv-vector")]
         vector_regs: [u128; 32],
+        #[cfg(feature = "riscv-vector")]
         vl: usize,
+        #[cfg(feature = "riscv-vector")]
         vtype: usize,
+        #[cfg(feature = "riscv-vector")]
         vstart: usize,
+        #[cfg(feature = "riscv-vector")]
         vcsr: usize,
     }
 
@@ -23,10 +25,15 @@ mod arch {
             Self {
                 regs: [0; 32],
                 fcsr: 0,
+                #[cfg(feature = "riscv-vector")]
                 vector_regs: [0; 32],
+                #[cfg(feature = "riscv-vector")]
                 vl: 0,
+                #[cfg(feature = "riscv-vector")]
                 vtype: 0,
+                #[cfg(feature = "riscv-vector")]
                 vstart: 0,
+                #[cfg(feature = "riscv-vector")]
                 vcsr: 0,
             }
         }
@@ -77,6 +84,8 @@ mod arch {
             }
             self.fcsr = fcsr;
 
+            #[cfg(feature = "riscv-vector")]
+            {
             let vector_base = self.vector_regs.as_mut_ptr();
             let vl: usize;
             let vtype: usize;
@@ -168,6 +177,7 @@ mod arch {
             self.vtype = vtype;
             self.vstart = vstart;
             self.vcsr = vcsr;
+            }
         }
 
         // 把保存过的用户浮点状态恢复到 CPU。
@@ -215,6 +225,8 @@ mod arch {
                 );
             }
 
+            #[cfg(feature = "riscv-vector")]
+            {
             let vector_base = self.vector_regs.as_ptr();
             let vl = self.vl;
             let vtype = self.vtype;
@@ -300,6 +312,7 @@ mod arch {
                     vstart = in(reg) vstart,
                     vcsr = in(reg) vcsr,
                 );
+            }
             }
         }
     }

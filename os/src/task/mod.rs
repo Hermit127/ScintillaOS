@@ -23,6 +23,39 @@ use polyhal_trap::trapframe::{TrapFrame, TrapFrameArgs};
 
 pub use crate::config::SIGNAL_RETURN_TRAMPOLINE;
 const SA_SIGINFO: usize = 4;
+
+#[inline]
+fn trap_gpr(ctx: &TrapFrame, reg: usize) -> usize {
+    #[cfg(target_arch = "riscv64")]
+    {
+        ctx.x[reg]
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        ctx.regs[reg]
+    }
+    #[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
+    {
+        let _ = (ctx, reg);
+        0
+    }
+}
+
+#[inline]
+fn set_trap_gpr(ctx: &mut TrapFrame, reg: usize, value: usize) {
+    #[cfg(target_arch = "riscv64")]
+    {
+        ctx.x[reg] = value;
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        ctx.regs[reg] = value;
+    }
+    #[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
+    {
+        let _ = (ctx, reg, value);
+    }
+}
 const SA_RESTORER: usize = 0x0400_0000;
 const SA_NOCLDWAIT: usize = 2;
 const SIG_IGN: usize = 1;
@@ -903,8 +936,8 @@ fn call_user_signal_handler(sig: usize, signal: SignalFlags) {
                     "[signal-trace] deliver pid={} sig={} pc={:#x} sp={:#x} handler={:#x}",
                     task.getpid(),
                     sig,
-                    interrupted.sepc,
-                    interrupted.x[2],
+                    interrupted[TrapFrameArgs::SEPC],
+                    interrupted[TrapFrameArgs::SP],
                     handler
                 );
             }
@@ -1035,13 +1068,13 @@ fn write_signal_frame(
     *translated_refmut(token, (ucontext_addr + UCONTEXT_SIGMASK_OFFSET) as *mut u64) =
         flags_to_user_sigset(old_mask);
     *translated_refmut(token, (ucontext_addr + UCONTEXT_PC_OFFSET) as *mut usize) =
-        interrupted.sepc;
+        interrupted[TrapFrameArgs::SEPC];
     for reg in 1..32 {
         *translated_refmut(
             token,
             (ucontext_addr + UCONTEXT_MCONTEXT_OFFSET + reg * size_of::<usize>())
                 as *mut usize,
-        ) = interrupted.x[reg];
+        ) = trap_gpr(interrupted, reg);
     }
     frame_base
 }
@@ -1064,23 +1097,24 @@ pub fn restore_current_signal_context() -> Option<isize> {
         return None;
     }
     let mut restored = inner.get_trap_cx().clone();
-    restored.sepc = pc;
+    restored[TrapFrameArgs::SEPC] = pc;
     for reg in 1..32 {
-        restored.x[reg] = *translated_ref(
+        let value = *translated_ref(
             token,
             (ucontext_addr + UCONTEXT_MCONTEXT_OFFSET + reg * size_of::<usize>())
                 as *const usize,
         );
+        set_trap_gpr(&mut restored, reg, value);
     }
-    let ret = restored.x[10] as isize;
+    let ret = restored[TrapFrameArgs::RET] as isize;
     if SIGNAL_TRACE_ENABLED {
         let n = SIGNAL_TRACE_COUNT.load(AtomicOrdering::Relaxed);
         if n > 0 && n <= 12 {
             println!(
                 "[signal-trace] return pid={} pc={:#x} sp={:#x}",
                 task.getpid(),
-                restored.sepc,
-                restored.x[2]
+                restored[TrapFrameArgs::SEPC],
+                restored[TrapFrameArgs::SP]
             );
         }
     }

@@ -1267,6 +1267,39 @@ pub fn mount_root() {
     });
 }
 
+/// Flush and unmount every ext4 volume immediately before powering off.
+///
+/// The mount table can contain multiple dentries backed by the same superblock,
+/// so deduplicate the snapshot before invoking lwext4.  Locks are released
+/// before flushing/unmounting to preserve the VFS lock order.
+pub fn shutdown_filesystems() {
+    let mut super_blocks: Vec<Arc<VfsSuperBlock>> = Vec::new();
+    {
+        let table = MOUNT_TABLE.exclusive_access();
+        for mount in table.iter() {
+            let sb = mount.mnt_root.super_block.clone();
+            if !super_blocks.iter().any(|known| Arc::ptr_eq(known, &sb)) {
+                super_blocks.push(sb);
+            }
+        }
+    }
+
+    if !super_blocks
+        .iter()
+        .any(|known| Arc::ptr_eq(known, &ROOT_SB))
+    {
+        super_blocks.push(ROOT_SB.clone());
+    }
+
+    for sb in &super_blocks {
+        let _ = sb.sync_all();
+    }
+    // Unmount child/test filesystems before the root filesystem.
+    for sb in super_blocks.iter().rev() {
+        sb.force_umount();
+    }
+}
+
 /// Mount the test disk (bus 0) at the specified mount point dentry.
 pub fn mount_test_disk_at(mnt_point: Arc<Dentry>) -> bool {
     let test_sb = match VfsSuperBlock::new_ext4(BLOCK_DEVICE.clone(), "ext4") {

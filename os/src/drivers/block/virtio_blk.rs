@@ -364,8 +364,10 @@ pub fn probe_all() -> Vec<Arc<dyn BlockDevice>> {
             capacity
         );
         out.push(
-            Arc::new(VirtIOBlock(DeviceLock::new_named(blk, "VirtIOBlock")))
-                as Arc<dyn BlockDevice>,
+            Arc::new(VirtIOBlock(
+                DeviceLock::new_named(blk, "VirtIOBlock"),
+                DeviceLock::new_named([0u8; DMA_BOUNCE_SIZE], "VirtIOBounce"),
+            )) as Arc<dyn BlockDevice>,
         );
     }
     crate::println!("[virtio-blk] probe_all: found {} devices", out.len());

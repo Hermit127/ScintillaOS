@@ -295,7 +295,16 @@ pub fn run_tasks() {
             // fully blocked system (notably futex and signal timeouts).
             assert_no_spin_locks_held("idle wait");
             IRQ::int_enable();
-            unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
+            #[cfg(target_arch = "riscv64")]
+            unsafe {
+                core::arch::asm!("wfi", options(nomem, nostack))
+            };
+            #[cfg(target_arch = "loongarch64")]
+            unsafe {
+                loongArch64::asm::idle()
+            };
+            #[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
+            core::hint::spin_loop();
         }
     }
 }

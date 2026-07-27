@@ -53,7 +53,9 @@ oskernel-testsuits-cooperation
 # Local tools and downloaded toolchains
 tools/
 pushall.sh
-vendor/
+vendor/**
+!vendor/*/
+!vendor/*/cargo-checksum.json
 riscv64-linux-musl-cross/
 zig-macos-*/
 tmp-musl-cross.tgz

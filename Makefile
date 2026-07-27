@@ -5,7 +5,7 @@ COMMA := ,
 # Keep the baseline runnable.  Set QEMU_SMP=4 only after the SMP lock audit
 # and regression suite have passed.
 QEMU_SMP ?= 1
-QEMU_CPU ?= max,v=true,vlen=128
+QEMU_CPU ?= max
 SMP_DIAGNOSTICS ?= 0
 
 ifeq ($(SMP_DIAGNOSTICS),1)
@@ -98,6 +98,10 @@ LTP_MODE ?= subset
 
 # ==================== Contest Submission Targets ====================
 
+prepare-vendor:
+	@find vendor -name cargo-checksum.json -exec sh -c \
+		'cp "$$1" "$$(dirname "$$1")/.cargo-checksum.json"' _ {} \;
+
 all: kernel-rv disk.img disk-rv.img kernel-la disk-la.img
 	@echo "===== Build complete ====="
 	@ls -lh kernel-rv kernel-la disk.img disk-rv.img disk-la.img 2>/dev/null || true
@@ -106,8 +110,8 @@ kernel-rv:
 	@echo "===== Building kernel-rv (riscv64) ====="
 	@$(MAKE) kernel ARCH=riscv64
 	@$(OBJCOPY) target/riscv64gc-unknown-none-elf/release/os --strip-all -O binary target/riscv64gc-unknown-none-elf/release/os.bin
-	@$(OBJCOPY) target/riscv64gc-unknown-none-elf/release/os --strip-all -O binary kernel-rv
-	@echo "kernel-rv ready"
+	@cp target/riscv64gc-unknown-none-elf/release/os kernel-rv
+	@echo "kernel-rv ready (ELF)"
 
 kernel-la:
 	@echo "===== Building kernel-la (loongarch64) ====="
@@ -149,7 +153,7 @@ env:
 $(KERNEL_BIN): kernel
 	@$(OBJCOPY) $(KERNEL_ELF) --strip-all -O binary $@
 
-fs-img: $(APPS)
+fs-img: prepare-vendor $(APPS)
 	@mkdir -p .cargo 2>/dev/null || true
 	@cp -f cargo_config/config.toml .cargo/config.toml 2>/dev/null || true
 	@cd user && make build TARGET=$(TARGET) TEST=$(TEST)
@@ -346,11 +350,13 @@ endif
 	@dd if=/dev/zero of=$(FS_IMG) bs=1M count=512
 	@mke2fs -t ext4 -b 4096 -F -O ^metadata_csum,^64bit,^orphan_file -d $(ROOTFS_DIR) $(FS_IMG)
 	@e2fsck -fy $(FS_IMG) 2>/dev/null || true
-	cp target/$(TARGET)/$(MODE)/fs.img fs-img.img
+	@if [ "$(ARCH)" = "x86_64" ]; then \
+		cp $(FS_IMG) fs-img.img; \
+	fi
 
 $(APPS):
 
-kernel:
+kernel: prepare-vendor
 	@echo Platform: $(BOARD)
 	@mkdir -p .cargo 2>/dev/null || true
 	@cp -f cargo_config/config.toml .cargo/config.toml 2>/dev/null || true
@@ -393,8 +399,9 @@ QEMU_ARGS_SINGLE := -drive file=$(FS_IMG),if=none,format=raw,id=x0,file.locking=
 			-drive file=$(FS_IMG),if=none,format=raw,id=x1,file.locking=off \
 			-device $(VIRTIO_BLK_DEVICE),drive=x1,bus=$(VIRTIO_BLK_BUS2)
 
-# Test disk path (user can override)
-TEST_DISK ?= fs-img.img
+# External contest test disk path (user can override).  This name is never
+# produced by the build, so make all cannot overwrite a downloaded test image.
+TEST_DISK ?= testcases.img
 ROOT_DISK ?= $(if $(filter loongarch64,$(ARCH)),disk-la.img,disk.img)
 
 # Dual-disk mode (test disk bus 0, arch-matched root disk bus 1)
@@ -447,4 +454,4 @@ gdbserver: build
 gdbclient:
 	@gdb -ex 'file $(KERNEL_ELF)' -ex 'set arch riscv:rv64' -ex 'target remote localhost:1234'
 
-.PHONY: all kernel-rv kernel-la disk.img disk-rv.img disk-la.img build env kernel clean disasm disasm-vim run run-smp4 run-inner run-dual run-dual-smp4 run-dual-prebuilt run-dual-smp4-prebuilt fs-img gdbserver gdbclient
+.PHONY: all prepare-vendor kernel-rv kernel-la disk.img disk-rv.img disk-la.img build env kernel clean disasm disasm-vim run run-smp4 run-inner run-dual run-dual-smp4 run-dual-prebuilt run-dual-smp4-prebuilt fs-img gdbserver gdbclient

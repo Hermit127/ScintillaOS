@@ -10,6 +10,10 @@ default = []
 # optimized kernel. This feature adds diagnostics only and does not change the
 # userspace ABI or test programs.
 smp-diagnostics = []
+# The official QEMU command does not enable the RISC-V V extension. Keep
+# vector context switching opt-in for local tests that explicitly add
+# `-cpu max,v=true,vlen=128`.
+riscv-vector = []
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

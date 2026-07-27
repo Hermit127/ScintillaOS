@@ -3,7 +3,7 @@
 #![feature(alloc_error_handler)]
 
 use crate::{
-    syscall::syscall,
+    syscall::{syscall, SYSCALL_EXEC},
     task::{
         check_and_wake_up_tasks, check_itimers, check_signals_error_of_current, current_add_signal,
         current_task, exit_current_and_run_next, force_exit_task_group, handle_signals,
@@ -144,10 +144,26 @@ fn exit_current_on_user_fault(signal: i32) -> ! {
     exit_current_and_run_next(exit_code);
 }
 
+#[inline]
+fn trap_from_user(ctx: &TrapFrame) -> bool {
+    #[cfg(target_arch = "riscv64")]
+    {
+        ctx.from_user()
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        ctx.prmd & 0b11 != 0
+    }
+    #[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
+    {
+        current_task().is_some()
+    }
+}
+
 /// kernel interrupt
 #[polyhal::arch_interrupt]
 fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
-    let from_user = ctx.from_user();
+    let from_user = trap_from_user(ctx);
     if from_user {
         if let Some(task) = crate::task::current_task() {
             task.save_user_float_state();
@@ -164,15 +180,21 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             // jump to next instruction anyway
             ctx.syscall_ok();
             let args = ctx.args();
+            let syscall_id = ctx[TrapFrameArgs::SYSCALL];
             // get system call return value
             // info!("syscall: {}", ctx[TrapFrameArgs::SYSCALL]);
 
             let result = syscall(
-                ctx[TrapFrameArgs::SYSCALL],
+                syscall_id,
                 [args[0], args[1], args[2], args[3], args[4], args[5]],
             );
-            // cx is changed during sys_exec, so we have to call it again
-            ctx[TrapFrameArgs::RET] = result as usize;
+            // A successful exec has replaced this trap frame with the new
+            // program's entry context.  In particular, ARG0/RET now contains
+            // argc.  Writing the syscall result (zero) would clobber argc.
+            // Failed exec calls still return their errno to the old program.
+            if syscall_id != SYSCALL_EXEC || result != 0 {
+                ctx[TrapFrameArgs::RET] = result as usize;
+            }
         }
         StorePageFault(bad_addr) => {
             handle_current_user_page_fault(
@@ -199,6 +221,7 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
         InstructionPageFault(bad_addr) => {
             #[cfg(feature = "smp-diagnostics")]
             if bad_addr == 0 || ctx[TrapFrameArgs::SEPC] == 0 {
+                let args = ctx.args();
                 let (tid, tgid) = current_task()
                     .map(|task| {
                         let tid = task.getpid();
@@ -214,12 +237,12 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
                     bad_addr,
                     ctx[TrapFrameArgs::SP],
                     ctx[TrapFrameArgs::RA],
-                    ctx.x[10],
-                    ctx.x[11],
-                    ctx.x[12],
-                    ctx.x[13],
-                    ctx.x[14],
-                    ctx.x[15],
+                    args[0],
+                    args[1],
+                    args[2],
+                    args[3],
+                    args[4],
+                    args[5],
                 );
             }
             handle_current_user_page_fault(
