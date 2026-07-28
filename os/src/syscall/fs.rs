@@ -23,6 +23,46 @@ const FILE_TIME_NOW_GUARD_SEC: i64 = 5;
 const PATH_MAX: usize = 4096;
 const NAME_MAX: usize = 255;
 const EROFS: isize = -30;
+const INLINE_IO_STAGING_SIZE: usize = 1024;
+
+pub(crate) enum IoStaging {
+    Inline {
+        bytes: [u8; INLINE_IO_STAGING_SIZE],
+        len: usize,
+    },
+    Heap(Vec<u8>),
+}
+
+impl IoStaging {
+    fn zeroed(len: usize) -> Result<Self, isize> {
+        if len <= INLINE_IO_STAGING_SIZE {
+            return Ok(Self::Inline {
+                bytes: [0; INLINE_IO_STAGING_SIZE],
+                len,
+            });
+        }
+        let mut bytes = Vec::new();
+        if bytes.try_reserve_exact(len).is_err() {
+            return Err(-12);
+        }
+        bytes.resize(len, 0);
+        Ok(Self::Heap(bytes))
+    }
+
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Inline { bytes, len } => &bytes[..*len],
+            Self::Heap(bytes) => bytes,
+        }
+    }
+
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
+        match self {
+            Self::Inline { bytes, len } => &mut bytes[..*len],
+            Self::Heap(bytes) => bytes,
+        }
+    }
+}
 
 fn map_dev_shm_path(path: &str) -> String {
     if let Some(name) = path.strip_prefix("/dev/shm/") {
@@ -58,6 +98,52 @@ fn valid_user_read_buf(ptr: *const u8, len: usize) -> bool {
     };
     let inner = task.inner_exclusive_access();
     inner.memory_set.valid_user_buf(ptr, len, false)
+}
+
+pub(crate) fn copy_from_user_for_io(
+    task: &Arc<crate::task::TaskControlBlock>,
+    _token: polyhal::pagetable::PageTable,
+    buf: *mut u8,
+    len: usize,
+) -> Result<IoStaging, isize> {
+    if len == 0 {
+        return IoStaging::zeroed(0);
+    }
+    let mut staging = IoStaging::zeroed(len)?;
+    if !super::process::copy_from_task_user(task, buf as usize, staging.as_mut_slice()) {
+        return Err(-14);
+    }
+    Ok(staging)
+}
+
+pub(crate) fn copy_to_user_after_io(
+    task: &Arc<crate::task::TaskControlBlock>,
+    _token: polyhal::pagetable::PageTable,
+    buf: *mut u8,
+    len: usize,
+) -> Result<IoStaging, isize> {
+    if len == 0 {
+        return IoStaging::zeroed(0);
+    }
+    if !super::process::prepare_task_user_access(task, buf as usize, len, true) {
+        return Err(-14);
+    }
+    IoStaging::zeroed(len)
+}
+
+pub(crate) fn copy_staged_output_to_user(
+    task: &Arc<crate::task::TaskControlBlock>,
+    _token: polyhal::pagetable::PageTable,
+    buf: *mut u8,
+    data: &[u8],
+) -> Result<(), isize> {
+    if data.is_empty() {
+        return Ok(());
+    }
+    if !super::process::copy_to_task_user(task, buf as usize, data) {
+        return Err(-14);
+    }
+    Ok(())
 }
 
 fn fd_path_for_proc(fd: usize) -> Option<String> {
@@ -406,13 +492,14 @@ pub fn sys_write(fd: usize, buf: *mut u8, len: usize) -> isize {
             }
         }
         drop(inner);
-        // File/device implementations keep VFS, lwext4 and VirtIO locks while
-        // consuming the buffer.  Materialize every user page first so a lazy
-        // page fault cannot re-enter TaskLock from inside those lock domains.
-        if !super::process::prepare_task_user_access(&task, buf as usize, len, false) {
-            return -14;
-        }
-        file.write(translated_byte_buffer(token, buf, len))
+        // File implementations may hold VFS, filesystem or device locks.
+        // Copy user data before entering them so a user page fault cannot
+        // re-enter TaskLock while an outer lock is held.
+        let mut staging = match copy_from_user_for_io(&task, token, buf, len) {
+            Ok(staging) => staging,
+            Err(errno) => return errno,
+        };
+        file.write(staging.as_mut_slice())
     } else {
         -1
     }
@@ -434,10 +521,24 @@ pub fn sys_read(fd: usize, buf: *mut u8, len: usize) -> isize {
             return -9;
         }
         drop(inner);
-        if !super::process::prepare_task_user_access(&task, buf as usize, len, true) {
-            return -14;
+        // The file layer receives only a kernel buffer.  Copying back to user
+        // space happens after all file-system and device locks are released.
+        let mut staging = match copy_to_user_after_io(&task, token, buf, len) {
+            Ok(staging) => staging,
+            Err(errno) => return errno,
+        };
+        let read = file.read(staging.as_mut_slice());
+        if read <= 0 {
+            return read;
         }
-        file.read(translated_byte_buffer(token, buf, len))
+        let read = read as usize;
+        if read > len {
+            return -5;
+        }
+        if let Err(errno) = copy_staged_output_to_user(&task, token, buf, &staging.as_slice()[..read]) {
+            return errno;
+        }
+        read as isize
     } else {
         -9
     }
@@ -2816,11 +2917,22 @@ pub fn sys_getdents64(fd: usize, dirp: *mut u8, len: usize) -> isize {
     if let Some(file) = &inner.fd_table[fd] {
         let file = file.clone();
         drop(inner);
-        if !super::process::prepare_task_user_access(&task, dirp as usize, len, true) {
-            return -14;
+        let mut staging = match copy_to_user_after_io(&task, token, dirp, len) {
+            Ok(staging) => staging,
+            Err(errno) => return errno,
+        };
+        let count = file.getdents64(staging.as_mut_slice());
+        if count <= 0 {
+            return count;
         }
-        let user_buf = translated_byte_buffer(token, dirp, len);
-        file.getdents64(user_buf)
+        let count = count as usize;
+        if count > len {
+            return -5;
+        }
+        if let Err(errno) = copy_staged_output_to_user(&task, token, dirp, &staging.as_slice()[..count]) {
+            return errno;
+        }
+        count as isize
     } else {
         -1
     }
@@ -3161,11 +3273,22 @@ pub fn sys_pread64(fd: usize, buf: *mut u8, len: usize, offset: usize) -> isize 
         return -9;
     }
     drop(inner);
-    if !super::process::prepare_task_user_access(&task, buf as usize, len, true) {
-        return -14;
+    let mut staging = match copy_to_user_after_io(&task, token, buf, len) {
+        Ok(staging) => staging,
+        Err(errno) => return errno,
+    };
+    let read = file.read_at(offset, staging.as_mut_slice());
+    if read <= 0 {
+        return read;
     }
-    let user_buf = translated_byte_buffer(token, buf, len);
-    file.read_at(offset, user_buf)
+    let read = read as usize;
+    if read > len {
+        return -5;
+    }
+    if let Err(errno) = copy_staged_output_to_user(&task, token, buf, &staging.as_slice()[..read]) {
+        return errno;
+    }
+    read as isize
 }
 
 pub fn sys_pwrite64(fd: usize, buf: *mut u8, len: usize, offset: usize) -> isize {
@@ -3190,11 +3313,11 @@ pub fn sys_pwrite64(fd: usize, buf: *mut u8, len: usize, offset: usize) -> isize
         return -9;
     }
     drop(inner);
-    if !super::process::prepare_task_user_access(&task, buf as usize, len, false) {
-        return -14;
-    }
-    let user_buf = translated_byte_buffer(token, buf, len);
-    file.write_at(offset, user_buf)
+    let mut staging = match copy_from_user_for_io(&task, token, buf, len) {
+        Ok(staging) => staging,
+        Err(errno) => return errno,
+    };
+    file.write_at(offset, staging.as_mut_slice())
 }
 
 pub fn sys_preadv(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> isize {
@@ -3254,22 +3377,31 @@ pub fn sys_preadv(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> is
         if iov.iov_len > isize::MAX as usize {
             return -22;
         }
-        let task = current_task().unwrap();
-        let inner = task.inner_exclusive_access();
-        let ok = inner
-            .memory_set
-            .valid_user_buf(iov.iov_base as *const u8, iov.iov_len, true);
-        drop(inner);
-        if !ok {
-            return -14;
-        }
-        let user_buf =
-            crate::mm::translated_byte_buffer(token, iov.iov_base as *mut u8, iov.iov_len);
-        let n = file.read_at(off, user_buf);
+        let mut staging = match copy_to_user_after_io(
+            &task,
+            token,
+            iov.iov_base as *mut u8,
+            iov.iov_len,
+        ) {
+            Ok(staging) => staging,
+            Err(errno) => return if total == 0 { errno } else { total },
+        };
+        let n = file.read_at(off, staging.as_mut_slice());
         if n < 0 {
             return if total == 0 { n } else { total };
         }
         let n = n as usize;
+        if n > iov.iov_len {
+            return if total == 0 { -5 } else { total };
+        }
+        if let Err(errno) = copy_staged_output_to_user(
+            &task,
+            token,
+            iov.iov_base as *mut u8,
+            &staging.as_slice()[..n],
+        ) {
+            return if total == 0 { errno } else { total };
+        }
         total += n as isize;
         off += n;
         if n < iov.iov_len {
@@ -3321,7 +3453,7 @@ pub fn sys_pwritev(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> i
         iov_base: usize,
         iov_len: usize,
     }
-    let mut iovecs = Vec::new();
+    let mut buffers = Vec::new();
     let mut requested = 0usize;
     for i in 0..iovcnt {
         let iov_ptr = unsafe { iov.add(i * core::mem::size_of::<IoVec>()) };
@@ -3333,22 +3465,22 @@ pub fn sys_pwritev(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> i
             Some(sum) if sum <= isize::MAX as usize => sum,
             _ => return -22,
         };
-        let task = current_task().unwrap();
-        let inner = task.inner_exclusive_access();
-        let ok = inner
-            .memory_set
-            .valid_user_buf(iov.iov_base as *const u8, iov.iov_len, false);
-        drop(inner);
-        if !ok {
-            return -14;
-        }
-        iovecs.push((iov.iov_base, iov.iov_len));
+        let staging = match copy_from_user_for_io(
+            &task,
+            token,
+            iov.iov_base as *mut u8,
+            iov.iov_len,
+        ) {
+            Ok(staging) => staging,
+            Err(errno) => return errno,
+        };
+        buffers.push(staging);
     }
     let mut off = offset;
     let mut total = 0isize;
-    for (base, len) in iovecs {
-        let user_buf = crate::mm::translated_byte_buffer(token, base as *mut u8, len);
-        let n = file.write_at(off, user_buf);
+    for mut staging in buffers {
+        let len = staging.as_slice().len();
+        let n = file.write_at(off, staging.as_mut_slice());
         if n < 0 {
             return if total == 0 { n } else { total };
         }

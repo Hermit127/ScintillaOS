@@ -89,6 +89,7 @@ pub static FRAME_ALLOCATOR: FrameAllocatorLock<FrameAllocator> =
     FrameAllocatorLock::new_named(FrameAllocator::new(), "Vm.frame_allocator");
 static TOTAL_FRAMES: AtomicUsize = AtomicUsize::new(0);
 static ALLOCATED_FRAMES: AtomicUsize = AtomicUsize::new(0);
+static FRAME_ALLOC_FAILURES: AtomicUsize = AtomicUsize::new(0);
 
 // 把启动阶段探测到的一段物理内存加入帧分配器。
 // 执行时先把这段物理内存清零，再按页对齐算出页号范围，最后加入 buddy frame allocator。
@@ -116,6 +117,8 @@ pub fn frame_alloc() -> Option<FrameTracker> {
         .map(FrameTracker::new);
     if ret.is_some() {
         ALLOCATED_FRAMES.fetch_add(1, Ordering::Relaxed);
+    } else {
+        FRAME_ALLOC_FAILURES.fetch_add(1, Ordering::Relaxed);
     }
     ret
 }
@@ -123,10 +126,14 @@ pub fn frame_alloc() -> Option<FrameTracker> {
 // 连续分配多页物理页，并逐页包装成 tracker。
 // 执行时从 buddy 分配器取连续页号，再按页大小展开成多个 FrameTracker。
 pub fn frames_alloc(count: usize) -> Option<Vec<FrameTracker>> {
-    let start = FRAME_ALLOCATOR
+    let Some(start) = FRAME_ALLOCATOR
         .lock()
         .alloc(count)
-        .map(|x| pa!(x * PAGE_SIZE))?;
+        .map(|x| pa!(x * PAGE_SIZE))
+    else {
+        FRAME_ALLOC_FAILURES.fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
     ALLOCATED_FRAMES.fetch_add(count, Ordering::Relaxed);
     let ret = (0..count)
         .into_iter()
@@ -155,15 +162,27 @@ pub fn available_frames() -> usize {
     total_frames().saturating_sub(ALLOCATED_FRAMES.load(Ordering::Relaxed))
 }
 
+pub fn allocated_frames() -> usize {
+    ALLOCATED_FRAMES.load(Ordering::Relaxed)
+}
+
+pub fn frame_alloc_failures() -> usize {
+    FRAME_ALLOC_FAILURES.load(Ordering::Relaxed)
+}
+
 // 分配一页不会被 FrameTracker 自动释放的物理页。
 // 执行时从 buddy 分配器取一页并清零，只返回 PhysAddr，让调用方自己管理生命周期。
 pub fn frame_alloc_persist() -> Option<PhysAddr> {
-    FRAME_ALLOCATOR
+    let ret = FRAME_ALLOCATOR
         .lock()
         .alloc(1)
         .map(|x| pa!(x * PAGE_SIZE))
         .inspect(|x| {
             x.clear_len(PAGE_SIZE);
             ALLOCATED_FRAMES.fetch_add(1, Ordering::Relaxed);
-        })
+        });
+    if ret.is_none() {
+        FRAME_ALLOC_FAILURES.fetch_add(1, Ordering::Relaxed);
+    }
+    ret
 }

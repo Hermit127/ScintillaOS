@@ -107,7 +107,7 @@ fn handle_current_user_page_fault(vaddr: polyhal::VirtAddr, access: crate::mm::P
             let inner = task.inner_exclusive_access();
             let ctx = inner.get_trap_cx();
             println!(
-                "[fault-diag] user page fault tid={} tgid={} access={} sepc={:#x} bad={:#x} sp={:#x} ra={:#x}",
+                "[fault-diag] user page fault tid={} tgid={} access={} sepc={:#x} bad={:#x} sp={:#x} ra={:#x} reason={} frames={}/{} free={} alloc_failures={}",
                 task.getpid(),
                 inner.tgid,
                 match access {
@@ -119,6 +119,11 @@ fn handle_current_user_page_fault(vaddr: polyhal::VirtAddr, access: crate::mm::P
                 vaddr.raw(),
                 ctx[TrapFrameArgs::SP],
                 ctx[TrapFrameArgs::RA],
+                crate::mm::last_page_fault_failure(),
+                crate::mm::allocated_frames(),
+                crate::mm::total_frames(),
+                crate::mm::available_frames(),
+                crate::mm::frame_alloc_failures(),
             );
         }
         // A userspace access-permission fault is delivered through the normal

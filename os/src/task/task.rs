@@ -684,9 +684,16 @@ impl TaskControlBlock {
         let mut trap_cx = TrapFrame::new();
         trap_cx[TrapFrameArgs::SEPC] = entry_point;
         trap_cx[TrapFrameArgs::SP] = crt_sp;
-        trap_cx[TrapFrameArgs::ARG0] = argc;
-        trap_cx[TrapFrameArgs::ARG1] = argv_base;
-        trap_cx[TrapFrameArgs::ARG2] = envp_base;
+        // Linux RISC-V programs obtain argc/argv/envp from the initial stack.
+        // At the ELF entry point a0 carries rtld_fini, which is zero when the
+        // kernel starts a program directly.  Supplying argc in a0 makes static
+        // glibc register it as an exit callback and later jump to that value.
+        #[cfg(not(target_arch = "riscv64"))]
+        {
+            trap_cx[TrapFrameArgs::ARG0] = argc;
+            trap_cx[TrapFrameArgs::ARG1] = argv_base;
+            trap_cx[TrapFrameArgs::ARG2] = envp_base;
+        }
         if tls_size > 0 {
             trap_cx[TrapFrameArgs::TLS] = tls_base + tls_size;
         } else {

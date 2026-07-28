@@ -1,7 +1,7 @@
 use core::ptr::NonNull;
 
 use super::BlockDevice;
-use crate::mm::{frame_dealloc, frames_alloc, FrameTracker};
+use crate::mm::{frames_alloc, FrameTracker};
 use crate::sync::DeviceLock;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -230,13 +230,35 @@ unsafe impl Hal for VirtioHal {
     }
 
     unsafe fn dma_dealloc(paddr: usize, _vaddr: NonNull<u8>, pages: usize) -> i32 {
-        // trace!("dealloc DMA: paddr={:#x}, pages={}", paddr, pages);
-        log::error!("dealloc paddr: {:?}", paddr);
-        let mut pa = PhysAddr::new(paddr);
-        for _ in 0..pages {
-            frame_dealloc(pa);
-            pa = pa + PAGE_SIZE;
+        // `dma_alloc` transfers FrameTracker ownership into QUEUE_FRAMES.
+        // Returning the pages directly here while those trackers remain alive
+        // lets the buddy allocator hand active DMA/page-table frames to a
+        // second owner. Remove the exact allocation and drop it after the
+        // device lock has been released instead.
+        let mut retired = Vec::with_capacity(pages);
+        {
+            let mut allocated = QUEUE_FRAMES.exclusive_access();
+            let Some(start) = allocated
+                .iter()
+                .position(|frame| frame.paddr.raw() == paddr)
+            else {
+                return -1;
+            };
+            let Some(end) = start.checked_add(pages) else {
+                return -1;
+            };
+            if end > allocated.len()
+                || allocated[start..end]
+                    .iter()
+                    .enumerate()
+                    .any(|(index, frame)| frame.paddr.raw() != paddr + index * PAGE_SIZE)
+            {
+                return -1;
+            }
+            retired.extend(allocated.drain(start..end));
         }
+
+        drop(retired);
         0
     }
 

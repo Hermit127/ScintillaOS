@@ -16,6 +16,19 @@ use alloc::vec::Vec;
 use buddy_system_allocator::LockedHeap;
 use syscall::*;
 
+#[cfg(target_arch = "riscv64")]
+core::arch::global_asm!(
+    r#"
+    .section .text.entry
+    .globl _start
+    .type _start, @function
+_start:
+    ld a0, 0(sp)
+    addi a1, sp, 8
+    tail __user_start
+    "#
+);
+
 pub use syscall::*;
 
 const USER_HEAP_SIZE: usize = 8 * 1024 * 1024; // 8MB for iperf3
@@ -30,9 +43,7 @@ pub fn handle_alloc_error(layout: core::alloc::Layout) -> ! {
     panic!("Heap allocation error, layout = {:?}", layout);
 }
 
-#[no_mangle]
-#[link_section = ".text.entry"]
-pub extern "C" fn _start(argc: usize, argv: usize) -> ! {
+fn user_start(argc: usize, argv: usize) -> ! {
     unsafe {
         HEAP.lock()
             .init(HEAP_SPACE.as_ptr() as usize, USER_HEAP_SIZE);
@@ -52,6 +63,19 @@ pub extern "C" fn _start(argc: usize, argv: usize) -> ! {
         );
     }
     exit(main(argc, v.as_slice()));
+}
+
+#[cfg(target_arch = "riscv64")]
+#[no_mangle]
+pub extern "C" fn __user_start(argc: usize, argv: usize) -> ! {
+    user_start(argc, argv)
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+#[no_mangle]
+#[link_section = ".text.entry"]
+pub extern "C" fn _start(argc: usize, argv: usize) -> ! {
+    user_start(argc, argv)
 }
 
 #[linkage = "weak"]

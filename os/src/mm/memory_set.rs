@@ -102,6 +102,23 @@ pub enum PageFaultResult {
     SharedMetadataChanged,
 }
 
+pub const PAGE_FAULT_INVALID_ADDRESS: usize = 1;
+pub const PAGE_FAULT_NO_AREA: usize = 2;
+pub const PAGE_FAULT_PERMISSION: usize = 3;
+pub const PAGE_FAULT_FRAME_ALLOC: usize = 4;
+pub const PAGE_FAULT_METADATA: usize = 5;
+
+static LAST_PAGE_FAULT_FAILURE: AtomicUsize = AtomicUsize::new(0);
+
+fn page_fault_failure(reason: usize) -> Option<PageFaultResult> {
+    LAST_PAGE_FAULT_FAILURE.store(reason, Ordering::Release);
+    None
+}
+
+pub fn last_page_fault_failure() -> usize {
+    LAST_PAGE_FAULT_FAILURE.load(Ordering::Acquire)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PageFaultAccess {
     Read,
@@ -771,7 +788,7 @@ impl MemorySet {
         access: PageFaultAccess,
     ) -> Option<PageFaultResult> {
         if vaddr.raw() < crate::config::PAGE_SIZE {
-            return None;
+            return page_fault_failure(PAGE_FAULT_INVALID_ADDRESS);
         }
         let vpn = vaddr.floor();
         let mut areas = self.areas.exclusive_access();
@@ -780,7 +797,7 @@ impl MemorySet {
             .find(|a| a.vaddr_range.get_start() <= vpn && vpn < a.vaddr_range.get_end())
         {
             Some(a) => a,
-            None => return None,
+            None => return page_fault_failure(PAGE_FAULT_NO_AREA),
         };
         let write_fault = access == PageFaultAccess::Write;
         match access {
@@ -788,17 +805,17 @@ impl MemorySet {
                 if !area.map_perm.contains(MapPermission::R)
                     && !area.map_perm.contains(MapPermission::W)
                 {
-                    return None;
+                    return page_fault_failure(PAGE_FAULT_PERMISSION);
                 }
             }
             PageFaultAccess::Write => {
                 if !area.map_perm.contains(MapPermission::W) {
-                    return None;
+                    return page_fault_failure(PAGE_FAULT_PERMISSION);
                 }
             }
             PageFaultAccess::Execute => {
                 if !area.map_perm.contains(MapPermission::X) {
-                    return None;
+                    return page_fault_failure(PAGE_FAULT_PERMISSION);
                 }
             }
         }
@@ -811,7 +828,7 @@ impl MemorySet {
                 if write_fault && !flags.contains(MappingFlags::W) {
                     let f = match frame_alloc() {
                         Some(f) => f,
-                        None => return None,
+                        None => return page_fault_failure(PAGE_FAULT_FRAME_ALLOC),
                     };
                     unsafe {
                         core::ptr::copy_nonoverlapping(
@@ -844,7 +861,7 @@ impl MemorySet {
         if !in_frames {
             let f = match frame_alloc() {
                 Some(f) => f,
-                None => return None,
+                None => return page_fault_failure(PAGE_FAULT_FRAME_ALLOC),
             };
             if let Some(ref file) = area.file {
                 let off = area.file_offset + (vpn.raw() - area.vaddr_range.get_start().raw());
@@ -863,7 +880,7 @@ impl MemorySet {
         if self.shared_page_table {
             let old = match area.data_frames.get(&vpn) {
                 Some(f) => f,
-                None => return None,
+                None => return page_fault_failure(PAGE_FAULT_METADATA),
             };
             self.page_table.unmap_page(vpn);
             self.page_table
@@ -872,7 +889,7 @@ impl MemorySet {
         }
         let old = match area.data_frames.get(&vpn) {
             Some(f) => f,
-            None => return None,
+            None => return page_fault_failure(PAGE_FAULT_METADATA),
         };
         let (paddr, flags) = match self.page_table.translate(vpn) {
             Some(x) => x,
@@ -892,7 +909,7 @@ impl MemorySet {
         if write_fault && !area.shared && old.is_shared() {
             let f = match frame_alloc() {
                 Some(f) => f,
-                None => return None,
+                None => return page_fault_failure(PAGE_FAULT_FRAME_ALLOC),
             };
             unsafe {
                 core::ptr::copy_nonoverlapping(
@@ -931,6 +948,74 @@ impl MemorySet {
             .translate(vaddr)
             .map(|(pa, flags)| (pa.into(), flags))
     }
+
+    /// Copy from an already validated user range without dereferencing a user
+    /// virtual address in supervisor mode.
+    pub fn copy_from_user(&self, addr: usize, dst: &mut [u8]) -> bool {
+        if dst.is_empty() {
+            return true;
+        }
+        // Hold the shared address-space metadata lock so munmap and a COW
+        // remap cannot replace a page while its direct-map address is copied.
+        let _areas = self.areas.exclusive_access();
+        let mut copied = 0usize;
+        while copied < dst.len() {
+            let Some(user_addr) = addr.checked_add(copied) else {
+                return false;
+            };
+            let Some((paddr, flags)) = self.translate(VirtAddr::from(user_addr)) else {
+                return false;
+            };
+            if !flags.contains(MappingFlags::P)
+                || (!flags.contains(MappingFlags::R) && !flags.contains(MappingFlags::W))
+            {
+                return false;
+            }
+            let page_remaining = PAGE_SIZE - (user_addr & (PAGE_SIZE - 1));
+            let chunk = page_remaining.min(dst.len() - copied);
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    paddr.get_ptr::<u8>(),
+                    dst.as_mut_ptr().add(copied),
+                    chunk,
+                );
+            }
+            copied += chunk;
+        }
+        true
+    }
+
+    /// Copy to an already validated user range through the physical direct map.
+    pub fn copy_to_user(&self, addr: usize, src: &[u8]) -> bool {
+        if src.is_empty() {
+            return true;
+        }
+        let _areas = self.areas.exclusive_access();
+        let mut copied = 0usize;
+        while copied < src.len() {
+            let Some(user_addr) = addr.checked_add(copied) else {
+                return false;
+            };
+            let Some((paddr, flags)) = self.translate(VirtAddr::from(user_addr)) else {
+                return false;
+            };
+            if !flags.contains(MappingFlags::P) || !flags.contains(MappingFlags::W) {
+                return false;
+            }
+            let page_remaining = PAGE_SIZE - (user_addr & (PAGE_SIZE - 1));
+            let chunk = page_remaining.min(src.len() - copied);
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    src.as_ptr().add(copied),
+                    paddr.get_mut_ptr::<u8>(),
+                    chunk,
+                );
+            }
+            copied += chunk;
+        }
+        true
+    }
+
     pub fn clone_frame_metadata(&self, vpn: VirtAddr) -> Option<FrameTracker> {
         self.areas
             .exclusive_access()

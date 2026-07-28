@@ -732,6 +732,26 @@ pub(crate) fn prepare_task_user_access(
     true
 }
 
+pub(crate) fn copy_from_task_user(
+    task: &Arc<TaskControlBlock>,
+    addr: usize,
+    dst: &mut [u8],
+) -> bool {
+    if !prepare_task_user_access(task, addr, dst.len(), false) {
+        return false;
+    }
+    let inner = task.inner_exclusive_access();
+    inner.memory_set.copy_from_user(addr, dst)
+}
+
+pub(crate) fn copy_to_task_user(task: &Arc<TaskControlBlock>, addr: usize, src: &[u8]) -> bool {
+    if !prepare_task_user_access(task, addr, src.len(), true) {
+        return false;
+    }
+    let inner = task.inner_exclusive_access();
+    inner.memory_set.copy_to_user(addr, src)
+}
+
 fn user_usize(task: &Arc<TaskControlBlock>, addr: usize) -> Option<usize> {
     if addr == 0 {
         return None;
@@ -747,34 +767,31 @@ fn user_usize(task: &Arc<TaskControlBlock>, addr: usize) -> Option<usize> {
 }
 
 fn user_u32(task: &Arc<TaskControlBlock>, addr: usize) -> Option<u32> {
-    if addr == 0 {
+    if addr == 0 || addr & (core::mem::align_of::<u32>() - 1) != 0 {
         return None;
     }
     if !prepare_task_user_access(task, addr, core::mem::size_of::<u32>(), false) {
         return None;
     }
-    let token = {
-        let inner = task.inner_exclusive_access();
-        inner.memory_set.token()
-    };
-    Some(*translated_ref(token, addr as *const u32))
+    // Robust-list and clear-child-tid words can be accessed concurrently by
+    // a userspace thread through futex. Keep both sides atomic on SMP.
+    Some(unsafe { (&*(addr as *const AtomicU32)).load(Ordering::Acquire) })
 }
 
 fn set_user_u32(task: &Arc<TaskControlBlock>, addr: usize, value: u32) -> Option<Vec<FutexKey>> {
-    if addr == 0 {
+    if addr == 0 || addr & (core::mem::align_of::<u32>() - 1) != 0 {
         return None;
     }
     if !prepare_task_user_access(task, addr, core::mem::size_of::<u32>(), true) {
         return None;
     }
-    let (token, keys) = {
+    let keys = {
         let inner = task.inner_exclusive_access();
-        (
-            inner.memory_set.token(),
-            futex_all_keys_for_addr(&inner, addr),
-        )
+        futex_all_keys_for_addr(&inner, addr)
     };
-    *translated_refmut(token, addr as *mut u32) = value;
+    unsafe {
+        (&*(addr as *const AtomicU32)).store(value, Ordering::Release);
+    }
     Some(keys)
 }
 
@@ -916,10 +933,9 @@ fn clear_task_tid_ptr(task: &Arc<TaskControlBlock>) {
     if !prepare_task_user_access(task, tid, core::mem::size_of::<i32>(), true) {
         return;
     }
-    let (token, wake_keys, _diagnostic_key) = {
+    let (wake_keys, _diagnostic_key) = {
         let inner = task.inner_exclusive_access();
         (
-            inner.memory_set.token(),
             futex_all_keys_for_addr(&inner, tid),
             futex_private_key(&inner, tid),
         )
@@ -928,10 +944,12 @@ fn clear_task_tid_ptr(task: &Arc<TaskControlBlock>) {
     record_futex_event(
         0x201,
         _diagnostic_key,
-        *translated_ref(token, tid as *const u32) as usize,
+        futex_word_load(tid as *const u32) as usize,
         tid as isize,
     );
-    *translated_refmut(token, tid as *mut i32) = 0;
+    unsafe {
+        (&*(tid as *const AtomicU32)).store(0, Ordering::Release);
+    }
     #[cfg(feature = "smp-diagnostics")]
     record_futex_event(0x202, _diagnostic_key, 0, tid as isize);
     {
@@ -1034,25 +1052,35 @@ pub fn sys_clone(flags: usize, stack: usize, ptid: usize, tls: usize, ctid: usiz
     let current_task = current_task().unwrap();
     if flags & CLONE_PARENT_SETTID != 0
         && ptid != 0
-        && !prepare_task_user_access(
-            &current_task,
-            ptid,
-            core::mem::size_of::<i32>(),
-            true,
-        )
+        && (ptid & (core::mem::align_of::<u32>() - 1) != 0
+            || !prepare_task_user_access(
+                &current_task,
+                ptid,
+                core::mem::size_of::<i32>(),
+                true,
+            ))
     {
-        return -14;
+        return if ptid & (core::mem::align_of::<u32>() - 1) != 0 {
+            -22
+        } else {
+            -14
+        };
     }
-    if flags & CLONE_CHILD_SETTID != 0
+    if flags & (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID) != 0
         && ctid != 0
-        && !prepare_task_user_access(
-            &current_task,
-            ctid,
-            core::mem::size_of::<i32>(),
-            true,
-        )
+        && (ctid & (core::mem::align_of::<u32>() - 1) != 0
+            || !prepare_task_user_access(
+                &current_task,
+                ctid,
+                core::mem::size_of::<i32>(),
+                true,
+            ))
     {
-        return -14;
+        return if ctid & (core::mem::align_of::<u32>() - 1) != 0 {
+            -22
+        } else {
+            -14
+        };
     }
     let parent_tgid = {
         let inner = current_task.inner_exclusive_access();
@@ -1074,7 +1102,7 @@ pub fn sys_clone(flags: usize, stack: usize, ptid: usize, tls: usize, ctid: usiz
     };
     let new_pid = new_task.pid.0;
 
-    let child_token = {
+    {
         let mut inner = new_task.inner_exclusive_access();
         inner.trap_cx[TrapFrameArgs::RET] = 0;
         if stack != 0 {
@@ -1089,8 +1117,7 @@ pub fn sys_clone(flags: usize, stack: usize, ptid: usize, tls: usize, ctid: usiz
         if flags & CLONE_CHILD_CLEARTID != 0 && ctid != 0 {
             inner.tid_ptr = ctid;
         }
-        inner.memory_set.token()
-    };
+    }
 
     if flags & CLONE_CHILD_SETTID != 0 && ctid != 0 {
         // A non-CLONE_VM child owns a COW copy.  Resolve the write in that
@@ -1104,7 +1131,9 @@ pub fn sys_clone(flags: usize, stack: usize, ptid: usize, tls: usize, ctid: usiz
         ) {
             return -14;
         }
-        *translated_refmut(child_token, ctid as *mut i32) = new_pid as i32;
+        unsafe {
+            (&*(ctid as *const AtomicU32)).store(new_pid as u32, Ordering::Release);
+        }
     }
     if flags & CLONE_PARENT_SETTID != 0 && ptid != 0 {
         if !prepare_task_user_access(
@@ -1115,7 +1144,9 @@ pub fn sys_clone(flags: usize, stack: usize, ptid: usize, tls: usize, ctid: usiz
         ) {
             return -14;
         }
-        *translated_refmut(current_user_token(), ptid as *mut i32) = new_pid as i32;
+        unsafe {
+            (&*(ptid as *const AtomicU32)).store(new_pid as u32, Ordering::Release);
+        }
     }
 
     if is_thread {
@@ -5086,19 +5117,29 @@ pub fn sys_readv(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
             Some(sum) if sum <= isize::MAX as usize => sum,
             _ => return -22,
         };
-        let task = current_task().unwrap();
-        let inner = task.inner_exclusive_access();
-        let ok = inner
-            .memory_set
-            .valid_user_buf(iov.iov_base as *const u8, iov.iov_len, true);
-        drop(inner);
-        if !ok {
-            return if total > 0 { total } else { -14 };
-        }
-        let buf = crate::mm::translated_byte_buffer(token, iov.iov_base as *mut u8, iov.iov_len);
-        let n = file.read(buf);
+        let mut staging = match super::fs::copy_to_user_after_io(
+            &task,
+            token,
+            iov.iov_base as *mut u8,
+            iov.iov_len,
+        ) {
+            Ok(staging) => staging,
+            Err(errno) => return if total > 0 { total } else { errno },
+        };
+        let n = file.read(staging.as_mut_slice());
         if n < 0 {
             return if total > 0 { total } else { n };
+        }
+        if n as usize > iov.iov_len {
+            return if total > 0 { total } else { -5 };
+        }
+        if let Err(errno) = super::fs::copy_staged_output_to_user(
+            &task,
+            token,
+            iov.iov_base as *mut u8,
+            &staging.as_slice()[..n as usize],
+        ) {
+            return if total > 0 { total } else { errno };
         }
         total += n as isize;
         if (n as usize) < iov.iov_len {
@@ -5142,7 +5183,7 @@ pub fn sys_writev(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
         return -9;
     }
     drop(inner);
-    let mut iovecs = Vec::new();
+    let mut buffers = Vec::new();
     let mut requested = 0usize;
     for i in 0..iovcnt {
         let iov_ptr = unsafe { iov.add(i * core::mem::size_of::<IoVec>()) };
@@ -5154,21 +5195,21 @@ pub fn sys_writev(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
             Some(sum) if sum <= isize::MAX as usize => sum,
             _ => return -22,
         };
-        let task = current_task().unwrap();
-        let inner = task.inner_exclusive_access();
-        let ok = inner
-            .memory_set
-            .valid_user_buf(iov.iov_base as *const u8, iov.iov_len, false);
-        drop(inner);
-        if !ok {
-            return -14;
-        }
-        iovecs.push((iov.iov_base, iov.iov_len));
+        let staging = match super::fs::copy_from_user_for_io(
+            &task,
+            token,
+            iov.iov_base as *mut u8,
+            iov.iov_len,
+        ) {
+            Ok(staging) => staging,
+            Err(errno) => return errno,
+        };
+        buffers.push(staging);
     }
     let mut total = 0isize;
-    for (base, len) in iovecs {
-        let buf = crate::mm::translated_byte_buffer(token, base as *mut u8, len);
-        let n = file.write(buf);
+    for mut staging in buffers {
+        let len = staging.as_slice().len();
+        let n = file.write(staging.as_mut_slice());
         if n < 0 {
             return if total > 0 { total } else { n };
         }
