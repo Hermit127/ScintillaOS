@@ -5,9 +5,8 @@ use core::ffi::{c_char, c_void};
 use core::ptr::null_mut;
 use core::slice::{from_raw_parts, from_raw_parts_mut};
 use core::str;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
-static FIRST_MOUNT: AtomicBool = AtomicBool::new(true);
 static DEV_COUNTER: AtomicU32 = AtomicU32::new(1);
 const MAX_DEVICES: u32 = 8;
 
@@ -46,7 +45,7 @@ impl<K: KernelDevOp> Ext4BlockWrapper<K> {
 
     pub fn new_with_name(
         block_dev: K::DevType,
-        dev_name: &str,
+        _dev_name: &str,
         mount_point: &str,
     ) -> Result<Self, i32> {
         // note this ownership
@@ -87,27 +86,16 @@ impl<K: KernelDevOp> Ext4BlockWrapper<K> {
             journal: null_mut(),
         };
 
-        let is_root = FIRST_MOUNT.swap(false, Ordering::Relaxed);
-        let dev_name_str = if is_root {
-            "ext4_root"
-        } else {
-            let id = DEV_COUNTER.fetch_add(1, Ordering::Relaxed) % MAX_DEVICES;
-            let name = alloc::format!("ext4_mnt{}", id);
-            // try to free stale entry from previous mount with same id
-            unsafe {
-                let c = CString::new(name.as_bytes()).unwrap();
-                ext4_device_unregister(c.as_ptr() as *const c_char);
-            }
-            let leaked: &'static str = Box::leak(name.into_boxed_str());
-            leaked
-        };
-        let c_name = CString::new(dev_name_str).expect("CString::new ext4_fs failed");
+        let id = DEV_COUNTER.fetch_add(1, Ordering::Relaxed) % MAX_DEVICES;
+        let name = alloc::format!("ext4_mnt{}", id);
+        // try to free stale entry from previous mount with same id
+        unsafe {
+            let c = CString::new(name.as_bytes()).unwrap();
+            ext4_device_unregister(c.as_ptr() as *const c_char);
+        }
+        let c_name = CString::new(name.as_str()).expect("CString::new ext4_fs failed");
         let c_name = c_name.as_bytes_with_nul();
-        let c_mountpoint = if dev_name_str == "ext4_root" {
-            CString::new("/").unwrap()
-        } else {
-            CString::new(mount_point).unwrap()
-        };
+        let c_mountpoint = CString::new(mount_point).unwrap();
         let c_mountpoint = c_mountpoint.as_bytes_with_nul();
 
         let mut name: [u8; 16] = [0; 16];

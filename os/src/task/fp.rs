@@ -322,102 +322,104 @@ mod arch {
 mod arch {
     use core::arch::asm;
 
+    #[repr(C, align(16))]
     #[derive(Clone, Copy)]
     pub struct UserFloatState {
-        regs: [u64; 32],
+        regs: [u128; 32],
     }
 
     impl UserFloatState {
-        // 创建一份清零的 LoongArch 用户浮点上下文。
         pub const fn new() -> Self {
             Self { regs: [0; 32] }
         }
 
-        // 保存当前 CPU 上的用户浮点寄存器。
-        // 执行时用 LoongArch 浮点存储指令把 $f0-$f31 顺序写入任务保存区。
         pub fn save_current(&mut self) {
-            let base = self.regs.as_mut_ptr();
-            unsafe {
-                asm!(
-                    "fst.d $f0,  {base}, 0",
-                    "fst.d $f1,  {base}, 8",
-                    "fst.d $f2,  {base}, 16",
-                    "fst.d $f3,  {base}, 24",
-                    "fst.d $f4,  {base}, 32",
-                    "fst.d $f5,  {base}, 40",
-                    "fst.d $f6,  {base}, 48",
-                    "fst.d $f7,  {base}, 56",
-                    "fst.d $f8,  {base}, 64",
-                    "fst.d $f9,  {base}, 72",
-                    "fst.d $f10, {base}, 80",
-                    "fst.d $f11, {base}, 88",
-                    "fst.d $f12, {base}, 96",
-                    "fst.d $f13, {base}, 104",
-                    "fst.d $f14, {base}, 112",
-                    "fst.d $f15, {base}, 120",
-                    "fst.d $f16, {base}, 128",
-                    "fst.d $f17, {base}, 136",
-                    "fst.d $f18, {base}, 144",
-                    "fst.d $f19, {base}, 152",
-                    "fst.d $f20, {base}, 160",
-                    "fst.d $f21, {base}, 168",
-                    "fst.d $f22, {base}, 176",
-                    "fst.d $f23, {base}, 184",
-                    "fst.d $f24, {base}, 192",
-                    "fst.d $f25, {base}, 200",
-                    "fst.d $f26, {base}, 208",
-                    "fst.d $f27, {base}, 216",
-                    "fst.d $f28, {base}, 224",
-                    "fst.d $f29, {base}, 232",
-                    "fst.d $f30, {base}, 240",
-                    "fst.d $f31, {base}, 248",
-                    base = in(reg) base,
-                );
-            }
+            unsafe { save_lsx(self.regs.as_mut_ptr()) }
         }
 
-        // 把保存过的用户浮点寄存器恢复到 CPU。
-        // 执行时用 LoongArch 浮点加载指令从任务保存区恢复 $f0-$f31。
         pub fn restore_current(&self) {
-            let base = self.regs.as_ptr();
-            unsafe {
-                asm!(
-                    "fld.d $f0,  {base}, 0",
-                    "fld.d $f1,  {base}, 8",
-                    "fld.d $f2,  {base}, 16",
-                    "fld.d $f3,  {base}, 24",
-                    "fld.d $f4,  {base}, 32",
-                    "fld.d $f5,  {base}, 40",
-                    "fld.d $f6,  {base}, 48",
-                    "fld.d $f7,  {base}, 56",
-                    "fld.d $f8,  {base}, 64",
-                    "fld.d $f9,  {base}, 72",
-                    "fld.d $f10, {base}, 80",
-                    "fld.d $f11, {base}, 88",
-                    "fld.d $f12, {base}, 96",
-                    "fld.d $f13, {base}, 104",
-                    "fld.d $f14, {base}, 112",
-                    "fld.d $f15, {base}, 120",
-                    "fld.d $f16, {base}, 128",
-                    "fld.d $f17, {base}, 136",
-                    "fld.d $f18, {base}, 144",
-                    "fld.d $f19, {base}, 152",
-                    "fld.d $f20, {base}, 160",
-                    "fld.d $f21, {base}, 168",
-                    "fld.d $f22, {base}, 176",
-                    "fld.d $f23, {base}, 184",
-                    "fld.d $f24, {base}, 192",
-                    "fld.d $f25, {base}, 200",
-                    "fld.d $f26, {base}, 208",
-                    "fld.d $f27, {base}, 216",
-                    "fld.d $f28, {base}, 224",
-                    "fld.d $f29, {base}, 232",
-                    "fld.d $f30, {base}, 240",
-                    "fld.d $f31, {base}, 248",
-                    base = in(reg) base,
-                );
-            }
+            unsafe { restore_lsx(self.regs.as_ptr()) }
         }
+    }
+
+    #[target_feature(enable = "lsx")]
+    unsafe fn save_lsx(base: *mut u128) {
+        asm!(
+            "vst $vr0,  {base}, 0",
+            "vst $vr1,  {base}, 16",
+            "vst $vr2,  {base}, 32",
+            "vst $vr3,  {base}, 48",
+            "vst $vr4,  {base}, 64",
+            "vst $vr5,  {base}, 80",
+            "vst $vr6,  {base}, 96",
+            "vst $vr7,  {base}, 112",
+            "vst $vr8,  {base}, 128",
+            "vst $vr9,  {base}, 144",
+            "vst $vr10, {base}, 160",
+            "vst $vr11, {base}, 176",
+            "vst $vr12, {base}, 192",
+            "vst $vr13, {base}, 208",
+            "vst $vr14, {base}, 224",
+            "vst $vr15, {base}, 240",
+            "vst $vr16, {base}, 256",
+            "vst $vr17, {base}, 272",
+            "vst $vr18, {base}, 288",
+            "vst $vr19, {base}, 304",
+            "vst $vr20, {base}, 320",
+            "vst $vr21, {base}, 336",
+            "vst $vr22, {base}, 352",
+            "vst $vr23, {base}, 368",
+            "vst $vr24, {base}, 384",
+            "vst $vr25, {base}, 400",
+            "vst $vr26, {base}, 416",
+            "vst $vr27, {base}, 432",
+            "vst $vr28, {base}, 448",
+            "vst $vr29, {base}, 464",
+            "vst $vr30, {base}, 480",
+            "vst $vr31, {base}, 496",
+            base = in(reg) base,
+            options(nostack),
+        );
+    }
+
+    #[target_feature(enable = "lsx")]
+    unsafe fn restore_lsx(base: *const u128) {
+        asm!(
+            "vld $vr0,  {base}, 0",
+            "vld $vr1,  {base}, 16",
+            "vld $vr2,  {base}, 32",
+            "vld $vr3,  {base}, 48",
+            "vld $vr4,  {base}, 64",
+            "vld $vr5,  {base}, 80",
+            "vld $vr6,  {base}, 96",
+            "vld $vr7,  {base}, 112",
+            "vld $vr8,  {base}, 128",
+            "vld $vr9,  {base}, 144",
+            "vld $vr10, {base}, 160",
+            "vld $vr11, {base}, 176",
+            "vld $vr12, {base}, 192",
+            "vld $vr13, {base}, 208",
+            "vld $vr14, {base}, 224",
+            "vld $vr15, {base}, 240",
+            "vld $vr16, {base}, 256",
+            "vld $vr17, {base}, 272",
+            "vld $vr18, {base}, 288",
+            "vld $vr19, {base}, 304",
+            "vld $vr20, {base}, 320",
+            "vld $vr21, {base}, 336",
+            "vld $vr22, {base}, 352",
+            "vld $vr23, {base}, 368",
+            "vld $vr24, {base}, 384",
+            "vld $vr25, {base}, 400",
+            "vld $vr26, {base}, 416",
+            "vld $vr27, {base}, 432",
+            "vld $vr28, {base}, 448",
+            "vld $vr29, {base}, 464",
+            "vld $vr30, {base}, 480",
+            "vld $vr31, {base}, 496",
+            base = in(reg) base,
+            options(nostack),
+        );
     }
 }
 

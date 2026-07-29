@@ -63,13 +63,17 @@ impl From<PTEFlags> for MappingFlags {
             flags |= MappingFlags::W;
         }
 
+        if !val.contains(PTEFlags::NR) {
+            flags |= MappingFlags::R;
+        }
+
+        if !val.contains(PTEFlags::NX) {
+            flags |= MappingFlags::X;
+        }
+
         if val.contains(PTEFlags::D) {
             flags |= MappingFlags::D;
         }
-
-        // if !self.contains(PTEFlags::NX) {
-        //     flags |= MappingFlags::X;
-        // }
 
         if val.contains(PTEFlags::PLV_USER) {
             flags |= MappingFlags::U;

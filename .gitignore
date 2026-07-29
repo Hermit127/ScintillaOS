@@ -48,6 +48,7 @@ artifacts/smp4-validation*/failure-*/
 
 # Local contest/test suites
 testsuits-for-oskernel
+testsuits-for-oskernel-final/
 oskernel-testsuits-cooperation
 
 # Local tools and downloaded toolchains

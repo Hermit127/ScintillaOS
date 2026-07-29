@@ -688,7 +688,7 @@ impl TaskControlBlock {
         // At the ELF entry point a0 carries rtld_fini, which is zero when the
         // kernel starts a program directly.  Supplying argc in a0 makes static
         // glibc register it as an exit callback and later jump to that value.
-        #[cfg(not(target_arch = "riscv64"))]
+        #[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
         {
             trap_cx[TrapFrameArgs::ARG0] = argc;
             trap_cx[TrapFrameArgs::ARG1] = argv_base;

@@ -61,8 +61,21 @@ pub fn init_dtb_once(dtb_ptr: PhysAddr) -> Result<(), FdtError<'static>> {
     fdt.memory()
         .flat_map(|x| x.regions())
         .for_each(|mm| unsafe {
-            #[cfg(not(target_arch = "riscv64"))]
+            #[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
             add_memory_region(mm.address as _, mm.address as usize + mm.size);
+            #[cfg(target_arch = "loongarch64")]
+            {
+                let mut start = mm.address as usize;
+                let mut size = mm.size;
+
+                // QEMU before the FDT memory-width fix encoded <2, base, 2, size>.
+                if start >> 32 == 2 && size >> 32 == 2 {
+                    start &= u32::MAX as usize;
+                    size &= u32::MAX as usize;
+                }
+
+                add_memory_region(start, start + size);
+            }
             #[cfg(target_arch = "riscv64")]
             {
                 let mut start = mm.address as _;

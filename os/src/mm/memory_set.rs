@@ -343,7 +343,12 @@ impl MemorySet {
             0x93, 0x08, 0xb0, 0x08, // addi a7, zero, __NR_rt_sigreturn (139)
             0x73, 0x00, 0x00, 0x00, // ecall
         ];
-        #[cfg(not(target_arch = "riscv64"))]
+        #[cfg(target_arch = "loongarch64")]
+        const CODE: [u8; 8] = [
+            0x0b, 0x2c, 0x82, 0x03, // ori a7, zero, __NR_rt_sigreturn (139)
+            0x00, 0x00, 0x2b, 0x00, // syscall 0
+        ];
+        #[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
         const CODE: [u8; 0] = [];
 
         let start = crate::config::SIGNAL_RETURN_TRAMPOLINE;

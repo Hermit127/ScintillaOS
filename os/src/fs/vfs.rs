@@ -16,6 +16,8 @@ use lwext4_rust::bindings::*;
 use lwext4_rust::Ext4BlockWrapper;
 
 const PATH_OWNER_CACHE_MAX_ENTRIES: usize = 1024;
+const ROOT_LWEXT4_MOUNT: &str = "/__rootfs/";
+const ROOT_LWEXT4_BIN: &str = "/__rootfs/bin";
 // The first SMP release has no mount hotplug requirement.  Reserving the
 // small mount table up front keeps Vec growth (and therefore allocation) out
 // of VfsLock critical sections.
@@ -675,7 +677,7 @@ impl Dentry {
         Arc::new(Dentry {
             name: String::from("/"),
             path: String::from("/"),
-            fs_path: String::from("/"),
+            fs_path: String::from(ROOT_LWEXT4_MOUNT),
             inode_num: 2,
             is_dir: true,
             is_link: false,
@@ -1077,13 +1079,17 @@ pub fn vfs_resolve_path(start: &Arc<Dentry>, path: &str) -> Option<Arc<Dentry>> 
         start.clone()
     };
 
-    for component in path.split('/') {
-        match component {
-            "" | "." => continue,
-            _ => {
-                current = vfs_lookup(&current, component)?;
-            }
-        }
+    let mut components = path
+        .split('/')
+        .filter(|component| !component.is_empty() && *component != ".")
+        .peekable();
+    while let Some(component) = components.next() {
+        let next = vfs_lookup(&current, component)?;
+        current = if components.peek().is_some() && next.is_link {
+            crate::fs::follow_symlink(&current, next, 0)?
+        } else {
+            next
+        };
     }
 
     lookup_mount(&current).or(Some(current))
@@ -1253,7 +1259,7 @@ use crate::drivers::{BLOCK_DEVICE, ROOT_BLOCK_DEVICE};
 
 lazy_static! {
     pub static ref ROOT_SB: Arc<VfsSuperBlock> = {
-        VfsSuperBlock::new_ext4(ROOT_BLOCK_DEVICE.clone(), "ext4")
+        VfsSuperBlock::new_ext4_at(ROOT_BLOCK_DEVICE.clone(), "ext4", ROOT_LWEXT4_MOUNT)
             .expect("Failed to mount root ext4 filesystem")
     };
     pub static ref ROOT_DENTRY: Arc<Dentry> = Dentry::new_root(ROOT_SB.clone());
@@ -1302,7 +1308,7 @@ pub fn shutdown_filesystems() {
 
 /// Mount the test disk (bus 0) at the specified mount point dentry.
 pub fn mount_test_disk_at(mnt_point: Arc<Dentry>) -> bool {
-    let test_sb = match VfsSuperBlock::new_ext4(BLOCK_DEVICE.clone(), "ext4") {
+    let test_sb = match VfsSuperBlock::new_ext4_at(BLOCK_DEVICE.clone(), "ext4", "/__mount_vda/") {
         Some(sb) => sb,
         None => return false,
     };
@@ -1312,7 +1318,7 @@ pub fn mount_test_disk_at(mnt_point: Arc<Dentry>) -> bool {
 pub fn list_apps() {
     println!("/**** APPS ****");
     ROOT_SB
-        .dir_get_entries("/bin")
+        .dir_get_entries(ROOT_LWEXT4_BIN)
         .iter()
         .filter(|e| {
             let name = e.get_name();

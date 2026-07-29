@@ -2054,7 +2054,14 @@ struct Winsize {
 }
 
 fn is_terminal_fd(fd: usize) -> bool {
-    fd == 0 || fd == 1 // stdin/stdout
+    let Some(task) = current_task() else {
+        return false;
+    };
+    let inner = task.inner_exclusive_access();
+    let Some(file) = inner.fd_table.get(fd).and_then(|file| file.as_ref()) else {
+        return false;
+    };
+    file.as_any().is::<crate::fs::Stdin>() || file.as_any().is::<crate::fs::Stdout>()
 }
 
 pub fn sys_ioctl(fd: usize, request: usize, arg: usize) -> isize {
@@ -2210,6 +2217,9 @@ pub fn sys_ioctl(fd: usize, request: usize, arg: usize) -> isize {
             0
         }
         TIOCGWINSZ => {
+            if !is_terminal_fd(fd) {
+                return -25; // ENOTTY
+            }
             if arg == 0 {
                 return -14;
             }

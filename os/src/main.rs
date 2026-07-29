@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 #![feature(alloc_error_handler)]
+#![cfg_attr(target_arch = "loongarch64", feature(loongarch_target_feature))]
 
 use crate::{
     syscall::{syscall, SYSCALL_EXEC},
@@ -260,7 +261,7 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             {
                 static ILLEGAL_DIAG_COUNT: core::sync::atomic::AtomicUsize =
                     core::sync::atomic::AtomicUsize::new(0);
-                if ILLEGAL_DIAG_COUNT.fetch_add(1, Ordering::Relaxed) < 16 {
+                if ILLEGAL_DIAG_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 16 {
                     let (tid, tgid) = current_task()
                         .map(|task| {
                             let tid = task.getpid();
@@ -460,6 +461,7 @@ extern "C" fn loongarch64_rust_tmp_main(hart_id: usize) -> ! {
     let _ = polyhal::mem::init_dtb_once(polyhal::consts::QEMU_DTB_ADDR);
     polyhal::percpu::set_local_thread_pointer(hart_id);
     loongArch64::register::euen::set_fpe(true);
+    loongArch64::register::euen::set_sxe(true);
     polyhal::ctor::ph_init_iter(polyhal::ctor::CtorType::Cpu).for_each(|x| (x.func)());
     polyhal::mem::parse_system_info();
     polyhal::ctor::ph_init_iter(polyhal::ctor::CtorType::Platform).for_each(|x| (x.func)());
