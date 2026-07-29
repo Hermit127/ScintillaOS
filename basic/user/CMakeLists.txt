@@ -39,9 +39,11 @@ set(CMAKE_C_LINK_FLAGS      "${LINK_FLAGS} -nostdlib -static -no-pie -T ${CMAKE_
 aux_source_directory(lib LIBS)
 #set(LIBS ${ARCH_DIR}/crt.S ${LIBS})
 set(LIBS ${ARCH_DIR}/crt.S ${ARCH_DIR}/clone.s ${LIBS})
-add_library(ulib ${LIBS} syscall_ids)
+set(GENERATED_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
+set(SYSCALL_IDS_HEADER ${GENERATED_DIR}/syscall_ids.h)
+add_library(ulib ${LIBS} ${SYSCALL_IDS_HEADER})
 include_directories(include/)
-target_include_directories(ulib PRIVATE ${ARCH_DIR})
+target_include_directories(ulib PRIVATE ${GENERATED_DIR} ${ARCH_DIR})
 
 # Execuatble
 set(ENTRY "0x1000")
@@ -86,9 +88,10 @@ foreach(PATH ${SRCS})
 endforeach()
 
 add_custom_command(
-        OUTPUT syscall_ids.h
-        COMMAND cp ${CMAKE_SOURCE_DIR}/${ARCH_DIR}/syscall_ids.h.in ${CMAKE_SOURCE_DIR}/lib/syscall_ids.h
+        OUTPUT ${SYSCALL_IDS_HEADER}
+        COMMAND mkdir -p ${GENERATED_DIR}
+        COMMAND cp ${CMAKE_SOURCE_DIR}/${ARCH_DIR}/syscall_ids.h.in ${SYSCALL_IDS_HEADER}
         COMMAND sed ARGS -n -e s/__NR_/SYS_/p
         < ${CMAKE_SOURCE_DIR}/${ARCH_DIR}/syscall_ids.h.in
-        >> ${CMAKE_SOURCE_DIR}/lib/syscall_ids.h
+        >> ${SYSCALL_IDS_HEADER}
 )

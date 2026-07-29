@@ -1,4 +1,7 @@
-use core::{arch::naked_asm, ptr::addr_of_mut};
+use core::{
+    arch::{asm, naked_asm},
+    ptr::addr_of_mut,
+};
 use polyhal::{
     consts::VIRT_ADDR_START,
     ctor::{ph_init_iter, CtorType},
@@ -139,6 +142,10 @@ fn init_cpu() {
         sstatus::set_sum();
         // Open float point support.
         sstatus::set_fs(sstatus::FS::Dirty);
+        // Enable the supervisor/user vector state.  Official glibc test ELFs
+        // require RISC-V V 1.0; the kernel saves and restores all vector
+        // registers around every user trap.
+        asm!("csrs sstatus, {vs}", vs = in(reg) 0x600usize);
         sie::set_sext();
         sie::set_ssoft();
     }

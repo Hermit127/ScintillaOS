@@ -1,5 +1,5 @@
 // 这里负责操作系统的进程管理：实现 pid 分配和 PidHandle 的自动回收。
-use crate::sync::UPSafeCell;
+use crate::sync::PidRegistryLock;
 use alloc::vec::Vec;
 use lazy_static::*;
 
@@ -41,8 +41,8 @@ impl PidAllocator {
 }
 
 lazy_static! {
-    static ref PID_ALLOCATOR: UPSafeCell<PidAllocator> =
-        unsafe { UPSafeCell::new(PidAllocator::new()) };
+    static ref PID_ALLOCATOR: PidRegistryLock<PidAllocator> =
+        PidRegistryLock::new_named(PidAllocator::new(), "PidAllocator");
 }
 
 pub struct PidHandle(pub usize);

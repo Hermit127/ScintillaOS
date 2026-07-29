@@ -16,6 +16,19 @@ use alloc::vec::Vec;
 use buddy_system_allocator::LockedHeap;
 use syscall::*;
 
+#[cfg(target_arch = "riscv64")]
+core::arch::global_asm!(
+    r#"
+    .section .text.entry
+    .globl _start
+    .type _start, @function
+_start:
+    ld a0, 0(sp)
+    addi a1, sp, 8
+    tail __user_start
+    "#
+);
+
 pub use syscall::*;
 
 const USER_HEAP_SIZE: usize = 8 * 1024 * 1024; // 8MB for iperf3
@@ -30,9 +43,7 @@ pub fn handle_alloc_error(layout: core::alloc::Layout) -> ! {
     panic!("Heap allocation error, layout = {:?}", layout);
 }
 
-#[no_mangle]
-#[link_section = ".text.entry"]
-pub extern "C" fn _start(argc: usize, argv: usize) -> ! {
+fn user_start(argc: usize, argv: usize) -> ! {
     unsafe {
         HEAP.lock()
             .init(HEAP_SPACE.as_ptr() as usize, USER_HEAP_SIZE);
@@ -52,6 +63,19 @@ pub extern "C" fn _start(argc: usize, argv: usize) -> ! {
         );
     }
     exit(main(argc, v.as_slice()));
+}
+
+#[cfg(target_arch = "riscv64")]
+#[no_mangle]
+pub extern "C" fn __user_start(argc: usize, argv: usize) -> ! {
+    user_start(argc, argv)
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+#[no_mangle]
+#[link_section = ".text.entry"]
+pub extern "C" fn _start(argc: usize, argv: usize) -> ! {
+    user_start(argc, argv)
 }
 
 #[linkage = "weak"]
@@ -144,6 +168,18 @@ pub fn execve(path: &str, args: &[*const u8], envs: &[*const u8]) -> isize {
 pub fn chroot(path: &str) -> isize {
     sys_chroot(path)
 }
+
+/// Convert a normal Linux-style wait status into the historic raw exit code
+/// exposed by this Rust user library.  The C libc and LTP paths intentionally
+/// use the raw syscall result and perform their own `WEXITSTATUS` decoding.
+fn decode_wait_status(status: i32) -> i32 {
+    if status >= 0 && (status & 0xff) == 0 {
+        status >> 8
+    } else {
+        status
+    }
+}
+
 pub fn wait(exit_code: &mut i32) -> isize {
     loop {
         match sys_waitpid(-1, exit_code as *mut _) {
@@ -151,7 +187,12 @@ pub fn wait(exit_code: &mut i32) -> isize {
                 yield_();
             }
             // -1 or a real pid
-            exit_pid => return exit_pid,
+            exit_pid => {
+                if exit_pid > 0 {
+                    *exit_code = decode_wait_status(*exit_code);
+                }
+                return exit_pid;
+            }
         }
     }
 }
@@ -163,7 +204,12 @@ pub fn waitpid(pid: usize, exit_code: &mut i32) -> isize {
                 yield_();
             }
             // -1 or a real pid
-            exit_pid => return exit_pid,
+            exit_pid => {
+                if exit_pid > 0 {
+                    *exit_code = decode_wait_status(*exit_code);
+                }
+                return exit_pid;
+            }
         }
     }
 }

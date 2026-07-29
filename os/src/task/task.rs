@@ -1,16 +1,16 @@
 use super::{current_task, SignalActions, UserFloatState};
-use super::{pid_alloc, PidHandle, SignalFlags};
+use super::{pid_alloc, PendingSignalInfo, PidHandle, SignalFlags};
 use crate::config::KERNEL_STACK_SIZE;
 use crate::fs::vfs::{Dentry, ROOT_DENTRY};
 use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{translated_refmut, LoadedElf, MapArea, MapPermission, MapType, MemorySet};
-use crate::sync::UPSafeCell;
+use crate::sync::{SignalActionsLock, TaskGuard, TaskLock};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
-use core::cell::{Ref, RefMut};
 use core::mem::size_of;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use polyhal::kcontext::{read_current_tp, KContext, KContextArgs};
 use polyhal::pagetable::PageTable;
 use polyhal_trap::trap::run_user_task;
@@ -19,9 +19,58 @@ use polyhal_trap::trapframe::{TrapFrame, TrapFrameArgs};
 pub struct TaskControlBlock {
     // immutable
     pub pid: PidHandle,
+    /// Lock-free scheduler ownership metadata.
+    ///
+    /// `inner.task_status` remains the compatibility-facing task state during
+    /// this transition.  These atomics give the scheduler a separate source of
+    /// truth for CPU ownership and queue membership, so it can later perform a
+    /// Ready -> Running handoff while holding `SchedulerLock` without exposing
+    /// a partially moved task to another hart.
+    scheduling: TaskSchedulingMeta,
     // mutable
-    inner: UPSafeCell<TaskControlBlockInner>,
+    /// Mutable per-task state.  Scheduler queue membership remains owned by
+    /// `SchedulerLock`; callers must not retain this guard while scheduling,
+    /// translating user pointers, performing I/O, or invoking callbacks.
+    inner: TaskLock<TaskControlBlockInner>,
 }
+
+/// Sentinel used when a task is not executing on any CPU.
+pub const NO_RUNNING_CPU: usize = usize::MAX;
+
+/// Per-task data that must be observable without taking the broad TaskLock.
+///
+/// RISC-V/QEMU starts with the fixed four-hart topology enabled after boot.
+/// Other architectures retain the old single-CPU default. Shared-address-
+/// space clone groups may run on multiple harts: every page-table mutation
+/// records the active CPU mask and completes a remote TLB shootdown before
+/// recycled frames become available again.
+struct TaskSchedulingMeta {
+    running_cpu: AtomicUsize,
+    allowed_cpus: AtomicUsize,
+    enqueued: AtomicBool,
+    exit_cleanup_done: AtomicBool,
+    /// Non-zero while this task is a vfork child whose parent must remain
+    /// suspended.  The value is the parent's TID, allowing exec/exit to
+    /// complete the handoff without taking either task's broad inner lock.
+    vfork_parent: AtomicUsize,
+}
+
+impl TaskSchedulingMeta {
+    const fn new() -> Self {
+        Self {
+            running_cpu: AtomicUsize::new(NO_RUNNING_CPU),
+            allowed_cpus: AtomicUsize::new(DEFAULT_TASK_CPU_MASK),
+            enqueued: AtomicBool::new(false),
+            exit_cleanup_done: AtomicBool::new(false),
+            vfork_parent: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
+const DEFAULT_TASK_CPU_MASK: usize = (1usize << crate::config::MAX_CPUS) - 1;
+#[cfg(not(target_arch = "riscv64"))]
+const DEFAULT_TASK_CPU_MASK: usize = 1;
 use log::*;
 impl Drop for TaskControlBlock {
     fn drop(&mut self) {
@@ -55,7 +104,6 @@ pub struct TaskControlBlockInner {
     pub memory_set: MemorySet,
     pub kernel_stack: KernelStack,
     pub parent: Option<Weak<TaskControlBlock>>,
-    pub vfork_parent: Option<Weak<TaskControlBlock>>,
     pub children: Vec<Arc<TaskControlBlock>>,
     pub exit_code: i32,
     pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
@@ -80,12 +128,18 @@ pub struct TaskControlBlockInner {
     pub umask: u32,
     pub nice: i32,
     pub signals: SignalFlags,
+    pub pending_signal_info: [PendingSignalInfo; super::MAX_SIG + 1],
     pub signal_mask: SignalFlags,
     pub signal_mask_backup: Option<SignalFlags>,
     // the signal which is being handling
     pub handling_sig: isize,
     // Signal actions
-    pub signal_actions: SignalActions,
+    /// Signal dispositions are process-wide when CLONE_SIGHAND is used.
+    ///
+    /// Keeping the table behind a separately locked Arc avoids the former
+    /// best-effort per-thread propagation, which could silently miss a thread
+    /// running on another hart.
+    pub signal_actions: Arc<SignalActionsLock<SignalActions>>,
     // if the task is killed
     pub killed: bool,
     // if the task is frozen by a signal
@@ -144,21 +198,11 @@ impl TaskControlBlockInner {
             max_fd
         }
     }
-    pub fn close_fd(&mut self, fd: usize) -> bool {
+    pub fn take_fd_for_close(&mut self, fd: usize) -> Option<Arc<dyn File + Send + Sync>> {
         if fd < self.fd_table.len() {
-            if let Some(file) = self.fd_table[fd].take() {
-                file.close_ref();
-                return true;
-            }
+            return self.fd_table[fd].take();
         }
-        false
-    }
-    pub fn clear_fd_table(&mut self) {
-        for fd in 0..self.fd_table.len() {
-            self.close_fd(fd);
-        }
-        self.fd_table.clear();
-        self.fd_cloexec.clear();
+        None
     }
 
     pub fn drain_fd_table(&mut self) -> Vec<Arc<dyn File + Send + Sync>> {
@@ -173,13 +217,17 @@ impl TaskControlBlockInner {
         files
     }
 
-    pub fn close_cloexec_fds(&mut self) {
+    pub fn take_cloexec_fds(&mut self) -> Vec<Arc<dyn File + Send + Sync>> {
+        let mut files = Vec::new();
         let len = self.fd_table.len().min(self.fd_cloexec.len());
         for fd in 0..len {
             if self.fd_cloexec[fd] {
-                self.close_fd(fd);
+                if let Some(file) = self.fd_table[fd].take() {
+                    files.push(file);
+                }
             }
         }
+        files
     }
 }
 
@@ -207,23 +255,24 @@ pub fn blank_kcontext(ksp: usize) -> KContext {
 
 impl TaskControlBlock {
     #[track_caller]
-    pub fn inner_exclusive_access(&self) -> RefMut<'_, TaskControlBlockInner> {
+    pub fn inner_exclusive_access(&self) -> TaskGuard<'_, TaskControlBlockInner> {
         self.inner.exclusive_access()
     }
     pub fn from_raw(pid: PidHandle, inner: TaskControlBlockInner) -> Self {
         Self {
             pid,
-            inner: unsafe { UPSafeCell::new(inner) },
+            scheduling: TaskSchedulingMeta::new(),
+            inner: TaskLock::new_named(inner, "TaskInner"),
         }
     }
     #[track_caller]
-    pub fn try_inner_exclusive_access(&self) -> Option<RefMut<'_, TaskControlBlockInner>> {
+    pub fn try_inner_exclusive_access(&self) -> Option<TaskGuard<'_, TaskControlBlockInner>> {
         match self.inner.try_borrow_mut() {
             Some(g) => Some(g),
             None => None,
         }
     }
-    pub fn try_inner_borrow(&self) -> Option<core::cell::Ref<'_, TaskControlBlockInner>> {
+    pub fn try_inner_borrow(&self) -> Option<TaskGuard<'_, TaskControlBlockInner>> {
         match self.inner.try_borrow() {
             Some(g) => Some(g),
             None => None,
@@ -253,15 +302,16 @@ impl TaskControlBlock {
         } = MemorySet::from_elf(elf_data);
 
         let heap_bottom = user_sp;
+        memory_set.set_program_brk(heap_bottom);
         // alloc a pid and a kernel stack in kernel space
         let pid_handle = pid_alloc();
         let pid_value = pid_handle.0;
         let kstack = KernelStack::new();
         let task_control_block = Self {
             pid: pid_handle,
-            inner: unsafe {
-                UPSafeCell::new_named(
-                    TaskControlBlockInner {
+            scheduling: TaskSchedulingMeta::new(),
+            inner: TaskLock::new_named(
+                TaskControlBlockInner {
                         trap_cx: TrapFrame::new(),
                         fp_state: UserFloatState::new(),
                         base_size: user_sp,
@@ -269,7 +319,6 @@ impl TaskControlBlock {
                         task_status: TaskStatus::Ready,
                         memory_set,
                         parent: None,
-                        vfork_parent: None,
                         children: Vec::new(),
                         exit_code: 0,
                         fd_table: vec![
@@ -301,10 +350,17 @@ impl TaskControlBlock {
                         umask: 0o022,
                         nice: 0,
                         signals: SignalFlags::empty(),
+                        pending_signal_info: [
+                            PendingSignalInfo::default();
+                            super::MAX_SIG + 1
+                        ],
                         signal_mask: SignalFlags::empty(),
                         signal_mask_backup: None,
                         handling_sig: -1,
-                        signal_actions: SignalActions::default(),
+                        signal_actions: Arc::new(SignalActionsLock::new_named(
+                            SignalActions::default(),
+                            "SignalActions",
+                        )),
                         killed: false,
                         frozen: false,
                         trap_ctx_backup: None,
@@ -330,10 +386,9 @@ impl TaskControlBlock {
                         alt_stack_flags: 0,
                         in_syscall: false,
                         exit_signal: 0,
-                    },
-                    "TaskInner",
-                )
-            },
+                },
+                "TaskInner",
+            ),
         };
         // prepare TrapContext in user space
         let tp_val = {
@@ -432,6 +487,30 @@ impl TaskControlBlock {
         let interp_base = loaded.interp_base;
         let memory_set = loaded.memory_set;
 
+        memory_set.set_program_brk(heap_bottom);
+        #[cfg(feature = "smp-diagnostics")]
+        crate::println!(
+            "[exec-diag] tid={} tgid={} entry={:#x} program_entry={:#x} phdr={:#x} phent={} phnum={} stack_top={:#x} brk={:#x} tls={:#x}+{:#x} interp_base={:#x} argc={} envc={}",
+            self.getpid(),
+            self.inner_exclusive_access().tgid,
+            entry_point,
+            program_entry,
+            ph_addr,
+            ph_entsize,
+            ph_num,
+            stack_top,
+            heap_bottom,
+            tls_base,
+            tls_size,
+            interp_base,
+            args.len(),
+            envs.len(),
+        );
+
+        // The new address space becomes active before its initial stack is
+        // populated. Mark it now so future shootdowns cannot overlook this
+        // hart during exec's page-table handoff.
+        memory_set.enter_cpu(crate::task::current_hart_id());
         memory_set.activate();
         let token = memory_set.token();
         let argc = args.len();
@@ -579,8 +658,19 @@ impl TaskControlBlock {
         let crt_sp = sp;
 
         let mut inner = self.inner_exclusive_access();
-        inner.close_cloexec_fds();
-        inner.signal_actions.reset_for_exec();
+        // The old page table is no longer installed after `activate()` above.
+        // Drop this hart from its activity mask before replacing the TCB's
+        // address-space owner.
+        inner
+            .memory_set
+            .leave_cpu(crate::task::current_hart_id());
+        let cloexec_files = inner.take_cloexec_fds();
+        let mut exec_actions = inner.signal_actions.lock().clone();
+        exec_actions.reset_for_exec();
+        inner.signal_actions = Arc::new(SignalActionsLock::new_named(
+            exec_actions,
+            "SignalActions",
+        ));
         inner.handling_sig = -1;
         inner.signal_mask_backup = None;
         inner.trap_ctx_backup = None;
@@ -594,9 +684,16 @@ impl TaskControlBlock {
         let mut trap_cx = TrapFrame::new();
         trap_cx[TrapFrameArgs::SEPC] = entry_point;
         trap_cx[TrapFrameArgs::SP] = crt_sp;
-        trap_cx[TrapFrameArgs::ARG0] = argc;
-        trap_cx[TrapFrameArgs::ARG1] = argv_base;
-        trap_cx[TrapFrameArgs::ARG2] = envp_base;
+        // Linux RISC-V programs obtain argc/argv/envp from the initial stack.
+        // At the ELF entry point a0 carries rtld_fini, which is zero when the
+        // kernel starts a program directly.  Supplying argc in a0 makes static
+        // glibc register it as an exit callback and later jump to that value.
+        #[cfg(not(target_arch = "riscv64"))]
+        {
+            trap_cx[TrapFrameArgs::ARG0] = argc;
+            trap_cx[TrapFrameArgs::ARG1] = argv_base;
+            trap_cx[TrapFrameArgs::ARG2] = envp_base;
+        }
         if tls_size > 0 {
             trap_cx[TrapFrameArgs::TLS] = tls_base + tls_size;
         } else {
@@ -614,20 +711,41 @@ impl TaskControlBlock {
                 trap_cx[TrapFrameArgs::TLS] = tls_va + crate::config::PAGE_SIZE;
             }
         }
+        #[cfg(feature = "smp-diagnostics")]
+        let committed_tp = trap_cx[TrapFrameArgs::TLS];
         *inner.get_trap_cx() = trap_cx;
-        let vfork_parent = inner.vfork_parent.take().and_then(|parent| parent.upgrade());
+        #[cfg(feature = "smp-diagnostics")]
+        crate::println!(
+            "[exec-diag] tid={} committed sepc={:#x} sp={:#x} argv={:#x} envp={:#x} tp={:#x}",
+            self.getpid(),
+            entry_point,
+            crt_sp,
+            argv_base,
+            envp_base,
+            committed_tp,
+        );
         drop(inner);
-        if let Some(parent) = vfork_parent {
-            super::wake_blocked_task(&parent);
+        for file in cloexec_files {
+            file.close_ref();
         }
     }
     pub fn fork(self: &Arc<TaskControlBlock>) -> Option<Arc<TaskControlBlock>> {
         trace!("os::task::TaskControlBlock::fork");
         // Copy the user address space before collecting the remaining task state.
+        // `from_existed_user` write-protects the parent's present writable
+        // mappings for COW. A parent which is already a CLONE_VM group can be
+        // active on several harts, so retain its activity mask while the PTEs
+        // are changed and shoot those harts down after releasing Task/Vm.
+        let mut parent_active_cpus = 0;
         let memory_set = {
             let mut parent_inner = self.inner_exclusive_access();
+            parent_active_cpus = parent_inner.memory_set.active_cpu_mask();
             MemorySet::from_existed_user(&mut parent_inner.memory_set)?
         };
+        assert!(
+            super::processor::flush_remote_tlb(parent_active_cpus, 0, 0),
+            "fork COW remote TLB shootdown failed"
+        );
 
         let (
             trap_cx_clone,
@@ -660,6 +778,10 @@ impl TaskControlBlock {
             fp_state,
         ) = {
             let parent_inner = self.inner_exclusive_access();
+            let fork_signal_actions = Arc::new(SignalActionsLock::new_named(
+                parent_inner.signal_actions.lock().clone(),
+                "SignalActions",
+            ));
             (
                 parent_inner.trap_cx.clone(),
                 parent_inner.base_size,
@@ -694,7 +816,7 @@ impl TaskControlBlock {
                 parent_inner.umask,
                 parent_inner.nice,
                 parent_inner.signal_mask,
-                parent_inner.signal_actions.clone(),
+                fork_signal_actions,
                 parent_inner.heap_bottom,
                 parent_inner.program_brk,
                 parent_inner.fp_state,
@@ -706,9 +828,9 @@ impl TaskControlBlock {
         let kstack = KernelStack::new();
         let task_control_block = Arc::new(TaskControlBlock {
             pid: pid_handle,
-            inner: unsafe {
-                UPSafeCell::new_named(
-                    TaskControlBlockInner {
+            scheduling: TaskSchedulingMeta::new(),
+            inner: TaskLock::new_named(
+                TaskControlBlockInner {
                         trap_cx: trap_cx_clone,
                         fp_state,
                         base_size,
@@ -716,7 +838,6 @@ impl TaskControlBlock {
                         task_status: TaskStatus::Ready,
                         memory_set,
                         parent: Some(Arc::downgrade(self)),
-                        vfork_parent: None,
                         children: Vec::new(),
                         exit_code: 0,
                         fd_table,
@@ -741,6 +862,10 @@ impl TaskControlBlock {
                         umask,
                         nice,
                         signals: SignalFlags::empty(),
+                        pending_signal_info: [
+                            PendingSignalInfo::default();
+                            super::MAX_SIG + 1
+                        ],
                         signal_mask,
                         signal_mask_backup: None,
                         handling_sig: -1,
@@ -769,10 +894,9 @@ impl TaskControlBlock {
                         alt_stack_flags: 0,
                         in_syscall: false,
                         exit_signal: 0,
-                    },
-                    "TaskInner",
-                )
-            },
+                },
+                "TaskInner",
+            ),
         });
         // add child to parent's children list
         {
@@ -781,8 +905,16 @@ impl TaskControlBlock {
         }
         Some(task_control_block)
     }
-    pub fn clone_shared_vm(self: &Arc<TaskControlBlock>) -> Option<Arc<TaskControlBlock>> {
+    pub fn clone_shared_vm(
+        self: &Arc<TaskControlBlock>,
+        share_signal_actions: bool,
+    ) -> Option<Arc<TaskControlBlock>> {
         trace!("os::task::TaskControlBlock::clone_shared_vm");
+        // A later CLONE_VM can restore writable PTEs which a previous fork
+        // write-protected for COW. Capture the complete shared address-space
+        // activity set before that mutation; no lock is held when the remote
+        // fence is issued below.
+        let mut parent_active_cpus = 0;
         let (
             memory_set,
             trap_cx_clone,
@@ -814,11 +946,20 @@ impl TaskControlBlock {
             fp_state,
         ) = {
             let mut parent_inner = self.inner_exclusive_access();
+            parent_active_cpus = parent_inner.memory_set.active_cpu_mask();
             if !parent_inner.memory_set.prepare_shared_writable_pages() {
                 return None;
             }
             parent_inner.memory_set.mark_shared();
             let memory_set = MemorySet::from_shared(&parent_inner.memory_set);
+            let child_signal_actions = if share_signal_actions {
+                parent_inner.signal_actions.clone()
+            } else {
+                Arc::new(SignalActionsLock::new_named(
+                    parent_inner.signal_actions.lock().clone(),
+                    "SignalActions",
+                ))
+            };
             (
                 memory_set,
                 parent_inner.trap_cx.clone(),
@@ -853,21 +994,26 @@ impl TaskControlBlock {
                 parent_inner.umask,
                 parent_inner.nice,
                 parent_inner.signal_mask,
-                parent_inner.signal_actions.clone(),
+                child_signal_actions,
                 parent_inner.heap_bottom,
                 parent_inner.program_brk,
                 parent_inner.fp_state,
             )
         };
 
+        assert!(
+            super::processor::flush_remote_tlb(parent_active_cpus, 0, 0),
+            "CLONE_VM remote TLB shootdown failed"
+        );
+
         let pid_handle = pid_alloc();
         let pid_value = pid_handle.0;
         let kstack = KernelStack::new();
         let task_control_block = Arc::new(TaskControlBlock {
             pid: pid_handle,
-            inner: unsafe {
-                UPSafeCell::new_named(
-                    TaskControlBlockInner {
+            scheduling: TaskSchedulingMeta::new(),
+            inner: TaskLock::new_named(
+                TaskControlBlockInner {
                         trap_cx: trap_cx_clone,
                         fp_state,
                         base_size,
@@ -875,7 +1021,6 @@ impl TaskControlBlock {
                         task_status: TaskStatus::Ready,
                         memory_set,
                         parent: Some(Arc::downgrade(self)),
-                        vfork_parent: None,
                         children: Vec::new(),
                         exit_code: 0,
                         fd_table,
@@ -900,6 +1045,10 @@ impl TaskControlBlock {
                         umask,
                         nice,
                         signals: SignalFlags::empty(),
+                        pending_signal_info: [
+                            PendingSignalInfo::default();
+                            super::MAX_SIG + 1
+                        ],
                         signal_mask,
                         signal_mask_backup: None,
                         handling_sig: -1,
@@ -928,10 +1077,9 @@ impl TaskControlBlock {
                         alt_stack_flags: 0,
                         in_syscall: false,
                         exit_signal: 0,
-                    },
-                    "TaskInner",
-                )
-            },
+                },
+                "TaskInner",
+            ),
         });
         {
             let mut parent_inner = self.inner_exclusive_access();
@@ -941,6 +1089,117 @@ impl TaskControlBlock {
     }
     pub fn getpid(&self) -> usize {
         self.pid.0
+    }
+
+    /// The hart currently running this task, or [`NO_RUNNING_CPU`].
+    pub fn running_cpu(&self) -> usize {
+        self.scheduling.running_cpu.load(Ordering::Acquire)
+    }
+
+    pub fn is_enqueued(&self) -> bool {
+        self.scheduling.enqueued.load(Ordering::Acquire)
+    }
+
+    pub fn exit_cleanup_done(&self) -> bool {
+        self.scheduling.exit_cleanup_done.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_vfork_parent(&self, parent_tid: usize) {
+        assert_ne!(parent_tid, 0, "vfork parent TID must be non-zero");
+        assert!(
+            self.scheduling
+                .vfork_parent
+                .compare_exchange(0, parent_tid, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "pid {} acquired two vfork parents",
+            self.getpid()
+        );
+    }
+
+    pub(crate) fn vfork_pending(&self) -> bool {
+        self.scheduling.vfork_parent.load(Ordering::Acquire) != 0
+    }
+
+    pub(crate) fn take_vfork_parent(&self) -> Option<usize> {
+        match self.scheduling.vfork_parent.swap(0, Ordering::AcqRel) {
+            0 => None,
+            tid => Some(tid),
+        }
+    }
+
+    pub(crate) fn publish_exit_cleanup_done(&self) {
+        self.scheduling
+            .exit_cleanup_done
+            .store(true, Ordering::Release);
+    }
+
+    /// Return the task's requested CPU mask.  The mask is not user-modifiable
+    /// until the four-hart scheduler is active.
+    pub fn allowed_cpus(&self) -> usize {
+        self.scheduling.allowed_cpus.load(Ordering::Acquire)
+    }
+
+    /// Store a previously validated affinity mask.  Callers that also need to
+    /// move a Ready task must do so through the scheduler, after this store.
+    pub(crate) fn set_allowed_cpus(&self, mask: usize) {
+        self.scheduling.allowed_cpus.store(mask, Ordering::Release);
+    }
+
+    /// Scheduler-only: record that the task has one ready-queue entry.
+    pub(crate) fn mark_enqueued(&self) {
+        assert!(
+            self.scheduling
+                .enqueued
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "pid {} was enqueued twice",
+            self.getpid()
+        );
+    }
+
+    /// Scheduler-only: record removal from the ready queue.
+    pub(crate) fn mark_dequeued(&self) {
+        assert!(
+            self.scheduling
+                .enqueued
+                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "pid {} was dequeued without a ready-queue entry",
+            self.getpid()
+        );
+    }
+
+    /// Scheduler-only: record the CPU which owns the task's execution.
+    pub(crate) fn mark_running_on(&self, cpu: usize) {
+        assert!(
+            self.scheduling
+                .running_cpu
+                .compare_exchange(
+                    NO_RUNNING_CPU,
+                    cpu,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok(),
+            "pid {} was dispatched while already owned by hart {}",
+            self.getpid(),
+            self.running_cpu(),
+        );
+    }
+
+    /// Scheduler-only: clear execution ownership after this CPU has removed
+    /// the task from its CpuLocal current slot.
+    pub(crate) fn clear_running_on(&self, cpu: usize) {
+        assert!(
+            self.scheduling
+                .running_cpu
+                .compare_exchange(cpu, NO_RUNNING_CPU, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "pid {} lost running ownership on hart {} (owner {})",
+            self.getpid(),
+            cpu,
+            self.running_cpu(),
+        );
     }
     pub fn record_time_user_to_kernel(&self) {
         let Some(mut inner) = self.try_inner_exclusive_access() else {
@@ -976,7 +1235,6 @@ impl TaskControlBlock {
 
 #[derive(Debug, Clone, Copy)]
 pub enum BlockReason {
-    Vfork,
     TcpRecv(usize),
     TcpSend(usize),
     TcpAccept(usize),
@@ -985,13 +1243,28 @@ pub enum BlockReason {
     PollWait,
     PipeRead(usize),
     PipeWrite(usize),
+    Futex(usize, usize),
     SignalWait(SignalFlags),
+    Vfork(usize),
 }
 
-#[derive(Copy, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 pub enum TaskStatus {
     Ready,
     Running,
+    /// The task has requested a yield, but its saved kernel context is not
+    /// publishable yet.  Only the owning CPU may turn this into `Ready`, and
+    /// it does so after `context_switch_pt` has returned to that CPU's idle
+    /// context.  Keeping this distinct from `Ready` closes the SMP window in
+    /// which another hart could otherwise execute an incompletely saved task.
+    Switching,
+    /// The task is registered in a scheduler wait queue but has not switched
+    /// out of its CPU context yet.  A concurrent wake changes this to
+    /// `WakePending`, never directly to `Ready`.
+    Blocking,
     Blocked,
+    /// A wake raced with the outgoing context switch.  The owning CPU turns
+    /// this into `Ready` only after it has reached the idle context.
+    WakePending,
     Zombie,
 }

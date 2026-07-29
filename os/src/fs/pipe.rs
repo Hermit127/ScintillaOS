@@ -1,11 +1,11 @@
 use super::{File, Kstat, S_IFIFO};
-use crate::sync::UPSafeCell;
+use crate::sync::DeviceLock;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::task::{
-    block_current_and_run_next, current_add_signal, current_task, has_interrupting_signal,
+    block_current_and_run_next_if, current_add_signal, current_task, has_interrupting_signal,
     wake_pipe_read_tasks, wake_pipe_write_tasks, wake_poll_wait_tasks, BlockReason, SignalFlags,
 };
 
@@ -26,12 +26,15 @@ fn current_task_interrupted() -> bool {
 pub struct Pipe {
     readable: bool,
     writable: bool,
-    buffer: Arc<UPSafeCell<PipeRingBuffer>>,
+    // The ring is shared by both pipe endpoints and may be touched by
+    // different harts.  Keep the device-domain lock local to the pipe rather
+    // than making the whole VFS path contend on one global lock.
+    buffer: Arc<DeviceLock<PipeRingBuffer>>,
     nonblock: AtomicBool,
 }
 
 impl Pipe {
-    pub fn read_end_with_buffer(buffer: Arc<UPSafeCell<PipeRingBuffer>>) -> Self {
+    pub fn read_end_with_buffer(buffer: Arc<DeviceLock<PipeRingBuffer>>) -> Self {
         Self {
             readable: true,
             writable: false,
@@ -39,7 +42,7 @@ impl Pipe {
             nonblock: AtomicBool::new(false),
         }
     }
-    pub fn write_end_with_buffer(buffer: Arc<UPSafeCell<PipeRingBuffer>>) -> Self {
+    pub fn write_end_with_buffer(buffer: Arc<DeviceLock<PipeRingBuffer>>) -> Self {
         Self {
             readable: false,
             writable: true,
@@ -168,8 +171,10 @@ impl PipeRingBuffer {
 
 /// Return (read_end, write_end)
 pub fn make_pipe() -> (Arc<Pipe>, Arc<Pipe>) {
-    let buffer =
-        Arc::new(unsafe { UPSafeCell::new_named(PipeRingBuffer::new(), "PipeRingBuffer") });
+    let buffer = Arc::new(DeviceLock::new_named(
+        PipeRingBuffer::new(),
+        "PipeRingBuffer",
+    ));
     let read_end = Arc::new(Pipe::read_end_with_buffer(buffer.clone()));
     let write_end = Arc::new(Pipe::write_end_with_buffer(buffer.clone()));
     (read_end, write_end)
@@ -188,6 +193,12 @@ impl File for Pipe {
         if want_to_read == 0 {
             return 0;
         }
+        // Never touch a userspace-backed slice while holding PipeRingBuffer.
+        // A COW or demand fault is synchronous and enters the trap handler
+        // even with local interrupts disabled; the handler needs CpuLocal,
+        // Task and Vm locks.  Copy through a preallocated kernel buffer so
+        // the device lock is released before the potentially faulting store.
+        let mut scratch = vec![0u8; want_to_read.min(RING_BUFFER_SIZE)];
         let mut already_read = 0usize;
         loop {
             if current_task_interrupted() {
@@ -210,13 +221,20 @@ impl File for Pipe {
                     return -11;
                 }
                 stdout_release_if_owner();
-                block_current_and_run_next(BlockReason::PipeRead(self.wait_key()));
+                let key = self.wait_key();
+                block_current_and_run_next_if(BlockReason::PipeRead(key), || {
+                    let ring_buffer = self.buffer.exclusive_access();
+                    ring_buffer.available_read() == 0
+                        && !ring_buffer.all_write_ends_closed()
+                });
                 continue;
             }
             let mut ring_buffer = self.buffer.exclusive_access();
-            let n = ring_buffer.read_buf(&mut buf[already_read..want_to_read]);
-            already_read += n;
+            let chunk = (want_to_read - already_read).min(scratch.len());
+            let n = ring_buffer.read_buf(&mut scratch[..chunk]);
             drop(ring_buffer);
+            buf[already_read..already_read + n].copy_from_slice(&scratch[..n]);
+            already_read += n;
             if n > 0 {
                 wake_pipe_write_tasks(self.wait_key());
                 wake_poll_wait_tasks();
@@ -232,6 +250,9 @@ impl File for Pipe {
         if want_to_write == 0 {
             return 0;
         }
+        // See read(): faulting user memory must never be accessed under the
+        // pipe lock.  Fill this scratch buffer before entering the ring.
+        let mut scratch = vec![0u8; want_to_write.min(RING_BUFFER_SIZE)];
         let mut already_write = 0usize;
         loop {
             if current_task_interrupted() {
@@ -253,11 +274,21 @@ impl File for Pipe {
                     return -11;
                 }
                 stdout_release_if_owner();
-                block_current_and_run_next(BlockReason::PipeWrite(self.wait_key()));
+                let key = self.wait_key();
+                block_current_and_run_next_if(BlockReason::PipeWrite(key), || {
+                    let ring_buffer = self.buffer.exclusive_access();
+                    ring_buffer.available_write() == 0
+                        && !ring_buffer.all_read_ends_closed()
+                });
                 continue;
             }
+            let chunk = loop_write
+                .min(want_to_write - already_write)
+                .min(scratch.len());
+            scratch[..chunk]
+                .copy_from_slice(&buf[already_write..already_write + chunk]);
             let mut ring_buffer = self.buffer.exclusive_access();
-            let n = ring_buffer.write_buf(&buf[already_write..want_to_write]);
+            let n = ring_buffer.write_buf(&scratch[..chunk]);
             already_write += n;
             drop(ring_buffer);
             if n > 0 {

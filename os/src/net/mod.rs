@@ -11,7 +11,7 @@ mod imp {
     use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, Ipv4Address, Ipv4Cidr};
 
     use crate::drivers::net::VirtIONetAdapter;
-    use crate::sync::UPSafeCell;
+    use crate::sync::DeviceLock;
     use lazy_static::lazy_static;
 
     pub static NET_INITED: AtomicBool = AtomicBool::new(false);
@@ -71,8 +71,11 @@ mod imp {
     }
 
     lazy_static! {
-        pub static ref NET_IFACE: UPSafeCell<Option<NetworkState>> =
-            unsafe { UPSafeCell::new(NetworkState::new()) };
+        // smoltcp's interface, socket set and the underlying VirtIO adapter
+        // form one serialized device transaction domain.  A poll or socket
+        // operation must never observe a partially-mutated interface.
+        pub static ref NET_IFACE: DeviceLock<Option<NetworkState>> =
+            DeviceLock::new_named(NetworkState::new(), "NetworkInterface");
     }
 }
 
@@ -267,17 +270,23 @@ const VIRTIO_NET_DEVICE_ID: u32 = 1;
 pub fn net_init() {
     #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
     {
-        let mut state = NET_IFACE.exclusive_access();
-        if let Some(state) = state.as_mut() {
-            state.inited = true;
-            NET_INITED.store(true, core::sync::atomic::Ordering::Relaxed);
-            println!(
-                "[net] VirtIO-Net initialized, MAC={:02x?}",
-                state.device.mac_address()
-            );
+        // Console output may issue SBI calls; collect the result while the
+        // network lock is held and log only after releasing it.
+        let mac = {
+            let mut state = NET_IFACE.exclusive_access();
+            if let Some(state) = state.as_mut() {
+                state.inited = true;
+                NET_INITED.store(true, core::sync::atomic::Ordering::Relaxed);
+                Some(state.device.mac_address())
+            } else {
+                NET_INITED.store(false, core::sync::atomic::Ordering::Relaxed);
+                None
+            }
+        };
+        if let Some(mac) = mac {
+            println!("[net] VirtIO-Net initialized, MAC={:02x?}", mac);
             println!("[net] Static IPs: loopback 127.0.0.0/8 + 10.0.2.15/24");
         } else {
-            NET_INITED.store(false, core::sync::atomic::Ordering::Relaxed);
             println!("[net] No virtio-net device available, networking disabled");
         }
     }
@@ -444,111 +453,100 @@ pub fn with_net_iface_tcp_connect(
 
 #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
 pub fn wake_net_blocked_tasks() {
-    use crate::task::{add_priority_task, BlockReason, TaskStatus, NET_BLOCK_QUEUE};
+    use crate::task::{net_blocked_snapshot, wake_task, BlockReason};
     use smoltcp::iface::SocketHandle;
     use smoltcp::socket::tcp::Socket as TcpSocket;
     use smoltcp::socket::udp::Socket as UdpSocket;
 
-    let mut to_wake = alloc::vec::Vec::new();
-    let orig_blocked;
-    {
-        let mut queue = NET_BLOCK_QUEUE.exclusive_access();
-        orig_blocked = queue.len();
-        let mut i = 0;
-        while i < queue.len() {
-            let should_wake = {
-                let inner = queue[i].inner_exclusive_access();
-                match &inner.block_reason {
-                    Some(BlockReason::TcpRecv(h)) => {
-                        let handle: SocketHandle = unsafe { core::mem::transmute(*h) };
-                        with_net_iface(|iface| {
-                            let sock: &TcpSocket = iface.sockets.get(handle);
-                            sock.can_recv() || !sock.may_recv()
-                        })
-                        .unwrap_or(true)
+    // Device polling and TCB inspection happen after taking a stable snapshot;
+    // no scheduler queue guard is retained across either operation.  Selected
+    // PIDs are then removed in one short scheduler-locked phase.
+    let mut wake_tasks = alloc::vec::Vec::new();
+    for task in net_blocked_snapshot() {
+        let (reason, local_pending) = {
+            let inner = task.inner_exclusive_access();
+            let reason = inner.block_reason;
+            let local_pending = match reason {
+                Some(BlockReason::TcpAccept(handle)) => inner.fd_table.iter().any(|file| {
+                    let Some(file) = file else {
+                        return false;
+                    };
+                    let Some(sock) = file
+                        .as_any()
+                        .downcast_ref::<crate::net::socket::SocketFile>()
+                    else {
+                        return false;
+                    };
+                    if sock.socket_type != crate::net::socket::SocketType::Tcp {
+                        return false;
                     }
-                    Some(BlockReason::TcpSend(h)) => {
-                        let handle: SocketHandle = unsafe { core::mem::transmute(*h) };
-                        with_net_iface(|iface| {
-                            let sock: &TcpSocket = iface.sockets.get(handle);
-                            sock.can_send()
-                        })
-                        .unwrap_or(true)
-                    }
-                    Some(BlockReason::TcpAccept(h)) => {
-                        let handle: SocketHandle = unsafe { core::mem::transmute(*h) };
-                        let local_pending = inner.fd_table.iter().any(|file| {
-                            let Some(file) = file else {
-                                return false;
-                            };
-                            let Some(sock) = file
-                                .as_any()
-                                .downcast_ref::<crate::net::socket::SocketFile>()
-                            else {
-                                return false;
-                            };
-                            if sock.socket_type != crate::net::socket::SocketType::Tcp {
-                                return false;
-                            }
-                            let sock_handle: usize =
-                                unsafe { core::mem::transmute(sock.get_handle()) };
-                            if sock_handle != *h {
-                                return false;
-                            }
-                            sock.get_local_endpoint()
-                                .map(|ep| crate::net::syscall::local_tcp_pending_on(ep.port))
-                                .unwrap_or(false)
-                        });
-                        local_pending
-                            || with_net_iface(|iface| {
-                                let sock: &TcpSocket = iface.sockets.get(handle);
-                                sock.is_active() && !sock.is_listening()
-                            })
-                            .unwrap_or(true)
-                    }
-                    Some(BlockReason::TcpConnect(h)) => {
-                        let handle: SocketHandle = unsafe { core::mem::transmute(*h) };
-                        with_net_iface(|iface| {
-                            let sock: &TcpSocket = iface.sockets.get(handle);
-                            sock.is_active()
-                        })
-                        .unwrap_or(true)
-                    }
-                    Some(BlockReason::UdpRecv(h)) => {
-                        let handle: SocketHandle = unsafe { core::mem::transmute(*h) };
-                        with_net_iface(|iface| {
-                            let sock: &UdpSocket = iface.sockets.get(handle);
-                            sock.can_recv()
-                        })
-                        .unwrap_or(true)
-                    }
-                    Some(BlockReason::PollWait) => true,
-                    Some(BlockReason::Vfork)
-                    | Some(BlockReason::PipeRead(_))
-                    | Some(BlockReason::PipeWrite(_))
-                    | Some(BlockReason::SignalWait(_)) => false,
-                    None => true, // block_reason cleared, should be woken
-                }
+                    let socket_handle: usize = unsafe { core::mem::transmute(sock.get_handle()) };
+                    socket_handle == handle
+                        && sock
+                            .get_local_endpoint()
+                            .map(|ep| crate::net::syscall::local_tcp_pending_on(ep.port))
+                            .unwrap_or(false)
+                }),
+                _ => false,
             };
-            if should_wake {
-                to_wake.push(queue.remove(i));
-            } else {
-                i += 1;
+            (reason, local_pending)
+        };
+        let should_wake = match reason {
+            Some(BlockReason::TcpRecv(handle)) => {
+                let handle: SocketHandle = unsafe { core::mem::transmute(handle) };
+                with_net_iface(|iface| {
+                    let sock: &TcpSocket = iface.sockets.get(handle);
+                    sock.can_recv() || !sock.may_recv()
+                })
+                .unwrap_or(true)
             }
+            Some(BlockReason::TcpSend(handle)) => {
+                let handle: SocketHandle = unsafe { core::mem::transmute(handle) };
+                with_net_iface(|iface| {
+                    let sock: &TcpSocket = iface.sockets.get(handle);
+                    sock.can_send()
+                })
+                .unwrap_or(true)
+            }
+            Some(BlockReason::TcpAccept(handle)) => {
+                let handle: SocketHandle = unsafe { core::mem::transmute(handle) };
+                local_pending
+                    || with_net_iface(|iface| {
+                        let sock: &TcpSocket = iface.sockets.get(handle);
+                        sock.is_active() && !sock.is_listening()
+                    })
+                    .unwrap_or(true)
+            }
+            Some(BlockReason::TcpConnect(handle)) => {
+                let handle: SocketHandle = unsafe { core::mem::transmute(handle) };
+                with_net_iface(|iface| {
+                    let sock: &TcpSocket = iface.sockets.get(handle);
+                    sock.is_active()
+                })
+                .unwrap_or(true)
+            }
+            Some(BlockReason::UdpRecv(handle)) => {
+                let handle: SocketHandle = unsafe { core::mem::transmute(handle) };
+                with_net_iface(|iface| {
+                    let sock: &UdpSocket = iface.sockets.get(handle);
+                    sock.can_recv()
+                })
+                .unwrap_or(true)
+            }
+            Some(BlockReason::PollWait) => true,
+            Some(BlockReason::PipeRead(_))
+            | Some(BlockReason::PipeWrite(_))
+            | Some(BlockReason::Futex(_, _))
+            | Some(BlockReason::SignalWait(_))
+            | Some(BlockReason::Vfork(_)) => false,
+            None => true,
+        };
+        if should_wake {
+            wake_tasks.push(task);
         }
     }
-    if !to_wake.is_empty() {
-    } else if orig_blocked > 0 {
-    }
-    if !to_wake.is_empty() {}
-    for task in &to_wake {
-        let mut inner = task.inner_exclusive_access();
-        if inner.task_status != TaskStatus::Zombie {
-            inner.task_status = TaskStatus::Ready;
-            inner.block_reason = None;
-            drop(inner);
-            add_priority_task(task.clone());
-        }
+    for task in wake_tasks {
+        let _ = wake_task(task);
     }
 }
 

@@ -8,7 +8,7 @@ use crate::fs::{
     DevNull, DevZero, File, Kstat, OpenFlags, Urandom, S_IFDIR, S_IFREG,
 };
 use crate::mm::{translated_byte_buffer, translated_refmut, translated_str};
-use crate::task::{current_task, current_user_token, PID2TCB};
+use crate::task::{current_task, current_user_token, task_snapshot};
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -23,6 +23,46 @@ const FILE_TIME_NOW_GUARD_SEC: i64 = 5;
 const PATH_MAX: usize = 4096;
 const NAME_MAX: usize = 255;
 const EROFS: isize = -30;
+const INLINE_IO_STAGING_SIZE: usize = 1024;
+
+pub(crate) enum IoStaging {
+    Inline {
+        bytes: [u8; INLINE_IO_STAGING_SIZE],
+        len: usize,
+    },
+    Heap(Vec<u8>),
+}
+
+impl IoStaging {
+    fn zeroed(len: usize) -> Result<Self, isize> {
+        if len <= INLINE_IO_STAGING_SIZE {
+            return Ok(Self::Inline {
+                bytes: [0; INLINE_IO_STAGING_SIZE],
+                len,
+            });
+        }
+        let mut bytes = Vec::new();
+        if bytes.try_reserve_exact(len).is_err() {
+            return Err(-12);
+        }
+        bytes.resize(len, 0);
+        Ok(Self::Heap(bytes))
+    }
+
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Inline { bytes, len } => &bytes[..*len],
+            Self::Heap(bytes) => bytes,
+        }
+    }
+
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
+        match self {
+            Self::Inline { bytes, len } => &mut bytes[..*len],
+            Self::Heap(bytes) => bytes,
+        }
+    }
+}
 
 fn map_dev_shm_path(path: &str) -> String {
     if let Some(name) = path.strip_prefix("/dev/shm/") {
@@ -58,6 +98,52 @@ fn valid_user_read_buf(ptr: *const u8, len: usize) -> bool {
     };
     let inner = task.inner_exclusive_access();
     inner.memory_set.valid_user_buf(ptr, len, false)
+}
+
+pub(crate) fn copy_from_user_for_io(
+    task: &Arc<crate::task::TaskControlBlock>,
+    _token: polyhal::pagetable::PageTable,
+    buf: *mut u8,
+    len: usize,
+) -> Result<IoStaging, isize> {
+    if len == 0 {
+        return IoStaging::zeroed(0);
+    }
+    let mut staging = IoStaging::zeroed(len)?;
+    if !super::process::copy_from_task_user(task, buf as usize, staging.as_mut_slice()) {
+        return Err(-14);
+    }
+    Ok(staging)
+}
+
+pub(crate) fn copy_to_user_after_io(
+    task: &Arc<crate::task::TaskControlBlock>,
+    _token: polyhal::pagetable::PageTable,
+    buf: *mut u8,
+    len: usize,
+) -> Result<IoStaging, isize> {
+    if len == 0 {
+        return IoStaging::zeroed(0);
+    }
+    if !super::process::prepare_task_user_access(task, buf as usize, len, true) {
+        return Err(-14);
+    }
+    IoStaging::zeroed(len)
+}
+
+pub(crate) fn copy_staged_output_to_user(
+    task: &Arc<crate::task::TaskControlBlock>,
+    _token: polyhal::pagetable::PageTable,
+    buf: *mut u8,
+    data: &[u8],
+) -> Result<(), isize> {
+    if data.is_empty() {
+        return Ok(());
+    }
+    if !super::process::copy_to_task_user(task, buf as usize, data) {
+        return Err(-14);
+    }
+    Ok(())
 }
 
 fn fd_path_for_proc(fd: usize) -> Option<String> {
@@ -107,16 +193,14 @@ fn install_fd_for_thread_group(
     file: Arc<dyn File + Send + Sync>,
     cloexec: bool,
 ) {
-    let tasks: Vec<_> = PID2TCB
-        .exclusive_access()
-        .values()
+    let tasks: Vec<_> = task_snapshot()
+        .into_iter()
         .filter(|task| task.getpid() != owner_pid)
         .filter(|task| {
             task.try_inner_borrow()
                 .map(|inner| inner.tgid == tgid)
                 .unwrap_or(false)
         })
-        .cloned()
         .collect();
     for task in tasks {
         if let Some(mut inner) = task.try_inner_exclusive_access() {
@@ -132,20 +216,21 @@ fn install_fd_for_thread_group(
 }
 
 fn close_fd_for_thread_group(owner_pid: usize, tgid: usize, fd: usize) {
-    let tasks: Vec<_> = PID2TCB
-        .exclusive_access()
-        .values()
+    let tasks: Vec<_> = task_snapshot()
+        .into_iter()
         .filter(|task| task.getpid() != owner_pid)
         .filter(|task| {
             task.try_inner_borrow()
                 .map(|inner| inner.tgid == tgid)
                 .unwrap_or(false)
         })
-        .cloned()
         .collect();
     for task in tasks {
-        if let Some(mut inner) = task.try_inner_exclusive_access() {
-            inner.close_fd(fd);
+        let file = task
+            .try_inner_exclusive_access()
+            .and_then(|mut inner| inner.take_fd_for_close(fd));
+        if let Some(file) = file {
+            file.close_ref();
         }
     }
 }
@@ -406,11 +491,15 @@ pub fn sys_write(fd: usize, buf: *mut u8, len: usize) -> isize {
                 return EROFS;
             }
         }
-        if !inner.memory_set.valid_user_buf(buf, len, false) {
-            return -14;
-        }
         drop(inner);
-        file.write(translated_byte_buffer(token, buf, len))
+        // File implementations may hold VFS, filesystem or device locks.
+        // Copy user data before entering them so a user page fault cannot
+        // re-enter TaskLock while an outer lock is held.
+        let mut staging = match copy_from_user_for_io(&task, token, buf, len) {
+            Ok(staging) => staging,
+            Err(errno) => return errno,
+        };
+        file.write(staging.as_mut_slice())
     } else {
         -1
     }
@@ -431,12 +520,25 @@ pub fn sys_read(fd: usize, buf: *mut u8, len: usize) -> isize {
         if !file.readable() {
             return -9;
         }
-        if !inner.memory_set.valid_user_buf(buf, len, true) {
-            return -14;
-        }
         drop(inner);
-
-        file.read(translated_byte_buffer(token, buf, len))
+        // The file layer receives only a kernel buffer.  Copying back to user
+        // space happens after all file-system and device locks are released.
+        let mut staging = match copy_to_user_after_io(&task, token, buf, len) {
+            Ok(staging) => staging,
+            Err(errno) => return errno,
+        };
+        let read = file.read(staging.as_mut_slice());
+        if read <= 0 {
+            return read;
+        }
+        let read = read as usize;
+        if read > len {
+            return -5;
+        }
+        if let Err(errno) = copy_staged_output_to_user(&task, token, buf, &staging.as_slice()[..read]) {
+            return errno;
+        }
+        read as isize
     } else {
         -9
     }
@@ -651,8 +753,8 @@ fn sys_open_tmpfile(dirfd: isize, path: &str, _mode: u32, cloexec: bool) -> isiz
 
 fn open_proc(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
     use crate::fs::proc::{
-        DevRtcFile, ProcDirFile, ProcMeminfoFile, ProcMountsFile, ProcPidStatFile,
-        ProcPidStatusFile, ProcStaticFile, PseudoDirFile, SysBlockStatFile,
+        DevRtcFile, ProcCpuinfoFile, ProcDirFile, ProcMeminfoFile, ProcMountsFile,
+        ProcPidStatFile, ProcPidStatusFile, ProcStaticFile, PseudoDirFile, SysBlockStatFile,
     };
     let path = if path.len() > 1 {
         path.trim_end_matches('/')
@@ -669,9 +771,7 @@ fn open_proc(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
         return Some(Arc::new(ProcMeminfoFile::new()));
     }
     if path == "/proc/cpuinfo" {
-        return Some(Arc::new(ProcStaticFile::new(
-            "processor\t: 0\nhart\t\t: 0\nisa\t\t: rv64imafdc\nmmu\t\t: sv39\n",
-        )));
+        return Some(Arc::new(ProcCpuinfoFile::new()));
     }
     if path == "/proc/sys/kernel/pid_max" {
         return Some(Arc::new(ProcStaticFile::new("4194304\n")));
@@ -936,7 +1036,8 @@ pub fn sys_unlinkat(dirfd: isize, path: *const u8, flags: u32) -> isize {
     if !can_modify_directory(&parent) {
         return -13;
     }
-    if unlink_at(Some(base_dir.clone()), path.as_str(), is_dir) {
+    let unlinked = unlink_at(Some(base_dir.clone()), path.as_str(), is_dir);
+    if unlinked {
         if !is_dir {
             crate::syscall::process::remove_shared_file_mappings(&dentry.fs_path);
         }
@@ -1078,6 +1179,7 @@ pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const u8, _flags: us
     const UTIME_OMIT: i64 = (1i64 << 30) - 2;
 
     #[repr(C)]
+    #[derive(Clone, Copy)]
     struct TimeSpec {
         tv_sec: i64,
         tv_nsec: i64,
@@ -1091,15 +1193,25 @@ pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const u8, _flags: us
         if fd >= inner.fd_table.len() {
             return -9;
         }
-        inner.fd_table[fd].as_ref().cloned()
+        let Some(file) = inner.fd_table[fd].as_ref().cloned() else {
+            return -9;
+        };
+        Some(file)
     } else {
         None
     };
     let dentry = if let Some(file) = &fd_file {
-        let Some(inode) = file.as_any().downcast_ref::<crate::fs::inode::OSInode>() else {
+        if let Some(inode) = file.as_any().downcast_ref::<crate::fs::inode::OSInode>() {
+            Some(inode.get_dentry().clone())
+        } else if file
+            .as_any()
+            .downcast_ref::<crate::fs::stdio::TmpFile>()
+            .is_some()
+        {
+            None
+        } else {
             return -9;
-        };
-        inode.get_dentry().clone()
+        }
     } else {
         let path_str = translated_str(token, path);
         if special_device_as_parent(path_str.as_str()) {
@@ -1113,7 +1225,7 @@ pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const u8, _flags: us
             None => return -2,
         };
         match vfs_resolve_with_fallback(&base, &path_str) {
-            Some(d) => d,
+            Some(d) => Some(d),
             None => return -2,
         }
     };
@@ -1124,7 +1236,8 @@ pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const u8, _flags: us
         (inner.euid, inner.egid)
     };
 
-    if euid != 0 {
+    if euid != 0 && dentry.is_some() {
+        let dentry = dentry.as_ref().unwrap();
         let permitted = match dentry.inode_info() {
             Some(info) => {
                 if info.uid == euid {
@@ -1147,32 +1260,49 @@ pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const u8, _flags: us
 
     let now_sec = super::process::user_realtime_sec_ceil().saturating_add(FILE_TIME_NOW_GUARD_SEC);
     let now_sec_u32 = now_sec.clamp(0, u32::MAX as i64) as u32;
+    let now = (now_sec, 0i64);
 
     let (new_atime, new_mtime, changed) = if times.is_null() {
-        (Some(now_sec), Some(now_sec), true)
+        (Some(now), Some(now), true)
     } else {
-        let ts0 = unsafe { &*(times as *const TimeSpec) };
-        let ts1 = unsafe { &*((times as *const TimeSpec).add(1)) };
+        if !super::process::prepare_task_user_access(
+            &task,
+            times as usize,
+            2 * core::mem::size_of::<TimeSpec>(),
+            false,
+        ) {
+            return -14;
+        }
+        let ts0 = unsafe { *(times as *const TimeSpec) };
+        let ts1 = unsafe { *((times as *const TimeSpec).add(1)) };
+        for ts in [ts0, ts1] {
+            if ts.tv_nsec != UTIME_NOW
+                && ts.tv_nsec != UTIME_OMIT
+                && !(0..1_000_000_000).contains(&ts.tv_nsec)
+            {
+                return -22;
+            }
+        }
         let mut ch = false;
 
         let at = if ts0.tv_nsec == UTIME_OMIT {
             None
         } else if ts0.tv_nsec == UTIME_NOW {
             ch = true;
-            Some(now_sec)
+            Some(now)
         } else {
             ch = true;
-            Some(ts0.tv_sec)
+            Some((ts0.tv_sec, ts0.tv_nsec))
         };
 
         let mt = if ts1.tv_nsec == UTIME_OMIT {
             None
         } else if ts1.tv_nsec == UTIME_NOW {
             ch = true;
-            Some(now_sec)
+            Some(now)
         } else {
             ch = true;
-            Some(ts1.tv_sec)
+            Some((ts1.tv_sec, ts1.tv_nsec))
         };
 
         if !ch {
@@ -1181,13 +1311,30 @@ pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const u8, _flags: us
         (at, mt, true)
     };
 
+    if let Some(file) = &fd_file {
+        if let Some(tmpfile) = file
+            .as_any()
+            .downcast_ref::<crate::fs::stdio::TmpFile>()
+        {
+            tmpfile.update_times(
+                new_atime,
+                new_mtime,
+                if changed { Some(now) } else { None },
+            );
+            return 0;
+        }
+    }
+
+    let dentry = dentry.unwrap();
+    let new_atime_sec = new_atime.map(|(sec, _)| sec);
+    let new_mtime_sec = new_mtime.map(|(sec, _)| sec);
     let fs_path = &dentry.fs_path;
-    if let Some(a) = new_atime {
+    if let Some(a) = new_atime_sec {
         dentry
             .super_block
             .set_atime(fs_path, a.clamp(0, u32::MAX as i64) as u32);
     }
-    if let Some(m) = new_mtime {
+    if let Some(m) = new_mtime_sec {
         dentry
             .super_block
             .set_mtime(fs_path, m.clamp(0, u32::MAX as i64) as u32);
@@ -1197,13 +1344,13 @@ pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const u8, _flags: us
     }
     crate::fs::inode::update_path_cached_times(
         fs_path,
-        new_atime,
-        new_mtime,
+        new_atime_sec,
+        new_mtime_sec,
         if changed { Some(now_sec) } else { None },
     );
     dentry.update_cached_times(
-        new_atime.map(|v| v.clamp(0, u32::MAX as i64) as u32),
-        new_mtime.map(|v| v.clamp(0, u32::MAX as i64) as u32),
+        new_atime_sec.map(|v| v.clamp(0, u32::MAX as i64) as u32),
+        new_mtime_sec.map(|v| v.clamp(0, u32::MAX as i64) as u32),
         if changed {
             Some(now_sec.clamp(0, u32::MAX as i64) as u32)
         } else {
@@ -1213,8 +1360,8 @@ pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const u8, _flags: us
     if let Some(file) = &fd_file {
         if let Some(inode) = file.as_any().downcast_ref::<crate::fs::inode::OSInode>() {
             inode.update_cached_times(
-                new_atime,
-                new_mtime,
+                new_atime_sec,
+                new_mtime_sec,
                 if changed { Some(now_sec) } else { None },
             );
         }
@@ -2083,8 +2230,10 @@ pub fn sys_close(fd: usize) -> isize {
     let task = current_task().unwrap();
     let mut inner = task.inner_exclusive_access();
     let tgid = inner.tgid;
-    if inner.close_fd(fd) {
-        drop(inner);
+    let file = inner.take_fd_for_close(fd);
+    drop(inner);
+    if let Some(file) = file {
+        file.close_ref();
         close_fd_for_thread_group(task.getpid(), tgid, fd);
         return 0;
     }
@@ -2120,7 +2269,11 @@ pub fn sys_pipe2(pipe: *mut usize, flags: usize) -> isize {
         inner.fd_table[read_fd] = Some(pipe_read);
         let write_fd = inner.alloc_fd();
         if write_fd >= inner.fd_table.len() {
-            inner.close_fd(read_fd);
+            let rollback = inner.take_fd_for_close(read_fd);
+            drop(inner);
+            if let Some(file) = rollback {
+                file.close_ref();
+            }
             return -24;
         }
         inner.fd_table[write_fd] = Some(pipe_write);
@@ -2184,9 +2337,13 @@ pub fn sys_dup3(fd: usize, new_fd: usize, flags: usize) -> isize {
         inner.fd_table.push(None);
         inner.fd_cloexec.push(false);
     }
-    inner.close_fd(new_fd);
+    let replaced = inner.take_fd_for_close(new_fd);
     inner.fd_table[new_fd] = Some(file);
     inner.fd_cloexec[new_fd] = (flags & O_CLOEXEC) != 0;
+    drop(inner);
+    if let Some(file) = replaced {
+        file.close_ref();
+    }
     new_fd as isize
 }
 
@@ -2760,8 +2917,22 @@ pub fn sys_getdents64(fd: usize, dirp: *mut u8, len: usize) -> isize {
     if let Some(file) = &inner.fd_table[fd] {
         let file = file.clone();
         drop(inner);
-        let user_buf = translated_byte_buffer(token, dirp, len);
-        file.getdents64(user_buf)
+        let mut staging = match copy_to_user_after_io(&task, token, dirp, len) {
+            Ok(staging) => staging,
+            Err(errno) => return errno,
+        };
+        let count = file.getdents64(staging.as_mut_slice());
+        if count <= 0 {
+            return count;
+        }
+        let count = count as usize;
+        if count > len {
+            return -5;
+        }
+        if let Err(errno) = copy_staged_output_to_user(&task, token, dirp, &staging.as_slice()[..count]) {
+            return errno;
+        }
+        count as isize
     } else {
         -1
     }
@@ -3102,11 +3273,22 @@ pub fn sys_pread64(fd: usize, buf: *mut u8, len: usize, offset: usize) -> isize 
         return -9;
     }
     drop(inner);
-    if !valid_user_write_buf(buf, len) {
-        return -14;
+    let mut staging = match copy_to_user_after_io(&task, token, buf, len) {
+        Ok(staging) => staging,
+        Err(errno) => return errno,
+    };
+    let read = file.read_at(offset, staging.as_mut_slice());
+    if read <= 0 {
+        return read;
     }
-    let user_buf = translated_byte_buffer(token, buf, len);
-    file.read_at(offset, user_buf)
+    let read = read as usize;
+    if read > len {
+        return -5;
+    }
+    if let Err(errno) = copy_staged_output_to_user(&task, token, buf, &staging.as_slice()[..read]) {
+        return errno;
+    }
+    read as isize
 }
 
 pub fn sys_pwrite64(fd: usize, buf: *mut u8, len: usize, offset: usize) -> isize {
@@ -3131,11 +3313,11 @@ pub fn sys_pwrite64(fd: usize, buf: *mut u8, len: usize, offset: usize) -> isize
         return -9;
     }
     drop(inner);
-    if !valid_user_read_buf(buf as *const u8, len) {
-        return -14;
-    }
-    let user_buf = translated_byte_buffer(token, buf, len);
-    file.write_at(offset, user_buf)
+    let mut staging = match copy_from_user_for_io(&task, token, buf, len) {
+        Ok(staging) => staging,
+        Err(errno) => return errno,
+    };
+    file.write_at(offset, staging.as_mut_slice())
 }
 
 pub fn sys_preadv(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> isize {
@@ -3195,22 +3377,31 @@ pub fn sys_preadv(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> is
         if iov.iov_len > isize::MAX as usize {
             return -22;
         }
-        let task = current_task().unwrap();
-        let inner = task.inner_exclusive_access();
-        let ok = inner
-            .memory_set
-            .valid_user_buf(iov.iov_base as *const u8, iov.iov_len, true);
-        drop(inner);
-        if !ok {
-            return -14;
-        }
-        let user_buf =
-            crate::mm::translated_byte_buffer(token, iov.iov_base as *mut u8, iov.iov_len);
-        let n = file.read_at(off, user_buf);
+        let mut staging = match copy_to_user_after_io(
+            &task,
+            token,
+            iov.iov_base as *mut u8,
+            iov.iov_len,
+        ) {
+            Ok(staging) => staging,
+            Err(errno) => return if total == 0 { errno } else { total },
+        };
+        let n = file.read_at(off, staging.as_mut_slice());
         if n < 0 {
             return if total == 0 { n } else { total };
         }
         let n = n as usize;
+        if n > iov.iov_len {
+            return if total == 0 { -5 } else { total };
+        }
+        if let Err(errno) = copy_staged_output_to_user(
+            &task,
+            token,
+            iov.iov_base as *mut u8,
+            &staging.as_slice()[..n],
+        ) {
+            return if total == 0 { errno } else { total };
+        }
         total += n as isize;
         off += n;
         if n < iov.iov_len {
@@ -3262,7 +3453,7 @@ pub fn sys_pwritev(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> i
         iov_base: usize,
         iov_len: usize,
     }
-    let mut iovecs = Vec::new();
+    let mut buffers = Vec::new();
     let mut requested = 0usize;
     for i in 0..iovcnt {
         let iov_ptr = unsafe { iov.add(i * core::mem::size_of::<IoVec>()) };
@@ -3274,22 +3465,22 @@ pub fn sys_pwritev(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> i
             Some(sum) if sum <= isize::MAX as usize => sum,
             _ => return -22,
         };
-        let task = current_task().unwrap();
-        let inner = task.inner_exclusive_access();
-        let ok = inner
-            .memory_set
-            .valid_user_buf(iov.iov_base as *const u8, iov.iov_len, false);
-        drop(inner);
-        if !ok {
-            return -14;
-        }
-        iovecs.push((iov.iov_base, iov.iov_len));
+        let staging = match copy_from_user_for_io(
+            &task,
+            token,
+            iov.iov_base as *mut u8,
+            iov.iov_len,
+        ) {
+            Ok(staging) => staging,
+            Err(errno) => return errno,
+        };
+        buffers.push(staging);
     }
     let mut off = offset;
     let mut total = 0isize;
-    for (base, len) in iovecs {
-        let user_buf = crate::mm::translated_byte_buffer(token, base as *mut u8, len);
-        let n = file.write_at(off, user_buf);
+    for mut staging in buffers {
+        let len = staging.as_slice().len();
+        let n = file.write_at(off, staging.as_mut_slice());
         if n < 0 {
             return if total == 0 { n } else { total };
         }
@@ -3802,10 +3993,16 @@ pub fn sys_close_range(first: usize, last: usize, flags: usize) -> isize {
         }
     } else {
         let tgid = inner.tgid;
+        let mut files = alloc::vec::Vec::new();
         for fd in first..=last {
-            inner.close_fd(fd);
+            if let Some(file) = inner.take_fd_for_close(fd) {
+                files.push(file);
+            }
         }
         drop(inner);
+        for file in files {
+            file.close_ref();
+        }
         for fd in first..=last {
             close_fd_for_thread_group(task.getpid(), tgid, fd);
         }

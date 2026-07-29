@@ -6,8 +6,10 @@ APPS := $(wildcard $(APP_DIR)/*.rs)
 ELFS := $(patsubst $(APP_DIR)/%.rs, $(TARGET_DIR)/%, $(APPS))
 BINS := $(patsubst $(APP_DIR)/%.rs, $(TARGET_DIR)/%.bin, $(APPS))
 
-OBJDUMP := rust-objdump --arch-name=riscv64
-OBJCOPY := rust-objcopy --binary-architecture=riscv64
+RUST_SYSROOT := $(shell rustc --print sysroot)
+LLVM_TOOLS_DIR := $(RUST_SYSROOT)/lib/rustlib/$(shell rustc -vV | sed -n 's/^host: //p')/bin
+OBJDUMP ?= $(if $(shell command -v rust-objdump 2>/dev/null),rust-objdump,$(LLVM_TOOLS_DIR)/llvm-objdump) --arch-name=riscv64
+OBJCOPY ?= $(if $(shell command -v rust-objcopy 2>/dev/null),rust-objcopy,$(LLVM_TOOLS_DIR)/llvm-objcopy) --binary-architecture=riscv64
 CP := cp 
 
 TEST ?= 

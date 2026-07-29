@@ -1,7 +1,7 @@
 // 这里负责操作系统的文件管理和伪文件接口：实现少量 /proc 和 /dev/rtc 伪文件，给用户态程序查询系统状态。
 use super::{File, Kstat};
-use crate::sync::UPSafeCell;
-use crate::task::PID2TCB;
+use crate::sync::VfsLock;
+use crate::task::{online_cpu_mask, task_snapshot};
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -14,8 +14,23 @@ const SYS_DEV_ENTRIES: [(&str, u8); 1] = [("block", DT_DIR)];
 const SYS_DEV_BLOCK_ENTRIES: [(&str, u8); 2] = [("254:0", DT_DIR), ("254:1", DT_DIR)];
 const SYS_DEV_BLOCK_DEVICE_ENTRIES: [(&str, u8); 1] = [("uevent", DT_REG)];
 
+/// Advance one opened pseudo-file's cursor while copying from an already
+/// prepared byte slice.  The caller must prepare the content before taking
+/// this lock: formatting, task lookup and allocation are not allowed while a
+/// VFS lock is held.
+fn read_with_offset(offset: &VfsLock<usize>, content: &[u8], buf: &mut [u8]) -> isize {
+    let mut offset = offset.exclusive_access();
+    if *offset >= content.len() {
+        return 0;
+    }
+    let len = buf.len().min(content.len() - *offset);
+    buf[..len].copy_from_slice(&content[*offset..*offset + len]);
+    *offset += len;
+    len as isize
+}
+
 pub struct ProcDirFile {
-    offset: UPSafeCell<usize>,
+    offset: VfsLock<usize>,
 }
 
 impl ProcDirFile {
@@ -23,7 +38,7 @@ impl ProcDirFile {
     // 执行时只初始化 offset 为 0，让每个打开的 /proc 目录都有自己的 getdents 进度。
     pub fn new() -> Self {
         Self {
-            offset: unsafe { UPSafeCell::new(0) },
+            offset: VfsLock::new_named(0, "ProcDirOffset"),
         }
     }
 }
@@ -65,10 +80,12 @@ impl File for ProcDirFile {
     // 执行时先从 PID2TCB 收集并排序 pid，再按 Linux dirent64 布局从当前 offset 写入用户缓冲区。
     fn getdents64(&self, buf: &mut [u8]) -> isize {
         const DIRENT64_FIXED_SIZE: usize = 8 + 8 + 2 + 1;
-        let mut inner = self.offset.exclusive_access();
-
-        let mut pids: Vec<usize> = PID2TCB.exclusive_access().keys().copied().collect();
+        // Snapshot PIDs before taking this proc-file object's lock: PID
+        // registry is outermost in the SMP order.
+        let mut pids: Vec<usize> = task_snapshot().iter().map(|task| task.getpid()).collect();
         pids.sort();
+
+        let mut inner = self.offset.exclusive_access();
 
         let mut entries: Vec<(String, u32)> = Vec::new();
         if *inner == 0 {
@@ -100,9 +117,10 @@ impl File for ProcDirFile {
             record[8..16].copy_from_slice(&d_off.to_le_bytes());
             record[16..18].copy_from_slice(&(record_size as u16).to_le_bytes());
 
-            let name_with_null = alloc::format!("{}\0", name);
-            let copy_len = name_with_null.len().min(record_size - DIRENT64_FIXED_SIZE);
-            record[19..19 + copy_len].copy_from_slice(&name_with_null.as_bytes()[..copy_len]);
+            // `record` was zero-filled above, so copying the name bytes leaves
+            // the mandatory trailing NUL in place without allocating a
+            // temporary `String` while the cursor lock is held.
+            record[19..19 + name_bytes.len()].copy_from_slice(name_bytes);
 
             written += record_size;
             idx += 1;
@@ -119,7 +137,7 @@ impl File for ProcDirFile {
 
 pub struct ProcPidStatFile {
     pid: usize,
-    offset: UPSafeCell<usize>,
+    offset: VfsLock<usize>,
 }
 
 impl ProcPidStatFile {
@@ -128,7 +146,7 @@ impl ProcPidStatFile {
     pub fn new(pid: usize) -> Self {
         Self {
             pid,
-            offset: unsafe { UPSafeCell::new(0) },
+            offset: VfsLock::new_named(0, "ProcPidStatOffset"),
         }
     }
 
@@ -137,27 +155,32 @@ impl ProcPidStatFile {
     fn build_content(&self) -> String {
         use alloc::format;
         if let Some(task) = crate::task::pid2task(self.pid) {
-            let inner = task.inner_exclusive_access();
-            let state = match inner.task_status {
-                crate::task::TaskStatus::Running => 'R',
-                crate::task::TaskStatus::Zombie => 'Z',
-                _ => 'S',
+            // Take only cheap task-state snapshots under TaskLock.  In
+            // particular, `File::path` may enter VFS, so use the cloned Arc
+            // only after dropping the TCB lock.
+            let (state, stdin, parent, pgid, sid, utime, stime) = {
+                let inner = task.inner_exclusive_access();
+                (
+                    match inner.task_status {
+                        crate::task::TaskStatus::Running => 'R',
+                        crate::task::TaskStatus::Zombie => 'Z',
+                        _ => 'S',
+                    },
+                    inner.fd_table.first().and_then(|file| file.as_ref()).cloned(),
+                    inner.parent.clone(),
+                    inner.pgid,
+                    inner.sid,
+                    inner.utime.max(1),
+                    inner.stime,
+                )
             };
-            let cmd = if let Some(f) = inner.fd_table.get(0).and_then(|x| x.as_ref()) {
-                f.path().unwrap_or_else(|| String::from("?"))
-            } else {
-                String::from("initproc")
-            };
-            let ppid = inner
-                .parent
-                .as_ref()
-                .and_then(|w| w.upgrade())
-                .map(|p| p.getpid())
+            let cmd = stdin
+                .and_then(|file| file.path())
+                .unwrap_or_else(|| String::from("initproc"));
+            let ppid = parent
+                .and_then(|parent| parent.upgrade())
+                .map(|parent| parent.getpid())
                 .unwrap_or(0);
-            let pgid = inner.pgid;
-            let sid = inner.sid;
-            let utime = inner.utime.max(1);
-            let stime = inner.stime;
             format!("{} ({}) {} {} {} {} 0 0 0 0 0 0 0 {} {} 0 0 20 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
                 self.pid, cmd, state, ppid, pgid, sid, utime, stime)
         } else {
@@ -180,16 +203,8 @@ impl File for ProcPidStatFile {
     // 按普通文本文件的方式分段读 stat 内容。
     // 执行时重新生成 stat 文本，从当前 offset 拷贝一段到 buf，并推进 offset。
     fn read(&self, buf: &mut [u8]) -> isize {
-        let mut off = self.offset.exclusive_access();
         let content = self.build_content();
-        let bytes = content.as_bytes();
-        if *off >= bytes.len() {
-            return 0;
-        }
-        let len = buf.len().min(bytes.len() - *off);
-        buf[..len].copy_from_slice(&bytes[*off..*off + len]);
-        *off += len;
-        len as isize
+        read_with_offset(&self.offset, content.as_bytes(), buf)
     }
     // 这个伪文件只读。
     // 执行时直接返回 -1，因为 /proc/<pid>/stat 不接受写入。
@@ -213,46 +228,58 @@ impl File for ProcPidStatFile {
 
 pub struct ProcPidStatusFile {
     pid: usize,
-    offset: UPSafeCell<usize>,
+    offset: VfsLock<usize>,
 }
 
 impl ProcPidStatusFile {
     pub fn new(pid: usize) -> Self {
         Self {
             pid,
-            offset: unsafe { UPSafeCell::new(0) },
+            offset: VfsLock::new_named(0, "ProcPidStatusOffset"),
         }
     }
 
     fn build_content(&self) -> String {
         use alloc::format;
         if let Some(task) = crate::task::pid2task(self.pid) {
-            let inner = task.inner_exclusive_access();
-            let state = match inner.task_status {
-                crate::task::TaskStatus::Running => "R (running)",
-                crate::task::TaskStatus::Zombie => "Z (zombie)",
-                _ => "S (sleeping)",
+            let (state, parent, tgid, uid, euid, suid, gid, egid, sgid) = {
+                let inner = task.inner_exclusive_access();
+                (
+                    match inner.task_status {
+                        crate::task::TaskStatus::Running => "R (running)",
+                        crate::task::TaskStatus::Zombie => "Z (zombie)",
+                        _ => "S (sleeping)",
+                    },
+                    inner.parent.clone(),
+                    inner.tgid,
+                    inner.uid,
+                    inner.euid,
+                    inner.suid,
+                    inner.gid,
+                    inner.egid,
+                    inner.sgid,
+                )
             };
-            let ppid = inner
-                .parent
-                .as_ref()
-                .and_then(|w| w.upgrade())
-                .map(|p| p.getpid())
+            let ppid = parent
+                .and_then(|parent| parent.upgrade())
+                .map(|parent| parent.getpid())
                 .unwrap_or(0);
+            let allowed = task.allowed_cpus() & online_cpu_mask();
             format!(
-                "Name:\tinitproc\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t{} {} {} {}\nGid:\t{} {} {} {}\nVmLck:\t       0 kB\nVmSwap:\t       0 kB\nThreads:\t1\nCpus_allowed:\t1\nMems_allowed:\t1\n",
+                "Name:\tinitproc\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t{} {} {} {}\nGid:\t{} {} {} {}\nVmLck:\t       0 kB\nVmSwap:\t       0 kB\nThreads:\t1\nCpus_allowed:\t{:x}\nMems_allowed:\t1\n",
                 state,
-                inner.tgid,
+                tgid,
                 self.pid,
                 ppid,
-                inner.uid,
-                inner.euid,
-                inner.suid,
-                inner.euid,
-                inner.gid,
-                inner.egid,
-                inner.sgid,
-                inner.egid
+                uid,
+                euid,
+                suid,
+                euid,
+                gid,
+                egid,
+                sgid,
+                egid,
+                allowed,
             )
         } else {
             String::new()
@@ -268,16 +295,8 @@ impl File for ProcPidStatusFile {
         false
     }
     fn read(&self, buf: &mut [u8]) -> isize {
-        let mut off = self.offset.exclusive_access();
         let content = self.build_content();
-        let bytes = content.as_bytes();
-        if *off >= bytes.len() {
-            return 0;
-        }
-        let len = buf.len().min(bytes.len() - *off);
-        buf[..len].copy_from_slice(&bytes[*off..*off + len]);
-        *off += len;
-        len as isize
+        read_with_offset(&self.offset, content.as_bytes(), buf)
     }
     fn write(&self, _buf: &mut [u8]) -> isize {
         -1
@@ -293,8 +312,72 @@ impl File for ProcPidStatusFile {
     }
 }
 
+/// Snapshot of the harts which completed scheduler initialization when
+/// `/proc/cpuinfo` was opened.  This makes the default one-core QEMU boot and
+/// the explicit four-core boot accurately distinguishable to userspace.
+pub struct ProcCpuinfoFile {
+    offset: VfsLock<usize>,
+    content: String,
+}
+
+impl ProcCpuinfoFile {
+    pub fn new() -> Self {
+        let online = online_cpu_mask();
+        let mut content = String::new();
+        for hart in 0..core::mem::size_of::<usize>() * 8 {
+            if online & (1usize << hart) == 0 {
+                continue;
+            }
+            #[cfg(target_arch = "riscv64")]
+            {
+                use alloc::fmt::Write;
+                let _ = writeln!(
+                    content,
+                    "processor\t: {hart}\nhart\t\t: {hart}\nisa\t\t: rv64imafdc\nmmu\t\t: sv39\n"
+                );
+            }
+            #[cfg(target_arch = "loongarch64")]
+            {
+                use alloc::fmt::Write;
+                let _ = writeln!(
+                    content,
+                    "processor\t: {hart}\nisa\t\t: loongarch64\n"
+                );
+            }
+        }
+        Self {
+            offset: VfsLock::new_named(0, "ProcCpuinfoOffset"),
+            content,
+        }
+    }
+}
+
+impl File for ProcCpuinfoFile {
+    fn readable(&self) -> bool {
+        true
+    }
+    fn writable(&self) -> bool {
+        false
+    }
+    fn read(&self, buf: &mut [u8]) -> isize {
+        read_with_offset(&self.offset, self.content.as_bytes(), buf)
+    }
+    fn write(&self, _buf: &mut [u8]) -> isize {
+        -1
+    }
+    fn stat(&self) -> Kstat {
+        let mut st = Kstat::new(super::S_IFREG);
+        st.st_size = self.content.len() as i64;
+        st.st_mode = super::S_IFREG | 0o444;
+        st
+    }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
 pub struct ProcMountsFile {
-    offset: UPSafeCell<usize>,
+    offset: VfsLock<usize>,
     content: String,
 }
 
@@ -302,16 +385,57 @@ impl ProcMountsFile {
     // 打开 /proc/mounts 时截一份当前挂载表文本。
     // 执行时遍历挂载表，把每个挂载点格式化成一行文本，并保存独立读取 offset。
     pub fn new() -> Self {
-        let mut content = String::new();
-        let table = crate::fs::vfs::MOUNT_TABLE.exclusive_access();
-        for m in table.iter() {
-            let device = "none";
-            let fstype = m.mnt_root.super_block.fs_type;
-            let mp = &m.mnt_point.path;
-            content.push_str(&alloc::format!("{device} {mp} {fstype} rw,relatime 0 0\n"));
-        }
+        const PREFIX: &str = "none ";
+        const SUFFIX: &str = " rw,relatime 0 0\n";
+
+        // MOUNT_TABLE may change between a sizing pass and a formatting pass.
+        // Retry rather than growing `content` with the VFS lock held.
+        let content = loop {
+            let required = {
+                let table = crate::fs::vfs::MOUNT_TABLE.exclusive_access();
+                table
+                    .iter()
+                    .map(|mount| {
+                        PREFIX.len()
+                            + mount.mnt_point.path.len()
+                            + 1
+                            + mount.mnt_root.super_block.fs_type.len()
+                            + SUFFIX.len()
+                    })
+                    .sum()
+            };
+            let mut content = String::with_capacity(required);
+            let complete = {
+                let table = crate::fs::vfs::MOUNT_TABLE.exclusive_access();
+                let exact_size: usize = table
+                    .iter()
+                    .map(|mount| {
+                        PREFIX.len()
+                            + mount.mnt_point.path.len()
+                            + 1
+                            + mount.mnt_root.super_block.fs_type.len()
+                            + SUFFIX.len()
+                    })
+                    .sum();
+                if exact_size > content.capacity() {
+                    false
+                } else {
+                    for mount in table.iter() {
+                        content.push_str(PREFIX);
+                        content.push_str(&mount.mnt_point.path);
+                        content.push(' ');
+                        content.push_str(mount.mnt_root.super_block.fs_type);
+                        content.push_str(SUFFIX);
+                    }
+                    true
+                }
+            };
+            if complete {
+                break content;
+            }
+        };
         Self {
-            offset: unsafe { UPSafeCell::new(0) },
+            offset: VfsLock::new_named(0, "ProcMountsOffset"),
             content,
         }
     }
@@ -331,15 +455,7 @@ impl File for ProcMountsFile {
     // 从打开时保存的挂载表文本里按 offset 读。
     // 执行时从 content 的当前 offset 拷贝一段到 buf，读到末尾后返回 0。
     fn read(&self, buf: &mut [u8]) -> isize {
-        let mut offset = self.offset.exclusive_access();
-        let bytes = self.content.as_bytes();
-        if *offset >= bytes.len() {
-            return 0;
-        }
-        let len = buf.len().min(bytes.len() - *offset);
-        buf[..len].copy_from_slice(&bytes[*offset..*offset + len]);
-        *offset += len;
-        len as isize
+        read_with_offset(&self.offset, self.content.as_bytes(), buf)
     }
     // 这个伪文件只读。
     // 执行时直接返回 -1，因为 /proc/mounts 不支持写入。
@@ -362,7 +478,7 @@ impl File for ProcMountsFile {
 }
 
 pub struct ProcMeminfoFile {
-    offset: UPSafeCell<usize>,
+    offset: VfsLock<usize>,
     content: String,
 }
 
@@ -384,7 +500,7 @@ impl ProcMeminfoFile {
             free_kb
         );
         Self {
-            offset: unsafe { UPSafeCell::new(0) },
+            offset: VfsLock::new_named(0, "ProcMeminfoOffset"),
             content,
         }
     }
@@ -404,15 +520,7 @@ impl File for ProcMeminfoFile {
     // 从打开时生成的 meminfo 文本里按 offset 读。
     // 执行时从 content 的当前 offset 拷贝一段到 buf，读完后推进 offset。
     fn read(&self, buf: &mut [u8]) -> isize {
-        let mut offset = self.offset.exclusive_access();
-        let bytes = self.content.as_bytes();
-        if *offset >= bytes.len() {
-            return 0;
-        }
-        let len = buf.len().min(bytes.len() - *offset);
-        buf[..len].copy_from_slice(&bytes[*offset..*offset + len]);
-        *offset += len;
-        len as isize
+        read_with_offset(&self.offset, self.content.as_bytes(), buf)
     }
     // 这个伪文件只读。
     // 执行时直接返回 -1，因为 /proc/meminfo 不接受写入。
@@ -435,14 +543,14 @@ impl File for ProcMeminfoFile {
 }
 
 pub struct ProcStaticFile {
-    offset: UPSafeCell<usize>,
+    offset: VfsLock<usize>,
     content: &'static str,
 }
 
 impl ProcStaticFile {
     pub fn new(content: &'static str) -> Self {
         Self {
-            offset: unsafe { UPSafeCell::new(0) },
+            offset: VfsLock::new_named(0, "ProcStaticOffset"),
             content,
         }
     }
@@ -456,15 +564,7 @@ impl File for ProcStaticFile {
         false
     }
     fn read(&self, buf: &mut [u8]) -> isize {
-        let mut offset = self.offset.exclusive_access();
-        let bytes = self.content.as_bytes();
-        if *offset >= bytes.len() {
-            return 0;
-        }
-        let len = buf.len().min(bytes.len() - *offset);
-        buf[..len].copy_from_slice(&bytes[*offset..*offset + len]);
-        *offset += len;
-        len as isize
+        read_with_offset(&self.offset, self.content.as_bytes(), buf)
     }
     fn write(&self, _buf: &mut [u8]) -> isize {
         -1
@@ -481,14 +581,14 @@ impl File for ProcStaticFile {
 }
 
 pub struct PseudoDirFile {
-    offset: UPSafeCell<usize>,
+    offset: VfsLock<usize>,
     entries: &'static [(&'static str, u8)],
 }
 
 impl PseudoDirFile {
     pub fn new(entries: &'static [(&'static str, u8)]) -> Self {
         Self {
-            offset: unsafe { UPSafeCell::new(0) },
+            offset: VfsLock::new_named(0, "PseudoDirOffset"),
             entries,
         }
     }
@@ -587,7 +687,7 @@ impl File for PseudoDirFile {
 }
 
 pub struct SysBlockStatFile {
-    offset: UPSafeCell<usize>,
+    offset: VfsLock<usize>,
     content: String,
 }
 
@@ -597,7 +697,7 @@ impl SysBlockStatFile {
         let io_ticks = sectors.max(1);
         let content = alloc::format!("0 0 0 0 0 0 {} 0 0 {} 0 0 0 0 0 0 0\n", sectors, io_ticks);
         Self {
-            offset: unsafe { UPSafeCell::new(0) },
+            offset: VfsLock::new_named(0, "SysBlockStatOffset"),
             content,
         }
     }
@@ -611,15 +711,7 @@ impl File for SysBlockStatFile {
         false
     }
     fn read(&self, buf: &mut [u8]) -> isize {
-        let mut offset = self.offset.exclusive_access();
-        let bytes = self.content.as_bytes();
-        if *offset >= bytes.len() {
-            return 0;
-        }
-        let len = buf.len().min(bytes.len() - *offset);
-        buf[..len].copy_from_slice(&bytes[*offset..*offset + len]);
-        *offset += len;
-        len as isize
+        read_with_offset(&self.offset, self.content.as_bytes(), buf)
     }
     fn write(&self, _buf: &mut [u8]) -> isize {
         -1

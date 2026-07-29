@@ -10,10 +10,10 @@ use crate::fs::stdio::stdout_release_if_owner;
 use crate::fs::File;
 use crate::mm::{translated_ref, translated_refmut};
 use crate::net::socket::{SocketFile, SocketType};
-use crate::sync::UPSafeCell;
+use crate::sync::DeviceLock;
 use crate::task::{
-    add_task, block_current_and_run_next, current_task, current_user_token,
-    suspend_current_and_run_next, BlockReason, TaskStatus, NET_BLOCK_QUEUE, PID2TCB,
+    block_current_and_run_next, block_current_and_run_next_if, current_task, current_user_token,
+    suspend_current_and_run_next, task_snapshot, wake_udp_waiters, BlockReason,
 };
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
@@ -72,12 +72,15 @@ struct LocalTcpListener {
 }
 
 lazy_static! {
-    static ref LOCAL_UDP_QUEUE: UPSafeCell<VecDeque<LocalUdpPacket>> =
-        unsafe { UPSafeCell::new(VecDeque::new()) };
-    static ref LOCAL_TCP_CONNS: UPSafeCell<Vec<Option<LocalTcpConn>>> =
-        unsafe { UPSafeCell::new(Vec::new()) };
-    static ref LOCAL_TCP_LISTENERS: UPSafeCell<Vec<LocalTcpListener>> =
-        unsafe { UPSafeCell::new(Vec::new()) };
+    /// Loopback UDP is a software device queue.  Wakers run only after this
+    /// lock is released; no scheduler or user-memory operation nests inside.
+    static ref LOCAL_UDP_QUEUE: DeviceLock<VecDeque<LocalUdpPacket>> =
+        DeviceLock::new_named(VecDeque::new(), "Net.local_udp_queue");
+    /// The local TCP tables form one serialised loopback device domain.
+    static ref LOCAL_TCP_CONNS: DeviceLock<Vec<Option<LocalTcpConn>>> =
+        DeviceLock::new_named(Vec::new(), "Net.local_tcp_connections");
+    static ref LOCAL_TCP_LISTENERS: DeviceLock<Vec<LocalTcpListener>> =
+        DeviceLock::new_named(Vec::new(), "Net.local_tcp_listeners");
 }
 
 fn net_ready() -> bool {
@@ -133,16 +136,14 @@ fn install_fd_for_thread_group(
     file: Arc<dyn File + Send + Sync>,
     cloexec: bool,
 ) {
-    let tasks: Vec<_> = PID2TCB
-        .exclusive_access()
-        .values()
+    let tasks: Vec<_> = task_snapshot()
+        .into_iter()
         .filter(|task| task.getpid() != owner_pid)
         .filter(|task| {
             task.try_inner_borrow()
                 .map(|inner| inner.tgid == tgid)
                 .unwrap_or(false)
         })
-        .cloned()
         .collect();
     for task in tasks {
         if let Some(mut inner) = task.try_inner_exclusive_access() {
@@ -750,29 +751,32 @@ fn enqueue_local_udp(src: IpEndpoint, data: &[u8], dest: IpEndpoint) -> isize {
 }
 
 fn wake_local_udp_receivers() {
-    let mut to_wake = Vec::new();
-    {
-        let mut queue = NET_BLOCK_QUEUE.exclusive_access();
-        let mut i = 0;
-        while i < queue.len() {
-            let should_wake = {
-                let inner = queue[i].inner_exclusive_access();
-                matches!(inner.block_reason, Some(BlockReason::UdpRecv(_)))
-            };
-            if should_wake {
-                to_wake.push(queue.remove(i));
-            } else {
-                i += 1;
-            }
-        }
+    wake_udp_waiters();
+}
+
+fn local_udp_ready(sockfd: usize, handle: SocketHandle) -> bool {
+    let Some(local) = local_recv_endpoint(sockfd, handle) else {
+        return false;
+    };
+    local_udp_pending_on(local, get_socket_peer_endpoint(sockfd))
+}
+
+fn local_udp_socket_ready(sock: &SocketFile, handle: SocketHandle) -> bool {
+    let Some(local) = local_recv_endpoint_socket(sock, handle) else {
+        return false;
+    };
+    local_udp_pending_on(local, sock.get_peer_endpoint())
+}
+
+fn udp_handle_can_recv(handle: SocketHandle) -> bool {
+    if !net_ready() {
+        return false;
     }
-    for task in to_wake {
-        let mut inner = task.inner_exclusive_access();
-        inner.task_status = TaskStatus::Ready;
-        inner.block_reason = None;
-        drop(inner);
-        add_task(task);
-    }
+    crate::net::with_net_iface(|iface| {
+        let sock: &UdpSocket = iface.sockets.get(handle);
+        sock.can_recv()
+    })
+    .unwrap_or(false)
 }
 
 fn try_send_local_udp(
@@ -882,7 +886,11 @@ pub(crate) fn udp_read_socket(
         return ret;
     }
     if nonblock {
-        return udp_recv(handle, true, buf);
+        return if net_ready() {
+            udp_recv(handle, true, buf)
+        } else {
+            -11
+        };
     }
 
     loop {
@@ -902,9 +910,13 @@ pub(crate) fn udp_read_socket(
         .flatten();
         match result {
             Some(n) => return n,
-            None => block_current_and_run_next(BlockReason::UdpRecv(unsafe {
-                core::mem::transmute(handle)
-            })),
+            None => {
+                let reason =
+                    BlockReason::UdpRecv(unsafe { core::mem::transmute(handle) });
+                block_current_and_run_next_if(reason, || {
+                    !local_udp_socket_ready(sock, handle) && !udp_handle_can_recv(handle)
+                });
+            }
         }
     }
 }
@@ -1444,9 +1456,10 @@ pub fn sys_recvfrom(
             if ret != -11 || dontwait {
                 break ret;
             }
-            block_current_and_run_next(BlockReason::UdpRecv(unsafe {
-                core::mem::transmute(handle)
-            }));
+            let reason = BlockReason::UdpRecv(unsafe { core::mem::transmute(handle) });
+            block_current_and_run_next_if(reason, || {
+                !local_udp_ready(sockfd, handle) && !udp_handle_can_recv(handle)
+            });
         },
         SocketType::Unix => -107,
     };
@@ -1576,9 +1589,10 @@ pub fn sys_recvmsg(sockfd: usize, msg: *mut u8, flags: usize) -> isize {
             if ret != -11 || dontwait {
                 break ret;
             }
-            block_current_and_run_next(BlockReason::UdpRecv(unsafe {
-                core::mem::transmute(handle)
-            }));
+            let reason = BlockReason::UdpRecv(unsafe { core::mem::transmute(handle) });
+            block_current_and_run_next_if(reason, || {
+                !local_udp_ready(sockfd, handle) && !udp_handle_can_recv(handle)
+            });
         },
         SocketType::Unix => -107,
     };
@@ -2029,9 +2043,11 @@ pub(crate) fn udp_recv(handle: SocketHandle, nonblock: bool, buf: &mut [u8]) -> 
         .flatten();
         match result {
             Some(n) => return n,
-            None => block_current_and_run_next(BlockReason::UdpRecv(unsafe {
-                core::mem::transmute(handle)
-            })),
+            None => {
+                let reason =
+                    BlockReason::UdpRecv(unsafe { core::mem::transmute(handle) });
+                block_current_and_run_next_if(reason, || !udp_handle_can_recv(handle));
+            }
         }
     }
 }

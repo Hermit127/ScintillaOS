@@ -59,6 +59,7 @@ fn kernel_callback(context: &mut TrapFrame) -> TrapType {
             timer::set_next_timeout();
             TrapType::Timer
         }
+        Trap::Interrupt(Interrupt::SupervisorSoft) => TrapType::SupervisorSoft,
         Trap::Exception(Exception::StorePageFault) => TrapType::StorePageFault(stval),
         Trap::Exception(Exception::StoreFault) => TrapType::StorePageFault(stval),
         Trap::Exception(Exception::InstructionPageFault) => TrapType::InstructionPageFault(stval),

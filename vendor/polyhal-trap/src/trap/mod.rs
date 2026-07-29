@@ -13,6 +13,12 @@ pub enum TrapType {
     SysCall,
     Timer,
     Unknown,
+    /// Supervisor software interrupt, delivered by SBI's IPI extension.
+    ///
+    /// The kernel owns acknowledgement of this interrupt because the action
+    /// (reschedule, remote TLB flush, etc.) is OS policy rather than trap
+    /// framework policy.
+    SupervisorSoft,
     SupervisorExternal,
     StorePageFault(usize),
     LoadPageFault(usize),
@@ -35,6 +41,7 @@ impl From<TrapType> for EscapeReason {
         match value {
             TrapType::SysCall => EscapeReason::SysCall,
             TrapType::Timer => EscapeReason::Timer,
+            TrapType::SupervisorSoft => EscapeReason::IRQ,
             TrapType::Irq(_) => EscapeReason::IRQ,
             _ => EscapeReason::NoReason,
         }

@@ -1,4 +1,6 @@
-use crate::sync::UPSafeCell;
+use crate::sync::{
+    DentryLock, FsAuxLock, FsGlobalGuard, FsGlobalLock, FsGuard, FsLock, VfsLock,
+};
 use alloc::collections::BTreeMap;
 use alloc::ffi::CString;
 use alloc::format;
@@ -6,6 +8,7 @@ use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::ffi::c_char;
+use core::ops::{Deref, DerefMut};
 use lazy_static::*;
 
 use super::block_device_stream::{BlockDeviceStream, BlockDeviceStreamOp, Ext4Wrapper};
@@ -13,10 +16,41 @@ use lwext4_rust::bindings::*;
 use lwext4_rust::Ext4BlockWrapper;
 
 const PATH_OWNER_CACHE_MAX_ENTRIES: usize = 1024;
+// The first SMP release has no mount hotplug requirement.  Reserving the
+// small mount table up front keeps Vec growth (and therefore allocation) out
+// of VfsLock critical sections.
+const MOUNT_TABLE_CAPACITY: usize = 16;
 
 lazy_static! {
-    static ref PATH_OWNER_CACHE: UPSafeCell<BTreeMap<String, (u32, u32)>> =
-        unsafe { UPSafeCell::new(BTreeMap::new()) };
+    // lwext4 keeps process-global mount/cache state internally.  Per-volume
+    // locks are insufficient in the dual-disk SMP configuration: operations
+    // on rootfs and the test disk must not enter lwext4 concurrently.
+    static ref LWEXT4_GLOBAL: FsGlobalLock<()> =
+        FsGlobalLock::new_named((), "LwExt4Global");
+    static ref PATH_OWNER_CACHE: VfsLock<BTreeMap<String, (u32, u32)>> =
+        VfsLock::new_named(BTreeMap::new(), "VfsPathOwnerCache");
+}
+
+pub(crate) struct VfsFsGuard<'a> {
+    // Struct fields are dropped in declaration order. The local Ext4 lock was
+    // acquired after the global lwext4 lock and therefore must be declared
+    // first so it is released first.
+    local: FsGuard<'a, FsInner>,
+    _global: FsGlobalGuard<'a, ()>,
+}
+
+impl Deref for VfsFsGuard<'_> {
+    type Target = FsInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.local
+    }
+}
+
+impl DerefMut for VfsFsGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.local
+    }
 }
 
 fn record_path_owner(fs_path: &str, uid: u32, gid: u32) {
@@ -74,10 +108,25 @@ pub enum FsInner {
 
 pub struct VfsSuperBlock {
     pub fs_type: &'static str,
-    pub fs_data: UPSafeCell<FsInner>,
+    /// Ext4/lwext4 is not reentrant.  The first SMP revision serializes each
+    /// mounted superblock explicitly, rather than relying on a global
+    /// single-core cell.
+    pub fs_data: FsLock<FsInner>,
 }
 
 impl VfsSuperBlock {
+    /// Serialize direct lwext4 handle operations.  Callers that also protect
+    /// dentry or open-file metadata must acquire that VFS lock first, then
+    /// this guard, following `VfsLock -> FsLock`.
+    pub(crate) fn lock_fs(&self) -> VfsFsGuard<'_> {
+        let global = LWEXT4_GLOBAL.exclusive_access();
+        let local = self.fs_data.exclusive_access();
+        VfsFsGuard {
+            local,
+            _global: global,
+        }
+    }
+
     pub fn new_ext4(
         blk_device: Arc<dyn crate::drivers::BlockDevice>,
         fs_type: &'static str,
@@ -96,27 +145,26 @@ impl VfsSuperBlock {
             inner: blk_device,
             pos: 0,
             total_size,
+            scratch: alloc::vec![0u8; 128 * 1024],
         };
         let ext4 =
             Ext4BlockWrapper::<BlockDeviceStreamOp>::new_with_name(stream, "ext4_fs", mount_point)
                 .ok()?;
         Some(Arc::new(VfsSuperBlock {
             fs_type,
-            fs_data: unsafe {
-                UPSafeCell::new_named(FsInner::Ext4(Ext4Wrapper(ext4)), "VfsFsData")
-            },
+            fs_data: FsLock::new_named(FsInner::Ext4(Ext4Wrapper(ext4)), "VfsFsData"),
         }))
     }
 
     fn with_fs<R>(&self, f: impl FnOnce(&Ext4Wrapper) -> R) -> R {
-        let data = self.fs_data.exclusive_access();
+        let data = self.lock_fs();
         match &*data {
             FsInner::Ext4(wrapper) => f(wrapper),
         }
     }
 
     pub fn force_umount(&self) {
-        let mut data = self.fs_data.exclusive_access();
+        let mut data = self.lock_fs();
         if let FsInner::Ext4(ref mut wrapper) = *data {
             unsafe {
                 wrapper.0.lwext4_umount().ok();
@@ -165,6 +213,10 @@ impl VfsSuperBlock {
     }
 
     pub fn get_inode_info(&self, fs_path: &str) -> Option<InodeInfo> {
+        // The owner cache is VFS metadata. Take this snapshot before
+        // `with_fs` acquires the superblock FsLock, preserving the documented
+        // `VfsLock -> FsLock` order.
+        let cached_owner = cached_path_owner(fs_path);
         self.with_fs(|_fs| {
             let mut mode: u32 = 0;
             let c_path2 = CString::new(fs_path).ok()?;
@@ -190,7 +242,7 @@ impl VfsSuperBlock {
             unsafe {
                 ext4_owner_get(c_path_owner.as_ptr() as *const c_char, &mut uid, &mut gid);
             }
-            if let Some((cached_uid, cached_gid)) = cached_path_owner(fs_path) {
+            if let Some((cached_uid, cached_gid)) = cached_owner {
                 uid = cached_uid;
                 gid = cached_gid;
             }
@@ -562,17 +614,19 @@ impl VfsSuperBlock {
     }
 
     pub fn set_owner(&self, fs_path: &str, uid: u32, gid: u32) -> i32 {
-        self.with_fs(|_fs| {
+        let result = self.with_fs(|_fs| {
             if let Ok(c_path) = CString::new(fs_path) {
-                let r = unsafe { ext4_owner_set(c_path.as_ptr() as *const c_char, uid, gid) };
-                if r == EOK as i32 {
-                    record_path_owner(fs_path, uid, gid);
-                }
-                r
+                unsafe { ext4_owner_set(c_path.as_ptr() as *const c_char, uid, gid) }
             } else {
                 -1
             }
-        })
+        });
+        // The owner cache is VFS metadata (rank 8), so update it only after
+        // with_fs has released the lwext4 global and per-volume locks.
+        if result == EOK as i32 {
+            record_path_owner(fs_path, uid, gid);
+        }
+        result
     }
 
     pub fn fsync(&self, fs_path: &str) -> i32 {
@@ -608,8 +662,12 @@ pub struct Dentry {
     pub is_link: bool,
     pub parent: Option<Weak<Dentry>>,
     pub super_block: Arc<VfsSuperBlock>,
-    pub children: UPSafeCell<Option<Vec<Arc<Dentry>>>>,
-    inode_info: UPSafeCell<Option<InodeInfo>>,
+    /// Cache updates use a two-phase protocol: create/reserve a replacement
+    /// list before acquiring this lock, and never call Ext4 while it is held.
+    pub children: DentryLock<Option<Vec<Arc<Dentry>>>>,
+    /// This is only an in-memory metadata cache.  Ext4 lookup happens after
+    /// dropping the lock, then the result is stored in a second short phase.
+    inode_info: DentryLock<Option<InodeInfo>>,
 }
 
 impl Dentry {
@@ -623,8 +681,8 @@ impl Dentry {
             is_link: false,
             parent: None,
             super_block: sb,
-            children: unsafe { UPSafeCell::new(None) },
-            inode_info: unsafe { UPSafeCell::new(None) },
+            children: DentryLock::new_named(None, "DentryChildren"),
+            inode_info: DentryLock::new_named(None, "DentryInodeInfo"),
         })
     }
 
@@ -638,8 +696,8 @@ impl Dentry {
             is_link: false,
             parent: None,
             super_block: sb,
-            children: unsafe { UPSafeCell::new(None) },
-            inode_info: unsafe { UPSafeCell::new(None) },
+            children: DentryLock::new_named(None, "DentryChildren"),
+            inode_info: DentryLock::new_named(None, "DentryInodeInfo"),
         })
     }
 
@@ -671,13 +729,14 @@ impl Dentry {
             is_link,
             parent: Some(Arc::downgrade(parent)),
             super_block: parent.super_block.clone(),
-            children: unsafe { UPSafeCell::new(None) },
-            inode_info: unsafe { UPSafeCell::new(None) },
+            children: DentryLock::new_named(None, "DentryChildren"),
+            inode_info: DentryLock::new_named(None, "DentryInodeInfo"),
         })
     }
 
     pub fn inode_info(&self) -> Option<InodeInfo> {
-        if let Some(info) = *self.inode_info.exclusive_access() {
+        let cached = { *self.inode_info.exclusive_access() };
+        if let Some(info) = cached {
             return Some(info);
         }
         let info = self.super_block.get_inode_info(&self.fs_path)?;
@@ -747,10 +806,15 @@ pub struct Mount {
 }
 
 lazy_static! {
-    pub static ref MOUNT_TABLE: UPSafeCell<Vec<Mount>> = unsafe { UPSafeCell::new(Vec::new()) };
-    static ref READONLY_MOUNT_PATHS: UPSafeCell<Vec<String>> =
-        unsafe { UPSafeCell::new(Vec::new()) };
-    static ref TMPFS_MOUNTS: UPSafeCell<Vec<TmpfsMount>> = unsafe { UPSafeCell::new(Vec::new()) };
+    pub static ref MOUNT_TABLE: VfsLock<Vec<Mount>> =
+        VfsLock::new_named(Vec::with_capacity(MOUNT_TABLE_CAPACITY), "VfsMountTable");
+    static ref READONLY_MOUNT_PATHS: VfsLock<Vec<String>> =
+        VfsLock::new_named(Vec::with_capacity(MOUNT_TABLE_CAPACITY), "VfsReadonlyMounts");
+    // Quota accounting is updated both before and after direct lwext4
+    // transactions.  It never calls back into VFS/Fs, so give it a dedicated
+    // post-Fs class instead of pretending it is ordinary dentry metadata.
+    static ref TMPFS_MOUNTS: FsAuxLock<Vec<TmpfsMount>> =
+        FsAuxLock::new_named(Vec::with_capacity(MOUNT_TABLE_CAPACITY), "VfsTmpfsMounts");
 }
 
 struct TmpfsMount {
@@ -911,25 +975,39 @@ fn vfs_parent(dentry: &Arc<Dentry>) -> Option<Arc<Dentry>> {
 }
 
 fn cache_child(parent: &Arc<Dentry>, child: Arc<Dentry>) {
-    let mut children = parent.children.exclusive_access();
-    let list = children.get_or_insert_with(Vec::new);
-
-    if let Some(slot) = list.iter_mut().find(|cached| cached.name == child.name) {
-        *slot = child;
-        return;
-    }
-
-    if list.len() >= DENTRY_CHILD_CACHE_LIMIT {
-        if let Some(idx) = list
-            .iter()
-            .position(|cached| Arc::strong_count(cached) == 1)
-        {
-            list.remove(idx);
+    // Reserve a complete cache line before taking the Dentry lock.  A second
+    // lookup below handles a racing initializer without calling the allocator
+    // while holding a VfsLock.
+    if parent.children.exclusive_access().is_none() {
+        let mut initial = Vec::with_capacity(DENTRY_CHILD_CACHE_LIMIT);
+        initial.push(child.clone());
+        let mut children = parent.children.exclusive_access();
+        if children.is_none() {
+            *children = Some(initial);
+            return;
         }
     }
 
-    if list.len() < DENTRY_CHILD_CACHE_LIMIT {
-        list.push(child);
+    let mut children = parent.children.exclusive_access();
+    let list = children
+        .as_mut()
+        .expect("Dentry child cache initialized before use");
+    debug_assert!(list.capacity() >= DENTRY_CHILD_CACHE_LIMIT);
+
+    if let Some(slot) = list.iter_mut().find(|cached| cached.name == child.name) {
+        *slot = child;
+    } else {
+        if list.len() >= DENTRY_CHILD_CACHE_LIMIT {
+            if let Some(idx) = list
+                .iter()
+                .position(|cached| Arc::strong_count(cached) == 1)
+            {
+                list.remove(idx);
+            }
+        }
+        if list.len() < DENTRY_CHILD_CACHE_LIMIT {
+            list.push(child);
+        }
     }
 }
 
@@ -948,16 +1026,17 @@ pub fn vfs_lookup(parent: &Arc<Dentry>, name: &str) -> Option<Arc<Dentry>> {
         _ => {}
     }
 
-    {
+    let cached = {
         let children = parent.children.exclusive_access();
-        if let Some(list) = children.as_ref() {
-            if let Some(cached) = list.iter().find(|c| c.name == name) {
-                if let Some(mnt_root) = lookup_mount(cached) {
-                    return Some(mnt_root);
-                }
-                return Some(cached.clone());
-            }
+        children
+            .as_ref()
+            .and_then(|list| list.iter().find(|cached| cached.name == name).cloned())
+    };
+    if let Some(cached) = cached {
+        if let Some(mnt_root) = lookup_mount(&cached) {
+            return Some(mnt_root);
         }
+        return Some(cached);
     }
 
     let child_fs_path = if parent.fs_path == "/" {
@@ -1128,6 +1207,7 @@ pub fn vfs_mount(mnt_point: Arc<Dentry>, sb: Arc<VfsSuperBlock>, fs_path: &str) 
         if table
             .iter()
             .any(|m| m.mnt_point.path == path && path != "/")
+            || table.len() == MOUNT_TABLE_CAPACITY
         {
             return false;
         }
@@ -1135,7 +1215,17 @@ pub fn vfs_mount(mnt_point: Arc<Dentry>, sb: Arc<VfsSuperBlock>, fs_path: &str) 
 
     let mnt_root = Dentry::new_mount_root(sb, mnt_point.path.clone(), fs_path);
 
-    MOUNT_TABLE.exclusive_access().push(Mount {
+    let mut table = MOUNT_TABLE.exclusive_access();
+    // Recheck after building the new dentry: another hart may have mounted in
+    // the interval.  The preallocated table must never grow under VfsLock.
+    if table
+        .iter()
+        .any(|m| m.mnt_point.path == path && path != "/")
+        || table.len() == MOUNT_TABLE_CAPACITY
+    {
+        return false;
+    }
+    table.push(Mount {
         mnt_point: mnt_point.clone(),
         mnt_root: mnt_root.clone(),
     });
@@ -1145,13 +1235,16 @@ pub fn vfs_mount(mnt_point: Arc<Dentry>, sb: Arc<VfsSuperBlock>, fs_path: &str) 
 
 pub fn vfs_umount(mnt_point: &Arc<Dentry>) -> bool {
     let path = &mnt_point.path;
-    let mut table = MOUNT_TABLE.exclusive_access();
-    if let Some(idx) = table.iter().position(|m| &m.mnt_point.path == path) {
-        table.remove(idx);
-        true
-    } else {
-        false
-    }
+    // Destructing a Mount drops Arcs and may release filesystem state.  Move
+    // it out before leaving the VFS domain rather than dropping it in-lock.
+    let removed = {
+        let mut table = MOUNT_TABLE.exclusive_access();
+        table
+            .iter()
+            .position(|m| &m.mnt_point.path == path)
+            .map(|idx| table.remove(idx))
+    };
+    removed.is_some()
 }
 
 // ==================== Root Filesystem ====================
@@ -1172,6 +1265,39 @@ pub fn mount_root() {
         mnt_point: root.clone(),
         mnt_root: root,
     });
+}
+
+/// Flush and unmount every ext4 volume immediately before powering off.
+///
+/// The mount table can contain multiple dentries backed by the same superblock,
+/// so deduplicate the snapshot before invoking lwext4.  Locks are released
+/// before flushing/unmounting to preserve the VFS lock order.
+pub fn shutdown_filesystems() {
+    let mut super_blocks: Vec<Arc<VfsSuperBlock>> = Vec::new();
+    {
+        let table = MOUNT_TABLE.exclusive_access();
+        for mount in table.iter() {
+            let sb = mount.mnt_root.super_block.clone();
+            if !super_blocks.iter().any(|known| Arc::ptr_eq(known, &sb)) {
+                super_blocks.push(sb);
+            }
+        }
+    }
+
+    if !super_blocks
+        .iter()
+        .any(|known| Arc::ptr_eq(known, &ROOT_SB))
+    {
+        super_blocks.push(ROOT_SB.clone());
+    }
+
+    for sb in &super_blocks {
+        let _ = sb.sync_all();
+    }
+    // Unmount child/test filesystems before the root filesystem.
+    for sb in super_blocks.iter().rev() {
+        sb.force_umount();
+    }
 }
 
 /// Mount the test disk (bus 0) at the specified mount point dentry.

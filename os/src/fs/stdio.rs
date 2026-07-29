@@ -2,7 +2,7 @@
 use polyhal::debug_console::DebugConsole;
 
 use super::{File, Kstat, S_IFBLK, S_IFCHR, S_IFREG, S_IFSOCK};
-use crate::sync::UPSafeCell;
+use crate::sync::DeviceLock;
 use crate::task::{current_task, pid2task, suspend_current_and_run_next};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -360,22 +360,27 @@ struct TmpFileInner {
     data: Vec<u8>,
     offset: usize,
     append: bool,
+    stat: Kstat,
 }
 
 pub struct TmpFile {
-    inner: UPSafeCell<TmpFileInner>,
+    /// Anonymous temporary files are a self-contained in-memory device.  The
+    /// lock protects the cursor, append flag and byte storage together.
+    inner: DeviceLock<TmpFileInner>,
 }
 
 impl TmpFile {
     pub fn new() -> Self {
         Self {
-            inner: unsafe {
-                UPSafeCell::new(TmpFileInner {
+            inner: DeviceLock::new_named(
+                TmpFileInner {
                     data: Vec::new(),
                     offset: 0,
                     append: false,
-                })
-            },
+                    stat: Kstat::new(S_IFREG | 0o600),
+                },
+                "TmpFile.inner",
+            ),
         }
     }
 
@@ -388,6 +393,27 @@ impl TmpFile {
         }
         inner.data[offset..end].copy_from_slice(buf);
         buf.len() as isize
+    }
+
+    pub fn update_times(
+        &self,
+        atime: Option<(i64, i64)>,
+        mtime: Option<(i64, i64)>,
+        ctime: Option<(i64, i64)>,
+    ) {
+        let mut inner = self.inner.exclusive_access();
+        if let Some((sec, nsec)) = atime {
+            inner.stat.st_atime_sec = sec;
+            inner.stat.st_atime_nsec = nsec;
+        }
+        if let Some((sec, nsec)) = mtime {
+            inner.stat.st_mtime_sec = sec;
+            inner.stat.st_mtime_nsec = nsec;
+        }
+        if let Some((sec, nsec)) = ctime {
+            inner.stat.st_ctime_sec = sec;
+            inner.stat.st_ctime_nsec = nsec;
+        }
     }
 }
 
@@ -444,7 +470,7 @@ impl File for TmpFile {
 
     fn stat(&self) -> Kstat {
         let inner = self.inner.exclusive_access();
-        let mut st = Kstat::new(S_IFREG | 0o600);
+        let mut st = inner.stat;
         st.st_size = inner.data.len() as i64;
         st.st_blksize = 4096;
         st.st_blocks = ((inner.data.len() as u64) + 511) / 512;

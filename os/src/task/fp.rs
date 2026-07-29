@@ -7,6 +7,16 @@ mod arch {
     pub struct UserFloatState {
         regs: [u64; 32],
         fcsr: usize,
+        #[cfg(feature = "riscv-vector")]
+        vector_regs: [u128; 32],
+        #[cfg(feature = "riscv-vector")]
+        vl: usize,
+        #[cfg(feature = "riscv-vector")]
+        vtype: usize,
+        #[cfg(feature = "riscv-vector")]
+        vstart: usize,
+        #[cfg(feature = "riscv-vector")]
+        vcsr: usize,
     }
 
     impl UserFloatState {
@@ -15,6 +25,16 @@ mod arch {
             Self {
                 regs: [0; 32],
                 fcsr: 0,
+                #[cfg(feature = "riscv-vector")]
+                vector_regs: [0; 32],
+                #[cfg(feature = "riscv-vector")]
+                vl: 0,
+                #[cfg(feature = "riscv-vector")]
+                vtype: 0,
+                #[cfg(feature = "riscv-vector")]
+                vstart: 0,
+                #[cfg(feature = "riscv-vector")]
+                vcsr: 0,
             }
         }
 
@@ -63,6 +83,101 @@ mod arch {
                 );
             }
             self.fcsr = fcsr;
+
+            #[cfg(feature = "riscv-vector")]
+            {
+            let vector_base = self.vector_regs.as_mut_ptr();
+            let vl: usize;
+            let vtype: usize;
+            let vstart: usize;
+            let vcsr: usize;
+            unsafe {
+                asm!(
+                    ".option push",
+                    ".option arch, +v",
+                    "csrr {vl}, vl",
+                    "csrr {vtype}, vtype",
+                    "csrr {vstart}, vstart",
+                    "csrr {vcsr}, vcsr",
+                    "vsetivli zero, 2, e64, m1, ta, ma",
+                    "mv {scratch}, {base}",
+                    "vse64.v v0, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vse64.v v1, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vse64.v v2, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vse64.v v3, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vse64.v v4, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vse64.v v5, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vse64.v v6, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vse64.v v7, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vse64.v v8, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vse64.v v9, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vse64.v v10, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vse64.v v11, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vse64.v v12, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vse64.v v13, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vse64.v v14, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vse64.v v15, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vse64.v v16, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vse64.v v17, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vse64.v v18, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vse64.v v19, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vse64.v v20, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vse64.v v21, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vse64.v v22, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vse64.v v23, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vse64.v v24, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vse64.v v25, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vse64.v v26, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vse64.v v27, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vse64.v v28, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vse64.v v29, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vse64.v v30, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vse64.v v31, ({scratch})",
+                    ".option pop",
+                    base = in(reg) vector_base,
+                    scratch = out(reg) _,
+                    vl = out(reg) vl,
+                    vtype = out(reg) vtype,
+                    vstart = out(reg) vstart,
+                    vcsr = out(reg) vcsr,
+                );
+            }
+            self.vl = vl;
+            self.vtype = vtype;
+            self.vstart = vstart;
+            self.vcsr = vcsr;
+            }
         }
 
         // 把保存过的用户浮点状态恢复到 CPU。
@@ -108,6 +223,96 @@ mod arch {
                     base = in(reg) base,
                     fcsr = in(reg) fcsr,
                 );
+            }
+
+            #[cfg(feature = "riscv-vector")]
+            {
+            let vector_base = self.vector_regs.as_ptr();
+            let vl = self.vl;
+            let vtype = self.vtype;
+            let vstart = self.vstart;
+            let vcsr = self.vcsr;
+            unsafe {
+                asm!(
+                    ".option push",
+                    ".option arch, +v",
+                    "vsetivli zero, 2, e64, m1, ta, ma",
+                    "mv {scratch}, {base}",
+                    "vle64.v v0, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vle64.v v1, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vle64.v v2, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vle64.v v3, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vle64.v v4, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vle64.v v5, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vle64.v v6, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vle64.v v7, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vle64.v v8, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vle64.v v9, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vle64.v v10, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vle64.v v11, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vle64.v v12, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vle64.v v13, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vle64.v v14, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vle64.v v15, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vle64.v v16, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vle64.v v17, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vle64.v v18, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vle64.v v19, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vle64.v v20, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vle64.v v21, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vle64.v v22, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vle64.v v23, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vle64.v v24, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vle64.v v25, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vle64.v v26, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vle64.v v27, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vle64.v v28, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vle64.v v29, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vle64.v v30, ({scratch})",
+                    "addi {scratch}, {scratch}, 16",
+                    "vle64.v v31, ({scratch})",
+                    "csrw vcsr, {vcsr}",
+                    "vsetvl zero, {vl}, {vtype}",
+                    "csrw vstart, {vstart}",
+                    ".option pop",
+                    base = in(reg) vector_base,
+                    scratch = lateout(reg) _,
+                    vl = in(reg) vl,
+                    vtype = in(reg) vtype,
+                    vstart = in(reg) vstart,
+                    vcsr = in(reg) vcsr,
+                );
+            }
             }
         }
     }

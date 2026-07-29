@@ -4,6 +4,17 @@ version = "0.1.0"
 authors = ["Yifan Wu <shinbokuow@163.com>"]
 edition = "2021"
 
+[features]
+default = []
+# Keep lock dependency checking and scheduler-stall snapshots available in an
+# optimized kernel. This feature adds diagnostics only and does not change the
+# userspace ABI or test programs.
+smp-diagnostics = []
+# The official QEMU command does not enable the RISC-V V extension. Keep
+# vector context switching opt-in for local tests that explicitly add
+# `-cpu max,v=true,vlen=128`.
+riscv-vector = []
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
@@ -35,6 +46,12 @@ lwext4_rust = { path = "../lwext4_rust", default-features = false }
 
 [target.'cfg(target_arch = "loongarch64")'.dependencies]
 loongArch64 = "0.2.6"
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+# Kept target-specific so the existing LoongArch single-core build does not
+# acquire an SBI or RISC-V CSR dependency.
+riscv = "0.13.0"
+sbi-rt = "0.0.2"
 
 [profile.release]
 debug = true

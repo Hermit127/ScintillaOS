@@ -2,6 +2,15 @@
 export LOG ?= error
 ARCH ?= riscv64
 COMMA := ,
+# Keep the baseline runnable.  Set QEMU_SMP=4 only after the SMP lock audit
+# and regression suite have passed.
+QEMU_SMP ?= 1
+QEMU_CPU ?= max
+SMP_DIAGNOSTICS ?= 0
+
+ifeq ($(SMP_DIAGNOSTICS),1)
+  OS_FEATURES := --features smp-diagnostics
+endif
 
 ifeq ($(ARCH), x86_64)
   TARGET := x86_64-unknown-none
@@ -18,6 +27,7 @@ else ifeq ($(ARCH), riscv64)
   TARGET := riscv64gc-unknown-none-elf
   QEMU_EXEC += qemu-system-$(ARCH) \
 				-machine virt \
+				-cpu $(QEMU_CPU) \
 				-kernel $(KERNEL_BIN)
   VIRTIO_BLK_BUS := virtio-mmio-bus.0
   VIRTIO_BLK_BUS2 := virtio-mmio-bus.1
@@ -70,8 +80,10 @@ endif
 KERNEL_ENTRY_PA := 0x80200000
 
 # Binutils
-OBJDUMP := rust-objdump --arch-name=riscv64
-OBJCOPY := rust-objcopy --binary-architecture=riscv64
+RUST_SYSROOT := $(shell rustc --print sysroot)
+LLVM_TOOLS_DIR := $(RUST_SYSROOT)/lib/rustlib/$(shell rustc -vV | sed -n 's/^host: //p')/bin
+OBJDUMP ?= $(if $(shell command -v rust-objdump 2>/dev/null),rust-objdump,$(LLVM_TOOLS_DIR)/llvm-objdump) --arch-name=riscv64
+OBJCOPY ?= $(if $(shell command -v rust-objcopy 2>/dev/null),rust-objcopy,$(LLVM_TOOLS_DIR)/llvm-objcopy) --binary-architecture=riscv64
 
 # Disassembly
 DISASM ?= -x
@@ -86,6 +98,10 @@ LTP_MODE ?= subset
 
 # ==================== Contest Submission Targets ====================
 
+prepare-vendor:
+	@find vendor -name cargo-checksum.json -exec sh -c \
+		'cp "$$1" "$$(dirname "$$1")/.cargo-checksum.json"' _ {} \;
+
 all: kernel-rv disk.img disk-rv.img kernel-la disk-la.img
 	@echo "===== Build complete ====="
 	@ls -lh kernel-rv kernel-la disk.img disk-rv.img disk-la.img 2>/dev/null || true
@@ -94,8 +110,8 @@ kernel-rv:
 	@echo "===== Building kernel-rv (riscv64) ====="
 	@$(MAKE) kernel ARCH=riscv64
 	@$(OBJCOPY) target/riscv64gc-unknown-none-elf/release/os --strip-all -O binary target/riscv64gc-unknown-none-elf/release/os.bin
-	@$(OBJCOPY) target/riscv64gc-unknown-none-elf/release/os --strip-all -O binary kernel-rv
-	@echo "kernel-rv ready"
+	@cp target/riscv64gc-unknown-none-elf/release/os kernel-rv
+	@echo "kernel-rv ready (ELF)"
 
 kernel-la:
 	@echo "===== Building kernel-la (loongarch64) ====="
@@ -128,14 +144,16 @@ build: env fs-img $(KERNEL_BIN)
 
 env:
 	(rustup target list | grep "$(TARGET) (installed)") || rustup target add $(TARGET)
-	(command -v rust-objcopy >/dev/null 2>&1 && command -v rust-objdump >/dev/null 2>&1) || cargo install cargo-binutils
+	(command -v rust-objcopy >/dev/null 2>&1 && command -v rust-objdump >/dev/null 2>&1) || \
+		(test -x "$(LLVM_TOOLS_DIR)/llvm-objcopy" && test -x "$(LLVM_TOOLS_DIR)/llvm-objdump") || \
+		(rustup component add llvm-tools-preview)
 	rustup component add rust-src
 	rustup component add llvm-tools-preview
 
 $(KERNEL_BIN): kernel
 	@$(OBJCOPY) $(KERNEL_ELF) --strip-all -O binary $@
 
-fs-img: $(APPS)
+fs-img: prepare-vendor $(APPS)
 	@mkdir -p .cargo 2>/dev/null || true
 	@cp -f cargo_config/config.toml .cargo/config.toml 2>/dev/null || true
 	@cd user && make build TARGET=$(TARGET) TEST=$(TEST)
@@ -316,6 +334,7 @@ else
 		echo "  LTP script not found, skipped"; \
 	fi
 endif
+
 	@mkdir -p $(ROOTFS_DIR)/ltp/testcases/bin
 	@if [ -d "$(LTP_BIN_DIR)/ltp/testcases/bin" ]; then \
 		for f in $(LTP_BIN_DIR)/ltp/testcases/bin/*; do \
@@ -331,16 +350,18 @@ endif
 	@dd if=/dev/zero of=$(FS_IMG) bs=1M count=512
 	@mke2fs -t ext4 -b 4096 -F -O ^metadata_csum,^64bit,^orphan_file -d $(ROOTFS_DIR) $(FS_IMG)
 	@e2fsck -fy $(FS_IMG) 2>/dev/null || true
-	cp target/$(TARGET)/$(MODE)/fs.img fs-img.img
+	@if [ "$(ARCH)" = "x86_64" ]; then \
+		cp $(FS_IMG) fs-img.img; \
+	fi
 
 $(APPS):
 
-kernel:
+kernel: prepare-vendor
 	@echo Platform: $(BOARD)
 	@mkdir -p .cargo 2>/dev/null || true
 	@cp -f cargo_config/config.toml .cargo/config.toml 2>/dev/null || true
 	@cd user && make build TARGET=$(TARGET)
-	@cargo build --release --target $(TARGET)
+	@cargo build --release --target $(TARGET) $(OS_FEATURES)
 
 clean:
 	@cargo clean
@@ -355,9 +376,18 @@ disasm-vim: kernel
 
 run: run-inner
 
+run-smp4:
+	@$(MAKE) run-inner ARCH=riscv64 QEMU_SMP=4 SMP_DIAGNOSTICS=$(SMP_DIAGNOSTICS)
+
+run-dual-smp4:
+	@$(MAKE) run-dual ARCH=riscv64 QEMU_SMP=4 SMP_DIAGNOSTICS=$(SMP_DIAGNOSTICS) TEST_DISK="$(TEST_DISK)" ROOT_DISK="$(ROOT_DISK)"
+
+run-dual-smp4-prebuilt:
+	@$(MAKE) run-dual-prebuilt ARCH=riscv64 QEMU_SMP=4 SMP_DIAGNOSTICS=$(SMP_DIAGNOSTICS) TEST_DISK="$(TEST_DISK)" ROOT_DISK="$(ROOT_DISK)"
+
 QEMU_EXEC += -nographic \
 				-m $(QEMU_MEM) \
-				-smp 1
+				-smp $(QEMU_SMP)
 
 # Uncomment for QEMU debug log:
 # 				-D qemu.log -d in_asm,int,pcall,cpu_reset,guest_errors
@@ -369,8 +399,9 @@ QEMU_ARGS_SINGLE := -drive file=$(FS_IMG),if=none,format=raw,id=x0,file.locking=
 			-drive file=$(FS_IMG),if=none,format=raw,id=x1,file.locking=off \
 			-device $(VIRTIO_BLK_DEVICE),drive=x1,bus=$(VIRTIO_BLK_BUS2)
 
-# Test disk path (user can override)
-TEST_DISK ?= fs-img.img
+# External contest test disk path (user can override).  This name is never
+# produced by the build, so make all cannot overwrite a downloaded test image.
+TEST_DISK ?= testcases.img
 ROOT_DISK ?= $(if $(filter loongarch64,$(ARCH)),disk-la.img,disk.img)
 
 # Dual-disk mode (test disk bus 0, arch-matched root disk bus 1)
@@ -423,4 +454,4 @@ gdbserver: build
 gdbclient:
 	@gdb -ex 'file $(KERNEL_ELF)' -ex 'set arch riscv:rv64' -ex 'target remote localhost:1234'
 
-.PHONY: all kernel-rv kernel-la disk.img disk-rv.img disk-la.img build env kernel clean disasm disasm-vim run-inner run-dual run-dual-prebuilt fs-img gdbserver gdbclient
+.PHONY: all prepare-vendor kernel-rv kernel-la disk.img disk-rv.img disk-la.img build env kernel clean disasm disasm-vim run run-smp4 run-inner run-dual run-dual-smp4 run-dual-prebuilt run-dual-smp4-prebuilt fs-img gdbserver gdbclient

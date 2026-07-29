@@ -1,4 +1,4 @@
-use super::{getpid, kill, SignalFlags};
+use super::exit;
 
 #[panic_handler]
 fn panic_handler(panic_info: &core::panic::PanicInfo) -> ! {
@@ -13,6 +13,8 @@ fn panic_handler(panic_info: &core::panic::PanicInfo) -> ! {
     } else {
         println!("Panicked: {}", err);
     }
-    kill(getpid() as usize, SignalFlags::SIGABRT.bits() as i32);
-    unreachable!()
+    // Do not raise SIGABRT through kill() here.  The old implementation passed
+    // the SIGABRT bit mask (64) where kill expects signal number 6, so the
+    // kernel ignored it and the following unreachable!() recursively panicked.
+    exit(-6)
 }

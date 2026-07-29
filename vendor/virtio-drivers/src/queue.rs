@@ -306,10 +306,12 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
         // valid and are not otherwise accessed until then.
         let token = unsafe { self.add(inputs, outputs) }?;
 
-        // Notify the queue.
-        if self.should_notify() {
-            transport.notify(self.queue_idx);
-        }
+        // Synchronous callers immediately wait for this descriptor.  Always
+        // kick the device here: an extra VirtIO notification is legal, while
+        // trusting a concurrently changing suppression hint can leave an
+        // idle device unaware of the only outstanding request and spin here
+        // forever.
+        transport.notify(self.queue_idx);
 
         // Wait until there is at least one element in the used ring.
         while !self.can_pop() {

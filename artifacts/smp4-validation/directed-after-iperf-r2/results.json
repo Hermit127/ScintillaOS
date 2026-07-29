@@ -1,0 +1,282 @@
+[
+  {
+    "round": 1,
+    "passed": true,
+    "detail": "completed",
+    "log": "round-01/serial.log",
+    "metrics": {
+      "group_end": 0,
+      "case_start": 0,
+      "case_end": 0,
+      "pass": 0,
+      "fail": 0,
+      "skip": 0
+    }
+  },
+  {
+    "round": 2,
+    "passed": true,
+    "detail": "completed",
+    "log": "round-02/serial.log",
+    "metrics": {
+      "group_end": 0,
+      "case_start": 0,
+      "case_end": 0,
+      "pass": 0,
+      "fail": 0,
+      "skip": 0
+    }
+  },
+  {
+    "round": 3,
+    "passed": true,
+    "detail": "completed",
+    "log": "round-03/serial.log",
+    "metrics": {
+      "group_end": 0,
+      "case_start": 0,
+      "case_end": 0,
+      "pass": 0,
+      "fail": 0,
+      "skip": 0
+    }
+  },
+  {
+    "round": 4,
+    "passed": true,
+    "detail": "completed",
+    "log": "round-04/serial.log",
+    "metrics": {
+      "group_end": 0,
+      "case_start": 0,
+      "case_end": 0,
+      "pass": 0,
+      "fail": 0,
+      "skip": 0
+    }
+  },
+  {
+    "round": 5,
+    "passed": true,
+    "detail": "completed",
+    "log": "round-05/serial.log",
+    "metrics": {
+      "group_end": 0,
+      "case_start": 0,
+      "case_end": 0,
+      "pass": 0,
+      "fail": 0,
+      "skip": 0
+    }
+  },
+  {
+    "round": 6,
+    "passed": true,
+    "detail": "completed",
+    "log": "round-06/serial.log",
+    "metrics": {
+      "group_end": 0,
+      "case_start": 0,
+      "case_end": 0,
+      "pass": 0,
+      "fail": 0,
+      "skip": 0
+    }
+  },
+  {
+    "round": 7,
+    "passed": true,
+    "detail": "completed",
+    "log": "round-07/serial.log",
+    "metrics": {
+      "group_end": 0,
+      "case_start": 0,
+      "case_end": 0,
+      "pass": 0,
+      "fail": 0,
+      "skip": 0
+    }
+  },
+  {
+    "round": 8,
+    "passed": true,
+    "detail": "completed",
+    "log": "round-08/serial.log",
+    "metrics": {
+      "group_end": 0,
+      "case_start": 0,
+      "case_end": 0,
+      "pass": 0,
+      "fail": 0,
+      "skip": 0
+    }
+  },
+  {
+    "round": 9,
+    "passed": true,
+    "detail": "completed",
+    "log": "round-09/serial.log",
+    "metrics": {
+      "group_end": 0,
+      "case_start": 0,
+      "case_end": 0,
+      "pass": 0,
+      "fail": 0,
+      "skip": 0
+    }
+  },
+  {
+    "round": 10,
+    "passed": true,
+    "detail": "completed",
+    "log": "round-10/serial.log",
+    "metrics": {
+      "group_end": 0,
+      "case_start": 0,
+      "case_end": 0,
+      "pass": 0,
+      "fail": 0,
+      "skip": 0
+    }
+  },
+  {
+    "round": 11,
+    "passed": true,
+    "detail": "completed",
+    "log": "round-11/serial.log",
+    "metrics": {
+      "group_end": 0,
+      "case_start": 0,
+      "case_end": 0,
+      "pass": 0,
+      "fail": 0,
+      "skip": 0
+    }
+  },
+  {
+    "round": 12,
+    "passed": true,
+    "detail": "completed",
+    "log": "round-12/serial.log",
+    "metrics": {
+      "group_end": 0,
+      "case_start": 0,
+      "case_end": 0,
+      "pass": 0,
+      "fail": 0,
+      "skip": 0
+    }
+  },
+  {
+    "round": 13,
+    "passed": true,
+    "detail": "completed",
+    "log": "round-13/serial.log",
+    "metrics": {
+      "group_end": 0,
+      "case_start": 0,
+      "case_end": 0,
+      "pass": 0,
+      "fail": 0,
+      "skip": 0
+    }
+  },
+  {
+    "round": 14,
+    "passed": true,
+    "detail": "completed",
+    "log": "round-14/serial.log",
+    "metrics": {
+      "group_end": 0,
+      "case_start": 0,
+      "case_end": 0,
+      "pass": 0,
+      "fail": 0,
+      "skip": 0
+    }
+  },
+  {
+    "round": 15,
+    "passed": true,
+    "detail": "completed",
+    "log": "round-15/serial.log",
+    "metrics": {
+      "group_end": 0,
+      "case_start": 0,
+      "case_end": 0,
+      "pass": 0,
+      "fail": 0,
+      "skip": 0
+    }
+  },
+  {
+    "round": 16,
+    "passed": true,
+    "detail": "completed",
+    "log": "round-16/serial.log",
+    "metrics": {
+      "group_end": 0,
+      "case_start": 0,
+      "case_end": 0,
+      "pass": 0,
+      "fail": 0,
+      "skip": 0
+    }
+  },
+  {
+    "round": 17,
+    "passed": true,
+    "detail": "completed",
+    "log": "round-17/serial.log",
+    "metrics": {
+      "group_end": 0,
+      "case_start": 0,
+      "case_end": 0,
+      "pass": 0,
+      "fail": 0,
+      "skip": 0
+    }
+  },
+  {
+    "round": 18,
+    "passed": true,
+    "detail": "completed",
+    "log": "round-18/serial.log",
+    "metrics": {
+      "group_end": 0,
+      "case_start": 0,
+      "case_end": 0,
+      "pass": 0,
+      "fail": 0,
+      "skip": 0
+    }
+  },
+  {
+    "round": 19,
+    "passed": true,
+    "detail": "completed",
+    "log": "round-19/serial.log",
+    "metrics": {
+      "group_end": 0,
+      "case_start": 0,
+      "case_end": 0,
+      "pass": 0,
+      "fail": 0,
+      "skip": 0
+    }
+  },
+  {
+    "round": 20,
+    "passed": true,
+    "detail": "completed",
+    "log": "round-20/serial.log",
+    "metrics": {
+      "group_end": 0,
+      "case_start": 0,
+      "case_end": 0,
+      "pass": 0,
+      "fail": 0,
+      "skip": 0
+    }
+  }
+]

@@ -107,7 +107,7 @@ const SYSCALL_RSEQ: usize = 293;
 const SYSCALL_RISCV_HWPROBE: usize = 258;
 const SYSCALL_CLONE: usize = 220;
 const SYSCALL_FORK: usize = 401;
-const SYSCALL_EXEC: usize = 221;
+pub(crate) const SYSCALL_EXEC: usize = 221;
 const SYSCALL_MMAP: usize = 222;
 const SYSCALL_FADVISE64: usize = 223;
 const SYSCALL_MSYNC: usize = 227;
@@ -171,7 +171,6 @@ use crate::net::syscall::{
     sys_listen, sys_recvfrom, sys_recvmsg, sys_sendmsg, sys_sendto, sys_setsockopt,
     sys_sock_shutdown, sys_socket,
 };
-use crate::task::SignalAction;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use fs::*;
 use process::*;
@@ -188,6 +187,10 @@ pub static LAST_SYSCALL_ARG2: AtomicUsize = AtomicUsize::new(0);
 pub static LAST_SYSCALL_RET: AtomicUsize = AtomicUsize::new(0);
 #[no_mangle]
 pub static LAST_SYSCALL_PID: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "smp-diagnostics")]
+// Kept at zero for acceptance runs: the snapshot atomics above retain the
+// last syscall without interleaving high-frequency text into test output.
+static SYSCALL_DIAG_BUDGET: AtomicUsize = AtomicUsize::new(0);
 
 pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     if syscall_id == SYSCALL_SHUTDOWN {
@@ -201,6 +204,24 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     LAST_SYSCALL_ARG1.store(args[1], Ordering::Relaxed);
     LAST_SYSCALL_ARG2.store(args[2], Ordering::Relaxed);
     LAST_SYSCALL_PID.store(current_pid, Ordering::Relaxed);
+    #[cfg(feature = "smp-diagnostics")]
+    let trace_this = current_pid >= 4
+        && SYSCALL_DIAG_BUDGET
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok();
+    #[cfg(feature = "smp-diagnostics")]
+    if trace_this {
+        crate::println!(
+            "[syscall-diag] enter tid={} nr={} a0={:#x} a1={:#x} a2={:#x}",
+            current_pid,
+            syscall_id,
+            args[0],
+            args[1],
+            args[2],
+        );
+    }
     // Avoid formatting on the syscall hot path; lmbench is very sensitive to this.
     let ret = match syscall_id {
         SYSCALL_DUP => sys_dup(args[0]),
@@ -312,8 +333,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_TGKILL => sys_tgkill(args[0], args[1], args[2] as i32),
         SYSCALL_SIGACTION => sys_sigaction(
             args[0] as i32,
-            args[1] as *const SignalAction,
-            args[2] as *mut SignalAction,
+            args[1] as *const u8,
+            args[2] as *mut u8,
             args[3],
         ),
         SYSCALL_SIGPROCMASK => sys_sigprocmask(
@@ -538,6 +559,15 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         _ => -38,
     };
     LAST_SYSCALL_RET.store(ret as usize, Ordering::Relaxed);
+    #[cfg(feature = "smp-diagnostics")]
+    if trace_this {
+        crate::println!(
+            "[syscall-diag] leave tid={} nr={} ret={}",
+            current_pid,
+            syscall_id,
+            ret,
+        );
+    }
     ret
 }
 
