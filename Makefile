@@ -102,9 +102,9 @@ prepare-vendor:
 	@find vendor -name cargo-checksum.json -exec sh -c \
 		'cp "$$1" "$$(dirname "$$1")/.cargo-checksum.json"' _ {} \;
 
-all: kernel-rv disk.img disk-rv.img kernel-la disk-la.img
+all: kernel-rv disk.img kernel-la disk-la.img
 	@echo "===== Build complete ====="
-	@ls -lh kernel-rv kernel-la disk.img disk-rv.img disk-la.img 2>/dev/null || true
+	@ls -lh kernel-rv kernel-la disk.img disk-la.img 2>/dev/null || true
 
 kernel-rv:
 	@echo "===== Building kernel-rv (riscv64) ====="
@@ -115,7 +115,6 @@ kernel-rv:
 
 kernel-la:
 	@echo "===== Building kernel-la (loongarch64) ====="
-	@$(MAKE) fs-img ARCH=loongarch64
 	@$(MAKE) kernel ARCH=loongarch64
 	@cp target/loongarch64-unknown-none/release/os kernel-la
 	@echo "kernel-la ready"
