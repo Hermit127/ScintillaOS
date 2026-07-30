@@ -13,7 +13,6 @@ use user_lib::{
 const CLONE_VM: usize = 0x100;
 const SIGCHLD: usize = 17;
 const CPUSET_BYTES: usize = core::mem::size_of::<usize>();
-const CHILD_CPU: u32 = 2;
 // Keep the in-image correctness check short; repeated invocations provide
 // the longer stress run without making an interactive QEMU regression flaky.
 const ITERATIONS: usize = 4_096;
@@ -31,6 +30,7 @@ static mut CHILD_STACK: ChildStack = ChildStack([0; 16 * 1024]);
 static CHILD_STARTED: AtomicUsize = AtomicUsize::new(0);
 static CHILD_DONE: AtomicUsize = AtomicUsize::new(0);
 static CHILD_ERROR: AtomicUsize = AtomicUsize::new(0);
+static CHILD_CPU: AtomicUsize = AtomicUsize::new(usize::MAX);
 static SHARED_VALUE: AtomicUsize = AtomicUsize::new(0);
 static TEST_MAPPING: AtomicUsize = AtomicUsize::new(0);
 static TLB_READY: AtomicUsize = AtomicUsize::new(0);
@@ -51,7 +51,8 @@ fn current_cpu() -> u32 {
 }
 
 fn child_main() -> ! {
-    let target = cpu_mask(CHILD_CPU as usize);
+    let child_cpu = CHILD_CPU.load(Ordering::Acquire);
+    let target = cpu_mask(child_cpu);
     let affinity_ret = sys_sched_setaffinity(0, &target);
     if affinity_ret != 0 {
         CHILD_ERROR.store(affinity_ret as usize, Ordering::Release);
@@ -60,9 +61,9 @@ fn child_main() -> ! {
 
     for _ in 0..64 {
         let _ = sys_yield();
-        if current_cpu() == CHILD_CPU {
+        if current_cpu() as usize == child_cpu {
             CHILD_STARTED.store(1, Ordering::Release);
-            // Fill CPU2's TLB with the old translation, then remain in user
+            // Fill the secondary CPU's TLB with the old translation, then remain in user
             // mode while CPU0 unmaps and recreates this virtual page. This is
             // the regression point for remote sfence.vma and delayed frame
             // release: the later load must observe the replacement page.
@@ -98,10 +99,17 @@ fn child_main() -> ! {
 pub fn main() -> i32 {
     let mut online = [0u8; CPUSET_BYTES];
     assert_eq!(sys_sched_getaffinity(0, &mut online), CPUSET_BYTES as isize);
-    if online[0] & (1 << CHILD_CPU) == 0 {
-        println!("clonesmptest skipped: CPU{} is offline", CHILD_CPU);
-        return 0;
+    let mut online_mask = 0usize;
+    for (index, byte) in online.iter().enumerate() {
+        online_mask |= (*byte as usize) << (index * 8);
     }
+    let Some(child_cpu) = (1..usize::BITS as usize)
+        .find(|cpu| online_mask & (1usize << cpu) != 0)
+    else {
+        println!("clonesmptest skipped: no secondary CPU is online");
+        return 0;
+    };
+    CHILD_CPU.store(child_cpu, Ordering::Release);
 
     let cpu0 = cpu_mask(0);
     assert_eq!(sys_sched_setaffinity(0, &cpu0), 0);
@@ -135,7 +143,7 @@ pub fn main() -> i32 {
         child_main();
     }
     assert!(child_pid > 0);
-    println!("clonesmptest: waiting for CPU{} old TLB entry", CHILD_CPU);
+    println!("clonesmptest: waiting for CPU{} old TLB entry", child_cpu);
 
     for _ in 0..20_000 {
         if TLB_READY.load(Ordering::Acquire) != 0 || CHILD_ERROR.load(Ordering::Acquire) != 0 {
@@ -162,7 +170,7 @@ pub fn main() -> i32 {
     assert_eq!(remap, mapping as isize);
     unsafe { (mapping as *mut u8).write_volatile(0xa5) };
     TLB_REMAP_DONE.store(1, Ordering::Release);
-    println!("clonesmptest: released CPU{}", CHILD_CPU);
+    println!("clonesmptest: released CPU{}", child_cpu);
 
     let mut observed = 0usize;
     for _ in 0..20_000 {
@@ -216,6 +224,6 @@ pub fn main() -> i32 {
         println!("clonesmptest failed: exec child status {}", exit_code);
         return 1;
     }
-    println!("clonesmptest passed: parent CPU0, child CPU{}", CHILD_CPU);
+    println!("clonesmptest passed: parent CPU0, child CPU{}", child_cpu);
     0
 }

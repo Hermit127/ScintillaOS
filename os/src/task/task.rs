@@ -67,10 +67,7 @@ impl TaskSchedulingMeta {
     }
 }
 
-#[cfg(target_arch = "riscv64")]
-const DEFAULT_TASK_CPU_MASK: usize = (1usize << crate::config::MAX_CPUS) - 1;
-#[cfg(not(target_arch = "riscv64"))]
-const DEFAULT_TASK_CPU_MASK: usize = 1;
+const DEFAULT_TASK_CPU_MASK: usize = (1usize << crate::config::PLATFORM_CPUS) - 1;
 use log::*;
 impl Drop for TaskControlBlock {
     fn drop(&mut self) {
