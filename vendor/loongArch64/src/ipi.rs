@@ -59,9 +59,9 @@ pub fn csr_mail_send(entry: u64, cpu: usize, mailbox: usize) {
 ///
 /// `[4:0]` 中断向量号，对应 IPI_Status 中的向量
 pub fn ipi_write_action(cpu: usize, action: u32) {
-    let mut val: u32 = IOCSR_IPI_SEND_BLOCKING;
     for i in 0..32 {
         if action.get_bit(i) {
+            let mut val: u32 = IOCSR_IPI_SEND_BLOCKING;
             val |= (cpu << IOCSR_IPI_SEND_CPU_SHIFT) as u32;
             val |= i as u32;
             iocsr_write_u32(LOONGARCH_IOCSR_IPI_SEND, val);
@@ -71,4 +71,22 @@ pub fn ipi_write_action(cpu: usize, action: u32) {
 
 pub fn send_ipi_single(cpu: usize, action: u32) {
     ipi_write_action(cpu, action);
+}
+
+/// Read the pending IPI action bits for the current CPU.
+#[inline]
+pub fn ipi_status() -> u32 {
+    iocsr_read_u32(LOONGARCH_IOCSR_IPI_STATUS)
+}
+
+/// Enable the selected IPI action bits on the current CPU.
+#[inline]
+pub fn enable_ipi(action: u32) {
+    iocsr_write_u32(LOONGARCH_IOCSR_IPI_EN, action);
+}
+
+/// Acknowledge the selected IPI action bits on the current CPU.
+#[inline]
+pub fn clear_ipi(action: u32) {
+    iocsr_write_u32(LOONGARCH_IOCSR_IPI_CLEAR, action);
 }

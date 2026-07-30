@@ -385,6 +385,15 @@ run-dual-smp4:
 run-dual-smp4-prebuilt:
 	@$(MAKE) run-dual-prebuilt ARCH=riscv64 QEMU_SMP=4 SMP_DIAGNOSTICS=$(SMP_DIAGNOSTICS) TEST_DISK="$(TEST_DISK)" ROOT_DISK="$(ROOT_DISK)"
 
+run-la-smp2:
+	@$(MAKE) run-inner ARCH=loongarch64 QEMU_SMP=2 SMP_DIAGNOSTICS=$(SMP_DIAGNOSTICS)
+
+run-la-dual-smp2:
+	@$(MAKE) run-dual ARCH=loongarch64 QEMU_SMP=2 SMP_DIAGNOSTICS=$(SMP_DIAGNOSTICS) TEST_DISK="$(TEST_DISK)" ROOT_DISK=disk-la.img
+
+run-la-dual-smp2-prebuilt:
+	@$(MAKE) run-dual-prebuilt ARCH=loongarch64 QEMU_SMP=2 SMP_DIAGNOSTICS=$(SMP_DIAGNOSTICS) TEST_DISK="$(TEST_DISK)" ROOT_DISK=disk-la.img
+
 QEMU_EXEC += -nographic \
 				-m $(QEMU_MEM) \
 				-smp $(QEMU_SMP)
@@ -454,4 +463,4 @@ gdbserver: build
 gdbclient:
 	@gdb -ex 'file $(KERNEL_ELF)' -ex 'set arch riscv:rv64' -ex 'target remote localhost:1234'
 
-.PHONY: all prepare-vendor kernel-rv kernel-la disk.img disk-rv.img disk-la.img build env kernel clean disasm disasm-vim run run-smp4 run-inner run-dual run-dual-smp4 run-dual-prebuilt run-dual-smp4-prebuilt fs-img gdbserver gdbclient
+.PHONY: all prepare-vendor kernel-rv kernel-la disk.img disk-rv.img disk-la.img build env kernel clean disasm disasm-vim run run-smp4 run-la-smp2 run-inner run-dual run-dual-smp4 run-la-dual-smp2 run-dual-prebuilt run-dual-smp4-prebuilt run-la-dual-smp2-prebuilt fs-img gdbserver gdbclient

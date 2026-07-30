@@ -208,6 +208,7 @@ fn loongarch64_trap_handler(tf: &mut TrapFrame) -> TrapType {
                     ticlr::clear_timer_interrupt();
                     TrapType::Timer
                 }
+                12 => TrapType::SupervisorSoft,
                 _ => panic!("unknown interrupt: {}", irq_num),
             }
         }

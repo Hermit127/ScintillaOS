@@ -14,7 +14,7 @@ use crate::{
 // use polyhal::api::ArchInterface;
 use log::*;
 use polyhal::{common::PageAlloc, irq::IRQ, mem::get_mem_areas, PhysAddr};
-#[cfg(target_arch = "riscv64")]
+#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[cfg(not(target_arch = "loongarch64"))]
 use polyhal_boot::define_entry;
@@ -42,25 +42,40 @@ mod task;
 
 pub struct ArchInterfaceImpl;
 
-/// The first SMP milestone recognises exactly the four QEMU virt harts.
-/// Secondary harts wait behind the global-init barrier.  After release they
-/// enter the same per-CPU idle/scheduler loop as hart 0.
-#[cfg(target_arch = "riscv64")]
+/// Secondary harts wait behind the global-init barrier. After release they
+/// enter the same per-CPU idle/scheduler loop as hart 0. RISC-V uses up to
+/// four application harts and LoongArch uses up to two.
+#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
 static SMP_GLOBAL_INIT_DONE: AtomicBool = AtomicBool::new(false);
 /// Every secondary reaches Rust only after polyhal has allocated and installed
-/// its per-CPU area.  Hart 0 must wait for all four allocations before it asks
-/// polyhal for the remaining physical-memory ranges; otherwise the buddy
+/// its per-CPU area. Hart 0 must wait for every configured allocation before
+/// it asks polyhal for the remaining physical-memory ranges; otherwise the buddy
 /// allocator can import and overwrite a late secondary's per-CPU storage.
-#[cfg(target_arch = "riscv64")]
+#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
 static SMP_PERCPU_READY: AtomicUsize = AtomicUsize::new(0);
 
-#[cfg(target_arch = "riscv64")]
+#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
 fn park_secondary_hart() -> ! {
     // Invalid harts are never published to the scheduler.  Keep their local
     // interrupts disabled and park permanently rather than touching globals.
     loop {
-        unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
+        #[cfg(target_arch = "riscv64")]
+        unsafe {
+            core::arch::asm!("wfi", options(nomem, nostack))
+        };
+        #[cfg(target_arch = "loongarch64")]
+        unsafe {
+            loongArch64::asm::idle()
+        };
     }
+}
+
+#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
+fn expected_cpu_mask() -> usize {
+    let cpu_count = polyhal::common::get_cpu_num()
+        .min(crate::config::PLATFORM_CPUS)
+        .max(1);
+    (1usize << cpu_count) - 1
 }
 
 fn sync_shared_vm_after_page_fault(
@@ -335,12 +350,12 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
 
 fn main(hartid: usize) {
     trace!("ch7 main: hartid: {}", hartid);
-    #[cfg(target_arch = "riscv64")]
-    if hartid >= crate::config::MAX_CPUS {
+    #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
+    if hartid >= crate::config::PLATFORM_CPUS {
         IRQ::int_disable();
         park_secondary_hart();
     }
-    #[cfg(target_arch = "riscv64")]
+    #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
     if hartid != 0 {
         // polyhal_boot already installed this hart's per-CPU pointer.  Do not
         // touch heap, drivers, VFS, or the scheduler until hart 0 publishes
@@ -359,12 +374,12 @@ fn main(hartid: usize) {
             polyhal::percpu::get_percpu_ptr(),
             online_mask
         );
-        if online_mask == (1usize << crate::config::MAX_CPUS) - 1 {
+        if online_mask == expected_cpu_mask() {
             println!("[smp] online mask {:#x}", online_mask);
         }
         task::run_tasks();
     }
-    #[cfg(not(target_arch = "riscv64"))]
+    #[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
     if hartid != 0 {
         return;
     }
@@ -373,9 +388,9 @@ fn main(hartid: usize) {
     logging::init(option_env!("LOG"));
     println!("init logging");
     task::init_current_cpu(hartid);
-    #[cfg(target_arch = "riscv64")]
+    #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
     {
-        let expected = (1usize << crate::config::MAX_CPUS) - 1;
+        let expected = expected_cpu_mask();
         SMP_PERCPU_READY.fetch_or(1, Ordering::Release);
         while SMP_PERCPU_READY.load(Ordering::Acquire) != expected {
             core::hint::spin_loop();
@@ -399,7 +414,7 @@ fn main(hartid: usize) {
     net::net_init();
     fs::list_apps();
     task::init_kernel_page();
-    #[cfg(target_arch = "riscv64")]
+    #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
     SMP_GLOBAL_INIT_DONE.store(true, Ordering::Release);
     task::add_initproc();
     task::run_tasks();
@@ -444,8 +459,32 @@ core::arch::global_asm!(
         csrrd       $a0, 0x20
         la.global   $t0, {entry}
         jirl        $zero, $t0, 0
+
+    .global _la_secondary_start
+    _la_secondary_start:
+        ori         $t0, $zero, 0x1
+        lu52i.d     $t0, $t0, -2048
+        csrwr       $t0, 0x180
+        ori         $t0, $zero, 0x11
+        lu52i.d     $t0, $t0, -1792
+        csrwr       $t0, 0x181
+
+        li.w        $t0, 0xb0
+        csrwr       $t0, 0x0
+        li.w        $t0, 0x00
+        csrwr       $t0, 0x1
+        li.w        $t0, 0x00
+        csrwr       $t0, 0x2
+
+        li.w        $t0, {mailbox1}
+        iocsrrd.d   $sp, $t0
+        csrrd       $a0, 0x20
+        la.global   $t0, {secondary_entry}
+        jirl        $zero, $t0, 0
     "#,
     entry = sym loongarch64_rust_tmp_main,
+    secondary_entry = sym loongarch64_rust_secondary_main,
+    mailbox1 = const loongArch64::consts::LOONGARCH_CSR_MAIL_BUF1,
 );
 
 #[cfg(target_arch = "loongarch64")]
@@ -466,10 +505,40 @@ extern "C" fn loongarch64_rust_tmp_main(hart_id: usize) -> ! {
     polyhal::mem::parse_system_info();
     polyhal::ctor::ph_init_iter(polyhal::ctor::CtorType::Platform).for_each(|x| (x.func)());
     polyhal::ctor::ph_init_iter(polyhal::ctor::CtorType::HALDriver).for_each(|x| (x.func)());
+    const SECONDARY_STACK_SIZE: usize = 0x40_0000;
+    let cpu_count = polyhal::common::get_cpu_num()
+        .min(crate::config::PLATFORM_CPUS)
+        .max(1);
+    for cpu in 1..cpu_count {
+        let stack_top = unsafe {
+            polyhal::mem::alloc(SECONDARY_STACK_SIZE).add(SECONDARY_STACK_SIZE) as usize
+                + polyhal::consts::VIRT_ADDR_START
+        };
+        polyhal::multicore::boot_core(
+            cpu,
+            _la_secondary_start as usize,
+            stack_top,
+        );
+    }
     main(hart_id);
     loop {
         core::hint::spin_loop();
     }
+}
+
+#[cfg(target_arch = "loongarch64")]
+extern "C" {
+    fn _la_secondary_start() -> !;
+}
+
+#[cfg(target_arch = "loongarch64")]
+extern "C" fn loongarch64_rust_secondary_main(hart_id: usize) -> ! {
+    polyhal::percpu::set_local_thread_pointer(hart_id);
+    loongArch64::register::euen::set_fpe(true);
+    loongArch64::register::euen::set_sxe(true);
+    polyhal::ctor::ph_init_iter(polyhal::ctor::CtorType::Cpu).for_each(|x| (x.func)());
+    main(hart_id);
+    park_secondary_hart()
 }
 
 pub struct PageAllocImpl;
