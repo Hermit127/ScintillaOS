@@ -29,6 +29,19 @@ _start:
     "#
 );
 
+#[cfg(target_arch = "loongarch64")]
+core::arch::global_asm!(
+    r#"
+    .section .text.entry
+    .globl _start
+    .type _start, @function
+_start:
+    ld.d $a0, $sp, 0
+    addi.d $a1, $sp, 8
+    b __user_start
+    "#
+);
+
 pub use syscall::*;
 
 const USER_HEAP_SIZE: usize = 8 * 1024 * 1024; // 8MB for iperf3
@@ -65,13 +78,13 @@ fn user_start(argc: usize, argv: usize) -> ! {
     exit(main(argc, v.as_slice()));
 }
 
-#[cfg(target_arch = "riscv64")]
+#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
 #[no_mangle]
 pub extern "C" fn __user_start(argc: usize, argv: usize) -> ! {
     user_start(argc, argv)
 }
 
-#[cfg(not(target_arch = "riscv64"))]
+#[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
 #[no_mangle]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start(argc: usize, argv: usize) -> ! {

@@ -61,6 +61,40 @@ impl UnmapResult {
     }
 }
 
+/// Result of relocating or resizing a user mapping.
+///
+/// Frames removed by a shrinking remap stay owned here until the caller has
+/// invalidated stale translations on every CPU that can use the address
+/// space.  Moving a mapping transfers the same frame trackers to their new
+/// virtual addresses, so its contents and copy-on-write state are retained.
+pub struct MremapResult {
+    new_addr: usize,
+    old_mapping_changed: bool,
+    retired_frames: Vec<FrameTracker>,
+}
+
+impl MremapResult {
+    fn new(new_addr: usize, old_mapping_changed: bool, retired_frames: Vec<FrameTracker>) -> Self {
+        Self {
+            new_addr,
+            old_mapping_changed,
+            retired_frames,
+        }
+    }
+
+    pub fn new_addr(&self) -> usize {
+        self.new_addr
+    }
+
+    pub fn old_mapping_changed(&self) -> bool {
+        self.old_mapping_changed
+    }
+
+    pub fn release(self) {
+        drop(self.retired_frames);
+    }
+}
+
 struct AddressSpaceActivity {
     active_cpus: AtomicUsize,
 }
@@ -70,6 +104,19 @@ impl AddressSpaceActivity {
         Self {
             active_cpus: AtomicUsize::new(0),
         }
+    }
+}
+
+/// A lock-free reference to the CPUs currently executing one address space.
+///
+/// TLB shootdown runs after the task and VM locks have been released, so it
+/// must retain this state without borrowing a `MemorySet` guard.
+#[derive(Clone)]
+pub struct AddressSpaceActivityHandle(Arc<AddressSpaceActivity>);
+
+impl AddressSpaceActivityHandle {
+    pub fn active_cpu_mask(&self) -> usize {
+        self.0.active_cpus.load(Ordering::Acquire)
     }
 }
 
@@ -157,8 +204,9 @@ const MAX_INTERP_PATH_LEN: usize = 4096;
 fn read_exact_at(file: &dyn File, mut offset: usize, buf: &mut [u8]) -> bool {
     let mut done = 0usize;
     while done < buf.len() {
+        let remaining = buf.len() - done;
         let n = file.read_at(offset, &mut buf[done..]);
-        if n <= 0 {
+        if n <= 0 || n as usize > remaining {
             return false;
         }
         let n = n as usize;
@@ -251,6 +299,15 @@ impl MemorySet {
         Arc::as_ptr(&self.page_table) as usize
     }
 
+    #[cfg(feature = "smp-diagnostics")]
+    pub fn diagnostic_identity(&self) -> (usize, usize, bool) {
+        (
+            Arc::as_ptr(&self.page_table) as usize,
+            Arc::as_ptr(&self.areas) as usize,
+            self.shared_page_table,
+        )
+    }
+
     pub fn program_brk(&self) -> usize {
         self.program_brk.load(Ordering::Acquire)
     }
@@ -259,13 +316,18 @@ impl MemorySet {
         self.program_brk.store(program_brk, Ordering::Release);
     }
 
-    /// Publish that `cpu` is about to run with this page table installed.
+    /// Publish that `cpu` may access user mappings through this page table.
     ///
-    /// The bit is set immediately before the context switch. A shootdown that
-    /// races with this handoff may flush a hart before SATP changes, which is
-    /// harmless; it must never miss a hart that already uses this page table.
+    /// Scheduler callers set this after the page-table switch and before
+    /// resuming any user-visible execution. The local switch invalidates its
+    /// TLB, so a concurrent mapping change before publication cannot leave a
+    /// stale user translation on this hart.
     pub fn enter_cpu(&self, cpu: usize) {
-        assert!(cpu < usize::BITS as usize, "invalid address-space CPU {}", cpu);
+        assert!(
+            cpu < usize::BITS as usize,
+            "invalid address-space CPU {}",
+            cpu
+        );
         self.activity
             .active_cpus
             .fetch_or(1usize << cpu, Ordering::Release);
@@ -273,7 +335,11 @@ impl MemorySet {
 
     /// Remove `cpu` after it has switched back to the kernel page table.
     pub fn leave_cpu(&self, cpu: usize) {
-        assert!(cpu < usize::BITS as usize, "invalid address-space CPU {}", cpu);
+        assert!(
+            cpu < usize::BITS as usize,
+            "invalid address-space CPU {}",
+            cpu
+        );
         self.activity
             .active_cpus
             .fetch_and(!(1usize << cpu), Ordering::Release);
@@ -283,6 +349,11 @@ impl MemorySet {
     /// mask for the upcoming remote-TLB-shootdown phase.
     pub fn active_cpu_mask(&self) -> usize {
         self.activity.active_cpus.load(Ordering::Acquire)
+    }
+
+    /// Keep the address-space activity state alive across a remote TLB fence.
+    pub fn activity_handle(&self) -> AddressSpaceActivityHandle {
+        AddressSpaceActivityHandle(self.activity.clone())
     }
 
     pub fn shared_metadata_snapshot(&self) -> Vec<MapArea> {
@@ -378,6 +449,34 @@ impl MemorySet {
         if !map_area.copy_file_data(file, file_offset, file_size, page_off) {
             map_area.unmap(&self.page_table);
             return false;
+        }
+        #[cfg(feature = "smp-diagnostics")]
+        {
+            let relocation_page: VirtAddr = 0x15_8000usize.into();
+            if map_area.vaddr_range.get_start() <= relocation_page
+                && relocation_page < map_area.vaddr_range.get_end()
+            {
+                if let Some(frame) = map_area.data_frames.get(&relocation_page) {
+                    let head = unsafe { core::ptr::read_unaligned(frame.paddr.get_ptr() as *const u32) };
+                    let relocation_info = unsafe {
+                        core::ptr::read_unaligned((frame.paddr + 0x404).get_ptr() as *const u32)
+                    };
+                    let source_offset = file_offset
+                        + relocation_page.raw()
+                        - map_area.vaddr_range.get_start().raw()
+                        + 0x404;
+                    let mut source = [0u8; core::mem::size_of::<u32>()];
+                    let read = file.read_at(source_offset, &mut source);
+                    crate::println!(
+                        "[elf-diag] relocation source off={:#x} read={} source={:#010x} loaded={:#010x}",
+                        source_offset,
+                        read,
+                        u32::from_le_bytes(source),
+                        relocation_info,
+                    );
+                    crate::mm::watch_frame(frame.paddr, 0x404, head, relocation_info);
+                }
+            }
         }
         self.areas.exclusive_access().push(map_area);
         true
@@ -494,10 +593,26 @@ impl MemorySet {
 
     pub fn from_elf_file(file: &dyn File) -> Option<LoadedElf> {
         trace!("os::mm::MemorySet::from_elf_file");
-        let header_data = read_elf_header_table(file)?;
-        let elf = xmas_elf::ElfFile::new(&header_data).ok()?;
+        let header_data = match read_elf_header_table(file) {
+            Some(data) => data,
+            None => {
+                #[cfg(feature = "smp-diagnostics")]
+                crate::println!("[exec-diag] ELF file load failed: header read");
+                return None;
+            }
+        };
+        let elf = match xmas_elf::ElfFile::new(&header_data) {
+            Ok(elf) => elf,
+            Err(_) => {
+                #[cfg(feature = "smp-diagnostics")]
+                crate::println!("[exec-diag] ELF file load failed: header parse");
+                return None;
+            }
+        };
         let elf_header = elf.header;
         if elf_header.pt1.magic != [0x7f, 0x45, 0x4c, 0x46] {
+            #[cfg(feature = "smp-diagnostics")]
+            crate::println!("[exec-diag] ELF file load failed: bad magic");
             return None;
         }
         let ph_count = elf_header.pt2.ph_count();
@@ -515,8 +630,22 @@ impl MemorySet {
         let program_entry = elf.header.pt2.entry_point() as usize + pie_base;
 
         for i in 0..ph_count {
-            let ph = elf.program_header(i).ok()?;
-            let ph_type = ph.get_type().ok()?;
+            let ph = match elf.program_header(i) {
+                Ok(ph) => ph,
+                Err(_) => {
+                    #[cfg(feature = "smp-diagnostics")]
+                    crate::println!("[exec-diag] ELF file load failed: bad program header {}", i);
+                    return None;
+                }
+            };
+            let ph_type = match ph.get_type() {
+                Ok(kind) => kind,
+                Err(_) => {
+                    #[cfg(feature = "smp-diagnostics")]
+                    crate::println!("[exec-diag] ELF file load failed: bad program type {}", i);
+                    return None;
+                }
+            };
             let va_offset = pie_base;
             if ph_type == xmas_elf::program::Type::Load {
                 let start_va: VirtAddr = (ph.virtual_addr() as usize + va_offset).into();
@@ -549,6 +678,13 @@ impl MemorySet {
                     ph.file_size() as usize,
                     page_off,
                 ) {
+                    #[cfg(feature = "smp-diagnostics")]
+                    crate::println!(
+                        "[exec-diag] ELF file load failed: segment {} offset={:#x} size={:#x}",
+                        i,
+                        ph.offset(),
+                        ph.file_size(),
+                    );
                     return None;
                 }
             } else if ph_type == xmas_elf::program::Type::Tls {
@@ -557,7 +693,14 @@ impl MemorySet {
             } else if ph_type == xmas_elf::program::Type::Interp {
                 let offset = ph.offset() as usize;
                 let size = ph.file_size() as usize;
-                let raw = read_small_file_region(file, offset, size)?;
+                let raw = match read_small_file_region(file, offset, size) {
+                    Some(data) => data,
+                    None => {
+                        #[cfg(feature = "smp-diagnostics")]
+                        crate::println!("[exec-diag] ELF file load failed: interp path");
+                        return None;
+                    }
+                };
                 let end = raw.iter().position(|&b| b == 0).unwrap_or(size);
                 interp_path = core::str::from_utf8(&raw[..end]).ok().map(|s| s.into());
             }
@@ -577,9 +720,13 @@ impl MemorySet {
             None,
             0,
         ) {
+            #[cfg(feature = "smp-diagnostics")]
+            crate::println!("[exec-diag] ELF file load failed: user stack");
             return None;
         }
         if !memory_set.install_signal_return_trampoline() {
+            #[cfg(feature = "smp-diagnostics")]
+            crate::println!("[exec-diag] ELF file load failed: signal trampoline");
             return None;
         }
         memory_set.set_program_brk(program_break);
@@ -868,13 +1015,68 @@ impl MemorySet {
                 Some(f) => f,
                 None => return page_fault_failure(PAGE_FAULT_FRAME_ALLOC),
             };
+            #[cfg(feature = "smp-diagnostics")]
+            let mut trace_rustc_driver_page = false;
             if let Some(ref file) = area.file {
                 let off = area.file_offset + (vpn.raw() - area.vaddr_range.get_start().raw());
                 let buf = f.paddr.slice_mut_with_len(crate::config::PAGE_SIZE);
-                let _ = file.read_at(off, buf);
+                let read = file.read_at(off, buf);
+                // A partial final page in a file mapping is defined to have a
+                // zero-filled tail.  Keeping that explicit also prevents a
+                // recycled physical page from leaking bytes into userspace.
+                let copied = read.max(0) as usize;
+                if copied < buf.len() {
+                    buf[copied..].fill(0);
+                }
+                #[cfg(feature = "smp-diagnostics")]
+                if area.map_perm.contains(MapPermission::X) && copied < buf.len() {
+                    crate::println!(
+                        "[mmap-diag] short executable page path={:?} off={:#x} copied={} page={} vpn={:#x}",
+                        file.path(),
+                        off,
+                        copied,
+                        buf.len(),
+                        vpn.raw(),
+                    );
+                }
+                #[cfg(feature = "smp-diagnostics")]
+                if file
+                    .path()
+                    .as_deref()
+                    .is_some_and(|path| path.contains("librustc_driver"))
+                    && off == 0x7468_000
+                {
+                    let head = unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const u32) };
+                    let instruction = unsafe {
+                        core::ptr::read_unaligned(buf.as_ptr().add(0xe18) as *const u32)
+                    };
+                    crate::println!(
+                        "[mmap-diag] driver-target-load off={:#x} copied={} head={:#010x} insn={:#010x} frame={:#x}",
+                        off,
+                        copied,
+                        head,
+                        instruction,
+                        f.paddr.raw(),
+                    );
+                    crate::mm::watch_frame(f.paddr, 0xe18, head, instruction);
+                    trace_rustc_driver_page = true;
+                }
             }
             self.page_table
                 .map_page(vpn, f.paddr, area.map_perm.into(), MappingSize::Page4KB);
+            #[cfg(feature = "smp-diagnostics")]
+            if trace_rustc_driver_page {
+                let head = unsafe { core::ptr::read_unaligned(f.paddr.get_ptr() as *const u32) };
+                let instruction = unsafe {
+                    core::ptr::read_unaligned((f.paddr + 0xe18).get_ptr() as *const u32)
+                };
+                crate::println!(
+                    "[mmap-diag] driver-target-post-map head={:#010x} insn={:#010x} frame={:#x}",
+                    head,
+                    instruction,
+                    f.paddr.raw(),
+                );
+            }
             area.data_frames.insert(vpn, f);
             return Some(if self.shared_page_table {
                 PageFaultResult::SharedMetadataChanged
@@ -952,6 +1154,62 @@ impl MemorySet {
         self.page_table
             .translate(vaddr)
             .map(|(pa, flags)| (pa.into(), flags))
+    }
+
+    #[cfg(feature = "smp-diagnostics")]
+    pub fn print_fault_mapping(&self, vaddr: VirtAddr) {
+        let vpn = vaddr.floor();
+        let areas = self.areas.exclusive_access();
+        let Some(area) = areas.iter().find(|area| {
+            area.vaddr_range.get_start() <= vpn && vpn < area.vaddr_range.get_end()
+        }) else {
+            crate::println!("[mmap-diag] fault-map va={:#x} absent", vaddr.raw());
+            return;
+        };
+        let pte = self.page_table.translate(vpn);
+        let frame = area.data_frames.get(&vpn);
+        crate::println!(
+            "[mmap-diag] fault-map va={:#x} range={:#x}-{:#x} perm={:#x} shared={} file={:?} file_off={:#x} resident={} frame={:#x} pte={:#x} pte_flags={:#x}",
+            vaddr.raw(),
+            area.vaddr_range.get_start().raw(),
+            area.vaddr_range.get_end().raw(),
+            area.map_perm.bits(),
+            area.shared,
+            area.file.as_ref().and_then(|file| file.path()),
+            area.file_offset,
+            frame.is_some(),
+            frame.map(|frame| frame.paddr.raw()).unwrap_or(0),
+            pte.map(|(paddr, _)| paddr.raw()).unwrap_or(0),
+            pte.map(|(_, flags)| flags.bits()).unwrap_or(0),
+        );
+    }
+
+    /// Print every VMA metadata entry that owns `paddr`.  It is used only
+    /// after a watched physical page changes unexpectedly, to distinguish an
+    /// allocator bug from an unintended writable alias in an address space.
+    #[cfg(feature = "smp-diagnostics")]
+    pub fn print_frame_aliases(&self, paddr: PhysAddr) {
+        let areas = self.areas.exclusive_access();
+        for area in areas.iter() {
+            for (&vpn, frame) in area.data_frames.iter() {
+                let pte = self.page_table.translate(vpn);
+                let pte_paddr = pte.map(|(mapped, _)| mapped.raw()).unwrap_or(0);
+                if frame.paddr.raw() == paddr.raw() || pte_paddr == paddr.raw() {
+                    crate::println!(
+                        "[frame-diag] alias va={:#x} range={:#x}-{:#x} perm={:#x} shared={} file={:?} meta={:#x} pte={:#x} pte_flags={:#x}",
+                        vpn.raw(),
+                        area.vaddr_range.get_start().raw(),
+                        area.vaddr_range.get_end().raw(),
+                        area.map_perm.bits(),
+                        area.shared,
+                        area.file.as_ref().and_then(|file| file.path()),
+                        frame.paddr.raw(),
+                        pte_paddr,
+                        pte.map(|(_, flags)| flags.bits()).unwrap_or(0),
+                    );
+                }
+            }
+        }
     }
 
     /// Copy from an already validated user range without dereferencing a user
@@ -1033,11 +1291,10 @@ impl MemorySet {
         if self.shared_page_table {
             return;
         }
-        if let Some(area) = self
-            .areas
-            .exclusive_access()
-            .iter_mut()
-            .find(|area| area.vaddr_range.get_start() <= vpn && vpn < area.vaddr_range.get_end())
+        if let Some(area) =
+            self.areas.exclusive_access().iter_mut().find(|area| {
+                area.vaddr_range.get_start() <= vpn && vpn < area.vaddr_range.get_end()
+            })
         {
             area.data_frames.insert(vpn, frame.shared_clone());
         }
@@ -1076,6 +1333,10 @@ impl MemorySet {
             let range_start = start.max(area_start);
             let range_end = end.min(area_end);
             let mut metadata = MapArea::from_another(area);
+            let Some(file_offset) = area.file_offset_at(range_start) else {
+                continue;
+            };
+            metadata.file_offset = file_offset;
             metadata.vaddr_range = VAddrRange::new(range_start, range_end);
             for (&vpn, frame) in area.data_frames.range(range_start..range_end) {
                 metadata.data_frames.insert(vpn, frame.shared_clone());
@@ -1258,6 +1519,165 @@ impl MemorySet {
         Self::find_free_area_in(&areas, len)
     }
 
+    fn split_area_at(areas: &mut Vec<MapArea>, index: usize, split: VirtAddr) -> Result<usize, isize> {
+        let area_start = areas[index].vaddr_range.get_start();
+        let area_end = areas[index].vaddr_range.get_end();
+        if split <= area_start || split >= area_end {
+            return Ok(index);
+        }
+
+        let file_offset = areas[index].file_offset_at(split).ok_or(-12isize)?;
+        let mut right = MapArea::from_another(&areas[index]);
+        right.file_offset = file_offset;
+        right.vaddr_range = VAddrRange::new(split, area_end);
+
+        let moved_frames: Vec<VirtAddr> = areas[index]
+            .data_frames
+            .range(split..area_end)
+            .map(|(&vpn, _)| vpn)
+            .collect();
+        for vpn in moved_frames {
+            if let Some(frame) = areas[index].data_frames.remove(&vpn) {
+                right.data_frames.insert(vpn, frame);
+            }
+        }
+        let moved_dirty: Vec<VirtAddr> = areas[index]
+            .dirty
+            .range(split..area_end)
+            .copied()
+            .collect();
+        for vpn in moved_dirty {
+            areas[index].dirty.remove(&vpn);
+            right.dirty.insert(vpn);
+        }
+
+        areas[index].vaddr_range = VAddrRange::new(area_start, split);
+        areas.insert(index + 1, right);
+        Ok(index + 1)
+    }
+
+    /// Resize an existing mapping while preserving all resident pages and
+    /// leaving nonresident pages lazy.  The supported `MREMAP_MAYMOVE` path
+    /// transfers the original frame trackers and recreates PTEs at the new
+    /// address, rather than copying through a temporary user buffer.
+    pub fn mremap(
+        &mut self,
+        old_start: VirtAddr,
+        old_len: usize,
+        new_len: usize,
+        may_move: bool,
+    ) -> Result<MremapResult, isize> {
+        let old_end_raw = old_start.raw().checked_add(old_len).ok_or(-12isize)?;
+        let new_end_at_old_raw = old_start.raw().checked_add(new_len).ok_or(-12isize)?;
+        let old_end = VirtAddr::from(old_end_raw);
+        let new_end_at_old = VirtAddr::from(new_end_at_old_raw);
+
+        let mut areas = self.areas.exclusive_access();
+        let mut source_index = areas
+            .iter()
+            .position(|area| {
+                area.vaddr_range.get_start() <= old_start && old_end <= area.vaddr_range.get_end()
+            })
+            .ok_or(-14isize)?;
+
+        if areas[source_index].file.is_some()
+            && areas[source_index]
+                .file_offset
+                .checked_add(new_len)
+                .is_none()
+        {
+            return Err(-12);
+        }
+
+        if old_start > areas[source_index].vaddr_range.get_start() {
+            source_index = Self::split_area_at(&mut areas, source_index, old_start)?;
+        }
+        if old_end < areas[source_index].vaddr_range.get_end() {
+            Self::split_area_at(&mut areas, source_index, old_end)?;
+        }
+
+        if new_len == old_len {
+            return Ok(MremapResult::new(old_start.raw(), false, Vec::new()));
+        }
+
+        if new_len < old_len {
+            let mut retired_frames = Vec::new();
+            let area = &mut areas[source_index];
+            let removed_frames: Vec<VirtAddr> = area
+                .data_frames
+                .range(new_end_at_old..old_end)
+                .map(|(&vpn, _)| vpn)
+                .collect();
+            for vpn in removed_frames {
+                if self
+                    .page_table
+                    .translate(vpn)
+                    .is_some_and(|(_, flags)| flags.contains(MappingFlags::P))
+                {
+                    self.page_table.unmap_page(vpn);
+                }
+                if let Some(frame) = area.data_frames.remove(&vpn) {
+                    retired_frames.push(frame);
+                }
+                area.dirty.remove(&vpn);
+            }
+            area.vaddr_range = VAddrRange::new(old_start, new_end_at_old);
+            return Ok(MremapResult::new(old_start.raw(), true, retired_frames));
+        }
+
+        let can_grow_in_place = !areas.iter().enumerate().any(|(index, area)| {
+            index != source_index
+                && area.vaddr_range.get_start() < new_end_at_old
+                && area.vaddr_range.get_end() > old_end
+        });
+        if can_grow_in_place {
+            areas[source_index].vaddr_range = VAddrRange::new(old_start, new_end_at_old);
+            return Ok(MremapResult::new(old_start.raw(), false, Vec::new()));
+        }
+        if !may_move {
+            return Err(-12);
+        }
+
+        let target_start = Self::find_free_area_in(&areas, new_len);
+        let target_end_raw = target_start.raw().checked_add(new_len).ok_or(-12isize)?;
+        let target_end = VirtAddr::from(target_end_raw);
+        let mut moved_area = areas.remove(source_index);
+        let old_frames = core::mem::take(&mut moved_area.data_frames);
+        let old_dirty = core::mem::take(&mut moved_area.dirty);
+        let mut new_frames = BTreeMap::new();
+        let mut new_dirty = alloc::collections::BTreeSet::new();
+
+        for (old_vpn, frame) in old_frames {
+            let offset = old_vpn.raw() - old_start.raw();
+            let new_vpn = VirtAddr::from(target_start.raw() + offset);
+            if self
+                .page_table
+                .translate(old_vpn)
+                .is_some_and(|(_, flags)| flags.contains(MappingFlags::P))
+            {
+                let permission = Self::pte_permission_for_frame(&moved_area, &frame);
+                self.page_table.map_page(
+                    new_vpn,
+                    frame.paddr,
+                    permission.into(),
+                    MappingSize::Page4KB,
+                );
+                self.page_table.unmap_page(old_vpn);
+            }
+            new_frames.insert(new_vpn, frame);
+        }
+        for old_vpn in old_dirty {
+            let offset = old_vpn.raw() - old_start.raw();
+            new_dirty.insert(VirtAddr::from(target_start.raw() + offset));
+        }
+
+        moved_area.vaddr_range = VAddrRange::new(target_start, target_end);
+        moved_area.data_frames = new_frames;
+        moved_area.dirty = new_dirty;
+        areas.push(moved_area);
+        Ok(MremapResult::new(target_start.raw(), true, Vec::new()))
+    }
+
     fn find_free_area_in(areas: &[MapArea], len: usize) -> polyhal::VirtAddr {
         let len = (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         if areas.is_empty() {
@@ -1311,16 +1731,64 @@ impl MemorySet {
     ) -> bool {
         let start_addr = start_addr.floor();
         let end_addr = end_addr.ceil();
-        if start_addr >= end_addr || self.is_overlap(start_addr, end_addr) {
+        if start_addr >= end_addr {
             return false;
         }
-        let area = MapArea::new(start_addr, end_addr, MapType::Framed, permission);
-        self.merge_or_push_metadata_area(area);
+        let mut areas = self.areas.exclusive_access();
+        if Self::areas_overlap(&areas, start_addr, end_addr) {
+            return false;
+        }
+        Self::merge_or_push_metadata_area_locked(
+            &mut areas,
+            MapArea::new(start_addr, end_addr, MapType::Framed, permission),
+        );
         true
     }
 
-    fn merge_or_push_metadata_area(&mut self, mut area: MapArea) {
+    /// Atomically choose the traditional high-water address for an anonymous
+    /// mapping and publish its VMA.  CLONE_VM siblings have distinct task
+    /// locks, so keeping these two actions under the shared VMA lock is
+    /// required to prevent overlapping mappings.
+    pub fn insert_lazy_area_auto(
+        &mut self,
+        len: usize,
+        permission: MapPermission,
+    ) -> Option<polyhal::VirtAddr> {
+        let len = len.checked_add(PAGE_SIZE - 1)? & !(PAGE_SIZE - 1);
+        if len == 0 {
+            return None;
+        }
         let mut areas = self.areas.exclusive_access();
+        let max_end = areas
+            .iter()
+            .map(|area| area.vaddr_range.get_end().raw())
+            .max()
+            .unwrap_or(0);
+        let start = max_end.checked_add(PAGE_SIZE - 1)? & !(PAGE_SIZE - 1);
+        let end = start.checked_add(len)?;
+        let start_addr = polyhal::VirtAddr::from(start);
+        let end_addr = polyhal::VirtAddr::from(end);
+        if Self::areas_overlap(&areas, start_addr, end_addr) {
+            return None;
+        }
+        Self::merge_or_push_metadata_area_locked(
+            &mut areas,
+            MapArea::new(start_addr, end_addr, MapType::Framed, permission),
+        );
+        Some(start_addr)
+    }
+
+    fn areas_overlap(
+        areas: &[MapArea],
+        start_addr: polyhal::VirtAddr,
+        end_addr: polyhal::VirtAddr,
+    ) -> bool {
+        areas.iter().any(|area| {
+            start_addr < area.vaddr_range.get_end() && end_addr > area.vaddr_range.get_start()
+        })
+    }
+
+    fn merge_or_push_metadata_area_locked(areas: &mut Vec<MapArea>, mut area: MapArea) {
         if !area.is_empty_metadata_mapping() {
             areas.push(area);
             return;
@@ -1346,6 +1814,11 @@ impl MemorySet {
         areas.push(area);
     }
 
+    fn merge_or_push_metadata_area(&mut self, area: MapArea) {
+        let mut areas = self.areas.exclusive_access();
+        Self::merge_or_push_metadata_area_locked(&mut areas, area);
+    }
+
     pub fn insert_file_area(
         &mut self,
         start_addr: polyhal::VirtAddr,
@@ -1360,9 +1833,7 @@ impl MemorySet {
             return false;
         }
         let mut areas = self.areas.exclusive_access();
-        if areas.iter().any(|area| {
-            start_addr < area.vaddr_range.get_end() && end_addr > area.vaddr_range.get_start()
-        }) {
+        if Self::areas_overlap(&areas, start_addr, end_addr) {
             return false;
         }
         let mut area = MapArea::new(start_addr, end_addr, MapType::Framed, permission);
@@ -1370,6 +1841,40 @@ impl MemorySet {
         area.file_offset = offset;
         areas.push(area);
         true
+    }
+
+    /// The file-backed counterpart of `insert_lazy_area_auto`.  It shares the
+    /// address selection lock with anonymous mappings, matching Linux's one
+    /// address-space VMA transaction for a non-fixed mmap.
+    pub fn insert_file_area_auto(
+        &mut self,
+        len: usize,
+        permission: MapPermission,
+        file: alloc::sync::Arc<dyn crate::fs::File>,
+        offset: usize,
+    ) -> Option<polyhal::VirtAddr> {
+        let len = len.checked_add(PAGE_SIZE - 1)? & !(PAGE_SIZE - 1);
+        if len == 0 {
+            return None;
+        }
+        let mut areas = self.areas.exclusive_access();
+        let max_end = areas
+            .iter()
+            .map(|area| area.vaddr_range.get_end().raw())
+            .max()
+            .unwrap_or(0);
+        let start = max_end.checked_add(PAGE_SIZE - 1)? & !(PAGE_SIZE - 1);
+        let end = start.checked_add(len)?;
+        let start_addr = polyhal::VirtAddr::from(start);
+        let end_addr = polyhal::VirtAddr::from(end);
+        if Self::areas_overlap(&areas, start_addr, end_addr) {
+            return None;
+        }
+        let mut area = MapArea::new(start_addr, end_addr, MapType::Framed, permission);
+        area.file = Some(file);
+        area.file_offset = offset;
+        areas.push(area);
+        Some(start_addr)
     }
 
     pub fn insert_shared_frames(
@@ -1497,7 +2002,24 @@ impl MemorySet {
                     }
                 }
                 if let Some(frame) = area.data_frames.get(&vpn) {
-                    frame.paddr.slice_mut_with_len(PAGE_SIZE).fill(0);
+                    #[cfg(feature = "smp-diagnostics")]
+                    if crate::mm::watched_frame_paddr()
+                        .is_some_and(|watched| watched.raw() == frame.paddr.raw())
+                    {
+                        crate::println!(
+                            "[frame-diag] madvise-zero va={:#x} range={:#x}-{:#x} perm={:#x} shared={} file={:?}",
+                            vpn.raw(),
+                            area.vaddr_range.get_start().raw(),
+                            area.vaddr_range.get_end().raw(),
+                            area.map_perm.bits(),
+                            area.shared,
+                            area.file.as_ref().and_then(|file| file.path()),
+                        );
+                    }
+                    frame
+                        .paddr
+                        .slice_mut_with_len::<u8>(PAGE_SIZE)
+                        .fill(0);
                 }
                 area.dirty.remove(&vpn);
             }
@@ -1576,7 +2098,11 @@ impl MemorySet {
             let protect_end = end_addr.min(area_end);
 
             if protect_start > area_start {
+                let Some(file_offset) = areas[i].file_offset_at(protect_start) else {
+                    return -12;
+                };
                 let mut right = MapArea::from_another(&areas[i]);
+                right.file_offset = file_offset;
                 right.vaddr_range = VAddrRange::new(protect_start, area_end);
                 let right_keys: alloc::vec::Vec<VirtAddr> = areas[i]
                     .data_frames
@@ -1598,7 +2124,11 @@ impl MemorySet {
             }
 
             if protect_end < area_end {
+                let Some(file_offset) = areas[i].file_offset_at(protect_end) else {
+                    return -12;
+                };
                 let mut right = MapArea::from_another(&areas[i]);
+                right.file_offset = file_offset;
                 right.vaddr_range = VAddrRange::new(protect_end, area_end);
                 let right_keys: alloc::vec::Vec<VirtAddr> = areas[i]
                     .data_frames
@@ -1618,8 +2148,7 @@ impl MemorySet {
             }
 
             areas[i].set_perm(permission);
-            let vpns: alloc::vec::Vec<VirtAddr> =
-                areas[i].data_frames.keys().copied().collect();
+            let vpns: alloc::vec::Vec<VirtAddr> = areas[i].data_frames.keys().copied().collect();
             for vpn in vpns {
                 let Some(frame) = areas[i].data_frames.get(&vpn) else {
                     continue;
@@ -1631,8 +2160,12 @@ impl MemorySet {
                 {
                     self.page_table.unmap_page(vpn);
                     let pte_perm = Self::pte_permission_for_frame(&areas[i], frame);
-                    self.page_table
-                        .map_page(vpn, frame.paddr, pte_perm.into(), MappingSize::Page4KB);
+                    self.page_table.map_page(
+                        vpn,
+                        frame.paddr,
+                        pte_perm.into(),
+                        MappingSize::Page4KB,
+                    );
                 }
             }
             i += 1;
@@ -1704,13 +2237,21 @@ impl MemorySet {
                 if unmap_start <= area_start && unmap_end >= area_end {
                     areas.remove(i);
                 } else if unmap_start <= area_start {
+                    let file_offset = areas[i]
+                        .file_offset_at(unmap_end)
+                        .expect("existing file mapping offset overflow");
+                    areas[i].file_offset = file_offset;
                     areas[i].vaddr_range = VAddrRange::new(unmap_end, area_end);
                     i += 1;
                 } else if unmap_end >= area_end {
                     areas[i].vaddr_range = VAddrRange::new(area_start, unmap_start);
                     i += 1;
                 } else {
+                    let file_offset = areas[i]
+                        .file_offset_at(unmap_end)
+                        .expect("existing file mapping offset overflow");
                     let mut right = MapArea::from_another(&areas[i]);
+                    right.file_offset = file_offset;
                     right.vaddr_range = VAddrRange::new(unmap_end, area_end);
                     let right_keys: alloc::vec::Vec<VirtAddr> = areas[i]
                         .data_frames
@@ -1805,13 +2346,21 @@ impl MemorySet {
                 if unmap_start <= area_start && unmap_end >= area_end {
                     areas.remove(i);
                 } else if unmap_start <= area_start {
+                    let file_offset = areas[i]
+                        .file_offset_at(unmap_end)
+                        .expect("existing file mapping offset overflow");
+                    areas[i].file_offset = file_offset;
                     areas[i].vaddr_range = VAddrRange::new(unmap_end, area_end);
                     i += 1;
                 } else if unmap_end >= area_end {
                     areas[i].vaddr_range = VAddrRange::new(area_start, unmap_start);
                     i += 1;
                 } else {
+                    let file_offset = areas[i]
+                        .file_offset_at(unmap_end)
+                        .expect("existing file mapping offset overflow");
                     let mut right = MapArea::from_another(&areas[i]);
+                    right.file_offset = file_offset;
                     right.vaddr_range = VAddrRange::new(unmap_end, area_end);
                     let right_keys: alloc::vec::Vec<VirtAddr> = areas[i]
                         .data_frames
@@ -1823,11 +2372,8 @@ impl MemorySet {
                             right.data_frames.insert(key, frame);
                         }
                     }
-                    let right_dirty: alloc::vec::Vec<VirtAddr> = areas[i]
-                        .dirty
-                        .range(unmap_end..area_end)
-                        .copied()
-                        .collect();
+                    let right_dirty: alloc::vec::Vec<VirtAddr> =
+                        areas[i].dirty.range(unmap_end..area_end).copied().collect();
                     for key in right_dirty {
                         areas[i].dirty.remove(&key);
                         right.dirty.insert(key);
@@ -1857,6 +2403,14 @@ pub struct MapArea {
 }
 
 impl MapArea {
+    fn file_offset_at(&self, start: VirtAddr) -> Option<usize> {
+        if self.file.is_none() {
+            return Some(self.file_offset);
+        }
+        self.file_offset
+            .checked_add(start.raw().checked_sub(self.vaddr_range.get_start().raw())?)
+    }
+
     pub fn set_perm(&mut self, perm: MapPermission) {
         self.map_perm = perm;
     }
@@ -2007,6 +2561,23 @@ impl MapArea {
             let dst = &mut (frame.paddr + page_off).slice_mut_with_len(chunk);
             if !read_exact_at(file, file_offset, dst) {
                 return false;
+            }
+            #[cfg(feature = "smp-diagnostics")]
+            if curr_vaddr.raw() == 0x15_8000 {
+                let mut retry = alloc::vec![0u8; chunk];
+                let retry_ok = read_exact_at(file, file_offset, &mut retry);
+                let dst_info = unsafe {
+                    core::ptr::read_unaligned((frame.paddr + page_off + 0x404).get_ptr() as *const u32)
+                };
+                let retry_info = u32::from_le_bytes(retry[0x404..0x408].try_into().unwrap());
+                crate::println!(
+                    "[elf-diag] page-read off={:#x} len={} retry_ok={} dst={:#010x} retry={:#010x}",
+                    file_offset,
+                    chunk,
+                    retry_ok,
+                    dst_info,
+                    retry_info,
+                );
             }
             copied += chunk;
             file_offset += chunk;

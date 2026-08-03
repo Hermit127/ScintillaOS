@@ -3,7 +3,6 @@ use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use log::{self, info, Level, LevelFilter, Log, Metadata, Record};
-use polyhal::debug_console::DebugConsole;
 
 const KLOG_SIZE: usize = 0x10000; // 64KB ring buffer
 static KLOG_BUF: [u8; KLOG_SIZE] = [0u8; KLOG_SIZE];
@@ -120,10 +119,8 @@ pub fn init(level: Option<&str>) {
 
 #[inline]
 // 向调试控制台写一段字节。
-// 执行时逐字节调用 DebugConsole::putchar，保证早期内核阶段也能直接输出。
+// The shared console lock keeps logger records from splitting userspace
+// output while secondary CPUs are active.
 pub fn puts(buffer: &[u8]) {
-    // 当前日志后端直接写调试串口，便于早期内核阶段也能输出。
-    for i in buffer {
-        DebugConsole::putchar(*i);
-    }
+    crate::console::write_bytes(buffer);
 }

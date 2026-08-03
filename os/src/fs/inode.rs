@@ -1,5 +1,5 @@
 use super::vfs::{
-    dentry_parent, vfs_create, vfs_resolve_parent_and_name, vfs_resolve_path,
+    dentry_parent, read_dentry_symlink, vfs_create, vfs_resolve_parent_and_name, vfs_resolve_path,
     vfs_resolve_with_fallback, vfs_tmpfs_can_resize, vfs_tmpfs_commit_resize, Dentry, DirEntry,
 };
 use super::{File, Kstat, S_IFDIR, S_IFLNK, S_IFREG};
@@ -292,10 +292,7 @@ impl OSInode {
 
     pub fn new(readable: bool, writable: bool, append: bool, dentry: Arc<Dentry>) -> Self {
         let offset = if append {
-            dentry
-                .inode_info()
-                .map(|i| i.size as usize)
-                .unwrap_or(0)
+            dentry.inode_info().map(|i| i.size as usize).unwrap_or(0)
         } else {
             0
         };
@@ -543,12 +540,8 @@ impl OSInode {
             st.st_mode = mode;
             st.st_ctime_sec = ctime;
         }
-        self.dentry.update_cached_owner(
-            uid,
-            gid,
-            mode,
-            ctime.clamp(0, u32::MAX as i64) as u32,
-        );
+        self.dentry
+            .update_cached_owner(uid, gid, mode, ctime.clamp(0, u32::MAX as i64) as u32);
     }
 
     pub fn update_cached_times(&self, atime: Option<i64>, mtime: Option<i64>, ctime: Option<i64>) {
@@ -587,8 +580,7 @@ impl OSInode {
         self.dentry.super_block.set_mtime(&self.dentry.fs_path, now);
         self.dentry.super_block.set_ctime(&self.dentry.fs_path, now);
         update_path_cached_times(&self.dentry.fs_path, None, Some(now_sec), Some(now_sec));
-        self.dentry
-            .update_cached_times(None, Some(now), Some(now));
+        self.dentry.update_cached_times(None, Some(now), Some(now));
     }
 
     pub fn align_up(value: usize, align: usize) -> usize {
@@ -820,29 +812,7 @@ pub fn follow_symlink(
         return Some(dentry);
     }
 
-    let mut target_buf = [0u8; 512];
-    let mut rcnt: usize = 0;
-    let c_path = alloc::ffi::CString::new(dentry.fs_path.as_bytes()).ok()?;
-    let rc = {
-        let _fs_lock = dentry.super_block.lock_fs();
-        unsafe {
-            lwext4_rust::bindings::ext4_readlink(
-                c_path.as_ptr() as *const core::ffi::c_char,
-                target_buf.as_mut_ptr() as *mut core::ffi::c_char,
-                target_buf.len(),
-                &mut rcnt,
-            )
-        }
-    };
-    if rc != 0 || rcnt == 0 {
-        return None;
-    }
-    let target = core::str::from_utf8(&target_buf[..rcnt])
-        .ok()?
-        .trim_matches('\0');
-    if target.is_empty() {
-        return None;
-    }
+    let target = read_dentry_symlink(&dentry)?;
 
     let base = if target.starts_with('/') {
         crate::task::current_task()
@@ -851,7 +821,7 @@ pub fn follow_symlink(
     } else {
         dentry_parent(&dentry).unwrap_or_else(|| start.clone())
     };
-    let next = vfs_resolve_with_fallback(&base, target)?;
+    let next = vfs_resolve_with_fallback(&base, target.as_str())?;
     follow_symlink(&base, next, depth + 1)
 }
 
@@ -943,15 +913,29 @@ impl File for OSInode {
             let mut total = 0usize;
             while total < max_read {
                 let mut rw_count: usize = 0;
+                let chunk_len = max_read - total;
+                #[cfg(feature = "smp-diagnostics")]
+                let watched_before = crate::mm::watched_frame_is_intact();
                 let rc = unsafe {
                     ext4_fread(
                         file,
                         buf[total..max_read].as_mut_ptr() as *mut core::ffi::c_void,
-                        max_read - total,
+                        chunk_len,
                         &mut rw_count,
                     )
                 };
-                if rc != EOK as i32 || rw_count == 0 {
+                #[cfg(feature = "smp-diagnostics")]
+                if watched_before && !crate::mm::watched_frame_is_intact() {
+                    crate::println!(
+                        "[frame-diag] watched page changed during inode fread path={} off={:#x} requested={} returned={} rc={}",
+                        self.dentry.fs_path,
+                        off + total,
+                        chunk_len,
+                        rw_count,
+                        rc,
+                    );
+                }
+                if rc != EOK as i32 || rw_count == 0 || rw_count > chunk_len {
                     break;
                 }
                 total += rw_count;
@@ -994,15 +978,29 @@ impl File for OSInode {
             let mut total = 0usize;
             while total < max_read {
                 let mut rw_count: usize = 0;
+                let chunk_len = max_read - total;
+                #[cfg(feature = "smp-diagnostics")]
+                let watched_before = crate::mm::watched_frame_is_intact();
                 let rc = unsafe {
                     ext4_fread(
                         file,
                         buf[total..max_read].as_mut_ptr() as *mut core::ffi::c_void,
-                        max_read - total,
+                        chunk_len,
                         &mut rw_count,
                     )
                 };
-                if rc != EOK as i32 || rw_count == 0 {
+                #[cfg(feature = "smp-diagnostics")]
+                if watched_before && !crate::mm::watched_frame_is_intact() {
+                    crate::println!(
+                        "[frame-diag] watched page changed during inode pread path={} off={:#x} requested={} returned={} rc={}",
+                        self.dentry.fs_path,
+                        offset + total,
+                        chunk_len,
+                        rw_count,
+                        rc,
+                    );
+                }
+                if rc != EOK as i32 || rw_count == 0 || rw_count > chunk_len {
                     break;
                 }
                 total += rw_count;

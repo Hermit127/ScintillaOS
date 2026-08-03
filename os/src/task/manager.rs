@@ -155,6 +155,7 @@ lazy_static! {
 
 pub fn add_task(task: Arc<TaskControlBlock>) {
     //trace!("os::task::manager::add_task");
+    super::register_files_task(&task);
     PID2TCB
         .exclusive_access()
         .insert(task.getpid(), Arc::clone(&task));
@@ -395,8 +396,23 @@ pub fn wake_task(task: Arc<TaskControlBlock>) -> bool {
             TaskStatus::WakePending => return true,
             _ => false,
         };
+        #[cfg(any(feature = "smp-diagnostics", feature = "timeout-trace"))]
+        if task.getpid() >= 3 {
+            println!(
+                "[wake-diag] scheduler tid={} enqueue={} status={:?}",
+                task.getpid(),
+                enqueue_now,
+                inner.task_status,
+            );
+        }
         drop(inner);
         let target = enqueue_now.then(|| scheduler.add_priority(task.clone()));
+        #[cfg(any(feature = "smp-diagnostics", feature = "timeout-trace"))]
+        if let Some(cpu) = target {
+            if task.getpid() >= 3 {
+                println!("[wake-diag] scheduler tid={} target={}", task.getpid(), cpu);
+            }
+        }
         drop(scheduler);
         if let Some(target) = target {
             super::processor::request_reschedule(target);
@@ -474,6 +490,37 @@ pub fn wake_udp_waiters() {
     wake_net_waiters_matching(|reason| matches!(reason, BlockReason::UdpRecv(_)));
 }
 
+pub fn wake_local_tcp_readers(conn_id: usize, server_side: bool) {
+    wake_net_waiters_matching(|reason| {
+        matches!(
+            reason,
+            BlockReason::LocalTcpRecv(id, side) if id == conn_id && side == server_side
+        )
+    });
+}
+
+pub fn wake_local_tcp_writers(conn_id: usize, server_side: bool) {
+    wake_net_waiters_matching(|reason| {
+        matches!(
+            reason,
+            BlockReason::LocalTcpSend(id, side) if id == conn_id && side == server_side
+        )
+    });
+}
+
+pub fn wake_local_tcp_acceptors(port: u16) {
+    wake_net_waiters_matching(|reason| {
+        matches!(reason, BlockReason::LocalTcpAccept(wait_port) if wait_port == port)
+    });
+}
+
+pub fn wake_local_tcp_connection_waiters(conn_id: usize) {
+    wake_net_waiters_matching(|reason| match reason {
+        BlockReason::LocalTcpRecv(id, _) | BlockReason::LocalTcpSend(id, _) => id == conn_id,
+        _ => false,
+    });
+}
+
 pub fn wake_poll_waiters() {
     wake_net_waiters_matching(|reason| matches!(reason, BlockReason::PollWait));
 }
@@ -510,6 +557,10 @@ pub fn begin_exit(task: &Arc<TaskControlBlock>, exit_code: i32) -> bool {
     inner.task_status = TaskStatus::Zombie;
     inner.exit_code = exit_code;
     inner.block_reason = None;
+    // Parents wait on the terminal process state, not on the later idle-loop
+    // file/page cleanup.  Publishing after exit_code makes the status visible
+    // before SIGCHLD is sent from the caller.
+    task.publish_waitable_zombie();
     true
 }
 
@@ -574,8 +625,6 @@ pub fn remove_net_blocked(pid: usize) -> Option<Arc<TaskControlBlock>> {
 }
 
 /// Copy references for an operation which must inspect a network device.
-/// The caller must subsequently remove the selected PIDs with
-/// [`take_net_blocked_by_pids`] before making them Ready.
 pub fn net_blocked_snapshot() -> Vec<Arc<TaskControlBlock>> {
     SCHEDULER
         .exclusive_access()
@@ -695,7 +744,10 @@ pub fn reap_exited_task(pid: usize) {
         scheduler
             .exited
             .iter()
-            .position(|task| task.getpid() == pid)
+            // A parent can observe a newly published zombie before the idle
+            // reaper has released its resources. Keep that queue ownership
+            // until cleanup is complete so an early waitpid cannot leak it.
+            .position(|task| task.getpid() == pid && task.exit_cleanup_done())
             .map(|index| scheduler.exited.remove(index))
     };
     drop(task);

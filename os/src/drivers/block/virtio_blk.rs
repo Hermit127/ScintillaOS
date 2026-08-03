@@ -1,4 +1,6 @@
 use core::ptr::NonNull;
+#[cfg(feature = "mount-trace")]
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use super::BlockDevice;
 use crate::mm::{frames_alloc, FrameTracker};
@@ -37,6 +39,10 @@ const VIRTIO0: PhysAddr = polyhal::pa!(0xa00_0000);
 const PCI_ECAM_BASE: PhysAddr = polyhal::pa!(0x20000000);
 
 const DMA_BOUNCE_SIZE: usize = 4096;
+#[cfg(feature = "mount-trace")]
+static MOUNT_TRACE_CAPACITY_COUNT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "smp-diagnostics")]
+const RUSTC_DRIVER_TRACE_SECTOR: usize = 715_880 * (PAGE_SIZE / SECTOR_SIZE);
 
 #[cfg(not(target_arch = "loongarch64"))]
 #[repr(C)]
@@ -73,9 +79,49 @@ impl BlockDevice for VirtIOBlock {
         let mut done = 0;
         while done < buf.len() {
             let chunk = (buf.len() - done).min(DMA_BOUNCE_SIZE);
+            #[cfg(feature = "smp-diagnostics")]
+            let watched_before_dma = crate::mm::watched_frame_is_intact();
             blk.read_blocks(block_id + done / SECTOR_SIZE, &mut bounce[..chunk])
                 .expect("Error when reading VirtIOBlk");
+            #[cfg(feature = "smp-diagnostics")]
+            if watched_before_dma && !crate::mm::watched_frame_is_intact() {
+                crate::println!(
+                    "[frame-diag] watched page changed during virtio DMA read block={} len={}",
+                    block_id + done / SECTOR_SIZE,
+                    chunk,
+                );
+            }
+            #[cfg(feature = "smp-diagnostics")]
+            {
+                let first_sector = block_id + done / SECTOR_SIZE;
+                let sector_count = chunk / SECTOR_SIZE;
+                if first_sector <= RUSTC_DRIVER_TRACE_SECTOR
+                    && RUSTC_DRIVER_TRACE_SECTOR < first_sector + sector_count
+                {
+                    let offset = (RUSTC_DRIVER_TRACE_SECTOR - first_sector) * SECTOR_SIZE;
+                    let head = unsafe {
+                        core::ptr::read_unaligned(bounce[offset..].as_ptr() as *const u32)
+                    };
+                    crate::println!(
+                        "[block-diag] driver-sector dev={:#x} sector={} head={:#010x}",
+                        self as *const Self as usize,
+                        RUSTC_DRIVER_TRACE_SECTOR,
+                        head,
+                    );
+                }
+            }
+            #[cfg(feature = "smp-diagnostics")]
+            let watched_before_copy = crate::mm::watched_frame_is_intact();
             buf[done..done + chunk].copy_from_slice(&bounce[..chunk]);
+            #[cfg(feature = "smp-diagnostics")]
+            if watched_before_copy && !crate::mm::watched_frame_is_intact() {
+                crate::println!(
+                    "[frame-diag] watched page changed during virtio bounce copy block={} len={} dst={:#x}",
+                    block_id + done / SECTOR_SIZE,
+                    chunk,
+                    buf[done..].as_ptr() as usize,
+                );
+            }
             done += chunk;
         }
     }
@@ -95,8 +141,24 @@ impl BlockDevice for VirtIOBlock {
     }
 
     fn capacity_bytes(&self) -> Option<u64> {
+        #[cfg(feature = "mount-trace")]
+        {
+            let sequence = MOUNT_TRACE_CAPACITY_COUNT.fetch_add(1, Ordering::Relaxed);
+            crate::println!(
+                "[mount-trace] virtio-capacity-enter seq={} dev={:#x}",
+                sequence,
+                self as *const Self as usize
+            );
+        }
         let blk = self.0.exclusive_access();
-        Some((blk.capacity() as u64) * (SECTOR_SIZE as u64))
+        let capacity = (blk.capacity() as u64) * (SECTOR_SIZE as u64);
+        #[cfg(feature = "mount-trace")]
+        crate::println!(
+            "[mount-trace] virtio-capacity-done dev={:#x} bytes={}",
+            self as *const Self as usize,
+            capacity
+        );
+        Some(capacity)
     }
 }
 

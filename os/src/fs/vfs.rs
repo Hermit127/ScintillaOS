@@ -1,7 +1,5 @@
-use crate::sync::{
-    DentryLock, FsAuxLock, FsGlobalGuard, FsGlobalLock, FsGuard, FsLock, VfsLock,
-};
-use alloc::collections::BTreeMap;
+use crate::sync::{DentryLock, FsAuxLock, FsGlobalGuard, FsGlobalLock, FsGuard, FsLock, VfsLock};
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::ffi::CString;
 use alloc::format;
 use alloc::string::String;
@@ -9,6 +7,8 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::ffi::c_char;
 use core::ops::{Deref, DerefMut};
+#[cfg(feature = "mount-watchdog")]
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use lazy_static::*;
 
 use super::block_device_stream::{BlockDeviceStream, BlockDeviceStreamOp, Ext4Wrapper};
@@ -31,6 +31,55 @@ lazy_static! {
         FsGlobalLock::new_named((), "LwExt4Global");
     static ref PATH_OWNER_CACHE: VfsLock<BTreeMap<String, (u32, u32)>> =
         VfsLock::new_named(BTreeMap::new(), "VfsPathOwnerCache");
+}
+
+#[cfg(feature = "mount-watchdog")]
+static MOUNT_WATCHDOG_STARTED_US: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "mount-watchdog")]
+static MOUNT_WATCHDOG_STAGE: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "mount-watchdog")]
+static MOUNT_WATCHDOG_REPORTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(feature = "mount-watchdog")]
+pub(crate) fn mount_watchdog_begin() {
+    MOUNT_WATCHDOG_STAGE.store(1, Ordering::Release);
+    MOUNT_WATCHDOG_REPORTED.store(false, Ordering::Release);
+    MOUNT_WATCHDOG_STARTED_US.store(
+        polyhal::time::Time::now().to_usec() as u64,
+        Ordering::Release,
+    );
+}
+
+#[cfg(feature = "mount-watchdog")]
+pub(crate) fn mount_watchdog_stage(stage: usize) {
+    if MOUNT_WATCHDOG_STARTED_US.load(Ordering::Acquire) != 0 {
+        MOUNT_WATCHDOG_STAGE.store(stage, Ordering::Release);
+    }
+}
+
+#[cfg(feature = "mount-watchdog")]
+pub(crate) fn mount_watchdog_finish() {
+    MOUNT_WATCHDOG_STAGE.store(0, Ordering::Release);
+    MOUNT_WATCHDOG_STARTED_US.store(0, Ordering::Release);
+}
+
+#[cfg(feature = "mount-watchdog")]
+pub(crate) fn mount_watchdog_poll() {
+    let started = MOUNT_WATCHDOG_STARTED_US.load(Ordering::Acquire);
+    if started == 0 {
+        return;
+    }
+    let now = polyhal::time::Time::now().to_usec() as u64;
+    if now.saturating_sub(started) < 3_000_000
+        || MOUNT_WATCHDOG_REPORTED.swap(true, Ordering::AcqRel)
+    {
+        return;
+    }
+    crate::println!(
+        "[mount-watchdog] stalled stage={} global-owner={}",
+        MOUNT_WATCHDOG_STAGE.load(Ordering::Acquire),
+        LWEXT4_GLOBAL.owner(),
+    );
 }
 
 pub(crate) struct VfsFsGuard<'a> {
@@ -80,7 +129,18 @@ impl DirEntry {
         String::from_utf8_lossy(&self.name_bytes).into_owned()
     }
     pub fn get_de_type(&self) -> u8 {
-        self.de_type
+        // ext4 stores its own compact directory-entry type values. Linux
+        // exposes a different DT_* encoding through getdents64.
+        match self.de_type as u32 {
+            EXT4_DE_FIFO => 1,
+            EXT4_DE_CHRDEV => 2,
+            EXT4_DE_DIR => 4,
+            EXT4_DE_BLKDEV => 6,
+            EXT4_DE_REG_FILE => 8,
+            EXT4_DE_SYMLINK => 10,
+            EXT4_DE_SOCK => 12,
+            _ => 0,
+        }
     }
 }
 
@@ -142,16 +202,62 @@ impl VfsSuperBlock {
         mount_point: &str,
     ) -> Option<Arc<Self>> {
         const FALLBACK_DISK_SIZE: u64 = 512 * 1024 * 1024;
+        #[cfg(feature = "mount-watchdog")]
+        mount_watchdog_stage(6);
+        #[cfg(feature = "mount-trace")]
+        crate::println!("[mount-trace] capacity-begin point={}", mount_point);
         let total_size = blk_device.capacity_bytes().unwrap_or(FALLBACK_DISK_SIZE);
+        #[cfg(feature = "mount-watchdog")]
+        mount_watchdog_stage(7);
+        #[cfg(feature = "mount-trace")]
+        crate::println!(
+            "[mount-trace] capacity-done point={} size={}",
+            mount_point,
+            total_size
+        );
         let stream = BlockDeviceStream {
             inner: blk_device,
             pos: 0,
             total_size,
             scratch: alloc::vec![0u8; 128 * 1024],
         };
-        let ext4 =
+        #[cfg(feature = "mount-watchdog")]
+        mount_watchdog_stage(8);
+        #[cfg(feature = "mount-trace")]
+        crate::println!("[mount-trace] stream-ready point={}", mount_point);
+        // lwext4 keeps mount/cache state globally, not per Ext4BlockWrapper.
+        // Mount creation must use the same serialization as normal filesystem
+        // operations, otherwise a second disk mount can race a rootfs access
+        // on another hart.
+        #[cfg(feature = "smp-diagnostics")]
+        crate::println!(
+            "[mount-diag] create-begin point={} size={}",
+            mount_point,
+            total_size
+        );
+        let ext4 = {
+            #[cfg(feature = "mount-watchdog")]
+            mount_watchdog_stage(9);
+            #[cfg(feature = "mount-trace")]
+            crate::println!("[mount-trace] lwext4-lock-begin point={}", mount_point);
+            let _global = LWEXT4_GLOBAL.exclusive_access();
+            #[cfg(feature = "mount-watchdog")]
+            mount_watchdog_stage(10);
+            #[cfg(feature = "mount-trace")]
+            crate::println!("[mount-trace] lwext4-lock-done point={}", mount_point);
+            #[cfg(feature = "smp-diagnostics")]
+            crate::println!("[mount-diag] global-acquired point={}", mount_point);
+            #[cfg(feature = "mount-trace")]
+            crate::println!("[mount-trace] lwext4-create-begin point={}", mount_point);
             Ext4BlockWrapper::<BlockDeviceStreamOp>::new_with_name(stream, "ext4_fs", mount_point)
-                .ok()?;
+                .ok()?
+        };
+        #[cfg(feature = "mount-watchdog")]
+        mount_watchdog_stage(11);
+        #[cfg(feature = "mount-trace")]
+        crate::println!("[mount-trace] lwext4-create-done point={}", mount_point);
+        #[cfg(feature = "smp-diagnostics")]
+        crate::println!("[mount-diag] create-done point={}", mount_point);
         Some(Arc::new(VfsSuperBlock {
             fs_type,
             fs_data: FsLock::new_named(FsInner::Ext4(Ext4Wrapper(ext4)), "VfsFsData"),
@@ -379,6 +485,8 @@ impl VfsSuperBlock {
             while total < max_read {
                 let chunk_len = max_read - total;
                 let mut rw_count: usize = 0;
+                #[cfg(feature = "smp-diagnostics")]
+                let watched_before = crate::mm::watched_frame_is_intact();
                 let read_rc = unsafe {
                     ext4_fread(
                         &mut file,
@@ -387,7 +495,21 @@ impl VfsSuperBlock {
                         &mut rw_count,
                     )
                 };
-                if read_rc != EOK as i32 || rw_count == 0 {
+                #[cfg(feature = "smp-diagnostics")]
+                if watched_before && !crate::mm::watched_frame_is_intact() {
+                    crate::println!(
+                        "[frame-diag] watched page changed during ext4_fread path={} off={:#x} requested={} returned={} rc={}",
+                        fs_path,
+                        offset + total,
+                        chunk_len,
+                        rw_count,
+                        read_rc,
+                    );
+                }
+                // The C API reports its transfer size through an out pointer.
+                // Never let an invalid value advance Rust's slice cursor past
+                // the caller-provided buffer.
+                if read_rc != EOK as i32 || rw_count == 0 || rw_count > chunk_len {
                     break;
                 }
                 total += rw_count;
@@ -976,6 +1098,47 @@ fn vfs_parent(dentry: &Arc<Dentry>) -> Option<Arc<Dentry>> {
     dentry_parent(dentry)
 }
 
+const MAX_SYMLINK_DEPTH: usize = 40;
+const MAX_SYMLINK_TARGET_LEN: usize = 4096;
+
+pub(crate) fn read_dentry_symlink(dentry: &Arc<Dentry>) -> Option<String> {
+    let info = dentry.inode_info()?;
+    if !info.is_link {
+        return None;
+    }
+    let size = usize::try_from(info.size).ok()?;
+    if size > MAX_SYMLINK_TARGET_LEN {
+        return None;
+    }
+
+    let mut target_buf = alloc::vec![0u8; size.saturating_add(1).max(1)];
+    let mut rcnt = 0usize;
+    let c_path = CString::new(dentry.fs_path.as_bytes()).ok()?;
+    let rc = {
+        let _fs_lock = dentry.super_block.lock_fs();
+        unsafe {
+            ext4_readlink(
+                c_path.as_ptr() as *const c_char,
+                target_buf.as_mut_ptr() as *mut c_char,
+                target_buf.len(),
+                &mut rcnt,
+            )
+        }
+    };
+    if rc != 0 || rcnt == 0 || rcnt > target_buf.len() {
+        return None;
+    }
+
+    let target = core::str::from_utf8(&target_buf[..rcnt])
+        .ok()?
+        .trim_matches('\0');
+    if target.is_empty() {
+        None
+    } else {
+        Some(String::from(target))
+    }
+}
+
 fn cache_child(parent: &Arc<Dentry>, child: Arc<Dentry>) {
     // Reserve a complete cache line before taking the Dentry lock.  A second
     // lookup below handles a racing initializer without calling the allocator
@@ -1064,35 +1227,59 @@ pub fn vfs_lookup(parent: &Arc<Dentry>, name: &str) -> Option<Arc<Dentry>> {
     Some(child)
 }
 
-pub fn vfs_resolve_path(start: &Arc<Dentry>, path: &str) -> Option<Arc<Dentry>> {
+fn vfs_resolve_path_inner(
+    start: &Arc<Dentry>,
+    path: &str,
+    follow_final_symlink: bool,
+) -> Option<Arc<Dentry>> {
     let path = path.trim_matches('\0');
     if path.is_empty() {
         return None;
     }
 
     let is_abs = path.starts_with('/');
-    let mut current = if is_abs {
-        crate::task::current_task()
-            .map(|t| t.inner_exclusive_access().root.clone())
-            .unwrap_or_else(|| ROOT_DENTRY.clone())
-    } else {
-        start.clone()
-    };
-
-    let mut components = path
+    let root = crate::task::current_task()
+        .map(|t| t.inner_exclusive_access().root.clone())
+        .unwrap_or_else(|| ROOT_DENTRY.clone());
+    let mut current = if is_abs { root.clone() } else { start.clone() };
+    let mut components: VecDeque<String> = path
         .split('/')
         .filter(|component| !component.is_empty() && *component != ".")
-        .peekable();
-    while let Some(component) = components.next() {
-        let next = vfs_lookup(&current, component)?;
-        current = if components.peek().is_some() && next.is_link {
-            crate::fs::follow_symlink(&current, next, 0)?
-        } else {
-            next
-        };
+        .map(String::from)
+        .collect();
+    let mut symlink_depth = 0usize;
+
+    while let Some(component) = components.pop_front() {
+        let next = vfs_lookup(&current, component.as_str())?;
+        if next.is_link && (follow_final_symlink || !components.is_empty()) {
+            symlink_depth += 1;
+            if symlink_depth > MAX_SYMLINK_DEPTH {
+                return None;
+            }
+
+            let target = read_dentry_symlink(&next)?;
+            if target.starts_with('/') {
+                current = root.clone();
+            }
+            let mut target_components: Vec<String> = target
+                .split('/')
+                .filter(|part| !part.is_empty() && *part != ".")
+                .map(String::from)
+                .collect();
+            while let Some(part) = target_components.pop() {
+                components.push_front(part);
+            }
+            continue;
+        }
+
+        current = next;
     }
 
     lookup_mount(&current).or(Some(current))
+}
+
+pub fn vfs_resolve_path(start: &Arc<Dentry>, path: &str) -> Option<Arc<Dentry>> {
+    vfs_resolve_path_inner(start, path, false)
 }
 
 pub fn vfs_resolve_with_fallback(start: &Arc<Dentry>, path: &str) -> Option<Arc<Dentry>> {
@@ -1118,15 +1305,6 @@ pub fn vfs_resolve_parent_and_name(
         return None;
     }
 
-    let is_abs = path.starts_with('/');
-    let mut current = if is_abs {
-        crate::task::current_task()
-            .map(|t| t.inner_exclusive_access().root.clone())
-            .unwrap_or_else(|| ROOT_DENTRY.clone())
-    } else {
-        start.clone()
-    };
-
     let components: Vec<&str> = path
         .split('/')
         .filter(|c| !c.is_empty() && *c != ".")
@@ -1136,17 +1314,26 @@ pub fn vfs_resolve_parent_and_name(
     }
 
     let filename = String::from(*components.last().unwrap());
-    for i in 0..components.len() - 1 {
-        if !current.is_dir {
-            return None;
+    let parent_path = if components.len() == 1 {
+        if path.starts_with('/') {
+            String::from("/")
+        } else {
+            String::from(".")
         }
-        current = vfs_lookup(&current, components[i])?;
-    }
-    if !current.is_dir {
+    } else {
+        let joined = components[..components.len() - 1].join("/");
+        if path.starts_with('/') {
+            format!("/{}", joined)
+        } else {
+            joined
+        }
+    };
+    let parent = vfs_resolve_path_inner(start, parent_path.as_str(), true)?;
+    if !parent.is_dir {
         return None;
     }
 
-    Some((current, filename))
+    Some((parent, filename))
 }
 
 // ==================== File Creation ====================

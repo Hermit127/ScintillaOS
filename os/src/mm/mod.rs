@@ -10,9 +10,14 @@ pub use frame_allocator::{
     allocated_frames, available_frames, frame_alloc, frame_alloc_failures, frame_alloc_persist,
     frame_dealloc, frames_alloc, total_frames, FrameTracker,
 };
+#[cfg(feature = "smp-diagnostics")]
+pub use frame_allocator::{
+    take_watched_frame_corruption, watch_frame, watched_frame_is_intact, watched_frame_paddr,
+};
 pub use heap_allocator::init_heap;
 pub use memory_set::{
-    get_elf_interp, get_elf_interp_file, last_page_fault_failure, LoadedElf, MapArea,
-    MapPermission, MapType, MemorySet, PageFaultAccess, PageFaultResult, UnmapResult,
+    get_elf_interp, get_elf_interp_file, last_page_fault_failure, AddressSpaceActivityHandle,
+    LoadedElf, MapArea, MapPermission, MapType, MemorySet, PageFaultAccess, PageFaultResult,
+    UnmapResult,
 };
 pub use page_table::{translated_byte_buffer, translated_ref, translated_refmut, translated_str};

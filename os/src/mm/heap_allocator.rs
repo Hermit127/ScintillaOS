@@ -1,23 +1,80 @@
 // 这里负责操作系统的内存管理：初始化内核堆，并处理堆分配失败。
 use crate::config::KERNEL_HEAP_SIZE;
 use buddy_system_allocator::LockedHeap;
+use core::alloc::{GlobalAlloc, Layout};
+use polyhal::irq::IRQ;
+
+struct IrqGuard {
+    restore: bool,
+}
+
+impl IrqGuard {
+    fn disable() -> Self {
+        let restore = IRQ::int_enabled();
+        IRQ::int_disable();
+        Self { restore }
+    }
+}
+
+impl Drop for IrqGuard {
+    fn drop(&mut self) {
+        if self.restore {
+            IRQ::int_enable();
+        }
+    }
+}
+
+struct IrqSafeHeap {
+    inner: LockedHeap<32>,
+}
+
+impl IrqSafeHeap {
+    const fn empty() -> Self {
+        Self {
+            inner: LockedHeap::empty(),
+        }
+    }
+
+    unsafe fn init(&self, start: usize, size: usize) {
+        let _irq = IrqGuard::disable();
+        self.inner.lock().init(start, size);
+    }
+
+    fn stats(&self) -> (usize, usize, usize) {
+        let _irq = IrqGuard::disable();
+        let heap = self.inner.lock();
+        (
+            heap.stats_alloc_user(),
+            heap.stats_alloc_actual(),
+            heap.stats_total_bytes(),
+        )
+    }
+}
+
+unsafe impl GlobalAlloc for IrqSafeHeap {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let _irq = IrqGuard::disable();
+        GlobalAlloc::alloc(&self.inner, layout)
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        let _irq = IrqGuard::disable();
+        GlobalAlloc::dealloc(&self.inner, ptr, layout);
+    }
+}
 
 #[global_allocator]
-static HEAP_ALLOCATOR: LockedHeap<32> = LockedHeap::empty();
+static HEAP_ALLOCATOR: IrqSafeHeap = IrqSafeHeap::empty();
 
 #[alloc_error_handler]
 // 内核堆分配失败时直接 panic，带上失败的 layout。
 // 执行时不尝试恢复，直接把失败的 Layout 打进 panic 信息，避免内核继续在无内存状态下运行。
 pub fn handle_alloc_error(layout: core::alloc::Layout) -> ! {
-    {
-        let heap = HEAP_ALLOCATOR.lock();
-        println!(
-            "[heap-debug] user={} actual={} total={}",
-            heap.stats_alloc_user(),
-            heap.stats_alloc_actual(),
-            heap.stats_total_bytes()
-        );
-    }
+    let (user, actual, total) = HEAP_ALLOCATOR.stats();
+    println!(
+        "[heap-debug] user={} actual={} total={}",
+        user, actual, total
+    );
     crate::task::dump_task_stats_for_oom("heap_alloc_error");
     panic!("Heap allocation error, layout = {:#x?}", layout);
 }
@@ -28,8 +85,6 @@ static mut HEAP_SPACE: [u8; KERNEL_HEAP_SIZE] = [0; KERNEL_HEAP_SIZE];
 // 执行时把静态 HEAP_SPACE 的地址和大小交给 LockedHeap，之后全局 allocator 才能服务 alloc。
 pub fn init_heap() {
     unsafe {
-        HEAP_ALLOCATOR
-            .lock()
-            .init(HEAP_SPACE.as_ptr() as usize, KERNEL_HEAP_SIZE);
+        HEAP_ALLOCATOR.init(HEAP_SPACE.as_ptr() as usize, KERNEL_HEAP_SIZE);
     }
 }

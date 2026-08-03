@@ -1,6 +1,45 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::{env, fs};
+use std::time::SystemTime;
+
+fn path_is_newer_than(path: &Path, reference: SystemTime) -> bool {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(_) => return true,
+    };
+    if metadata.is_dir() {
+        let entries = match fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(_) => return true,
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => return true,
+            };
+            if path_is_newer_than(&entry.path(), reference) {
+                return true;
+            }
+        }
+        false
+    } else {
+        metadata
+            .modified()
+            .map(|modified| modified > reference)
+            .unwrap_or(true)
+    }
+}
+
+fn needs_rebuild(library: &Path, inputs: &[&Path]) -> bool {
+    let modified = match fs::metadata(library).and_then(|metadata| metadata.modified()) {
+        Ok(modified) => modified,
+        Err(_) => return true,
+    };
+    inputs
+        .iter()
+        .any(|input| path_is_newer_than(input, modified))
+}
 
 fn main() {
     let c_path = PathBuf::from("c/lwext4")
@@ -9,8 +48,8 @@ fn main() {
 
     let lwext4_make = Path::new("c/lwext4/toolchain/musl-generic.cmake");
 
-    // Always ensure musl-generic.cmake is in place (vendored code)
-    if !Path::new(lwext4_make).exists() {
+    // Keep the copied toolchain file synchronized with its vendored source.
+    if needs_rebuild(lwext4_make, &[Path::new("c/musl-generic.cmake")]) {
         fs::copy(
             "c/musl-generic.cmake",
             "c/lwext4/toolchain/musl-generic.cmake",
@@ -20,8 +59,17 @@ fn main() {
 
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
     let lwext4_lib = &format!("lwext4-{}", arch);
-    let lwext4_lib_path = &format!("c/lwext4/lib{}.a", lwext4_lib);
-    if !Path::new(lwext4_lib_path).exists() {
+    let lwext4_lib_path = PathBuf::from(format!("c/lwext4/lib{}.a", lwext4_lib));
+    let lwext4_inputs = [
+        Path::new("c/lwext4/CMakeLists.txt"),
+        Path::new("c/lwext4/Makefile"),
+        Path::new("c/lwext4/include"),
+        Path::new("c/lwext4/src"),
+        Path::new("c/lwext4/toolchain"),
+        Path::new("c/musl-generic.cmake"),
+        Path::new("c/wrapper.h"),
+    ];
+    if needs_rebuild(&lwext4_lib_path, &lwext4_inputs) {
         let status = Command::new("make")
             .args(&[
                 "musl-generic",
@@ -32,20 +80,20 @@ fn main() {
             .status()
             .expect("failed to execute process: make lwext4");
         assert!(status.success());
+    }
 
-        if !Path::new("src/bindings.rs").exists() {
-            let cc = &format!("{}-linux-musl-gcc", arch);
-            let output = Command::new(cc)
-                .args(["-print-sysroot"])
-                .output()
-                .expect("failed to execute process: gcc -print-sysroot");
+    if !Path::new("src/bindings.rs").exists() {
+        let cc = &format!("{}-linux-musl-gcc", arch);
+        let output = Command::new(cc)
+            .args(["-print-sysroot"])
+            .output()
+            .expect("failed to execute process: gcc -print-sysroot");
 
-            let sysroot = core::str::from_utf8(&output.stdout).unwrap();
-            let sysroot = sysroot.trim_end();
-            let sysroot_inc = &format!("-I{}/include/", sysroot);
+        let sysroot = core::str::from_utf8(&output.stdout).unwrap();
+        let sysroot = sysroot.trim_end();
+        let sysroot_inc = &format!("-I{}/include/", sysroot);
 
-            generates_bindings_to_rust(sysroot_inc);
-        }
+        generates_bindings_to_rust(sysroot_inc);
     }
 
     /* No longer need to implement the libc.a
@@ -68,7 +116,12 @@ fn main() {
         c_path.to_str().unwrap()
     );
     println!("cargo:rerun-if-changed=c/wrapper.h");
-    println!("cargo:rerun-if-changed={}", c_path.to_str().unwrap());
+    println!("cargo:rerun-if-changed=c/musl-generic.cmake");
+    println!("cargo:rerun-if-changed=c/lwext4/CMakeLists.txt");
+    println!("cargo:rerun-if-changed=c/lwext4/Makefile");
+    println!("cargo:rerun-if-changed=c/lwext4/include");
+    println!("cargo:rerun-if-changed=c/lwext4/src");
+    println!("cargo:rerun-if-changed=c/lwext4/toolchain");
 }
 
 fn generates_bindings_to_rust(mpath: &str) {

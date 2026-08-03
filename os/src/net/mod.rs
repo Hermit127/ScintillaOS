@@ -96,6 +96,7 @@ pub mod syscall;
 pub mod syscall {
     use alloc::sync::Arc;
 
+    use crate::syscall::install_fd_shared;
     use crate::task::current_task;
 
     const AF_INET: usize = 2;
@@ -113,14 +114,9 @@ pub mod syscall {
         }
 
         let task = current_task().unwrap();
-        let mut inner = task.inner_exclusive_access();
-        let fd = inner.alloc_fd();
-        if fd >= inner.fd_table.len() {
-            return -24;
-        }
-        inner.fd_table[fd] = Some(Arc::new(crate::fs::NullSocket));
-        inner.fd_cloexec[fd] = (type_ & SOCK_CLOEXEC) != 0;
-        fd as isize
+        install_fd_shared(&task, Arc::new(crate::fs::NullSocket), (type_ & SOCK_CLOEXEC) != 0)
+            .map(|fd| fd as isize)
+            .unwrap_or_else(|errno| errno)
     }
     pub fn sys_bind(_sockfd: usize, _addr: *const u8, _addrlen: usize) -> isize {
         -38
@@ -298,35 +294,39 @@ pub fn net_poll() {
         if !NET_INITED.load(core::sync::atomic::Ordering::Relaxed) {
             return;
         }
-        {
+        let readiness_changed = {
             let mut state = NET_IFACE.exclusive_access();
-            if let Some(state) = state.as_mut() {
-                if !state.inited {
-                    return;
-                }
-                state.clock_ms += 10;
-                let clock = state.clock_ms;
-                let timestamp = smoltcp::time::Instant::from_millis(clock as i64);
-                let NetworkState {
-                    ref mut iface,
-                    ref mut device,
-                    ref mut sockets,
-                    ref mut dhcp_handle,
-                    ref mut dhcp_logged,
-                    ..
-                } = state;
-                iface.poll(timestamp, device, sockets);
+            let Some(state) = state.as_mut() else {
+                return;
+            };
+            if !state.inited {
+                return;
+            }
+            state.clock_ms += 10;
+            let clock = state.clock_ms;
+            let timestamp = smoltcp::time::Instant::from_millis(clock as i64);
+            let NetworkState {
+                ref mut iface,
+                ref mut device,
+                ref mut sockets,
+                ref mut dhcp_handle,
+                ref mut dhcp_logged,
+                ..
+            } = state;
+            let readiness_changed = iface.poll(timestamp, device, sockets);
 
-                if !*dhcp_logged && iface.ip_addrs().len() > 2 {
-                    *dhcp_logged = true;
-                    println!("[net] DHCP assigned additional IP, total IPs:");
-                    for addr in iface.ip_addrs() {
-                        println!("[net]   {}", addr);
-                    }
+            if !*dhcp_logged && iface.ip_addrs().len() > 2 {
+                *dhcp_logged = true;
+                println!("[net] DHCP assigned additional IP, total IPs:");
+                for addr in iface.ip_addrs() {
+                    println!("[net]   {}", addr);
                 }
             }
+            readiness_changed
+        };
+        if readiness_changed {
+            wake_net_blocked_tasks();
         }
-        wake_net_blocked_tasks();
     }
 }
 
@@ -461,8 +461,8 @@ pub fn wake_net_blocked_tasks() {
     // Device polling and TCB inspection happen after taking a stable snapshot;
     // no scheduler queue guard is retained across either operation.  Selected
     // PIDs are then removed in one short scheduler-locked phase.
-    let mut wake_tasks = alloc::vec::Vec::new();
-    for task in net_blocked_snapshot() {
+    let mut wake_tasks = net_blocked_snapshot();
+    wake_tasks.retain(|task| {
         let (reason, local_pending) = {
             let inner = task.inner_exclusive_access();
             let reason = inner.block_reason;
@@ -534,17 +534,18 @@ pub fn wake_net_blocked_tasks() {
                 .unwrap_or(true)
             }
             Some(BlockReason::PollWait) => true,
-            Some(BlockReason::PipeRead(_))
+            Some(BlockReason::LocalTcpRecv(_, _))
+            | Some(BlockReason::LocalTcpSend(_, _))
+            | Some(BlockReason::LocalTcpAccept(_))
+            | Some(BlockReason::PipeRead(_))
             | Some(BlockReason::PipeWrite(_))
             | Some(BlockReason::Futex(_, _))
             | Some(BlockReason::SignalWait(_))
             | Some(BlockReason::Vfork(_)) => false,
             None => true,
         };
-        if should_wake {
-            wake_tasks.push(task);
-        }
-    }
+        should_wake
+    });
     for task in wake_tasks {
         let _ = wake_task(task);
     }

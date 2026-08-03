@@ -8,6 +8,11 @@ endif()
 set(CMAKE_SYSTEM_NAME "Linux")
 set(CMAKE_SYSTEM_PROCESSOR ${ARCH})
 
+# lwext4 is linked into the kernel as a freestanding static library.  The
+# cross compiler intentionally has no userspace crt or libc, so CMake's
+# compiler probe must not try to link a hosted executable.
+set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+
 # Toolchain settings
 set(TOOLCHAIN_PREFIX ${ARCH}-linux-gnu)
 
