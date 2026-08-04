@@ -10,17 +10,18 @@
 //! 1. [`PidRegistryLock`] -- only acquire/copy/remove an `Arc<TaskControlBlock>`.
 //! 2. [`FutexLock`] -- futex wait-table registration only.
 //! 3. [`SchedulerLock`] -- ready and wait queues.
-//! 4. [`TaskLock`] -- one task's mutable state.
-//! 5. [`SignalActionsLock`] -- one process' shared signal dispositions.
-//! 6. [`VmLock`] -- address-space and shared-memory metadata.
-//! 7. [`FrameRefLock`] -- shared physical-frame reference counts.
-//! 8. [`FrameAllocatorLock`] -- physical-frame buddy allocator.
-//! 9. [`VfsLock`] -- open-file, mount and path-owner metadata.
-//! 10. [`FsGlobalLock`] -- process-global lwext4 state.
-//! 11. [`FsLock`] -- one Ext4 instance.
-//! 12. [`DentryLock`] -- dentry child and inode caches.
-//! 13. [`FsAuxLock`] -- post-filesystem quota/accounting metadata.
-//! 14. [`DeviceLock`] -- one device or pipe ring.
+//! 4. [`FilesLock`] -- shared descriptor-table mutation.
+//! 5. [`TaskLock`] -- one task's mutable state.
+//! 6. [`SignalActionsLock`] -- one process' shared signal dispositions.
+//! 7. [`VmLock`] -- address-space and shared-memory metadata.
+//! 8. [`FrameRefLock`] -- shared physical-frame reference counts.
+//! 9. [`FrameAllocatorLock`] -- physical-frame buddy allocator.
+//! 10. [`VfsLock`] -- open-file, mount and path-owner metadata.
+//! 11. [`FsGlobalLock`] -- process-global lwext4 state.
+//! 12. [`FsLock`] -- one Ext4 instance.
+//! 13. [`DentryLock`] -- dentry child and inode caches.
+//! 14. [`FsAuxLock`] -- post-filesystem quota/accounting metadata.
+//! 15. [`DeviceLock`] -- one device or pipe ring.
 //!
 //! No lock may be held across scheduling, blocking I/O, user-address
 //! translation, page-table changes, SBI calls, allocation which can re-enter
@@ -47,17 +48,18 @@ pub enum LockClass {
     /// atomically publish both its key and its `Blocking` task state.
     Futex = 2,
     Scheduler = 3,
-    Task = 4,
-    SignalActions = 5,
-    Vm = 6,
-    FrameRef = 7,
-    FrameAllocator = 8,
-    Vfs = 9,
-    FsGlobal = 10,
-    Fs = 11,
-    Dentry = 12,
-    FsAux = 13,
-    Device = 14,
+    Files = 4,
+    Task = 5,
+    SignalActions = 6,
+    Vm = 7,
+    FrameRef = 8,
+    FrameAllocator = 9,
+    Vfs = 10,
+    FsGlobal = 11,
+    Fs = 12,
+    Dentry = 13,
+    FsAux = 14,
+    Device = 15,
 }
 
 impl LockClass {
@@ -495,6 +497,7 @@ define_domain_lock!(PidRegistryLock, PidRegistryGuard, LockClass::PidRegistry);
 define_domain_lock!(CpuLocalLock, CpuLocalGuard, LockClass::CpuLocal);
 define_domain_lock!(FutexLock, FutexGuard, LockClass::Futex);
 define_domain_lock!(SchedulerLock, SchedulerGuard, LockClass::Scheduler);
+define_domain_lock!(FilesLock, FilesGuard, LockClass::Files);
 define_domain_lock!(TaskLock, TaskGuard, LockClass::Task);
 define_domain_lock!(
     SignalActionsLock,

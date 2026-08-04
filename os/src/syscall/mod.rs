@@ -45,6 +45,8 @@ const SYSCALL_YIELD: usize = 124;
 const SYSCALL_KILL: usize = 129;
 const SYSCALL_TKILL: usize = 130;
 const SYSCALL_TGKILL: usize = 131;
+const SYSCALL_SIGALTSTACK: usize = 132;
+const SYSCALL_SIGSUSPEND: usize = 133;
 const SYSCALL_SIGACTION: usize = 134;
 const SYSCALL_SIGPROCMASK: usize = 135;
 const SYSCALL_RT_SIGTIMEDWAIT: usize = 137;
@@ -78,6 +80,7 @@ const SYSCALL_GETGROUPS: usize = 158;
 const SYSCALL_SETGROUPS: usize = 159;
 const SYSCALL_BRK: usize = 214;
 const SYSCALL_MUNMAP: usize = 215;
+const SYSCALL_MREMAP: usize = 216;
 const SYSCALL_READV: usize = 65;
 const SYSCALL_MPROTECT: usize = 226;
 const SYSCALL_SETPGID: usize = 154;
@@ -101,8 +104,10 @@ const SYSCALL_GETPRIORITY: usize = 141;
 const SYSCALL_SCHED_SETAFFINITY: usize = 122;
 const SYSCALL_SCHED_GETAFFINITY: usize = 123;
 const SYSCALL_EPOLL_CREATE1: usize = 20;
+const SYSCALL_EPOLL_CTL: usize = 21;
+const SYSCALL_EPOLL_PWAIT: usize = 22;
 const SYSCALL_STATX: usize = 291;
-const SYSCALL_EVENTFD2: usize = 290;
+const SYSCALL_EVENTFD2: usize = 19;
 const SYSCALL_RSEQ: usize = 293;
 const SYSCALL_RISCV_HWPROBE: usize = 258;
 const SYSCALL_CLONE: usize = 220;
@@ -139,6 +144,7 @@ const SYSCALL_RENAMEAT2: usize = 276;
 const SYSCALL_FLOCK: usize = 32;
 const SYSCALL_READAHEAD: usize = 213;
 const SYSCALL_SOCKET: usize = 198;
+const SYSCALL_SOCKETPAIR: usize = 199;
 const SYSCALL_SHMGET: usize = 194;
 const SYSCALL_SHMCTL: usize = 195;
 const SYSCALL_SHMAT: usize = 196;
@@ -166,6 +172,8 @@ const SYSCALL_WAITID: usize = 95;
 mod fs;
 pub(crate) mod process;
 
+pub(crate) use fs::install_fd_shared;
+
 use crate::net::syscall::{
     sys_accept, sys_bind, sys_connect, sys_getpeername, sys_getsockname, sys_getsockopt,
     sys_listen, sys_recvfrom, sys_recvmsg, sys_sendmsg, sys_sendto, sys_setsockopt,
@@ -188,12 +196,22 @@ pub static LAST_SYSCALL_RET: AtomicUsize = AtomicUsize::new(0);
 #[no_mangle]
 pub static LAST_SYSCALL_PID: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "smp-diagnostics")]
-// Kept at zero for acceptance runs: the snapshot atomics above retain the
-// last syscall without interleaving high-frequency text into test output.
+// This is enabled only in the local diagnostic build. Start at cargo new so
+// the dynamic loaders for the shell, rustc and cargo --version do not consume
+// the trace budget before the filesystem operation under investigation.
 static SYSCALL_DIAG_BUDGET: AtomicUsize = AtomicUsize::new(0);
 
 pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     if syscall_id == SYSCALL_SHUTDOWN {
+        #[cfg(feature = "smp-diagnostics")]
+        crate::println!(
+            "[shutdown-diag] tid={} a0={:#x} a1={:#x}",
+            crate::task::current_task()
+                .map(|task| task.getpid())
+                .unwrap_or(0),
+            args[0],
+            args[1],
+        );
         return sys_shutdown();
     }
     let current_pid = crate::task::current_task()
@@ -205,7 +223,21 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     LAST_SYSCALL_ARG2.store(args[2], Ordering::Relaxed);
     LAST_SYSCALL_PID.store(current_pid, Ordering::Relaxed);
     #[cfg(feature = "smp-diagnostics")]
-    let trace_this = current_pid >= 4
+    let trace_this = current_pid >= 3
+        && matches!(
+            syscall_id,
+            SYSCALL_SETITIMER
+                | 107..=111
+                | SYSCALL_FUTEX
+                | SYSCALL_WAITPID
+                | SYSCALL_SIGPROCMASK
+                | SYSCALL_SIGRETURN
+                | SYSCALL_KILL
+                | SYSCALL_TKILL
+                | SYSCALL_TGKILL
+                | SYSCALL_EXIT
+                | SYSCALL_EXIT_GROUP
+        )
         && SYSCALL_DIAG_BUDGET
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
                 left.checked_sub(1)
@@ -331,6 +363,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_KILL => sys_kill(args[0] as isize, args[1] as i32),
         SYSCALL_TKILL => sys_tkill(args[0], args[1] as i32),
         SYSCALL_TGKILL => sys_tgkill(args[0], args[1], args[2] as i32),
+        SYSCALL_SIGALTSTACK => sys_sigaltstack(args[0] as *const u8, args[1] as *mut u8),
+        SYSCALL_SIGSUSPEND => sys_rt_sigsuspend(args[0] as *const u8, args[1]),
         SYSCALL_SIGACTION => sys_sigaction(
             args[0] as i32,
             args[1] as *const u8,
@@ -381,16 +415,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETGROUPS => sys_getgroups(args[0], args[1] as *mut u32),
         SYSCALL_SETGROUPS => sys_setgroups(args[0], args[1] as *const u32),
         SYSCALL_SET_TID_ADDRESS => sys_set_tid_address(args[0] as *mut i32),
-        SYSCALL_CLONE => {
-            #[cfg(target_arch = "loongarch64")]
-            {
-                sys_clone(args[0], args[1], args[2], args[4], args[3])
-            }
-            #[cfg(not(target_arch = "loongarch64"))]
-            {
-                sys_clone(args[0], args[1], args[2], args[3], args[4])
-            }
-        }
+        SYSCALL_CLONE => sys_clone(args[0], args[1], args[2], args[3], args[4]),
         SYSCALL_FORK => sys_fork(),
         SYSCALL_EXEC => sys_exec(
             args[0] as *const u8,
@@ -427,6 +452,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SLEEP => sys_sleep(args[0] as u64),
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4] as i32, args[5]),
         SYSCALL_MUNMAP => sys_munmap(args[0], args[1]),
+        SYSCALL_MREMAP => sys_mremap(args[0], args[1], args[2], args[3], args[4]),
         SYSCALL_MSYNC => sys_msync(args[0], args[1], args[2]),
         SYSCALL_MLOCK => sys_mlock(args[0], args[1]),
         SYSCALL_MUNLOCK => sys_munlock(args[0], args[1]),
@@ -440,6 +466,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SHMAT => sys_shmat(args[0], args[1], args[2]),
         SYSCALL_SHMDT => sys_shmdt(args[0]),
         SYSCALL_SOCKET => sys_socket(args[0], args[1], args[2]),
+        SYSCALL_SOCKETPAIR => sys_socketpair(args[0], args[1], args[2], args[3] as *mut usize),
         SYSCALL_BIND => sys_bind(args[0], args[1] as *const u8, args[2]),
         SYSCALL_LISTEN => sys_listen(args[0], args[1]),
         SYSCALL_ACCEPT => sys_accept(args[0], args[1] as *mut u8, args[2] as *mut usize),
@@ -515,7 +542,16 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETPRIORITY => sys_getpriority(args[0], args[1]),
         SYSCALL_SCHED_SETAFFINITY => sys_sched_setaffinity(args[0], args[1], args[2] as *const u8),
         SYSCALL_SCHED_GETAFFINITY => sys_sched_getaffinity(args[0], args[1], args[2] as *mut u8),
-        SYSCALL_EPOLL_CREATE1 => -38,
+        SYSCALL_EPOLL_CREATE1 => sys_epoll_create1(args[0]),
+        SYSCALL_EPOLL_CTL => sys_epoll_ctl(args[0], args[1], args[2], args[3] as *const u8),
+        SYSCALL_EPOLL_PWAIT => sys_epoll_pwait(
+            args[0],
+            args[1] as *mut u8,
+            args[2],
+            args[3] as isize,
+            args[4] as *const u8,
+            args[5],
+        ),
         SYSCALL_STATX => sys_statx(
             args[0] as isize,
             args[1] as *const u8,
@@ -523,7 +559,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3] as u32,
             args[4] as *mut u8,
         ),
-        SYSCALL_EVENTFD2 => -38,
+        SYSCALL_EVENTFD2 => sys_eventfd2(args[0] as u32, args[1]),
         SYSCALL_RSEQ => -38,
         SYSCALL_RISCV_HWPROBE => -38,
         SYSCALL_TIMES => sys_times(args[0]),
@@ -559,6 +595,17 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         _ => -38,
     };
     LAST_SYSCALL_RET.store(ret as usize, Ordering::Relaxed);
+    #[cfg(feature = "smp-diagnostics")]
+    if ret == -38 {
+        crate::println!(
+            "[syscall-diag] ENOSYS tid={} nr={} a0={:#x} a1={:#x} a2={:#x}",
+            current_pid,
+            syscall_id,
+            args[0],
+            args[1],
+            args[2],
+        );
+    }
     #[cfg(feature = "smp-diagnostics")]
     if trace_this {
         crate::println!(

@@ -1,9 +1,12 @@
 // 这里负责操作系统的文件管理：定义文件系统模块的公共类型、File trait 和子模块导出。
 pub mod block_device_stream;
+mod epoll;
+mod eventfd;
 pub mod inode;
 mod pipe;
 pub mod proc;
 pub mod stdio;
+mod unix_socket;
 pub mod vfs;
 
 use alloc::string::String;
@@ -169,6 +172,9 @@ pub use inode::{
     follow_symlink, link_at, mkdir_at, open_file, open_file_at, rename_at, symlink_at, unlink_at,
     OpenFlags,
 };
+pub use epoll::{EpollEvent, EpollFile, EPOLL_MAX_INTERESTS};
+pub use eventfd::EventFdFile;
 pub use pipe::make_pipe;
 pub use stdio::{DevBlock, DevNull, DevZero, NullSocket, Stdin, Stdout, TmpFile, Urandom};
+pub use unix_socket::{make_unix_socket_pair, UnixSocketFile, UnixSocketKind};
 pub use vfs::{list_apps, mount_root};

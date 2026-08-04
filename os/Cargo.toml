@@ -10,6 +10,13 @@ default = []
 # optimized kernel. This feature adds diagnostics only and does not change the
 # userspace ABI or test programs.
 smp-diagnostics = []
+# Lightweight mount-path tracing for local SMP diagnosis. Unlike
+# `smp-diagnostics`, this does not enable lock-dependency instrumentation.
+mount-trace = []
+# Local trace for interval timers and waitpid lifecycle races under SMP.
+timeout-trace = []
+# Records mount progress with atomics and reports only a stalled operation.
+mount-watchdog = []
 # The official QEMU command does not enable the RISC-V V extension. Keep
 # vector context switching opt-in for local tests that explicitly add
 # `-cpu max,v=true,vlen=128`.

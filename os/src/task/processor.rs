@@ -5,9 +5,12 @@ use super::TaskControlBlock;
 use super::{fetch_task, reap_exited_tasks};
 use super::manager::complete_context_switch;
 use crate::config::MAX_CPUS;
+use crate::mm::AddressSpaceActivityHandle;
 use crate::sync::{assert_no_spin_locks_held, CpuLocalLock};
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(target_arch = "loongarch64")]
+use core::sync::atomic::{fence, AtomicBool};
 use lazyinit::LazyInit;
 use log::*;
 use polyhal::irq::IRQ;
@@ -66,12 +69,37 @@ static HART_BY_PERCPU_BASE: [AtomicUsize; MAX_CPUS] =
     [const { AtomicUsize::new(usize::MAX) }; MAX_CPUS];
 
 /// Pending IPI work, indexed by the stable QEMU hart ID. The producer sets a
-/// bit before issuing SBI `send_ipi`; the receiving hart clears it after
-/// acknowledging SSIP. Keeping this state outside `CpuLocal` is necessary:
+/// bit before issuing the architecture-specific IPI; the receiving hart
+/// clears it after acknowledging the interrupt. Keeping this state outside
+/// `CpuLocal` is necessary:
 /// a remote CPU must be able to publish its request without accessing another
 /// hart's per-CPU storage directly.
 const IPI_RESCHEDULE: usize = 1;
+#[cfg(target_arch = "loongarch64")]
+const IPI_TLB_FLUSH: usize = 1 << 1;
+#[cfg(target_arch = "loongarch64")]
+const LA_IPI_RESCHEDULE: u32 = 1 << 1;
+#[cfg(target_arch = "loongarch64")]
+const LA_IPI_TLB_FLUSH: u32 = 1 << 2;
+#[cfg(target_arch = "loongarch64")]
+const LA_IPI_KERNEL_MASK: u32 = LA_IPI_RESCHEDULE | LA_IPI_TLB_FLUSH;
 static PENDING_IPI: [AtomicUsize; MAX_CPUS] =
+    [const { AtomicUsize::new(0) }; MAX_CPUS];
+#[cfg(target_arch = "loongarch64")]
+static TLB_SHOOTDOWN_BUSY: AtomicBool = AtomicBool::new(false);
+#[cfg(target_arch = "loongarch64")]
+static TLB_GLOBAL_SEQ: AtomicUsize = AtomicUsize::new(0);
+#[cfg(target_arch = "loongarch64")]
+static TLB_REQUEST_SEQ: [AtomicUsize; MAX_CPUS] =
+    [const { AtomicUsize::new(0) }; MAX_CPUS];
+#[cfg(target_arch = "loongarch64")]
+static TLB_ACK_SEQ: [AtomicUsize; MAX_CPUS] =
+    [const { AtomicUsize::new(0) }; MAX_CPUS];
+#[cfg(all(target_arch = "loongarch64", feature = "smp-diagnostics"))]
+static IPI_HANDLER_COUNT: [AtomicUsize; MAX_CPUS] =
+    [const { AtomicUsize::new(0) }; MAX_CPUS];
+#[cfg(all(target_arch = "loongarch64", feature = "smp-diagnostics"))]
+static LAST_IPI_ACTIONS: [AtomicUsize; MAX_CPUS] =
     [const { AtomicUsize::new(0) }; MAX_CPUS];
 static SCHEDULER_PHASE: [AtomicUsize; MAX_CPUS] =
     [const { AtomicUsize::new(0) }; MAX_CPUS];
@@ -124,6 +152,14 @@ pub fn init_current_cpu(hart_id: usize) {
     PROCESSOR
         .ref_mut()
         .write(CpuLocalLock::new_named(CpuLocal::new(), "CpuLocal"));
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let pending = loongArch64::ipi::ipi_status();
+        if pending != 0 {
+            loongArch64::ipi::clear_ipi(pending);
+        }
+        loongArch64::ipi::enable_ipi(LA_IPI_KERNEL_MASK);
+    }
 }
 
 /// Return the boot-protocol hart ID of the current CPU.
@@ -162,6 +198,14 @@ pub fn request_reschedule(cpu: usize) {
         // next timer interrupt.
         let _ = sbi_rt::send_ipi(1usize << cpu, 0);
     }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        // The IPI is an MMIO notification rather than an atomic operation on
+        // PENDING_IPI. Publish the mailbox before making the hardware signal
+        // observable by the target hart.
+        fence(Ordering::SeqCst);
+        loongArch64::ipi::send_ipi_single(cpu, LA_IPI_RESCHEDULE);
+    }
 }
 
 /// Acknowledge a supervisor software interrupt on this hart and consume its
@@ -173,23 +217,101 @@ pub fn handle_ipi() -> usize {
     // This function only runs from the RISC-V supervisor software-interrupt
     // trap arm, so the CSR operation is valid for the current hart.
     unsafe { riscv::register::sip::clear_ssoft() };
-    PENDING_IPI[current_hart_id()].swap(0, Ordering::AcqRel)
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let hardware_actions = loongArch64::ipi::ipi_status();
+        #[cfg(feature = "smp-diagnostics")]
+        {
+            let cpu = current_hart_id();
+            IPI_HANDLER_COUNT[cpu].fetch_add(1, Ordering::Relaxed);
+            LAST_IPI_ACTIONS[cpu].store(hardware_actions as usize, Ordering::Release);
+        }
+        if hardware_actions != 0 {
+            loongArch64::ipi::clear_ipi(hardware_actions);
+            // Match Linux's smp_mb() after clearing IPI_STATUS. The hardware
+            // notification orders neither the sender's mailbox writes nor
+            // this hart's following read of PENDING_IPI by itself.
+            fence(Ordering::SeqCst);
+        }
+    }
+    let cpu = current_hart_id();
+    let pending = PENDING_IPI[cpu].swap(0, Ordering::AcqRel);
+    #[cfg(target_arch = "loongarch64")]
+    if pending & IPI_TLB_FLUSH != 0 {
+        let sequence = TLB_REQUEST_SEQ[cpu].load(Ordering::Acquire);
+        polyhal::pagetable::TLB::flush_all();
+        TLB_ACK_SEQ[cpu].store(sequence, Ordering::Release);
+    }
+    pending
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn service_local_ipi_while_waiting() {
+    let cpu = current_hart_id();
+    if loongArch64::ipi::ipi_status() != 0
+        || PENDING_IPI[cpu].load(Ordering::Acquire) != 0
+    {
+        let _ = handle_ipi();
+    }
+}
+
+#[cfg(target_arch = "loongarch64")]
+struct TlbShootdownGuard;
+
+#[cfg(target_arch = "loongarch64")]
+impl TlbShootdownGuard {
+    fn acquire() -> Self {
+        let mut spins = 0usize;
+        while TLB_SHOOTDOWN_BUSY
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            service_local_ipi_while_waiting();
+            spins = spins.wrapping_add(1);
+            if spins == 100_000_000 {
+                panic!(
+                    "LoongArch TLB shootdown gate timeout: cpu={}, online={:#x}",
+                    current_hart_id(),
+                    super::manager::online_cpu_mask()
+                );
+            }
+            core::hint::spin_loop();
+        }
+        Self
+    }
+}
+
+#[cfg(target_arch = "loongarch64")]
+impl Drop for TlbShootdownGuard {
+    fn drop(&mut self) {
+        TLB_SHOOTDOWN_BUSY.store(false, Ordering::Release);
+    }
 }
 
 /// Invalidate a virtual-address range on the other harts that currently use
 /// the same user page table.
 ///
-/// Callers must capture `active_cpus` while they still own the address-space
-/// metadata, then release every Task/Vm/VFS lock before calling this helper.
-/// The local hart is intentionally excluded: `PageTable::{map,unmap}_page`
-/// already executes the local `sfence.vma` for every changed PTE.  OpenSBI's
-/// RFENCE call completes the remote operation before it returns, which is the
-/// acknowledgement used by this first implementation. A firmware failure is
-/// fatal: callers may release retired frames immediately after this helper
-/// returns, so continuing with stale remote translations would corrupt memory.
-pub fn flush_remote_tlb(active_cpus: usize, start_addr: usize, size: usize) -> bool {
+/// Callers retain `activity` while releasing every Task/Vm/VFS lock before
+/// calling this helper. The local hart is intentionally excluded:
+/// `PageTable::{map,unmap}_page` already executes the architecture's local
+/// invalidation for every changed PTE. RISC-V uses OpenSBI RFENCE; LoongArch
+/// sends an IPI and waits for an explicit acknowledgement after the remote
+/// CPU flushes its complete TLB.
+///
+/// A target which leaves the address space while the request is in flight has
+/// already switched to the kernel page table. Its next entry performs a local
+/// full TLB flush before it publishes itself active again, so it is safe to
+/// treat that transition as a completed quiescent state instead of waiting for
+/// an IPI that raced with the context switch.
+#[track_caller]
+pub fn flush_remote_tlb(
+    activity: &AddressSpaceActivityHandle,
+    start_addr: usize,
+    size: usize,
+) -> bool {
     let current = current_hart_id();
-    let remote = active_cpus
+    let remote = activity
+        .active_cpu_mask()
         & super::manager::online_cpu_mask()
         & !(1usize << current);
     if remote == 0 {
@@ -207,7 +329,84 @@ pub fn flush_remote_tlb(active_cpus: usize, start_addr: usize, size: usize) -> b
         }
     }
 
-    #[cfg(not(target_arch = "riscv64"))]
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let _guard = TlbShootdownGuard::acquire();
+        let mut sequence = TLB_GLOBAL_SEQ.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+        if sequence == 0 {
+            sequence = TLB_GLOBAL_SEQ.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+        }
+
+        for cpu in 0..MAX_CPUS {
+            if remote & (1usize << cpu) == 0 {
+                continue;
+            }
+            TLB_REQUEST_SEQ[cpu].store(sequence, Ordering::Release);
+            PENDING_IPI[cpu].fetch_or(IPI_TLB_FLUSH, Ordering::Release);
+        }
+        // The IPI device is outside the cache-coherent atomic domain. Ensure
+        // every target can observe its request before its interrupt arrives.
+        fence(Ordering::SeqCst);
+        for cpu in 0..MAX_CPUS {
+            if remote & (1usize << cpu) != 0 {
+                loongArch64::ipi::send_ipi_single(cpu, LA_IPI_TLB_FLUSH);
+            }
+        }
+
+        let mut spins = 0usize;
+        loop {
+            service_local_ipi_while_waiting();
+            let active_cpus = activity.active_cpu_mask();
+            let mut waiting = usize::MAX;
+            for cpu in 0..MAX_CPUS {
+                if remote & (1usize << cpu) != 0
+                    && active_cpus & (1usize << cpu) != 0
+                    && TLB_ACK_SEQ[cpu].load(Ordering::Acquire) != sequence
+                {
+                    waiting = cpu;
+                    break;
+                }
+            }
+            if waiting == usize::MAX {
+                break;
+            }
+            spins = spins.wrapping_add(1);
+            if spins == 100_000_000 {
+                let snapshot = scheduler_cpu_snapshots()[waiting];
+                #[cfg(feature = "smp-diagnostics")]
+                {
+                    let caller = core::panic::Location::caller();
+                    println!(
+                        "[tlb-diag] target={} handled={} last_actions={:#x} request={} ack={} caller={}:{}",
+                        waiting,
+                        IPI_HANDLER_COUNT[waiting].load(Ordering::Acquire),
+                        LAST_IPI_ACTIONS[waiting].load(Ordering::Acquire),
+                        TLB_REQUEST_SEQ[waiting].load(Ordering::Acquire),
+                        TLB_ACK_SEQ[waiting].load(Ordering::Acquire),
+                        caller.file(),
+                        caller.line(),
+                    );
+                }
+                panic!(
+                    "LoongArch TLB shootdown timeout: requester={}, target={}, seq={}, start={:#x}, size={:#x}, online={:#x}, active={:#x}, phase={}, pid={}, tgid={}, pending={:#x}",
+                    current,
+                    waiting,
+                    sequence,
+                    start_addr,
+                    size,
+                    super::manager::online_cpu_mask(),
+                    active_cpus,
+                    snapshot.phase,
+                    snapshot.pid,
+                    snapshot.tgid,
+                    snapshot.pending_ipi,
+                );
+            }
+            core::hint::spin_loop();
+        }
+    }
+
+    #[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
     let _ = (remote, start_addr, size);
 
     true
@@ -250,7 +449,14 @@ pub fn run_tasks() {
             // created on a different hart, so refresh it immediately before
             // dispatching rather than restoring the creator's CPU-local base.
             task_inner.task_cx[KContextArgs::KTP] = read_current_tp();
-            task_inner.memory_set.enter_cpu(current_hart_id());
+            #[cfg(target_arch = "riscv64")]
+            {
+                // OpenSBI completes remote sfence.vma independently of the
+                // target hart's interrupt state. Publish before the switch so
+                // an unmap cannot race the SATP handoff; the local page-table
+                // switch performs its own full TLB invalidation afterwards.
+                task_inner.memory_set.enter_cpu(current_hart_id());
+            }
             let pid = task.getpid();
             let tgid = task_inner.tgid;
             let tcb = Arc::as_ptr(&task) as usize;
@@ -333,6 +539,20 @@ pub fn current_task() -> Option<Arc<TaskControlBlock>> {
     current_cpu().exclusive_access().current()
 }
 
+/// Publish the current task's address space after its page table is installed.
+///
+/// `context_switch_pt` invalidates the local TLB before entering a task.  The
+/// activity bit therefore only needs to cover the interval in which this hart
+/// can execute user mappings.  Publishing it before the context switch would
+/// make a remote unmap wait for a hart that still has interrupts disabled in
+/// the scheduler handoff.
+pub fn mark_current_task_address_space_active() {
+    let task = current_task().expect("activate address space without current task");
+    task.inner_exclusive_access()
+        .memory_set
+        .enter_cpu(current_hart_id());
+}
+
 /// Account a timer interrupt on the current hart.  The counter is deliberately
 /// per-CPU so the old global mutable tick cannot race once secondary harts run.
 pub fn record_timer_tick() {
@@ -360,6 +580,10 @@ pub fn schedule(switched_task_cx_ptr: *mut KContext) {
     unsafe {
         context_switch_pt(switched_task_cx_ptr, idle_task_cx_ptr, *BOOT_PAGE_TABLE);
     }
+    // This continuation runs only after a previously saved task context has
+    // been restored with its user page table.  Mark it active before returning
+    // to the syscall/trap path, which may resume userspace immediately.
+    mark_current_task_address_space_active();
 }
 
 // 记录启动时的内核页表，之后调度回 idle 时使用。

@@ -2,6 +2,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::{env, fs};
 
+fn copy_if_different(source: &Path, destination: &Path) {
+    let source_data = fs::read(source).expect("cannot read lwext4 toolchain file");
+    if fs::read(destination).ok().as_deref() != Some(source_data.as_slice()) {
+        fs::write(destination, source_data).expect("cannot update lwext4 toolchain file");
+    }
+}
+
 fn main() {
     let c_path = PathBuf::from("c/lwext4")
         .canonicalize()
@@ -9,19 +16,15 @@ fn main() {
 
     let lwext4_make = Path::new("c/lwext4/toolchain/musl-generic.cmake");
 
-    // Always ensure musl-generic.cmake is in place (vendored code)
-    if !Path::new(lwext4_make).exists() {
-        fs::copy(
-            "c/musl-generic.cmake",
-            "c/lwext4/toolchain/musl-generic.cmake",
-        )
-        .unwrap();
-    }
+    // Git does not preserve mtimes, so content comparison is deterministic
+    // across a fresh clone and a branch switch.
+    copy_if_different(Path::new("c/musl-generic.cmake"), lwext4_make);
 
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
     let lwext4_lib = &format!("lwext4-{}", arch);
-    let lwext4_lib_path = &format!("c/lwext4/lib{}.a", lwext4_lib);
-    if !Path::new(lwext4_lib_path).exists() {
+    let lwext4_lib_path = PathBuf::from(format!("c/lwext4/lib{}.a", lwext4_lib));
+    let force_rebuild = env::var_os("LWEXT4_FORCE_REBUILD").is_some();
+    if force_rebuild || !lwext4_lib_path.exists() {
         let status = Command::new("make")
             .args(&[
                 "musl-generic",
@@ -32,20 +35,20 @@ fn main() {
             .status()
             .expect("failed to execute process: make lwext4");
         assert!(status.success());
+    }
 
-        if !Path::new("src/bindings.rs").exists() {
-            let cc = &format!("{}-linux-musl-gcc", arch);
-            let output = Command::new(cc)
-                .args(["-print-sysroot"])
-                .output()
-                .expect("failed to execute process: gcc -print-sysroot");
+    if !Path::new("src/bindings.rs").exists() {
+        let cc = &format!("{}-linux-musl-gcc", arch);
+        let output = Command::new(cc)
+            .args(["-print-sysroot"])
+            .output()
+            .expect("failed to execute process: gcc -print-sysroot");
 
-            let sysroot = core::str::from_utf8(&output.stdout).unwrap();
-            let sysroot = sysroot.trim_end();
-            let sysroot_inc = &format!("-I{}/include/", sysroot);
+        let sysroot = core::str::from_utf8(&output.stdout).unwrap();
+        let sysroot = sysroot.trim_end();
+        let sysroot_inc = &format!("-I{}/include/", sysroot);
 
-            generates_bindings_to_rust(sysroot_inc);
-        }
+        generates_bindings_to_rust(sysroot_inc);
     }
 
     /* No longer need to implement the libc.a
@@ -68,7 +71,13 @@ fn main() {
         c_path.to_str().unwrap()
     );
     println!("cargo:rerun-if-changed=c/wrapper.h");
-    println!("cargo:rerun-if-changed={}", c_path.to_str().unwrap());
+    println!("cargo:rerun-if-changed=c/musl-generic.cmake");
+    println!("cargo:rerun-if-changed=c/lwext4/CMakeLists.txt");
+    println!("cargo:rerun-if-changed=c/lwext4/Makefile");
+    println!("cargo:rerun-if-changed=c/lwext4/include");
+    println!("cargo:rerun-if-changed=c/lwext4/src");
+    println!("cargo:rerun-if-changed=c/lwext4/toolchain");
+    println!("cargo:rerun-if-env-changed=LWEXT4_FORCE_REBUILD");
 }
 
 fn generates_bindings_to_rust(mpath: &str) {

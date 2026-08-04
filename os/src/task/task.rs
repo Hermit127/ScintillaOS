@@ -1,4 +1,4 @@
-use super::{current_task, SignalActions, UserFloatState};
+use super::{current_task, mark_current_task_address_space_active, SignalActions, UserFloatState};
 use super::{pid_alloc, PendingSignalInfo, PidHandle, SignalFlags};
 use crate::config::KERNEL_STACK_SIZE;
 use crate::fs::vfs::{Dentry, ROOT_DENTRY};
@@ -11,6 +11,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use polyhal::irq::IRQ;
 use polyhal::kcontext::{read_current_tp, KContext, KContextArgs};
 use polyhal::pagetable::PageTable;
 use polyhal_trap::trap::run_user_task;
@@ -48,6 +49,10 @@ struct TaskSchedulingMeta {
     running_cpu: AtomicUsize,
     allowed_cpus: AtomicUsize,
     enqueued: AtomicBool,
+    /// Published with release ordering when begin_exit has committed the
+    /// terminal status and exit code.  A parent may reap this zombie before
+    /// the deferred idle-context resource cleanup completes.
+    waitable_zombie: AtomicBool,
     exit_cleanup_done: AtomicBool,
     /// Non-zero while this task is a vfork child whose parent must remain
     /// suspended.  The value is the parent's TID, allowing exec/exit to
@@ -61,16 +66,14 @@ impl TaskSchedulingMeta {
             running_cpu: AtomicUsize::new(NO_RUNNING_CPU),
             allowed_cpus: AtomicUsize::new(DEFAULT_TASK_CPU_MASK),
             enqueued: AtomicBool::new(false),
+            waitable_zombie: AtomicBool::new(false),
             exit_cleanup_done: AtomicBool::new(false),
             vfork_parent: AtomicUsize::new(0),
         }
     }
 }
 
-#[cfg(target_arch = "riscv64")]
-const DEFAULT_TASK_CPU_MASK: usize = (1usize << crate::config::MAX_CPUS) - 1;
-#[cfg(not(target_arch = "riscv64"))]
-const DEFAULT_TASK_CPU_MASK: usize = 1;
+const DEFAULT_TASK_CPU_MASK: usize = (1usize << crate::config::PLATFORM_CPUS) - 1;
 use log::*;
 impl Drop for TaskControlBlock {
     fn drop(&mut self) {
@@ -108,12 +111,15 @@ pub struct TaskControlBlockInner {
     pub exit_code: i32,
     pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
     pub fd_cloexec: Vec<bool>,
+    /// Identifies the Linux files_struct shared through CLONE_FILES.
+    pub files_id: usize,
     pub rlimit_nofile: usize,
     pub rlimit_nofile_max: usize,
     pub rlimit_memlock: usize,
     pub rlimit_memlock_max: usize,
     pub cwd: Arc<Dentry>,
     pub root: Arc<Dentry>,
+    pub executable_path: String,
     pub tid_ptr: usize,
     pub tgid: usize,
     pub pgid: usize,
@@ -131,6 +137,11 @@ pub struct TaskControlBlockInner {
     pub pending_signal_info: [PendingSignalInfo; super::MAX_SIG + 1],
     pub signal_mask: SignalFlags,
     pub signal_mask_backup: Option<SignalFlags>,
+    /// `rt_sigsuspend` restores its caller's mask before returning EINTR, but
+    /// the signal that woke it still has to be delivered at this trap exit.
+    /// This records that one selected pending signal without changing its
+    /// disposition or losing the mask restored by the syscall.
+    pub sigsuspend_delivery: Option<SignalFlags>,
     // the signal which is being handling
     pub handling_sig: isize,
     // Signal actions
@@ -142,6 +153,13 @@ pub struct TaskControlBlockInner {
     pub signal_actions: Arc<SignalActionsLock<SignalActions>>,
     // if the task is killed
     pub killed: bool,
+    // Set while execve is retiring this sibling thread. Unlike a process-wide
+    // fatal signal, this must not make the retiring thread kill the execing
+    // thread group leader.
+    pub terminating_for_exec: bool,
+    // Set for siblings selected by exit_group or a process-wide fatal fault.
+    // The stored exit_code is authoritative even when it is zero.
+    pub terminating_for_group: bool,
     // if the task is frozen by a signal
     pub frozen: bool,
     pub trap_ctx_backup: Option<TrapFrame>,
@@ -200,6 +218,7 @@ impl TaskControlBlockInner {
     }
     pub fn take_fd_for_close(&mut self, fd: usize) -> Option<Arc<dyn File + Send + Sync>> {
         if fd < self.fd_table.len() {
+            self.fd_cloexec[fd] = false;
             return self.fd_table[fd].take();
         }
         None
@@ -225,6 +244,7 @@ impl TaskControlBlockInner {
                 if let Some(file) = self.fd_table[fd].take() {
                     files.push(file);
                 }
+                self.fd_cloexec[fd] = false;
             }
         }
         files
@@ -233,6 +253,11 @@ impl TaskControlBlockInner {
 
 fn task_entry() {
     trace!("os::task::task_entry");
+    // The scheduler has installed this task's page table and invalidated this
+    // hart's local TLB.  Publish it before the first return to userspace.
+    mark_current_task_address_space_active();
+    #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
+    crate::SMP_FIRST_TASK_ENTERED.store(true, Ordering::Release);
     loop {
         let trap_cx = {
             let task = current_task().unwrap();
@@ -241,6 +266,10 @@ fn task_entry() {
             trap_cx
         };
         let ctx_mut = unsafe { trap_cx.as_mut().unwrap() };
+        // sscratch identifies a user trap frame while user_restore is loading
+        // registers. Keep that handoff non-reentrant; sret restores the user
+        // interrupt state from the trap frame.
+        IRQ::int_disable();
         run_user_task(ctx_mut);
     }
 }
@@ -279,9 +308,11 @@ impl TaskControlBlock {
         }
     }
     pub fn save_user_float_state(&self) {
-        if let Some(mut inner) = self.try_inner_exclusive_access() {
-            inner.fp_state.save_current();
-        }
+        // A trap boundary is the only point at which this task's live LSX
+        // registers can be captured.  Skipping the save on transient TaskLock
+        // contention lets a later migration restore another thread's state.
+        let mut inner = self.inner_exclusive_access();
+        inner.fp_state.save_current();
     }
     pub fn restore_user_float_state(&self) {
         let fp_state = {
@@ -312,80 +343,82 @@ impl TaskControlBlock {
             scheduling: TaskSchedulingMeta::new(),
             inner: TaskLock::new_named(
                 TaskControlBlockInner {
-                        trap_cx: TrapFrame::new(),
-                        fp_state: UserFloatState::new(),
-                        base_size: user_sp,
-                        task_cx: blank_kcontext(kstack.get_position().1), // Set task_cx's Kernel Stack Top
-                        task_status: TaskStatus::Ready,
-                        memory_set,
-                        parent: None,
-                        children: Vec::new(),
-                        exit_code: 0,
-                        fd_table: vec![
-                            // 0 -> stdin
-                            Some(Arc::new(Stdin)),
-                            // 1 -> stdout
-                            Some(Arc::new(Stdout)),
-                            // 2 -> stderr
-                            Some(Arc::new(Stdout)),
-                        ],
-                        fd_cloexec: vec![false, false, false],
-                        rlimit_nofile: 1024,
-                        rlimit_nofile_max: 1024,
-                        rlimit_memlock: 64 * 1024,
-                        rlimit_memlock_max: 64 * 1024,
-                        cwd: ROOT_DENTRY.clone(),
-                        root: ROOT_DENTRY.clone(),
-                        tid_ptr: 0,
-                        tgid: pid_value,
-                        pgid: pid_value,
-                        sid: pid_value,
-                        uid: 0,
-                        euid: 0,
-                        suid: 0,
-                        gid: 0,
-                        egid: 0,
-                        sgid: 0,
-                        supplementary_groups: Vec::new(),
-                        umask: 0o022,
-                        nice: 0,
-                        signals: SignalFlags::empty(),
-                        pending_signal_info: [
-                            PendingSignalInfo::default();
-                            super::MAX_SIG + 1
-                        ],
-                        signal_mask: SignalFlags::empty(),
-                        signal_mask_backup: None,
-                        handling_sig: -1,
-                        signal_actions: Arc::new(SignalActionsLock::new_named(
-                            SignalActions::default(),
-                            "SignalActions",
-                        )),
-                        killed: false,
-                        frozen: false,
-                        trap_ctx_backup: None,
-                        signal_ucontext: None,
-                        kernel_stack: kstack,
-                        // added
-                        heap_bottom,
-                        program_brk: heap_bottom,
-                        sleeping: None,
-                        utime: 0,
-                        stime: 0,
-                        cutime: 0,
-                        cstime: 0,
-                        last_time: polyhal::time::Time::now().to_nsec() as usize,
-                        block_reason: None,
-                        itimer_expire: 0,
-                        itimer_interval_us: 0,
-                        child_tid: 0,
-                        robust_list_head: 0,
-                        robust_list_len: 0,
-                        alt_stack: 0,
-                        alt_stack_size: 0,
-                        alt_stack_flags: 0,
-                        in_syscall: false,
-                        exit_signal: 0,
+                    trap_cx: TrapFrame::new(),
+                    fp_state: UserFloatState::new(),
+                    base_size: user_sp,
+                    task_cx: blank_kcontext(kstack.get_position().1), // Set task_cx's Kernel Stack Top
+                    task_status: TaskStatus::Ready,
+                    memory_set,
+                    parent: None,
+                    children: Vec::new(),
+                    exit_code: 0,
+                    fd_table: vec![
+                        // 0 -> stdin
+                        Some(Arc::new(Stdin)),
+                        // 1 -> stdout
+                        Some(Arc::new(Stdout)),
+                        // 2 -> stderr
+                        Some(Arc::new(Stdout)),
+                    ],
+                    fd_cloexec: vec![false, false, false],
+                    files_id: pid_value,
+                    rlimit_nofile: 1024,
+                    rlimit_nofile_max: 1024,
+                    rlimit_memlock: 64 * 1024,
+                    rlimit_memlock_max: 64 * 1024,
+                    cwd: ROOT_DENTRY.clone(),
+                    root: ROOT_DENTRY.clone(),
+                    executable_path: String::from("/initproc"),
+                    tid_ptr: 0,
+                    tgid: pid_value,
+                    pgid: pid_value,
+                    sid: pid_value,
+                    uid: 0,
+                    euid: 0,
+                    suid: 0,
+                    gid: 0,
+                    egid: 0,
+                    sgid: 0,
+                    supplementary_groups: Vec::new(),
+                    umask: 0o022,
+                    nice: 0,
+                    signals: SignalFlags::empty(),
+                    pending_signal_info: [PendingSignalInfo::default(); super::MAX_SIG + 1],
+                    signal_mask: SignalFlags::empty(),
+                    signal_mask_backup: None,
+                    sigsuspend_delivery: None,
+                    handling_sig: -1,
+                    signal_actions: Arc::new(SignalActionsLock::new_named(
+                        SignalActions::default(),
+                        "SignalActions",
+                    )),
+                    killed: false,
+                    terminating_for_exec: false,
+                    terminating_for_group: false,
+                    frozen: false,
+                    trap_ctx_backup: None,
+                    signal_ucontext: None,
+                    kernel_stack: kstack,
+                    // added
+                    heap_bottom,
+                    program_brk: heap_bottom,
+                    sleeping: None,
+                    utime: 0,
+                    stime: 0,
+                    cutime: 0,
+                    cstime: 0,
+                    last_time: polyhal::time::Time::now().to_nsec() as usize,
+                    block_reason: None,
+                    itimer_expire: 0,
+                    itimer_interval_us: 0,
+                    child_tid: 0,
+                    robust_list_head: 0,
+                    robust_list_len: 0,
+                    alt_stack: 0,
+                    alt_stack_size: 0,
+                    alt_stack_flags: 0,
+                    in_syscall: false,
+                    exit_signal: 0,
                 },
                 "TaskInner",
             ),
@@ -458,12 +491,21 @@ impl TaskControlBlock {
 
         let mut loaded = match MemorySet::from_elf_file(elf_file) {
             Some(loaded) => loaded,
-            None => return false,
+            None => {
+                #[cfg(feature = "smp-diagnostics")]
+                crate::println!("[exec-diag] tid={} main ELF load failed", self.getpid());
+                return false;
+            }
         };
         if let Some(file) = interp_file {
             let Some((interp_entry, interp_base)) =
                 MemorySet::load_interp_file(&mut loaded.memory_set, file, INTERP_BASE)
             else {
+                #[cfg(feature = "smp-diagnostics")]
+                crate::println!(
+                    "[exec-diag] tid={} interpreter ELF load failed",
+                    self.getpid()
+                );
                 return false;
             };
             loaded.entry_point = interp_entry;
@@ -507,12 +549,27 @@ impl TaskControlBlock {
             envs.len(),
         );
 
-        // The new address space becomes active before its initial stack is
-        // populated. Mark it now so future shootdowns cannot overlook this
-        // hart during exec's page-table handoff.
-        memory_set.enter_cpu(crate::task::current_hart_id());
-        memory_set.activate();
-        let token = memory_set.token();
+        // Keep the TCB's address-space metadata in step with the hardware
+        // page-table switch. A timer may schedule from an interruptible exec
+        // syscall, so publishing the replacement only after `activate()`
+        // would let the scheduler clear or mark the wrong activity bitmap.
+        let restore_interrupts = IRQ::int_enabled();
+        IRQ::int_disable();
+        let cpu = crate::task::current_hart_id();
+        let retired_memory_set = {
+            let mut inner = self.inner_exclusive_access();
+            inner.memory_set.leave_cpu(cpu);
+            core::mem::replace(&mut inner.memory_set, memory_set)
+        };
+        let token = {
+            let inner = self.inner_exclusive_access();
+            inner.memory_set.activate();
+            inner.memory_set.enter_cpu(cpu);
+            inner.memory_set.token()
+        };
+        // The processor no longer uses the old page table, so its frames may
+        // be released before constructing the new initial stack.
+        drop(retired_memory_set);
         let argc = args.len();
         let envc = envs.len();
 
@@ -658,24 +715,32 @@ impl TaskControlBlock {
         let crt_sp = sp;
 
         let mut inner = self.inner_exclusive_access();
-        // The old page table is no longer installed after `activate()` above.
-        // Drop this hart from its activity mask before replacing the TCB's
-        // address-space owner.
-        inner
-            .memory_set
-            .leave_cpu(crate::task::current_hart_id());
+        #[cfg(feature = "smp-diagnostics")]
+        for (fd, file) in inner.fd_table.iter().enumerate() {
+            if inner.fd_cloexec.get(fd).copied().unwrap_or(false)
+                && file
+                    .as_ref()
+                    .map(|file| file.as_any().is::<crate::fs::UnixSocketFile>())
+                    .unwrap_or(false)
+            {
+                crate::println!(
+                    "[socketpair-diag] exec-close tid={} tgid={} fd={}",
+                    self.getpid(),
+                    inner.tgid,
+                    fd,
+                );
+            }
+        }
         let cloexec_files = inner.take_cloexec_fds();
         let mut exec_actions = inner.signal_actions.lock().clone();
         exec_actions.reset_for_exec();
-        inner.signal_actions = Arc::new(SignalActionsLock::new_named(
-            exec_actions,
-            "SignalActions",
-        ));
+        inner.signal_actions =
+            Arc::new(SignalActionsLock::new_named(exec_actions, "SignalActions"));
         inner.handling_sig = -1;
         inner.signal_mask_backup = None;
+        inner.sigsuspend_delivery = None;
         inner.trap_ctx_backup = None;
         inner.signal_ucontext = None;
-        inner.memory_set = memory_set;
         inner.heap_bottom = heap_bottom;
         inner.program_brk = heap_bottom;
         inner.fp_state = UserFloatState::new();
@@ -694,21 +759,24 @@ impl TaskControlBlock {
             trap_cx[TrapFrameArgs::ARG1] = argv_base;
             trap_cx[TrapFrameArgs::ARG2] = envp_base;
         }
-        if tls_size > 0 {
-            trap_cx[TrapFrameArgs::TLS] = tls_base + tls_size;
-        } else {
-            let max_va: usize = inner.memory_set.max_end_vaddr().into();
-            let tls_va = (max_va + crate::config::PAGE_SIZE - 1) / crate::config::PAGE_SIZE
-                * crate::config::PAGE_SIZE;
-            let ok = inner.memory_set.insert_framed_area(
-                tls_va.into(),
-                (tls_va + crate::config::PAGE_SIZE).into(),
-                crate::mm::MapPermission::R
-                    | crate::mm::MapPermission::W
-                    | crate::mm::MapPermission::U,
-            );
-            if ok {
-                trap_cx[TrapFrameArgs::TLS] = tls_va + crate::config::PAGE_SIZE;
+        // ld.so owns TCB/DTV initialization for a dynamically linked program.
+        if interp_base == 0 {
+            if tls_size > 0 {
+                trap_cx[TrapFrameArgs::TLS] = tls_base + tls_size;
+            } else {
+                let max_va: usize = inner.memory_set.max_end_vaddr().into();
+                let tls_va = (max_va + crate::config::PAGE_SIZE - 1) / crate::config::PAGE_SIZE
+                    * crate::config::PAGE_SIZE;
+                let ok = inner.memory_set.insert_framed_area(
+                    tls_va.into(),
+                    (tls_va + crate::config::PAGE_SIZE).into(),
+                    crate::mm::MapPermission::R
+                        | crate::mm::MapPermission::W
+                        | crate::mm::MapPermission::U,
+                );
+                if ok {
+                    trap_cx[TrapFrameArgs::TLS] = tls_va + crate::config::PAGE_SIZE;
+                }
             }
         }
         #[cfg(feature = "smp-diagnostics")]
@@ -725,6 +793,9 @@ impl TaskControlBlock {
             committed_tp,
         );
         drop(inner);
+        if restore_interrupts {
+            IRQ::int_enable();
+        }
         for file in cloexec_files {
             file.close_ref();
         }
@@ -736,17 +807,18 @@ impl TaskControlBlock {
         // mappings for COW. A parent which is already a CLONE_VM group can be
         // active on several harts, so retain its activity mask while the PTEs
         // are changed and shoot those harts down after releasing Task/Vm.
-        let mut parent_active_cpus = 0;
+        let parent_activity;
         let memory_set = {
             let mut parent_inner = self.inner_exclusive_access();
-            parent_active_cpus = parent_inner.memory_set.active_cpu_mask();
+            parent_activity = parent_inner.memory_set.activity_handle();
             MemorySet::from_existed_user(&mut parent_inner.memory_set)?
         };
         assert!(
-            super::processor::flush_remote_tlb(parent_active_cpus, 0, 0),
+            super::processor::flush_remote_tlb(&parent_activity, 0, 0),
             "fork COW remote TLB shootdown failed"
         );
 
+        let _files_guard = super::FILE_TABLE_LOCK.lock();
         let (
             trap_cx_clone,
             base_size,
@@ -758,6 +830,7 @@ impl TaskControlBlock {
             rlimit_memlock_max,
             cwd,
             root,
+            executable_path,
             _tid_ptr,
             _parent_tgid,
             pgid,
@@ -802,6 +875,7 @@ impl TaskControlBlock {
                 parent_inner.rlimit_memlock_max,
                 parent_inner.cwd.clone(),
                 parent_inner.root.clone(),
+                parent_inner.executable_path.clone(),
                 parent_inner.tid_ptr,
                 parent_inner.tgid,
                 parent_inner.pgid,
@@ -822,6 +896,7 @@ impl TaskControlBlock {
                 parent_inner.fp_state,
             )
         };
+        drop(_files_guard);
 
         let pid_handle = pid_alloc();
         let pid_value = pid_handle.0;
@@ -831,69 +906,71 @@ impl TaskControlBlock {
             scheduling: TaskSchedulingMeta::new(),
             inner: TaskLock::new_named(
                 TaskControlBlockInner {
-                        trap_cx: trap_cx_clone,
-                        fp_state,
-                        base_size,
-                        task_cx: blank_kcontext(kstack.get_position().1), // Set task_cx's Kernel Stack Top
-                        task_status: TaskStatus::Ready,
-                        memory_set,
-                        parent: Some(Arc::downgrade(self)),
-                        children: Vec::new(),
-                        exit_code: 0,
-                        fd_table,
-                        fd_cloexec,
-                        rlimit_nofile,
-                        rlimit_nofile_max,
-                        rlimit_memlock,
-                        rlimit_memlock_max,
-                        cwd,
-                        root,
-                        tid_ptr: 0,
-                        tgid: pid_value,
-                        pgid,
-                        sid,
-                        uid,
-                        euid,
-                        suid,
-                        gid,
-                        egid,
-                        sgid,
-                        supplementary_groups,
-                        umask,
-                        nice,
-                        signals: SignalFlags::empty(),
-                        pending_signal_info: [
-                            PendingSignalInfo::default();
-                            super::MAX_SIG + 1
-                        ],
-                        signal_mask,
-                        signal_mask_backup: None,
-                        handling_sig: -1,
-                        signal_actions,
-                        killed: false,
-                        frozen: false,
-                        trap_ctx_backup: None,
-                        signal_ucontext: None,
-                        kernel_stack: kstack,
-                        heap_bottom,
-                        program_brk,
-                        sleeping: None,
-                        utime: 0,
-                        stime: 0,
-                        cutime: 0,
-                        cstime: 0,
-                        last_time: polyhal::time::Time::now().to_nsec() as usize,
-                        block_reason: None,
-                        itimer_expire: 0,
-                        itimer_interval_us: 0,
-                        child_tid: 0,
-                        robust_list_head: 0,
-                        robust_list_len: 0,
-                        alt_stack: 0,
-                        alt_stack_size: 0,
-                        alt_stack_flags: 0,
-                        in_syscall: false,
-                        exit_signal: 0,
+                    trap_cx: trap_cx_clone,
+                    fp_state,
+                    base_size,
+                    task_cx: blank_kcontext(kstack.get_position().1), // Set task_cx's Kernel Stack Top
+                    task_status: TaskStatus::Ready,
+                    memory_set,
+                    parent: Some(Arc::downgrade(self)),
+                    children: Vec::new(),
+                    exit_code: 0,
+                    fd_table,
+                    fd_cloexec,
+                    files_id: pid_value,
+                    rlimit_nofile,
+                    rlimit_nofile_max,
+                    rlimit_memlock,
+                    rlimit_memlock_max,
+                    cwd,
+                    root,
+                    executable_path,
+                    tid_ptr: 0,
+                    tgid: pid_value,
+                    pgid,
+                    sid,
+                    uid,
+                    euid,
+                    suid,
+                    gid,
+                    egid,
+                    sgid,
+                    supplementary_groups,
+                    umask,
+                    nice,
+                    signals: SignalFlags::empty(),
+                    pending_signal_info: [PendingSignalInfo::default(); super::MAX_SIG + 1],
+                    signal_mask,
+                    signal_mask_backup: None,
+                    sigsuspend_delivery: None,
+                    handling_sig: -1,
+                    signal_actions,
+                    killed: false,
+                    terminating_for_exec: false,
+                    terminating_for_group: false,
+                    frozen: false,
+                    trap_ctx_backup: None,
+                    signal_ucontext: None,
+                    kernel_stack: kstack,
+                    heap_bottom,
+                    program_brk,
+                    sleeping: None,
+                    utime: 0,
+                    stime: 0,
+                    cutime: 0,
+                    cstime: 0,
+                    last_time: polyhal::time::Time::now().to_nsec() as usize,
+                    block_reason: None,
+                    itimer_expire: 0,
+                    itimer_interval_us: 0,
+                    child_tid: 0,
+                    robust_list_head: 0,
+                    robust_list_len: 0,
+                    alt_stack: 0,
+                    alt_stack_size: 0,
+                    alt_stack_flags: 0,
+                    in_syscall: false,
+                    exit_signal: 0,
                 },
                 "TaskInner",
             ),
@@ -908,25 +985,27 @@ impl TaskControlBlock {
     pub fn clone_shared_vm(
         self: &Arc<TaskControlBlock>,
         share_signal_actions: bool,
+        share_files: bool,
+        materialize_writable_pages: bool,
     ) -> Option<Arc<TaskControlBlock>> {
         trace!("os::task::TaskControlBlock::clone_shared_vm");
-        // A later CLONE_VM can restore writable PTEs which a previous fork
-        // write-protected for COW. Capture the complete shared address-space
-        // activity set before that mutation; no lock is held when the remote
-        // fence is issued below.
-        let mut parent_active_cpus = 0;
+        let _files_guard = super::FILE_TABLE_LOCK.lock();
+        let mut parent_activity = None;
+        let mut remapped_shared_pages = false;
         let (
             memory_set,
             trap_cx_clone,
             base_size,
             fd_table,
             fd_cloexec,
+            parent_files_id,
             rlimit_nofile,
             rlimit_nofile_max,
             rlimit_memlock,
             rlimit_memlock_max,
             cwd,
             root,
+            executable_path,
             _tid_ptr,
             pgid,
             sid,
@@ -946,9 +1025,15 @@ impl TaskControlBlock {
             fp_state,
         ) = {
             let mut parent_inner = self.inner_exclusive_access();
-            parent_active_cpus = parent_inner.memory_set.active_cpu_mask();
-            if !parent_inner.memory_set.prepare_shared_writable_pages() {
-                return None;
+            // COW mappings require normalization only when this is the first
+            // CLONE_VM conversion of a private address space. Rewriting an
+            // already shared page table would race with its running siblings.
+            if materialize_writable_pages && !parent_inner.memory_set.is_shared() {
+                parent_activity = Some(parent_inner.memory_set.activity_handle());
+                if !parent_inner.memory_set.prepare_shared_writable_pages() {
+                    return None;
+                }
+                remapped_shared_pages = true;
             }
             parent_inner.memory_set.mark_shared();
             let memory_set = MemorySet::from_shared(&parent_inner.memory_set);
@@ -960,27 +1045,37 @@ impl TaskControlBlock {
                     "SignalActions",
                 ))
             };
+            let (fd_table, fd_cloexec) = if share_files {
+                (Vec::new(), Vec::new())
+            } else {
+                (
+                    parent_inner
+                        .fd_table
+                        .iter()
+                        .map(|f| {
+                            f.as_ref().map(|x| {
+                                x.dup_ref();
+                                x.clone()
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                    parent_inner.fd_cloexec.clone(),
+                )
+            };
             (
                 memory_set,
                 parent_inner.trap_cx.clone(),
                 parent_inner.base_size,
-                parent_inner
-                    .fd_table
-                    .iter()
-                    .map(|f| {
-                        f.as_ref().map(|x| {
-                            x.dup_ref();
-                            x.clone()
-                        })
-                    })
-                    .collect::<Vec<_>>(),
-                parent_inner.fd_cloexec.clone(),
+                fd_table,
+                fd_cloexec,
+                parent_inner.files_id,
                 parent_inner.rlimit_nofile,
                 parent_inner.rlimit_nofile_max,
                 parent_inner.rlimit_memlock,
                 parent_inner.rlimit_memlock_max,
                 parent_inner.cwd.clone(),
                 parent_inner.root.clone(),
+                parent_inner.executable_path.clone(),
                 parent_inner.tid_ptr,
                 parent_inner.pgid,
                 parent_inner.sid,
@@ -1001,10 +1096,20 @@ impl TaskControlBlock {
             )
         };
 
-        assert!(
-            super::processor::flush_remote_tlb(parent_active_cpus, 0, 0),
-            "CLONE_VM remote TLB shootdown failed"
-        );
+        // Do not retain the descriptor-table serialization lock while sending
+        // an inter-processor TLB fence.
+        drop(_files_guard);
+
+        if remapped_shared_pages {
+            assert!(
+                super::processor::flush_remote_tlb(
+                    parent_activity.as_ref().expect("missing shared VM activity"),
+                    0,
+                    0,
+                ),
+                "CLONE_VM remote TLB shootdown failed"
+            );
+        }
 
         let pid_handle = pid_alloc();
         let pid_value = pid_handle.0;
@@ -1014,69 +1119,71 @@ impl TaskControlBlock {
             scheduling: TaskSchedulingMeta::new(),
             inner: TaskLock::new_named(
                 TaskControlBlockInner {
-                        trap_cx: trap_cx_clone,
-                        fp_state,
-                        base_size,
-                        task_cx: blank_kcontext(kstack.get_position().1),
-                        task_status: TaskStatus::Ready,
-                        memory_set,
-                        parent: Some(Arc::downgrade(self)),
-                        children: Vec::new(),
-                        exit_code: 0,
-                        fd_table,
-                        fd_cloexec,
-                        rlimit_nofile,
-                        rlimit_nofile_max,
-                        rlimit_memlock,
-                        rlimit_memlock_max,
-                        cwd,
-                        root,
-                        tid_ptr: 0,
-                        tgid: pid_value,
-                        pgid,
-                        sid,
-                        uid,
-                        euid,
-                        suid,
-                        gid,
-                        egid,
-                        sgid,
-                        supplementary_groups,
-                        umask,
-                        nice,
-                        signals: SignalFlags::empty(),
-                        pending_signal_info: [
-                            PendingSignalInfo::default();
-                            super::MAX_SIG + 1
-                        ],
-                        signal_mask,
-                        signal_mask_backup: None,
-                        handling_sig: -1,
-                        signal_actions,
-                        killed: false,
-                        frozen: false,
-                        trap_ctx_backup: None,
-                        signal_ucontext: None,
-                        kernel_stack: kstack,
-                        heap_bottom,
-                        program_brk,
-                        sleeping: None,
-                        utime: 0,
-                        stime: 0,
-                        cutime: 0,
-                        cstime: 0,
-                        last_time: polyhal::time::Time::now().to_nsec() as usize,
-                        block_reason: None,
-                        itimer_expire: 0,
-                        itimer_interval_us: 0,
-                        child_tid: 0,
-                        robust_list_head: 0,
-                        robust_list_len: 0,
-                        alt_stack: 0,
-                        alt_stack_size: 0,
-                        alt_stack_flags: 0,
-                        in_syscall: false,
-                        exit_signal: 0,
+                    trap_cx: trap_cx_clone,
+                    fp_state,
+                    base_size,
+                    task_cx: blank_kcontext(kstack.get_position().1),
+                    task_status: TaskStatus::Ready,
+                    memory_set,
+                    parent: Some(Arc::downgrade(self)),
+                    children: Vec::new(),
+                    exit_code: 0,
+                    fd_table,
+                    fd_cloexec,
+                    files_id: if share_files { parent_files_id } else { pid_value },
+                    rlimit_nofile,
+                    rlimit_nofile_max,
+                    rlimit_memlock,
+                    rlimit_memlock_max,
+                    cwd,
+                    root,
+                    executable_path,
+                    tid_ptr: 0,
+                    tgid: pid_value,
+                    pgid,
+                    sid,
+                    uid,
+                    euid,
+                    suid,
+                    gid,
+                    egid,
+                    sgid,
+                    supplementary_groups,
+                    umask,
+                    nice,
+                    signals: SignalFlags::empty(),
+                    pending_signal_info: [PendingSignalInfo::default(); super::MAX_SIG + 1],
+                    signal_mask,
+                    signal_mask_backup: None,
+                    sigsuspend_delivery: None,
+                    handling_sig: -1,
+                    signal_actions,
+                    killed: false,
+                    terminating_for_exec: false,
+                    terminating_for_group: false,
+                    frozen: false,
+                    trap_ctx_backup: None,
+                    signal_ucontext: None,
+                    kernel_stack: kstack,
+                    heap_bottom,
+                    program_brk,
+                    sleeping: None,
+                    utime: 0,
+                    stime: 0,
+                    cutime: 0,
+                    cstime: 0,
+                    last_time: polyhal::time::Time::now().to_nsec() as usize,
+                    block_reason: None,
+                    itimer_expire: 0,
+                    itimer_interval_us: 0,
+                    child_tid: 0,
+                    robust_list_head: 0,
+                    robust_list_len: 0,
+                    alt_stack: 0,
+                    alt_stack_size: 0,
+                    alt_stack_flags: 0,
+                    in_syscall: false,
+                    exit_signal: 0,
                 },
                 "TaskInner",
             ),
@@ -1085,10 +1192,44 @@ impl TaskControlBlock {
             let mut parent_inner = self.inner_exclusive_access();
             parent_inner.children.push(task_control_block.clone());
         }
+        if share_files {
+            let mut files = super::FILE_TABLE_LOCK.lock();
+            task_control_block.initialize_shared_files_from(self);
+            super::register_files_task_locked(&mut files, &task_control_block);
+        }
         Some(task_control_block)
+    }
+    pub(crate) fn initialize_shared_files_from(&self, parent: &Arc<TaskControlBlock>) {
+        let (files_id, fd_table, fd_cloexec) = {
+            let parent_inner = parent.inner_exclusive_access();
+            (
+                parent_inner.files_id,
+                parent_inner
+                    .fd_table
+                    .iter()
+                    .map(|file| {
+                        file.as_ref().map(|file| {
+                            file.dup_ref();
+                            file.clone()
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+                parent_inner.fd_cloexec.clone(),
+            )
+        };
+        let mut inner = self.inner_exclusive_access();
+        debug_assert!(inner.fd_table.is_empty());
+        debug_assert!(inner.fd_cloexec.is_empty());
+        debug_assert_eq!(inner.files_id, files_id);
+        inner.fd_table = fd_table;
+        inner.fd_cloexec = fd_cloexec;
     }
     pub fn getpid(&self) -> usize {
         self.pid.0
+    }
+
+    pub fn set_executable_path(&self, executable_path: String) {
+        self.inner_exclusive_access().executable_path = executable_path;
     }
 
     /// The hart currently running this task, or [`NO_RUNNING_CPU`].
@@ -1102,6 +1243,10 @@ impl TaskControlBlock {
 
     pub fn exit_cleanup_done(&self) -> bool {
         self.scheduling.exit_cleanup_done.load(Ordering::Acquire)
+    }
+
+    pub fn is_waitable_zombie(&self) -> bool {
+        self.scheduling.waitable_zombie.load(Ordering::Acquire)
     }
 
     pub(crate) fn set_vfork_parent(&self, parent_tid: usize) {
@@ -1131,6 +1276,10 @@ impl TaskControlBlock {
         self.scheduling
             .exit_cleanup_done
             .store(true, Ordering::Release);
+    }
+
+    pub(crate) fn publish_waitable_zombie(&self) {
+        self.scheduling.waitable_zombie.store(true, Ordering::Release);
     }
 
     /// Return the task's requested CPU mask.  The mask is not user-modifiable
@@ -1174,12 +1323,7 @@ impl TaskControlBlock {
         assert!(
             self.scheduling
                 .running_cpu
-                .compare_exchange(
-                    NO_RUNNING_CPU,
-                    cpu,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
+                .compare_exchange(NO_RUNNING_CPU, cpu, Ordering::AcqRel, Ordering::Acquire,)
                 .is_ok(),
             "pid {} was dispatched while already owned by hart {}",
             self.getpid(),
@@ -1239,6 +1383,9 @@ pub enum BlockReason {
     TcpSend(usize),
     TcpAccept(usize),
     TcpConnect(usize),
+    LocalTcpRecv(usize, bool),
+    LocalTcpSend(usize, bool),
+    LocalTcpAccept(u16),
     UdpRecv(usize),
     PollWait,
     PipeRead(usize),

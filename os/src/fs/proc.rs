@@ -314,7 +314,7 @@ impl File for ProcPidStatusFile {
 
 /// Snapshot of the harts which completed scheduler initialization when
 /// `/proc/cpuinfo` was opened.  This makes the default one-core QEMU boot and
-/// the explicit four-core boot accurately distinguishable to userspace.
+/// an explicit SMP boot accurately distinguishable to userspace.
 pub struct ProcCpuinfoFile {
     offset: VfsLock<usize>,
     content: String,

@@ -12,7 +12,13 @@ use crate::task::{
 use crate::fs::stdio::stdout_release_if_owner;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(feature = "smp-diagnostics")]
+use core::sync::atomic::AtomicUsize;
+
 const O_NONBLOCK: usize = 0x800;
+
+#[cfg(feature = "smp-diagnostics")]
+static NEXT_PIPE_DIAG_ID: AtomicUsize = AtomicUsize::new(1);
 
 fn current_task_interrupted() -> bool {
     current_task()
@@ -58,7 +64,10 @@ impl Pipe {
     }
 }
 
-const RING_BUFFER_SIZE: usize = 8192;
+// Linux creates pipes with a 16-page capacity by default.  Keeping the same
+// baseline avoids deadlocking a parent that waits for a child whose bounded
+// diagnostic output has not yet been drained.
+const RING_BUFFER_SIZE: usize = 16 * crate::config::PAGE_SIZE;
 
 #[derive(Copy, Clone, PartialEq)]
 enum RingBufferStatus {
@@ -74,6 +83,8 @@ pub struct PipeRingBuffer {
     status: RingBufferStatus,
     read_open: usize,
     write_open: usize,
+    #[cfg(feature = "smp-diagnostics")]
+    diagnostic_id: usize,
 }
 
 impl PipeRingBuffer {
@@ -85,6 +96,8 @@ impl PipeRingBuffer {
             status: RingBufferStatus::Empty,
             read_open: 1,
             write_open: 1,
+            #[cfg(feature = "smp-diagnostics")]
+            diagnostic_id: NEXT_PIPE_DIAG_ID.fetch_add(1, Ordering::Relaxed),
         }
     }
     pub fn write_buf(&mut self, src: &[u8]) -> usize {
@@ -177,6 +190,13 @@ pub fn make_pipe() -> (Arc<Pipe>, Arc<Pipe>) {
     ));
     let read_end = Arc::new(Pipe::read_end_with_buffer(buffer.clone()));
     let write_end = Arc::new(Pipe::write_end_with_buffer(buffer.clone()));
+    #[cfg(feature = "smp-diagnostics")]
+    crate::println!(
+        "[pipe-diag] create tid={} id={} key={:#x}",
+        current_task().map(|task| task.getpid()).unwrap_or(0),
+        buffer.exclusive_access().diagnostic_id,
+        Arc::as_ptr(&buffer) as usize,
+    );
     (read_end, write_end)
 }
 
@@ -266,12 +286,34 @@ impl File for Pipe {
                 )
             };
             if read_end_closed {
+                #[cfg(feature = "smp-diagnostics")]
+                {
+                    let diagnostic_id = self.buffer.exclusive_access().diagnostic_id;
+                    crate::println!(
+                        "[pipe-diag] epipe tid={} id={} key={:#x}",
+                        current_task().map(|task| task.getpid()).unwrap_or(0),
+                        diagnostic_id,
+                        self.wait_key(),
+                    );
+                }
                 current_add_signal(SignalFlags::SIGPIPE);
                 return -32;
             }
             if loop_write == 0 {
                 if self.is_nonblock() {
                     return -11;
+                }
+                #[cfg(feature = "smp-diagnostics")]
+                {
+                    let diagnostic_id = self.buffer.exclusive_access().diagnostic_id;
+                    crate::println!(
+                        "[pipe-diag] write-block tid={} id={} key={:#x} total={} written={}",
+                        current_task().map(|task| task.getpid()).unwrap_or(0),
+                        diagnostic_id,
+                        self.wait_key(),
+                        want_to_write,
+                        already_write,
+                    );
                 }
                 stdout_release_if_owner();
                 let key = self.wait_key();
@@ -340,6 +382,8 @@ impl File for Pipe {
         }
     }
     fn close_ref(&self) {
+        #[cfg(feature = "smp-diagnostics")]
+        let closing_tid = current_task().map(|task| task.getpid()).unwrap_or(0);
         let mut ring_buffer = self.buffer.exclusive_access();
         let mut last_read_closed = false;
         let mut last_write_closed = false;
@@ -350,6 +394,16 @@ impl File for Pipe {
             last_write_closed = ring_buffer.close_write_end();
         }
         drop(ring_buffer);
+        #[cfg(feature = "smp-diagnostics")]
+        if last_read_closed {
+            let diagnostic_id = self.buffer.exclusive_access().diagnostic_id;
+            crate::println!(
+                "[pipe-diag] last-read-close tid={} id={} key={:#x}",
+                closing_tid,
+                diagnostic_id,
+                self.wait_key(),
+            );
+        }
         if last_read_closed || last_write_closed {
             let key = self.wait_key();
             if last_read_closed {

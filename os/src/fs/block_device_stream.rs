@@ -1,11 +1,15 @@
 // 这里负责操作系统的文件管理：把块设备包装成 lwext4 可以读写和 seek 的流接口。
 use crate::drivers::BlockDevice;
 use alloc::sync::Arc;
+#[cfg(feature = "mount-trace")]
+use core::sync::atomic::{AtomicUsize, Ordering};
 use lwext4_rust::Ext4BlockWrapper;
 use lwext4_rust::KernelDevOp;
 
 const SECTOR_SIZE: usize = 512;
 const MAX_BULK_IO_SIZE: usize = 64 * 1024;
+#[cfg(feature = "mount-trace")]
+static MOUNT_TRACE_TEST_DISK_READS: AtomicUsize = AtomicUsize::new(0);
 
 pub struct BlockDeviceStream {
     pub inner: Arc<dyn BlockDevice>,
@@ -77,6 +81,18 @@ impl KernelDevOp for BlockDeviceStreamOp {
         let pos = dev.pos;
         let sector = pos / SECTOR_SIZE;
         let offset = pos % SECTOR_SIZE;
+        #[cfg(feature = "mount-trace")]
+        let trace = dev.total_size == 512 * 1024 * 1024
+            && MOUNT_TRACE_TEST_DISK_READS.fetch_add(1, Ordering::Relaxed) < 32;
+        #[cfg(feature = "mount-trace")]
+        if trace {
+            crate::println!(
+                "[mount-trace] test-disk-read-begin pos={} len={} sector={}",
+                pos,
+                buf.len(),
+                sector
+            );
+        }
 
         if offset == 0 && buf.len() % SECTOR_SIZE == 0 {
             let mut read = 0;
@@ -104,6 +120,14 @@ impl KernelDevOp for BlockDeviceStreamOp {
             let len = buf.len();
             buf.copy_from_slice(&raw[offset..offset + len]);
             dev.pos = pos + len;
+        }
+        #[cfg(feature = "mount-trace")]
+        if trace {
+            crate::println!(
+                "[mount-trace] test-disk-read-done pos={} len={}",
+                pos,
+                buf.len()
+            );
         }
         Ok(buf.len())
     }

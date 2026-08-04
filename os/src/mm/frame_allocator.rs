@@ -6,7 +6,6 @@ use alloc::vec::Vec;
 use buddy_system_allocator::FrameAllocator;
 use core::{
     fmt::{self, Debug, Formatter},
-    mem::size_of,
     sync::atomic::{AtomicUsize, Ordering},
 };
 use polyhal::{pa, PhysAddr};
@@ -25,10 +24,11 @@ fn ref_key(paddr: PhysAddr) -> usize {
 
 // 增加共享物理页的引用计数。
 // 执行时锁住 FRAME_REFS，找到页号对应计数，没有记录时从 1 开始，再递增一次。
-fn ref_inc(paddr: PhysAddr) {
+fn ref_inc(paddr: PhysAddr) -> usize {
     let mut refs = FRAME_REFS.lock();
     let entry = refs.entry(ref_key(paddr)).or_insert(1);
     *entry += 1;
+    *entry
 }
 
 pub struct FrameTracker {
@@ -45,7 +45,9 @@ impl FrameTracker {
     // 为共享映射复制一个 tracker，不实际分配新页。
     // 执行时只增加这页的共享引用计数，并返回指向同一物理页的新 tracker。
     pub fn shared_clone(&self) -> Self {
-        ref_inc(self.paddr);
+        let refs = ref_inc(self.paddr);
+        #[cfg(feature = "smp-diagnostics")]
+        trace_shared_clone(self.paddr, refs);
         Self { paddr: self.paddr }
     }
     // 判断这页是否还有别的 tracker 引用。
@@ -65,11 +67,17 @@ impl Drop for FrameTracker {
         if let Some(count) = refs.get_mut(&key) {
             if *count > 1 {
                 *count -= 1;
+                let remaining = *count;
+                drop(refs);
+                #[cfg(feature = "smp-diagnostics")]
+                trace_drop(self.paddr, remaining);
                 return;
             }
             refs.remove(&key);
         }
         drop(refs);
+        #[cfg(feature = "smp-diagnostics")]
+        trace_drop(self.paddr, 0);
         frame_dealloc(self.paddr);
     }
 }
@@ -90,17 +98,141 @@ pub static FRAME_ALLOCATOR: FrameAllocatorLock<FrameAllocator> =
 static TOTAL_FRAMES: AtomicUsize = AtomicUsize::new(0);
 static ALLOCATED_FRAMES: AtomicUsize = AtomicUsize::new(0);
 static FRAME_ALLOC_FAILURES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "smp-diagnostics")]
+static WATCHED_FRAME: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "smp-diagnostics")]
+static WATCHED_FRAME_OFFSET: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "smp-diagnostics")]
+static WATCHED_FRAME_HEAD: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "smp-diagnostics")]
+static WATCHED_FRAME_WORD: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "smp-diagnostics")]
+static WATCHED_FRAME_REPORTED: AtomicUsize = AtomicUsize::new(0);
 
-// 把启动阶段探测到的一段物理内存加入帧分配器。
-// 执行时先把这段物理内存清零，再按页对齐算出页号范围，最后加入 buddy frame allocator。
-pub fn add_frames_range(mm_start: usize, mm_end: usize) {
-    unsafe {
-        core::slice::from_raw_parts_mut(
-            pa!(mm_start).get_mut_ptr::<u128>(),
-            (mm_end - mm_start) / size_of::<u128>(),
-        )
-        .fill(0);
+#[cfg(feature = "smp-diagnostics")]
+pub fn watch_frame(paddr: PhysAddr, offset: usize, head: u32, word: u32) {
+    WATCHED_FRAME_OFFSET.store(offset, Ordering::Relaxed);
+    WATCHED_FRAME_HEAD.store(head as usize, Ordering::Relaxed);
+    WATCHED_FRAME_WORD.store(word as usize, Ordering::Relaxed);
+    WATCHED_FRAME_REPORTED.store(0, Ordering::Relaxed);
+    WATCHED_FRAME.store(paddr.raw(), Ordering::Release);
+    crate::println!(
+        "[frame-diag] watch paddr={:#x} offset={:#x} head={:#010x} word={:#010x}",
+        paddr.raw(),
+        offset,
+        head,
+        word,
+    );
+}
+
+/// Return the first observed mutation of the currently watched physical page.
+/// This is diagnostic-only and deliberately checks two independent words so a
+/// benign instruction-cache effect cannot be confused with memory corruption.
+#[cfg(feature = "smp-diagnostics")]
+pub fn take_watched_frame_corruption() -> Option<(PhysAddr, usize, u32, u32, u32, u32)> {
+    let raw = WATCHED_FRAME.load(Ordering::Acquire);
+    if raw == 0 {
+        return None;
     }
+    let offset = WATCHED_FRAME_OFFSET.load(Ordering::Relaxed);
+    let expected_head = WATCHED_FRAME_HEAD.load(Ordering::Relaxed) as u32;
+    let expected_word = WATCHED_FRAME_WORD.load(Ordering::Relaxed) as u32;
+    let paddr = pa!(raw);
+    let actual_head = unsafe { core::ptr::read_unaligned(paddr.get_ptr::<u32>()) };
+    let actual_word = unsafe {
+        core::ptr::read_unaligned((paddr + offset).get_ptr::<u32>())
+    };
+    if actual_head == expected_head && actual_word == expected_word {
+        return None;
+    }
+    if WATCHED_FRAME_REPORTED
+        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return None;
+    }
+    Some((
+        paddr,
+        offset,
+        expected_head,
+        actual_head,
+        expected_word,
+        actual_word,
+    ))
+}
+
+/// Check the watched page without consuming the first-corruption report.
+/// Callers that serialize an external writer can use this to identify the
+/// operation which changed the page before the next timer interrupt observes
+/// it.
+#[cfg(feature = "smp-diagnostics")]
+pub fn watched_frame_is_intact() -> bool {
+    let raw = WATCHED_FRAME.load(Ordering::Acquire);
+    if raw == 0 {
+        return true;
+    }
+    let offset = WATCHED_FRAME_OFFSET.load(Ordering::Relaxed);
+    let expected_head = WATCHED_FRAME_HEAD.load(Ordering::Relaxed) as u32;
+    let expected_word = WATCHED_FRAME_WORD.load(Ordering::Relaxed) as u32;
+    let paddr = pa!(raw);
+    let actual_head = unsafe { core::ptr::read_unaligned(paddr.get_ptr::<u32>()) };
+    let actual_word = unsafe {
+        core::ptr::read_unaligned((paddr + offset).get_ptr::<u32>())
+    };
+    actual_head == expected_head && actual_word == expected_word
+}
+
+#[cfg(feature = "smp-diagnostics")]
+pub fn watched_frame_paddr() -> Option<PhysAddr> {
+    let raw = WATCHED_FRAME.load(Ordering::Acquire);
+    (raw != 0).then(|| pa!(raw))
+}
+
+#[cfg(feature = "smp-diagnostics")]
+fn trace_allocation(paddr: PhysAddr, kind: &'static str) {
+    if WATCHED_FRAME.load(Ordering::Acquire) == paddr.raw() {
+        crate::println!(
+            "[frame-diag] allocate kind={} paddr={:#x}",
+            kind,
+            paddr.raw(),
+        );
+    }
+}
+
+#[cfg(feature = "smp-diagnostics")]
+fn trace_shared_clone(paddr: PhysAddr, refs: usize) {
+    if WATCHED_FRAME.load(Ordering::Acquire) == paddr.raw() {
+        crate::println!(
+            "[frame-diag] shared-clone paddr={:#x} refs={}",
+            paddr.raw(),
+            refs,
+        );
+    }
+}
+
+#[cfg(feature = "smp-diagnostics")]
+fn trace_drop(paddr: PhysAddr, remaining_refs: usize) {
+    if WATCHED_FRAME.load(Ordering::Acquire) == paddr.raw() {
+        crate::println!(
+            "[frame-diag] drop paddr={:#x} remaining_refs={}",
+            paddr.raw(),
+            remaining_refs,
+        );
+    }
+}
+
+#[cfg(feature = "smp-diagnostics")]
+fn trace_deallocation(paddr: PhysAddr) {
+    if WATCHED_FRAME.load(Ordering::Acquire) == paddr.raw() {
+        crate::println!("[frame-diag] deallocate paddr={:#x}", paddr.raw());
+    }
+}
+
+// Register a boot-discovered physical-memory range with the frame allocator.
+// Pages are cleared when handed out, not eagerly here: clearing all RAM at
+// boot makes large-memory QEMU configurations spend most of their startup
+// time writing unused pages while providing no additional isolation.
+pub fn add_frames_range(mm_start: usize, mm_end: usize) {
     let start = (mm_start + 0xfff) / PAGE_SIZE;
     let end = mm_end / PAGE_SIZE;
     TOTAL_FRAMES.fetch_add(end - start, Ordering::Relaxed);
@@ -110,11 +242,12 @@ pub fn add_frames_range(mm_start: usize, mm_end: usize) {
 // 分配一页受 RAII 管理的物理页。
 // 执行时从 buddy 分配器取 1 页，转换成 PhysAddr 并包成 FrameTracker，成功后增加已分配计数。
 pub fn frame_alloc() -> Option<FrameTracker> {
-    let ret = FRAME_ALLOCATOR
-        .lock()
-        .alloc(1)
-        .map(|x| pa!(x * PAGE_SIZE))
-        .map(FrameTracker::new);
+    let paddr = { FRAME_ALLOCATOR.lock().alloc(1).map(|x| pa!(x * PAGE_SIZE)) };
+    let ret = paddr.map(|paddr| {
+        #[cfg(feature = "smp-diagnostics")]
+        trace_allocation(paddr, "tracked");
+        FrameTracker::new(paddr)
+    });
     if ret.is_some() {
         ALLOCATED_FRAMES.fetch_add(1, Ordering::Relaxed);
     } else {
@@ -126,10 +259,7 @@ pub fn frame_alloc() -> Option<FrameTracker> {
 // 连续分配多页物理页，并逐页包装成 tracker。
 // 执行时从 buddy 分配器取连续页号，再按页大小展开成多个 FrameTracker。
 pub fn frames_alloc(count: usize) -> Option<Vec<FrameTracker>> {
-    let Some(start) = FRAME_ALLOCATOR
-        .lock()
-        .alloc(count)
-        .map(|x| pa!(x * PAGE_SIZE))
+    let Some(start) = ({ FRAME_ALLOCATOR.lock().alloc(count).map(|x| pa!(x * PAGE_SIZE)) })
     else {
         FRAME_ALLOC_FAILURES.fetch_add(1, Ordering::Relaxed);
         return None;
@@ -138,7 +268,11 @@ pub fn frames_alloc(count: usize) -> Option<Vec<FrameTracker>> {
     let ret = (0..count)
         .into_iter()
         .map(|idx| (start + idx * PAGE_SIZE))
-        .map(FrameTracker::new)
+        .map(|paddr| {
+            #[cfg(feature = "smp-diagnostics")]
+            trace_allocation(paddr, "tracked-batch");
+            FrameTracker::new(paddr)
+        })
         .collect();
     Some(ret)
 }
@@ -146,6 +280,8 @@ pub fn frames_alloc(count: usize) -> Option<Vec<FrameTracker>> {
 // 归还一页物理内存。
 // 执行时把物理地址换算成页号交回 buddy 分配器，并减少已分配页计数。
 pub fn frame_dealloc(paddr: PhysAddr) {
+    #[cfg(feature = "smp-diagnostics")]
+    trace_deallocation(paddr);
     FRAME_ALLOCATOR.lock().dealloc(paddr.raw() / PAGE_SIZE, 1);
     ALLOCATED_FRAMES.fetch_sub(1, Ordering::Relaxed);
 }
@@ -173,14 +309,13 @@ pub fn frame_alloc_failures() -> usize {
 // 分配一页不会被 FrameTracker 自动释放的物理页。
 // 执行时从 buddy 分配器取一页并清零，只返回 PhysAddr，让调用方自己管理生命周期。
 pub fn frame_alloc_persist() -> Option<PhysAddr> {
-    let ret = FRAME_ALLOCATOR
-        .lock()
-        .alloc(1)
-        .map(|x| pa!(x * PAGE_SIZE))
-        .inspect(|x| {
-            x.clear_len(PAGE_SIZE);
-            ALLOCATED_FRAMES.fetch_add(1, Ordering::Relaxed);
-        });
+    let ret = { FRAME_ALLOCATOR.lock().alloc(1).map(|x| pa!(x * PAGE_SIZE)) };
+    if let Some(paddr) = ret {
+        #[cfg(feature = "smp-diagnostics")]
+        trace_allocation(paddr, "persistent");
+        paddr.clear_len(PAGE_SIZE);
+        ALLOCATED_FRAMES.fetch_add(1, Ordering::Relaxed);
+    }
     if ret.is_none() {
         FRAME_ALLOC_FAILURES.fetch_add(1, Ordering::Relaxed);
     }

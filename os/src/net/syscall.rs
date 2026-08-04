@@ -10,10 +10,11 @@ use crate::fs::stdio::stdout_release_if_owner;
 use crate::fs::File;
 use crate::mm::{translated_ref, translated_refmut};
 use crate::net::socket::{SocketFile, SocketType};
+use crate::syscall::install_fd_shared;
 use crate::sync::DeviceLock;
 use crate::task::{
     block_current_and_run_next, block_current_and_run_next_if, current_task, current_user_token,
-    suspend_current_and_run_next, task_snapshot, wake_udp_waiters, BlockReason,
+    suspend_current_and_run_next, wake_udp_waiters, BlockReason,
 };
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
@@ -103,59 +104,17 @@ fn create_socket_fd(st: SocketType, nonblock: bool, cloexec: bool) -> isize {
         dummy_socket_handle()
     };
     let task = current_task().unwrap();
-    let mut inner = task.inner_exclusive_access();
-    let fd = inner.alloc_fd();
-    if fd >= inner.fd_table.len() {
-        return -24;
-    }
     let file: Arc<dyn File + Send + Sync> = Arc::new(SocketFile::new(handle, st, nonblock));
-    inner.fd_table[fd] = Some(file.clone());
-    inner.fd_cloexec[fd] = cloexec;
-    let tgid = inner.tgid;
-    drop(inner);
-    install_fd_for_thread_group(task.getpid(), tgid, fd, file, cloexec);
-    fd as isize
+    install_fd_shared(&task, file, cloexec)
+        .map(|fd| fd as isize)
+        .unwrap_or_else(|errno| errno)
 }
 
 fn alloc_null_socket_fd(cloexec: bool) -> isize {
     let task = current_task().unwrap();
-    let mut inner = task.inner_exclusive_access();
-    let fd = inner.alloc_fd();
-    if fd >= inner.fd_table.len() {
-        return -24;
-    }
-    inner.fd_table[fd] = Some(Arc::new(crate::fs::NullSocket));
-    inner.fd_cloexec[fd] = cloexec;
-    fd as isize
-}
-
-fn install_fd_for_thread_group(
-    owner_pid: usize,
-    tgid: usize,
-    fd: usize,
-    file: Arc<dyn File + Send + Sync>,
-    cloexec: bool,
-) {
-    let tasks: Vec<_> = task_snapshot()
-        .into_iter()
-        .filter(|task| task.getpid() != owner_pid)
-        .filter(|task| {
-            task.try_inner_borrow()
-                .map(|inner| inner.tgid == tgid)
-                .unwrap_or(false)
-        })
-        .collect();
-    for task in tasks {
-        if let Some(mut inner) = task.try_inner_exclusive_access() {
-            while inner.fd_table.len() <= fd {
-                inner.fd_table.push(None);
-                inner.fd_cloexec.push(false);
-            }
-            file.dup_ref();
-            inner.fd_table[fd] = Some(file.clone());
-            inner.fd_cloexec[fd] = cloexec;
-        }
-    }
+    install_fd_shared(&task, Arc::new(crate::fs::NullSocket), cloexec)
+        .map(|fd| fd as isize)
+        .unwrap_or_else(|errno| errno)
 }
 
 fn next_ephemeral_port() -> u16 {
@@ -310,6 +269,17 @@ fn sock_lookup(sockfd: usize) -> Option<(SocketHandle, SocketType, bool)> {
     Some((handle, st, nonblock))
 }
 
+fn with_unix_socket<T>(sockfd: usize, action: impl FnOnce(&crate::fs::UnixSocketFile) -> T) -> Option<T> {
+    let task = current_task()?;
+    let file = {
+        let inner = task.inner_exclusive_access();
+        inner.fd_table.get(sockfd)?.as_ref()?.clone()
+    };
+    file.as_any()
+        .downcast_ref::<crate::fs::UnixSocketFile>()
+        .map(action)
+}
+
 fn set_socket_local_endpoint(sockfd: usize, endpoint: IpEndpoint) {
     let Some(task) = current_task() else {
         return;
@@ -386,11 +356,6 @@ fn smoltcp_udp_endpoint(handle: SocketHandle) -> Option<IpEndpoint> {
     .flatten()
 }
 
-fn local_tcp_listener_index(port: u16) -> Option<usize> {
-    let listeners = LOCAL_TCP_LISTENERS.exclusive_access();
-    listeners.iter().position(|listener| listener.port == port)
-}
-
 fn local_tcp_endpoint(addr: IpEndpoint) -> bool {
     is_local_ipv4(addr.addr)
 }
@@ -436,8 +401,12 @@ pub(crate) fn local_tcp_listen(port: u16) {
 }
 
 pub(crate) fn local_tcp_unlisten(port: u16) {
-    let mut listeners = LOCAL_TCP_LISTENERS.exclusive_access();
-    listeners.retain(|listener| listener.port != port);
+    {
+        let mut listeners = LOCAL_TCP_LISTENERS.exclusive_access();
+        listeners.retain(|listener| listener.port != port);
+    }
+    crate::task::wake_local_tcp_acceptors(port);
+    crate::task::wake_poll_wait_tasks();
 }
 
 pub(crate) fn local_tcp_pending_on(port: u16) -> bool {
@@ -447,6 +416,39 @@ pub(crate) fn local_tcp_pending_on(port: u16) -> bool {
         .find(|listener| listener.port == port)
         .map(|listener| !listener.pending.is_empty())
         .unwrap_or(false)
+}
+
+fn local_tcp_listening(port: u16) -> bool {
+    LOCAL_TCP_LISTENERS
+        .exclusive_access()
+        .iter()
+        .any(|listener| listener.port == port)
+}
+
+fn local_tcp_recv_would_block(conn_id: usize, server_side: bool) -> bool {
+    let conns = LOCAL_TCP_CONNS.exclusive_access();
+    let Some(Some(conn)) = conns.get(conn_id) else {
+        return false;
+    };
+    let (src, peer_closed) = if server_side {
+        (&conn.client_to_server, conn.client_closed)
+    } else {
+        (&conn.server_to_client, conn.server_closed)
+    };
+    src.is_empty() && !peer_closed
+}
+
+fn local_tcp_send_would_block(conn_id: usize, server_side: bool) -> bool {
+    let conns = LOCAL_TCP_CONNS.exclusive_access();
+    let Some(Some(conn)) = conns.get(conn_id) else {
+        return false;
+    };
+    let (dst, peer_closed, self_closed) = if server_side {
+        (&conn.server_to_client, conn.client_closed, conn.server_closed)
+    } else {
+        (&conn.client_to_server, conn.server_closed, conn.client_closed)
+    };
+    !peer_closed && !self_closed && dst.len() >= LOCAL_TCP_BUFFER_LIMIT
 }
 
 fn local_udp_packet_matches(
@@ -481,7 +483,9 @@ fn local_tcp_connect(
     client_endpoint: IpEndpoint,
     server_endpoint: IpEndpoint,
 ) -> Option<usize> {
-    let listener_idx = local_tcp_listener_index(port)?;
+    if !local_tcp_listening(port) {
+        return None;
+    }
     let conn_id = {
         let mut conns = LOCAL_TCP_CONNS.exclusive_access();
         let conn = LocalTcpConn {
@@ -500,11 +504,24 @@ fn local_tcp_connect(
             conns.len() - 1
         }
     };
-    let mut listeners = LOCAL_TCP_LISTENERS.exclusive_access();
-    if let Some(listener) = listeners.get_mut(listener_idx) {
-        listener.pending.push_back(conn_id);
+    let connected = {
+        let mut listeners = LOCAL_TCP_LISTENERS.exclusive_access();
+        if let Some(listener) = listeners.iter_mut().find(|listener| listener.port == port) {
+            listener.pending.push_back(conn_id);
+            true
+        } else {
+            false
+        }
+    };
+    if connected {
+        crate::task::wake_local_tcp_acceptors(port);
+        crate::task::wake_poll_wait_tasks();
         Some(conn_id)
     } else {
+        let mut conns = LOCAL_TCP_CONNS.exclusive_access();
+        if conn_id < conns.len() {
+            conns[conn_id] = None;
+        }
         None
     }
 }
@@ -549,7 +566,12 @@ pub(crate) fn local_tcp_send(
             let Some(Some(conn)) = conns.get_mut(conn_id) else {
                 return -32;
             };
-            if (server_side && conn.client_closed) || (!server_side && conn.server_closed) {
+            let (peer_closed, self_closed) = if server_side {
+                (conn.client_closed, conn.server_closed)
+            } else {
+                (conn.server_closed, conn.client_closed)
+            };
+            if peer_closed || self_closed {
                 return -32;
             }
             let dst = if server_side {
@@ -569,15 +591,20 @@ pub(crate) fn local_tcp_send(
             }
         };
         if ret > 0 {
+            crate::task::wake_local_tcp_readers(conn_id, !server_side);
+            crate::task::wake_poll_wait_tasks();
             offset += ret as usize;
             if offset == data.len() || nonblock {
                 return offset as isize;
             }
+        } else if ret != -11 {
+            return if offset > 0 { offset as isize } else { ret };
         } else if nonblock {
             return if offset > 0 { offset as isize } else { -11 };
         } else {
-            stdout_release_if_owner();
-            suspend_current_and_run_next();
+            block_current_and_run_next_if(BlockReason::LocalTcpSend(conn_id, server_side), || {
+                local_tcp_send_would_block(conn_id, server_side)
+            });
         }
     }
 }
@@ -621,27 +648,36 @@ pub(crate) fn local_tcp_recv(
                 -11
             }
         };
+        if ret > 0 && !peek {
+            crate::task::wake_local_tcp_writers(conn_id, !server_side);
+            crate::task::wake_poll_wait_tasks();
+        }
         if ret != -11 || nonblock {
             return ret;
         }
-        stdout_release_if_owner();
-        suspend_current_and_run_next();
+        block_current_and_run_next_if(BlockReason::LocalTcpRecv(conn_id, server_side), || {
+            local_tcp_recv_would_block(conn_id, server_side)
+        });
     }
 }
 
 pub(crate) fn local_tcp_close(conn_id: usize, server_side: bool) {
-    let mut conns = LOCAL_TCP_CONNS.exclusive_access();
-    let Some(Some(conn)) = conns.get_mut(conn_id) else {
-        return;
-    };
-    if server_side {
-        conn.server_closed = true;
-    } else {
-        conn.client_closed = true;
+    {
+        let mut conns = LOCAL_TCP_CONNS.exclusive_access();
+        let Some(Some(conn)) = conns.get_mut(conn_id) else {
+            return;
+        };
+        if server_side {
+            conn.server_closed = true;
+        } else {
+            conn.client_closed = true;
+        }
+        if conn.server_closed && conn.client_closed {
+            conns[conn_id] = None;
+        }
     }
-    if conn.server_closed && conn.client_closed {
-        conns[conn_id] = None;
-    }
+    crate::task::wake_local_tcp_connection_waiters(conn_id);
+    crate::task::wake_poll_wait_tasks();
 }
 
 pub(crate) fn local_tcp_shutdown(conn_id: usize, server_side: bool, how: usize) -> isize {
@@ -894,8 +930,6 @@ pub(crate) fn udp_read_socket(
     }
 
     loop {
-        crate::net::net_poll();
-        crate::net::net_poll();
         crate::net::net_poll();
         if let Some(ret) = try_recv_local_udp_socket(sock, handle, buf, false) {
             return ret;
@@ -1221,11 +1255,6 @@ pub fn sys_accept(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
                     dummy_socket_handle()
                 };
                 let task = current_task().unwrap();
-                let mut inner = task.inner_exclusive_access();
-                let new_fd = inner.alloc_fd();
-                if new_fd >= inner.fd_table.len() {
-                    return -24;
-                }
                 let new_sock = Arc::new(SocketFile::new(new_handle, SocketType::Tcp, nonblock));
                 new_sock.set_local_tcp(conn_id, true);
                 if let Some(local) = local_tcp_server_endpoint(conn_id) {
@@ -1235,18 +1264,19 @@ pub fn sys_accept(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
                     new_sock.set_peer_endpoint(peer);
                 }
                 let file: Arc<dyn File + Send + Sync> = new_sock.clone();
-                inner.fd_table[new_fd] = Some(file.clone());
-                let tgid = inner.tgid;
-                let cloexec = inner.fd_cloexec.get(new_fd).copied().unwrap_or(false);
-                drop(inner);
-                install_fd_for_thread_group(task.getpid(), tgid, new_fd, file, cloexec);
-                return new_fd as isize;
+                return install_fd_shared(&task, file, false)
+                    .map(|fd| fd as isize)
+                    .unwrap_or_else(|errno| errno);
             }
             if nonblock {
                 return -11;
             }
-            stdout_release_if_owner();
-            suspend_current_and_run_next();
+            if !local_tcp_listening(port) {
+                return -22;
+            }
+            block_current_and_run_next_if(BlockReason::LocalTcpAccept(port), || {
+                local_tcp_listening(port) && !local_tcp_pending_on(port)
+            });
         }
     }
 
@@ -1259,7 +1289,6 @@ pub fn sys_accept(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
     if !nonblock {
         let mut prev_listening = true;
         loop {
-            crate::net::net_poll();
             crate::net::net_poll();
             let active = crate::net::with_net_iface(|iface| {
                 let sock: &TcpSocket = iface.sockets.get(handle);
@@ -1330,23 +1359,16 @@ pub fn sys_accept(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
         }
     }
 
-    // The new fd gets the old (now active) handle
-    let new_fd = inner.alloc_fd();
-    if new_fd >= inner.fd_table.len() {
-        return -24;
-    }
+    // The new descriptor gets the old (now active) handle.
     let file: Arc<dyn File + Send + Sync> =
         Arc::new(SocketFile::new(handle, SocketType::Tcp, nonblock));
-    inner.fd_table[new_fd] = Some(file.clone());
-    let tgid = inner.tgid;
-    let cloexec = inner.fd_cloexec.get(new_fd).copied().unwrap_or(false);
-
-    // Release inner lock before writing peer address (avoids holding lock during net_poll)
     drop(inner);
-    install_fd_for_thread_group(task.getpid(), tgid, new_fd, file, cloexec);
+    let new_fd = match install_fd_shared(&task, file, false) {
+        Ok(fd) => fd,
+        Err(errno) => return errno,
+    };
 
     // Ensure any pending data from client is delivered to the accepted socket
-    crate::net::net_poll();
     crate::net::net_poll();
 
     if !addr.is_null() && !addrlen.is_null() {
@@ -1376,6 +1398,16 @@ pub fn sys_sendto(
     dest_addr: *const u8,
     addrlen: usize,
 ) -> isize {
+    if let Some(result) = with_unix_socket(sockfd, |socket| {
+        if !dest_addr.is_null() && addrlen != 0 {
+            return -106;
+        }
+        let data = unsafe { core::slice::from_raw_parts(buf, len) };
+        socket.send_with_flags(data, flags)
+    }) {
+        return result;
+    }
+
     let (handle, st, nonblock) = match sock_lookup(sockfd) {
         Some(v) => v,
         None => return -9,
@@ -1425,6 +1457,17 @@ pub fn sys_recvfrom(
     src_addr: *mut u8,
     addrlen: *mut usize,
 ) -> isize {
+    if let Some(result) = with_unix_socket(sockfd, |socket| {
+        if !addrlen.is_null() {
+            let token = current_user_token();
+            *translated_refmut(token, addrlen as *mut u32) = 0;
+        }
+        let recv_buf = unsafe { core::slice::from_raw_parts_mut(buf, len) };
+        socket.recv_with_flags(recv_buf, flags)
+    }) {
+        return result;
+    }
+
     let (handle, st, nonblock) = match sock_lookup(sockfd) {
         Some(v) => v,
         None => return -9,
@@ -1489,6 +1532,18 @@ pub fn sys_sendmsg(sockfd: usize, msg: *const u8, flags: usize) -> isize {
     let token = current_user_token();
     let msghdr: &Msghdr = translated_ref(token, msg as *const Msghdr);
 
+    if let Some(result) = with_unix_socket(sockfd, |socket| {
+        if !msghdr.msg_name.is_null() && msghdr.msg_namelen != 0 {
+            return -106;
+        }
+        let total = iov_total_len(msghdr.msg_iov as *const Iovec, msghdr.msg_iovlen);
+        let mut buf = alloc::vec![0u8; total.min(SOCKET_BUFFER_SIZE)];
+        let copied = copy_from_iov(&mut buf, msghdr.msg_iov as *const Iovec, msghdr.msg_iovlen);
+        socket.send_with_flags(&buf[..copied], flags)
+    }) {
+        return result;
+    }
+
     let (handle, st, nonblock) = match sock_lookup(sockfd) {
         Some(v) => v,
         None => return -9,
@@ -1543,6 +1598,26 @@ pub fn sys_sendmsg(sockfd: usize, msg: *const u8, flags: usize) -> isize {
 pub fn sys_recvmsg(sockfd: usize, msg: *mut u8, flags: usize) -> isize {
     let token = current_user_token();
     let msghdr: &Msghdr = translated_ref(token, msg as *const Msghdr);
+
+    if let Some(result) = with_unix_socket(sockfd, |socket| {
+        let total = iov_total_len(msghdr.msg_iov as *const Iovec, msghdr.msg_iovlen);
+        if total == 0 {
+            return 0;
+        }
+        let mut buf = alloc::vec![0u8; total.min(SOCKET_BUFFER_SIZE)];
+        let result = socket.recv_with_flags(&mut buf, flags);
+        if result > 0 {
+            copy_to_iov(&buf[..result as usize], msghdr.msg_iov, msghdr.msg_iovlen);
+        }
+        let msghdr_mut: &mut Msghdr = translated_refmut(token, msg as *mut Msghdr);
+        msghdr_mut.msg_flags = 0;
+        if !msghdr_mut.msg_name.is_null() {
+            msghdr_mut.msg_namelen = 0;
+        }
+        result
+    }) {
+        return result;
+    }
 
     let (handle, st, nonblock) = match sock_lookup(sockfd) {
         Some(v) => v,
@@ -2030,8 +2105,6 @@ pub(crate) fn udp_recv(handle: SocketHandle, nonblock: bool, buf: &mut [u8]) -> 
     }
 
     loop {
-        crate::net::net_poll();
-        crate::net::net_poll();
         crate::net::net_poll();
         let result = crate::net::with_net_iface(|iface| {
             let sock: &mut UdpSocket = iface.sockets.get_mut(handle);

@@ -7,6 +7,9 @@ use polyhal::instruction::shutdown;
 // 内核 panic 入口，尽量打印位置和消息后关机。
 // 执行时优先打印 panic 的文件和行号；没有位置信息时只打印消息，最后调用 shutdown 停机。
 fn panic(info: &PanicInfo) -> ! {
+    // Always emit a direct UART record before halting: logging may be unavailable
+    // after an early SMP failure.
+    crate::println!("[kernel] panic: {}", info);
     if let Some(location) = info.location() {
         error!(
             "[kernel] Panicked at {}:{} {}",

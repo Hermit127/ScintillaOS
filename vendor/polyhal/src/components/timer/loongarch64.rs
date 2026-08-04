@@ -29,6 +29,7 @@ pub fn init() {
     let inter = LineBasedInterrupt::TIMER
         | LineBasedInterrupt::SWI0
         | LineBasedInterrupt::SWI1
-        | LineBasedInterrupt::HWI0;
+        | LineBasedInterrupt::HWI0
+        | LineBasedInterrupt::IPI;
     ecfg::set_lie(inter);
 }

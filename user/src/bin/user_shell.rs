@@ -244,7 +244,7 @@ pub fn main() -> i32 {
                                     exec_path.push_str(cmd.as_str());
                                     exec_path.push('\0');
                                 }
-                                if exec(exec_path.as_str(), args_addr.as_slice()) == -1 {
+                                if exec(exec_path.as_str(), args_addr.as_slice()) < 0 {
                                     user_lib::write(2, b"Error when executing!\n");
                                     return -4;
                                 }

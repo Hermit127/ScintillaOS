@@ -4,11 +4,15 @@ use crate::fs::vfs::{
     vfs_tmpfs_commit_resize, Dentry, VfsSuperBlock,
 };
 use crate::fs::{
-    follow_symlink, link_at, make_pipe, open_file_at, rename_at, symlink_at, unlink_at, DevBlock,
-    DevNull, DevZero, File, Kstat, OpenFlags, Urandom, S_IFDIR, S_IFREG,
+    follow_symlink, link_at, make_pipe, make_unix_socket_pair, open_file_at, rename_at,
+    symlink_at, unlink_at, DevBlock, DevNull, DevZero, EpollEvent, EpollFile, EventFdFile, File,
+    Kstat, OpenFlags, UnixSocketKind, Urandom, EPOLL_MAX_INTERESTS, S_IFDIR, S_IFREG,
 };
 use crate::mm::{translated_byte_buffer, translated_refmut, translated_str};
-use crate::task::{current_task, current_user_token, task_snapshot};
+use crate::task::{
+    current_task, current_user_token, file_group_tasks_locked, has_interrupting_signal,
+    pid2task, FILE_TABLE_LOCK,
+};
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -186,53 +190,107 @@ fn proc_fd_readlink(path: &str) -> Option<String> {
     fd_path_for_proc(fd)
 }
 
-fn install_fd_for_thread_group(
-    owner_pid: usize,
-    tgid: usize,
-    fd: usize,
-    file: Arc<dyn File + Send + Sync>,
-    cloexec: bool,
-) {
-    let tasks: Vec<_> = task_snapshot()
-        .into_iter()
-        .filter(|task| task.getpid() != owner_pid)
-        .filter(|task| {
-            task.try_inner_borrow()
-                .map(|inner| inner.tgid == tgid)
-                .unwrap_or(false)
-        })
-        .collect();
-    for task in tasks {
-        if let Some(mut inner) = task.try_inner_exclusive_access() {
-            while inner.fd_table.len() <= fd {
-                inner.fd_table.push(None);
-                inner.fd_cloexec.push(false);
-            }
-            file.dup_ref();
-            inner.fd_table[fd] = Some(file.clone());
-            inner.fd_cloexec[fd] = cloexec;
-        }
+fn proc_exe_task(path: &str) -> Option<Arc<crate::task::TaskControlBlock>> {
+    let path = path.trim_end_matches('/');
+    if path == "/proc/self/exe" {
+        return current_task();
+    }
+    let pid = path
+        .strip_prefix("/proc/")?
+        .strip_suffix("/exe")?
+        .parse::<usize>()
+        .ok()?;
+    pid2task(pid)
+}
+
+fn proc_exe_readlink(path: &str) -> Option<String> {
+    let task = proc_exe_task(path)?;
+    let inner = task.inner_exclusive_access();
+    if inner.executable_path.is_empty() {
+        None
+    } else {
+        Some(inner.executable_path.clone())
     }
 }
 
-fn close_fd_for_thread_group(owner_pid: usize, tgid: usize, fd: usize) {
-    let tasks: Vec<_> = task_snapshot()
-        .into_iter()
-        .filter(|task| task.getpid() != owner_pid)
-        .filter(|task| {
-            task.try_inner_borrow()
-                .map(|inner| inner.tgid == tgid)
-                .unwrap_or(false)
-        })
-        .collect();
-    for task in tasks {
-        let file = task
-            .try_inner_exclusive_access()
-            .and_then(|mut inner| inner.take_fd_for_close(fd));
-        if let Some(file) = file {
-            file.close_ref();
-        }
+fn open_proc_executable(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
+    let task = proc_exe_task(path)?;
+    let (root, executable_path) = {
+        let inner = task.inner_exclusive_access();
+        (inner.root.clone(), inner.executable_path.clone())
+    };
+    if executable_path.is_empty() {
+        return None;
     }
+    let relative_path = executable_path.strip_prefix('/').unwrap_or(&executable_path);
+    let file = open_file_at(Some(root), relative_path, OpenFlags::RDONLY, 0)?;
+    let file: Arc<dyn File + Send + Sync> = file;
+    Some(file)
+}
+
+fn proc_exe_stat(path: &str, nofollow: bool) -> Option<Kstat> {
+    let target = proc_exe_readlink(path)?;
+    if nofollow {
+        let mut stat = Kstat::new(crate::fs::S_IFLNK | 0o777);
+        stat.st_size = target.len() as i64;
+        return Some(stat);
+    }
+    open_proc_executable(path).map(|file| file.stat())
+}
+
+fn shared_fd_limit(tasks: &[Arc<crate::task::TaskControlBlock>]) -> usize {
+    tasks
+        .iter()
+        .map(|task| task.inner_exclusive_access().rlimit_nofile.min(1024))
+        .min()
+        .unwrap_or(0)
+}
+
+fn first_free_shared_fd(
+    tasks: &[Arc<crate::task::TaskControlBlock>],
+    start: usize,
+    limit: usize,
+) -> Option<usize> {
+    (start..limit).find(|&fd| {
+        tasks.iter().all(|task| {
+            let inner = task.inner_exclusive_access();
+            fd >= inner.fd_table.len() || inner.fd_table[fd].is_none()
+        })
+    })
+}
+
+fn ensure_fd_slot(inner: &mut crate::task::TaskControlBlockInner, fd: usize) {
+    while inner.fd_table.len() <= fd {
+        inner.fd_table.push(None);
+        inner.fd_cloexec.push(false);
+    }
+}
+
+/// Install one descriptor into every task sharing the same Linux files_struct.
+/// Each per-task mirror owns one File reference, so all mirrors are updated
+/// under FILE_TABLE_LOCK before another thread can reuse the descriptor number.
+pub(crate) fn install_fd_shared(
+    task: &Arc<crate::task::TaskControlBlock>,
+    file: Arc<dyn File + Send + Sync>,
+    cloexec: bool,
+) -> Result<usize, isize> {
+    let mut files = FILE_TABLE_LOCK.lock();
+    let tasks = file_group_tasks_locked(&mut files, task);
+    let limit = shared_fd_limit(&tasks);
+    let Some(fd) = first_free_shared_fd(&tasks, 0, limit) else {
+        return Err(-24);
+    };
+    for _ in 1..tasks.len() {
+        file.dup_ref();
+    }
+    for target in tasks {
+        let mut inner = target.inner_exclusive_access();
+        ensure_fd_slot(&mut inner, fd);
+        debug_assert!(inner.fd_table[fd].is_none());
+        inner.fd_table[fd] = Some(file.clone());
+        inner.fd_cloexec[fd] = cloexec;
+    }
+    Ok(fd)
 }
 
 fn install_fd(
@@ -240,33 +298,367 @@ fn install_fd(
     file: Arc<dyn File + Send + Sync>,
     cloexec: bool,
 ) -> Result<usize, isize> {
-    let mut inner = task.inner_exclusive_access();
-    let fd = inner.alloc_fd();
-    if fd >= inner.fd_table.len() {
-        return Err(-24);
-    }
-    inner.fd_table[fd] = Some(file);
-    inner.fd_cloexec[fd] = cloexec;
-    Ok(fd)
+    install_fd_shared(task, file, cloexec)
 }
 
-fn install_fd_shared(
+fn close_fd_shared(
     task: &Arc<crate::task::TaskControlBlock>,
-    file: Arc<dyn File + Send + Sync>,
+    fd: usize,
+) -> Result<bool, isize> {
+    let mut file_state = FILE_TABLE_LOCK.lock();
+    let tasks = file_group_tasks_locked(&mut file_state, task);
+    let is_unix_socket = {
+        let inner = task.inner_exclusive_access();
+        let Some(file) = inner.fd_table.get(fd).and_then(|file| file.as_ref()) else {
+            return Err(-9);
+        };
+        file.as_any().is::<crate::fs::UnixSocketFile>()
+    };
+    let mut closed_files = Vec::new();
+    for target in tasks {
+        let mut inner = target.inner_exclusive_access();
+        if let Some(file) = inner.take_fd_for_close(fd) {
+            closed_files.push(file);
+        }
+    }
+    drop(file_state);
+    for file in closed_files {
+        file.close_ref();
+    }
+    Ok(is_unix_socket)
+}
+
+fn duplicate_fd_shared(
+    task: &Arc<crate::task::TaskControlBlock>,
+    fd: usize,
+    minimum: usize,
     cloexec: bool,
 ) -> Result<usize, isize> {
-    let (fd, tgid) = {
-        let mut inner = task.inner_exclusive_access();
-        let fd = inner.alloc_fd();
-        if fd >= inner.fd_table.len() {
-            return Err(-24);
-        }
-        inner.fd_table[fd] = Some(file.clone());
-        inner.fd_cloexec[fd] = cloexec;
-        (fd, inner.tgid)
+    let mut files = FILE_TABLE_LOCK.lock();
+    let tasks = file_group_tasks_locked(&mut files, task);
+    let source = {
+        let inner = task.inner_exclusive_access();
+        inner
+            .fd_table
+            .get(fd)
+            .and_then(|file| file.as_ref())
+            .cloned()
+            .ok_or(-9isize)?
     };
-    install_fd_for_thread_group(task.getpid(), tgid, fd, file, cloexec);
-    Ok(fd)
+    let limit = shared_fd_limit(&tasks);
+    if minimum >= limit {
+        return Err(-22);
+    }
+    let Some(new_fd) = first_free_shared_fd(&tasks, minimum, limit) else {
+        return Err(-24);
+    };
+    for _ in 0..tasks.len() {
+        source.dup_ref();
+    }
+    for target in tasks {
+        let mut inner = target.inner_exclusive_access();
+        ensure_fd_slot(&mut inner, new_fd);
+        debug_assert!(inner.fd_table[new_fd].is_none());
+        inner.fd_table[new_fd] = Some(source.clone());
+        inner.fd_cloexec[new_fd] = cloexec;
+    }
+    Ok(new_fd)
+}
+
+fn replace_fd_shared(
+    task: &Arc<crate::task::TaskControlBlock>,
+    fd: usize,
+    new_fd: usize,
+    cloexec: bool,
+) -> Result<usize, isize> {
+    if fd == new_fd {
+        return Ok(new_fd);
+    }
+    let mut files = FILE_TABLE_LOCK.lock();
+    let tasks = file_group_tasks_locked(&mut files, task);
+    let source = {
+        let inner = task.inner_exclusive_access();
+        inner
+            .fd_table
+            .get(fd)
+            .and_then(|file| file.as_ref())
+            .cloned()
+            .ok_or(-9isize)?
+    };
+    if new_fd >= shared_fd_limit(&tasks) {
+        return Err(-9);
+    }
+    for _ in 0..tasks.len() {
+        source.dup_ref();
+    }
+    let mut replaced = Vec::new();
+    for target in tasks {
+        let mut inner = target.inner_exclusive_access();
+        ensure_fd_slot(&mut inner, new_fd);
+        if let Some(file) = inner.take_fd_for_close(new_fd) {
+            replaced.push(file);
+        }
+        inner.fd_table[new_fd] = Some(source.clone());
+        inner.fd_cloexec[new_fd] = cloexec;
+    }
+    drop(files);
+    for file in replaced {
+        file.close_ref();
+    }
+    Ok(new_fd)
+}
+
+fn set_fd_cloexec_shared(
+    task: &Arc<crate::task::TaskControlBlock>,
+    fd: usize,
+    cloexec: bool,
+) -> Result<(), isize> {
+    let mut files = FILE_TABLE_LOCK.lock();
+    let tasks = file_group_tasks_locked(&mut files, task);
+    {
+        let inner = task.inner_exclusive_access();
+        if inner.fd_table.get(fd).and_then(|file| file.as_ref()).is_none() {
+            return Err(-9);
+        }
+    }
+    for target in tasks {
+        let mut inner = target.inner_exclusive_access();
+        if fd < inner.fd_table.len() && inner.fd_table[fd].is_some() {
+            inner.fd_cloexec[fd] = cloexec;
+        }
+    }
+    Ok(())
+}
+
+const EPOLL_EVENT_SIZE: usize = 12;
+const EPOLL_CLOEXEC: usize = 0x80000;
+const EPOLL_CTL_ADD: usize = 1;
+const EPOLL_CTL_DEL: usize = 2;
+const EPOLL_CTL_MOD: usize = 3;
+
+fn read_epoll_event(event: *const u8) -> Result<EpollEvent, isize> {
+    if !valid_user_read_buf(event, EPOLL_EVENT_SIZE) {
+        return Err(-14);
+    }
+    let task = current_task().ok_or(-3isize)?;
+    let mut bytes = [0u8; EPOLL_EVENT_SIZE];
+    if !super::process::copy_from_task_user(&task, event as usize, &mut bytes) {
+        return Err(-14);
+    }
+    Ok(EpollEvent {
+        events: u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+        data: u64::from_ne_bytes([
+            bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11],
+        ]),
+    })
+}
+
+fn encode_epoll_events(events: &[EpollEvent]) -> Result<Vec<u8>, isize> {
+    let len = events
+        .len()
+        .checked_mul(EPOLL_EVENT_SIZE)
+        .ok_or(-22isize)?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(len).map_err(|_| -12isize)?;
+    for event in events {
+        bytes.extend_from_slice(&event.events.to_ne_bytes());
+        bytes.extend_from_slice(&event.data.to_ne_bytes());
+    }
+    Ok(bytes)
+}
+
+fn epoll_fd_for_current_task(fd: usize) -> Result<Arc<dyn File + Send + Sync>, isize> {
+    let task = current_task().ok_or(-3isize)?;
+    let inner = task.inner_exclusive_access();
+    inner
+        .fd_table
+        .get(fd)
+        .and_then(|file| file.as_ref())
+        .cloned()
+        .ok_or(-9)
+}
+
+pub fn sys_eventfd2(initval: u32, flags: usize) -> isize {
+    const EFD_SEMAPHORE: usize = 0x1;
+    const EFD_NONBLOCK: usize = 0x800;
+    const EFD_CLOEXEC: usize = 0x80000;
+    if flags & !(EFD_SEMAPHORE | EFD_NONBLOCK | EFD_CLOEXEC) != 0 {
+        return -22;
+    }
+    let task = current_task().unwrap();
+    let file: Arc<dyn File + Send + Sync> = Arc::new(EventFdFile::new(initval, flags));
+    install_fd_shared(&task, file, flags & EFD_CLOEXEC != 0)
+        .map(|fd| fd as isize)
+        .unwrap_or_else(|errno| errno)
+}
+
+pub fn sys_epoll_create1(flags: usize) -> isize {
+    if flags & !EPOLL_CLOEXEC != 0 {
+        return -22;
+    }
+    let epoll = match EpollFile::new() {
+        Ok(epoll) => epoll,
+        Err(errno) => return errno,
+    };
+    let task = current_task().unwrap();
+    let file: Arc<dyn File + Send + Sync> = Arc::new(epoll);
+    install_fd_shared(&task, file, flags & EPOLL_CLOEXEC != 0)
+        .map(|fd| fd as isize)
+        .unwrap_or_else(|errno| errno)
+}
+
+pub fn sys_epoll_ctl(epfd: usize, op: usize, fd: usize, event: *const u8) -> isize {
+    if !matches!(op, EPOLL_CTL_ADD | EPOLL_CTL_DEL | EPOLL_CTL_MOD) {
+        return -22;
+    }
+    let epoll_file = match epoll_fd_for_current_task(epfd) {
+        Ok(file) => file,
+        Err(errno) => return errno,
+    };
+    let watched_file = match epoll_fd_for_current_task(fd) {
+        Ok(file) => file,
+        Err(errno) => return errno,
+    };
+    if Arc::ptr_eq(&epoll_file, &watched_file) {
+        return -22;
+    }
+    let Some(epoll) = epoll_file.as_any().downcast_ref::<EpollFile>() else {
+        return -22;
+    };
+
+    match op {
+        EPOLL_CTL_ADD => match read_epoll_event(event) {
+            Ok(event) => epoll.add(fd, watched_file, event).map_or_else(|errno| errno, |_| 0),
+            Err(errno) => errno,
+        },
+        EPOLL_CTL_DEL => epoll.remove(fd).map_or_else(|errno| errno, |_| 0),
+        EPOLL_CTL_MOD => match read_epoll_event(event) {
+            Ok(event) => epoll.modify(fd, event).map_or_else(|errno| errno, |_| 0),
+            Err(errno) => errno,
+        },
+        _ => unreachable!(),
+    }
+}
+
+pub fn sys_epoll_pwait(
+    epfd: usize,
+    events: *mut u8,
+    maxevents: usize,
+    timeout_ms: isize,
+    sigmask: *const u8,
+    sigsetsize: usize,
+) -> isize {
+    if maxevents == 0 || maxevents > EPOLL_MAX_INTERESTS || timeout_ms < -1 {
+        return -22;
+    }
+    let Some(output_len) = maxevents.checked_mul(EPOLL_EVENT_SIZE) else {
+        return -22;
+    };
+    if !valid_user_write_buf(events, output_len) {
+        return -14;
+    }
+    if !sigmask.is_null() && sigsetsize != core::mem::size_of::<u64>() {
+        return -22;
+    }
+
+    let task = current_task().unwrap();
+    let epoll_file = match epoll_fd_for_current_task(epfd) {
+        Ok(file) => file,
+        Err(errno) => return errno,
+    };
+    let Some(epoll) = epoll_file.as_any().downcast_ref::<EpollFile>() else {
+        return -22;
+    };
+
+    let saved_mask = if sigmask.is_null() {
+        None
+    } else {
+        if !valid_user_read_buf(sigmask, core::mem::size_of::<u64>()) {
+            return -14;
+        }
+        let mut raw = [0u8; core::mem::size_of::<u64>()];
+        if !super::process::copy_from_task_user(&task, sigmask as usize, &mut raw) {
+            return -14;
+        }
+        let raw = u64::from_ne_bytes(raw);
+        let mut mask = super::process::user_sigset_to_flags(raw);
+        mask.remove(crate::task::SignalFlags::SIGKILL | crate::task::SignalFlags::SIGSTOP);
+        let mut inner = task.inner_exclusive_access();
+        let saved = inner.signal_mask;
+        inner.signal_mask = mask;
+        Some(saved)
+    };
+
+    let result = (|| {
+        let deadline_ns = if timeout_ms > 0 {
+            let timeout_ns = (timeout_ms as usize).saturating_mul(1_000_000);
+            Some(
+                (polyhal::time::Time::now().to_nsec() as usize).saturating_add(timeout_ns),
+            )
+        } else {
+            None
+        };
+        loop {
+            crate::task::check_itimers();
+            crate::net::net_poll();
+            if has_interrupting_signal(&task.inner_exclusive_access()) {
+                return -4;
+            }
+
+            let ready = match epoll.collect_ready(maxevents) {
+                Ok(ready) => ready,
+                Err(errno) => return errno,
+            };
+            if !ready.is_empty() {
+                let bytes = match encode_epoll_events(&ready) {
+                    Ok(bytes) => bytes,
+                    Err(errno) => return errno,
+                };
+                let token = current_user_token();
+                return match copy_staged_output_to_user(&task, token, events, &bytes) {
+                    Ok(()) => ready.len() as isize,
+                    Err(errno) => errno,
+                };
+            }
+            if timeout_ms == 0 {
+                return 0;
+            }
+            if let Some(deadline_ns) = deadline_ns {
+                if (polyhal::time::Time::now().to_nsec() as usize) >= deadline_ns {
+                    return 0;
+                }
+            }
+
+            let should_block = || {
+                if has_interrupting_signal(&task.inner_exclusive_access()) {
+                    return false;
+                }
+                if let Some(deadline_ns) = deadline_ns {
+                    if (polyhal::time::Time::now().to_nsec() as usize) >= deadline_ns {
+                        return false;
+                    }
+                }
+                !epoll.has_ready()
+            };
+            if let Some(deadline_ns) = deadline_ns {
+                crate::task::block_current_until_if(
+                    crate::task::BlockReason::PollWait,
+                    deadline_ns,
+                    should_block,
+                );
+            } else {
+                crate::task::block_current_and_run_next_if(
+                    crate::task::BlockReason::PollWait,
+                    should_block,
+                );
+            }
+        }
+    })();
+
+    if let Some(saved) = saved_mask {
+        task.inner_exclusive_access().signal_mask = saved;
+    }
+    result
 }
 
 fn translated_path_bounded(path: *const u8) -> Result<String, isize> {
@@ -510,6 +902,14 @@ pub fn sys_read(fd: usize, buf: *mut u8, len: usize) -> isize {
     let task = current_task().unwrap();
     let inner = task.inner_exclusive_access();
     if fd >= inner.fd_table.len() {
+        #[cfg(feature = "smp-diagnostics")]
+        crate::println!(
+            "[socketpair-diag] read-ebadf tid={} tgid={} fd={} table_len={}",
+            task.getpid(),
+            inner.tgid,
+            fd,
+            inner.fd_table.len(),
+        );
         return -9;
     }
     if let Some(file) = &inner.fd_table[fd] {
@@ -535,11 +935,20 @@ pub fn sys_read(fd: usize, buf: *mut u8, len: usize) -> isize {
         if read > len {
             return -5;
         }
-        if let Err(errno) = copy_staged_output_to_user(&task, token, buf, &staging.as_slice()[..read]) {
+        if let Err(errno) =
+            copy_staged_output_to_user(&task, token, buf, &staging.as_slice()[..read])
+        {
             return errno;
         }
         read as isize
     } else {
+        #[cfg(feature = "smp-diagnostics")]
+        crate::println!(
+            "[socketpair-diag] read-ebadf tid={} tgid={} fd={} empty-slot",
+            task.getpid(),
+            inner.tgid,
+            fd,
+        );
         -9
     }
 }
@@ -677,10 +1086,7 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> isize
                 let inner = task.inner_exclusive_access();
                 inner.euid
             };
-            let owner = existing
-                .inode_info()
-                .map(|info| info.uid)
-                .unwrap_or(0);
+            let owner = existing.inode_info().map(|info| info.uid).unwrap_or(0);
             if euid != 0 && euid != owner {
                 return -1;
             }
@@ -708,18 +1114,9 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> isize
         } else {
             inode.clone()
         };
-        let (fd, tgid) = {
-            let mut inner = task.inner_exclusive_access();
-            let fd = inner.alloc_fd();
-            if fd >= inner.fd_table.len() {
-                return -24;
-            }
-            inner.fd_table[fd] = Some(file.clone());
-            inner.fd_cloexec[fd] = cloexec;
-            (fd, inner.tgid)
-        };
-        install_fd_for_thread_group(task.getpid(), tgid, fd, file, cloexec);
-        fd as isize
+        install_fd_shared(&task, file, cloexec)
+            .map(|fd| fd as isize)
+            .unwrap_or_else(|errno| errno)
     } else {
         -2
     }
@@ -753,14 +1150,17 @@ fn sys_open_tmpfile(dirfd: isize, path: &str, _mode: u32, cloexec: bool) -> isiz
 
 fn open_proc(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
     use crate::fs::proc::{
-        DevRtcFile, ProcCpuinfoFile, ProcDirFile, ProcMeminfoFile, ProcMountsFile,
-        ProcPidStatFile, ProcPidStatusFile, ProcStaticFile, PseudoDirFile, SysBlockStatFile,
+        DevRtcFile, ProcCpuinfoFile, ProcDirFile, ProcMeminfoFile, ProcMountsFile, ProcPidStatFile,
+        ProcPidStatusFile, ProcStaticFile, PseudoDirFile, SysBlockStatFile,
     };
     let path = if path.len() > 1 {
         path.trim_end_matches('/')
     } else {
         path
     };
+    if let Some(file) = open_proc_executable(path) {
+        return Some(file);
+    }
     if path == "/proc" {
         return Some(Arc::new(ProcDirFile::new()));
     }
@@ -929,6 +1329,10 @@ pub fn sys_mkdirat(dirfd: isize, path: *const u8, mode: u32) -> isize {
         Ok(path) => path,
         Err(errno) => return errno,
     };
+    #[cfg(feature = "smp-diagnostics")]
+    if path.starts_with("/mnt") {
+        crate::println!("[mkdir-diag] begin path={}", path);
+    }
     if path_has_too_long_component(&path) {
         return -36;
     }
@@ -962,11 +1366,23 @@ pub fn sys_mkdirat(dirfd: isize, path: *const u8, mode: u32) -> isize {
     if path.is_empty() {
         return -2;
     }
+    #[cfg(feature = "smp-diagnostics")]
+    if path.starts_with("/mnt") {
+        crate::println!("[mkdir-diag] base-ready path={}", path);
+    }
     if special_device_stat(path.as_str()).is_some() {
         return -17;
     }
+    #[cfg(feature = "smp-diagnostics")]
+    if path.starts_with("/mnt") {
+        crate::println!("[mkdir-diag] resolving-existing path={}", path);
+    }
     if vfs_resolve_path(&base_dir, path.as_str()).is_some() {
         return -17;
+    }
+    #[cfg(feature = "smp-diagnostics")]
+    if path.starts_with("/mnt") {
+        crate::println!("[mkdir-diag] resolving-parent path={}", path);
     }
     let (parent, name) = match resolve_parent_and_name_checked(&base_dir, path.as_str()) {
         Ok(parts) => parts,
@@ -978,7 +1394,15 @@ pub fn sys_mkdirat(dirfd: isize, path: *const u8, mode: u32) -> isize {
     if !can_modify_directory(&parent) {
         return -13;
     }
+    #[cfg(feature = "smp-diagnostics")]
+    if path.starts_with("/mnt") {
+        crate::println!("[mkdir-diag] creating path={}", path);
+    }
     if vfs_create(&parent, &name, true, mode).is_some() {
+        #[cfg(feature = "smp-diagnostics")]
+        if path.starts_with("/mnt") {
+            crate::println!("[mkdir-diag] done path={}", path);
+        }
         0
     } else {
         -2 // ENOENT
@@ -1312,15 +1736,8 @@ pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const u8, _flags: us
     };
 
     if let Some(file) = &fd_file {
-        if let Some(tmpfile) = file
-            .as_any()
-            .downcast_ref::<crate::fs::stdio::TmpFile>()
-        {
-            tmpfile.update_times(
-                new_atime,
-                new_mtime,
-                if changed { Some(now) } else { None },
-            );
+        if let Some(tmpfile) = file.as_any().downcast_ref::<crate::fs::stdio::TmpFile>() {
+            tmpfile.update_times(new_atime, new_mtime, if changed { Some(now) } else { None });
             return 0;
         }
     }
@@ -1931,28 +2348,10 @@ pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             if arg >= MAX_FD {
                 return -22;
             }
-            while inner.fd_table.len() <= arg && inner.fd_table.len() < MAX_FD {
-                inner.fd_table.push(None);
-                inner.fd_cloexec.push(false);
-            }
-            let new_fd = if let Some(fd) =
-                (arg..inner.fd_table.len()).find(|&i| inner.fd_table[i].is_none())
-            {
-                fd
-            } else if inner.fd_table.len() < MAX_FD {
-                inner.fd_table.push(None);
-                inner.fd_cloexec.push(false);
-                inner.fd_table.len() - 1
-            } else {
-                return -24;
-            };
-            let file = inner.fd_table[fd].as_ref().unwrap().clone();
-            file.dup_ref();
-            inner.fd_table[new_fd] = Some(file);
-            if cmd == F_DUPFD_CLOEXEC {
-                inner.fd_cloexec[new_fd] = true;
-            }
-            new_fd as isize
+            drop(inner);
+            return duplicate_fd_shared(&task, fd, arg, cmd == F_DUPFD_CLOEXEC)
+                .map(|new_fd| new_fd as isize)
+                .unwrap_or_else(|errno| errno);
         }
         F_GETFD => {
             if inner.fd_cloexec[fd] {
@@ -1962,8 +2361,10 @@ pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             }
         }
         F_SETFD => {
-            inner.fd_cloexec[fd] = (arg & FD_CLOEXEC) != 0;
-            0
+            drop(inner);
+            return set_fd_cloexec_shared(&task, fd, (arg & FD_CLOEXEC) != 0)
+                .map(|()| 0)
+                .unwrap_or_else(|errno| errno);
         }
         F_GETFL => {
             if let Some(file) = &inner.fd_table[fd] {
@@ -2030,6 +2431,7 @@ pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
 
 const TCGETS: usize = 0x5401;
 const TIOCGWINSZ: usize = 0x5413;
+const FIONBIO: usize = 0x5421;
 const BLKGETSIZE: usize = 0x1260;
 const BLKGETSIZE64: usize = 0x80081272;
 const FS_IOC_GETFLAGS: usize = 0x80086601;
@@ -2067,6 +2469,34 @@ fn is_terminal_fd(fd: usize) -> bool {
 pub fn sys_ioctl(fd: usize, request: usize, arg: usize) -> isize {
     let token = current_user_token();
     let request = request & 0xffffffff;
+
+    if request == FIONBIO {
+        const O_NONBLOCK: usize = 0x800;
+        if arg == 0
+            || !valid_user_read_buf(arg as *const u8, core::mem::size_of::<i32>())
+        {
+            return -14;
+        }
+        let enabled = *crate::mm::translated_ref(token, arg as *const i32) != 0;
+        let file = {
+            let task = current_task().unwrap();
+            let inner = task.inner_exclusive_access();
+            if fd >= inner.fd_table.len() {
+                return -9;
+            }
+            match &inner.fd_table[fd] {
+                Some(file) => file.clone(),
+                None => return -9,
+            }
+        };
+        let mut flags = file.get_flags();
+        if enabled {
+            flags |= O_NONBLOCK;
+        } else {
+            flags &= !O_NONBLOCK;
+        }
+        return if file.set_flags(flags) { 0 } else { -25 };
+    }
 
     // RTC ioctl
     const RTC_RD_TIME: usize = 0x80247009;
@@ -2238,16 +2668,17 @@ pub fn sys_ioctl(fd: usize, request: usize, arg: usize) -> isize {
 
 pub fn sys_close(fd: usize) -> isize {
     let task = current_task().unwrap();
-    let mut inner = task.inner_exclusive_access();
-    let tgid = inner.tgid;
-    let file = inner.take_fd_for_close(fd);
-    drop(inner);
-    if let Some(file) = file {
-        file.close_ref();
-        close_fd_for_thread_group(task.getpid(), tgid, fd);
-        return 0;
+    match close_fd_shared(&task, fd) {
+        Ok(is_unix_socket) => {
+        #[cfg(feature = "smp-diagnostics")]
+        if is_unix_socket {
+            let tgid = task.inner_exclusive_access().tgid;
+            crate::println!("[socketpair-diag] close tid={} tgid={} fd={}", task.getpid(), tgid, fd);
+        }
+        0
+        }
+        Err(errno) => errno,
     }
-    -9
 }
 
 pub fn sys_pipe(pipe: *mut usize) -> isize {
@@ -2265,33 +2696,22 @@ pub fn sys_pipe2(pipe: *mut usize, flags: usize) -> isize {
     }
     let task = current_task().unwrap();
     let token = current_user_token();
-    let (read_fd, write_fd) = {
-        let mut inner = task.inner_exclusive_access();
-        let (pipe_read, pipe_write) = make_pipe();
-        if flags & O_NONBLOCK != 0 {
-            pipe_read.set_flags(O_NONBLOCK);
-            pipe_write.set_flags(O_NONBLOCK);
+    let (pipe_read, pipe_write) = make_pipe();
+    if flags & O_NONBLOCK != 0 {
+        pipe_read.set_flags(O_NONBLOCK);
+        pipe_write.set_flags(O_NONBLOCK);
+    }
+    let cloexec = flags & O_CLOEXEC != 0;
+    let read_fd = match install_fd_shared(&task, pipe_read, cloexec) {
+        Ok(fd) => fd,
+        Err(errno) => return errno,
+    };
+    let write_fd = match install_fd_shared(&task, pipe_write, cloexec) {
+        Ok(fd) => fd,
+        Err(errno) => {
+            let _ = close_fd_shared(&task, read_fd);
+            return errno;
         }
-        let read_fd = inner.alloc_fd();
-        if read_fd >= inner.fd_table.len() {
-            return -24;
-        }
-        inner.fd_table[read_fd] = Some(pipe_read);
-        let write_fd = inner.alloc_fd();
-        if write_fd >= inner.fd_table.len() {
-            let rollback = inner.take_fd_for_close(read_fd);
-            drop(inner);
-            if let Some(file) = rollback {
-                file.close_ref();
-            }
-            return -24;
-        }
-        inner.fd_table[write_fd] = Some(pipe_write);
-        if flags & O_CLOEXEC != 0 {
-            inner.fd_cloexec[read_fd] = true;
-            inner.fd_cloexec[write_fd] = true;
-        }
-        (read_fd, write_fd)
     };
     let p = pipe as *mut u8;
     *translated_refmut(token, p as *mut u32) = read_fd as u32;
@@ -2301,21 +2721,9 @@ pub fn sys_pipe2(pipe: *mut usize, flags: usize) -> isize {
 
 pub fn sys_dup(fd: usize) -> isize {
     let task = current_task().unwrap();
-    let mut inner = task.inner_exclusive_access();
-    if fd >= inner.fd_table.len() {
-        return -9;
-    }
-    if inner.fd_table[fd].is_none() {
-        return -9;
-    }
-    let new_fd = inner.alloc_fd();
-    if new_fd >= inner.fd_table.len() {
-        return -24;
-    }
-    let file = Arc::clone(inner.fd_table[fd].as_ref().unwrap());
-    file.dup_ref();
-    inner.fd_table[new_fd] = Some(file);
-    new_fd as isize
+    duplicate_fd_shared(&task, fd, 0, false)
+        .map(|new_fd| new_fd as isize)
+        .unwrap_or_else(|errno| errno)
 }
 
 pub fn sys_dup2(fd: usize, new_fd: usize) -> isize {
@@ -2335,26 +2743,9 @@ pub fn sys_dup3(fd: usize, new_fd: usize, flags: usize) -> isize {
         return -9;
     }
     let task = current_task().unwrap();
-    let mut inner = task.inner_exclusive_access();
-    if fd >= inner.fd_table.len() {
-        return -9;
-    }
-    let Some(file) = inner.fd_table[fd].as_ref().cloned() else {
-        return -9;
-    };
-    file.dup_ref();
-    while inner.fd_table.len() <= new_fd {
-        inner.fd_table.push(None);
-        inner.fd_cloexec.push(false);
-    }
-    let replaced = inner.take_fd_for_close(new_fd);
-    inner.fd_table[new_fd] = Some(file);
-    inner.fd_cloexec[new_fd] = (flags & O_CLOEXEC) != 0;
-    drop(inner);
-    if let Some(file) = replaced {
-        file.close_ref();
-    }
-    new_fd as isize
+    replace_fd_shared(&task, fd, new_fd, (flags & O_CLOEXEC) != 0)
+        .map(|new_fd| new_fd as isize)
+        .unwrap_or_else(|errno| errno)
 }
 
 pub fn sys_lseek(fd: usize, offset: i64, whence: i32) -> isize {
@@ -2634,7 +3025,9 @@ pub fn sys_readlinkat(dirfd: isize, path: *const u8, buf: *mut u8, bufsiz: usize
         user_buf.copy_from_slice(&link_target[..len]);
         return len as isize;
     }
-    if let Some(link_target) = proc_fd_readlink(path_str.as_str()) {
+    if let Some(link_target) = proc_exe_readlink(path_str.as_str())
+        .or_else(|| proc_fd_readlink(path_str.as_str()))
+    {
         let bytes = link_target.as_bytes();
         let len = bytes.len().min(bufsiz);
         let user_buf = crate::mm::translated_byte_buffer(token, buf, len);
@@ -2696,6 +3089,10 @@ pub fn sys_fstatat(dirfd: isize, path: *const u8, stat_buf: *mut u8, flags: usiz
         } else {
             -2
         };
+    }
+    if let Some(st) = proc_exe_stat(path_str.as_str(), flags & AT_SYMLINK_NOFOLLOW != 0) {
+        *translated_refmut(token, stat_buf as *mut Kstat) = st;
+        return 0;
     }
     if let Some(st) = special_device_stat(path_str.as_str()) {
         *translated_refmut(token, stat_buf as *mut Kstat) = st;
@@ -2789,6 +3186,10 @@ pub fn sys_statx(
 
     if path_str.is_empty() {
         return -2;
+    }
+    if let Some(st) = proc_exe_stat(path_str.as_str(), flags & AT_SYMLINK_NOFOLLOW != 0) {
+        write_statx(statx_buf, &st, mask);
+        return 0;
     }
     if let Some(st) = special_device_stat(path_str.as_str()) {
         write_statx(statx_buf, &st, mask);
@@ -2939,7 +3340,9 @@ pub fn sys_getdents64(fd: usize, dirp: *mut u8, len: usize) -> isize {
         if count > len {
             return -5;
         }
-        if let Err(errno) = copy_staged_output_to_user(&task, token, dirp, &staging.as_slice()[..count]) {
+        if let Err(errno) =
+            copy_staged_output_to_user(&task, token, dirp, &staging.as_slice()[..count])
+        {
             return errno;
         }
         count as isize
@@ -2950,8 +3353,6 @@ pub fn sys_getdents64(fd: usize, dirp: *mut u8, len: usize) -> isize {
 
 // ==================== mount / umount ====================
 
-use crate::drivers::block::VirtIOBlock;
-use crate::drivers::{BLOCK_DEVICE, ROOT_BLOCK_DEVICE};
 use crate::fs::vfs::{vfs_mount, vfs_umount};
 
 fn parse_tmpfs_size(data: &str) -> Option<u64> {
@@ -3021,6 +3422,21 @@ pub fn sys_mount(
 
     let fstype_name = fstype_str.trim_end_matches('\0');
     let source_name = source_str.trim_end_matches('\0');
+    #[cfg(feature = "mount-trace")]
+    crate::println!(
+        "[mount-trace] syscall-enter source={} target={} fs={}",
+        source_name,
+        target_path.trim_end_matches('\0'),
+        fstype_str.trim_end_matches('\0')
+    );
+    #[cfg(feature = "smp-diagnostics")]
+    crate::println!(
+        "[mount-diag] syscall tid={} source={} target={} fs={}",
+        current_task().map(|task| task.getpid()).unwrap_or(0),
+        source_name,
+        target_path.trim_end_matches('\0'),
+        fstype_name
+    );
 
     let task = current_task().unwrap();
     let cwd = {
@@ -3028,12 +3444,26 @@ pub fn sys_mount(
         inner.cwd.clone()
     };
 
+    #[cfg(feature = "mount-watchdog")]
+    crate::fs::vfs::mount_watchdog_begin();
+    #[cfg(feature = "mount-watchdog")]
+    crate::fs::vfs::mount_watchdog_stage(2);
     let mnt_point = match vfs_resolve_path(&cwd, target_path.as_str()) {
         Some(d) => d,
-        None => return -1,
+        None => {
+            #[cfg(feature = "mount-watchdog")]
+            crate::fs::vfs::mount_watchdog_finish();
+            return -1;
+        }
     };
+    #[cfg(feature = "mount-watchdog")]
+    crate::fs::vfs::mount_watchdog_stage(3);
+    #[cfg(feature = "mount-trace")]
+    crate::println!("[mount-trace] path-resolved point={}", mnt_point.path);
 
     if !mnt_point.is_dir {
+        #[cfg(feature = "mount-watchdog")]
+        crate::fs::vfs::mount_watchdog_finish();
         return -20;
     }
 
@@ -3046,19 +3476,27 @@ pub fn sys_mount(
         let data_name = data_str.trim_end_matches('\0');
         vfs_set_tmpfs_mount(&mnt_point.path, parse_tmpfs_size(data_name));
         vfs_set_readonly_mount(&mnt_point.path, mountflags & MS_RDONLY != 0);
+        #[cfg(feature = "mount-watchdog")]
+        crate::fs::vfs::mount_watchdog_finish();
         return 0;
     }
 
     if mountflags & MS_REMOUNT != 0 {
         vfs_set_readonly_mount(&mnt_point.path, mountflags & MS_RDONLY != 0);
+        #[cfg(feature = "mount-watchdog")]
+        crate::fs::vfs::mount_watchdog_finish();
         return 0;
     }
 
     if fstype_name != "ext4" && fstype_name != "vfat" {
+        #[cfg(feature = "mount-watchdog")]
+        crate::fs::vfs::mount_watchdog_finish();
         return -19;
     }
 
     if fstype_name == "vfat" && matches!(source_name, "/dev/vda2" | "vda2") {
+        #[cfg(feature = "mount-watchdog")]
+        crate::fs::vfs::mount_watchdog_finish();
         return 0;
     }
 
@@ -3068,18 +3506,31 @@ pub fn sys_mount(
         let table = MOUNT_TABLE.exclusive_access();
         let found = table.iter().any(|m| m.mnt_point.path == mnt_point.path);
         if found {
+            #[cfg(feature = "mount-watchdog")]
+            crate::fs::vfs::mount_watchdog_finish();
             return 0;
         }
     }
+    #[cfg(feature = "mount-watchdog")]
+    crate::fs::vfs::mount_watchdog_stage(4);
 
     let blk_dev = match source_name {
-        "" | "vda" | "/dev/vda" => BLOCK_DEVICE.clone(),
-        "vdb" | "/dev/vdb" => ROOT_BLOCK_DEVICE.clone(),
-        "vdc" | "/dev/vdc" => Arc::new(VirtIOBlock::new_at(polyhal::PhysAddr::new(0x10003000))),
-        "vdd" | "/dev/vdd" => Arc::new(VirtIOBlock::new_at(polyhal::PhysAddr::new(0x10004000))),
-        name if name.starts_with("/dev/") => return -15,
-        _ => return -2,
+        "" => crate::drivers::block::get_block_device(0),
+        name => match block_device_index(name) {
+            Some(index) => crate::drivers::block::get_block_device(index),
+            None if name.starts_with("/dev/") => return -15,
+            None => return -2,
+        },
     };
+    let Some(blk_dev) = blk_dev else {
+        #[cfg(feature = "mount-watchdog")]
+        crate::fs::vfs::mount_watchdog_finish();
+        return -19;
+    };
+    #[cfg(feature = "mount-watchdog")]
+    crate::fs::vfs::mount_watchdog_stage(5);
+    #[cfg(feature = "mount-trace")]
+    crate::println!("[mount-trace] block-device-selected source={}", source_name);
     let mut lwext4_mount_path =
         String::from(target_path.trim_end_matches('\0').trim_end_matches('/'));
     if lwext4_mount_path.is_empty() {
@@ -3088,12 +3539,27 @@ pub fn sys_mount(
         lwext4_mount_path.push('/');
     }
 
+    #[cfg(feature = "mount-trace")]
+    crate::println!("[mount-trace] create-super-begin point={}", lwext4_mount_path);
+    #[cfg(feature = "smp-diagnostics")]
+    crate::println!("[mount-diag] create-super point={}", lwext4_mount_path);
     let sb = match VfsSuperBlock::new_ext4_at(blk_dev, "ext4", lwext4_mount_path.as_str()) {
         Some(sb) => sb,
-        None => return -17,
+        None => {
+            #[cfg(feature = "mount-watchdog")]
+            crate::fs::vfs::mount_watchdog_finish();
+            return -17;
+        }
     };
 
-    if vfs_mount(mnt_point.clone(), sb, lwext4_mount_path.as_str()) {
+    #[cfg(feature = "mount-trace")]
+    crate::println!("[mount-trace] create-super-done point={}", mnt_point.path);
+    #[cfg(feature = "smp-diagnostics")]
+    crate::println!("[mount-diag] publish point={}", mnt_point.path);
+    let mounted = vfs_mount(mnt_point.clone(), sb, lwext4_mount_path.as_str());
+    #[cfg(feature = "mount-watchdog")]
+    crate::fs::vfs::mount_watchdog_finish();
+    if mounted {
         vfs_set_readonly_mount(&mnt_point.path, mountflags & MS_RDONLY != 0);
         0
     } else {
@@ -3387,15 +3853,11 @@ pub fn sys_preadv(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> is
         if iov.iov_len > isize::MAX as usize {
             return -22;
         }
-        let mut staging = match copy_to_user_after_io(
-            &task,
-            token,
-            iov.iov_base as *mut u8,
-            iov.iov_len,
-        ) {
-            Ok(staging) => staging,
-            Err(errno) => return if total == 0 { errno } else { total },
-        };
+        let mut staging =
+            match copy_to_user_after_io(&task, token, iov.iov_base as *mut u8, iov.iov_len) {
+                Ok(staging) => staging,
+                Err(errno) => return if total == 0 { errno } else { total },
+            };
         let n = file.read_at(off, staging.as_mut_slice());
         if n < 0 {
             return if total == 0 { n } else { total };
@@ -3475,15 +3937,11 @@ pub fn sys_pwritev(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> i
             Some(sum) if sum <= isize::MAX as usize => sum,
             _ => return -22,
         };
-        let staging = match copy_from_user_for_io(
-            &task,
-            token,
-            iov.iov_base as *mut u8,
-            iov.iov_len,
-        ) {
-            Ok(staging) => staging,
-            Err(errno) => return errno,
-        };
+        let staging =
+            match copy_from_user_for_io(&task, token, iov.iov_base as *mut u8, iov.iov_len) {
+                Ok(staging) => staging,
+                Err(errno) => return errno,
+            };
         buffers.push(staging);
     }
     let mut off = offset;
@@ -3967,13 +4425,9 @@ pub fn sys_copy_file_range(
 
 pub fn sys_memfd_create(_name: *const u8, _flags: usize) -> isize {
     let task = current_task().unwrap();
-    let mut inner = task.inner_exclusive_access();
-    let fd = inner.alloc_fd();
-    if fd >= inner.fd_table.len() {
-        return -24;
-    }
-    inner.fd_table[fd] = Some(alloc::sync::Arc::new(crate::fs::DevNull));
-    fd as isize
+    install_fd_shared(&task, alloc::sync::Arc::new(crate::fs::DevNull), false)
+        .map(|fd| fd as isize)
+        .unwrap_or_else(|errno| errno)
 }
 
 // ---- close_range (436) ----
@@ -3988,33 +4442,20 @@ pub fn sys_close_range(first: usize, last: usize, flags: usize) -> isize {
         return -22;
     }
     let task = current_task().unwrap();
-    let mut inner = task.inner_exclusive_access();
-    let last = last.min(inner.fd_table.len().saturating_sub(1));
+    let last = {
+        let inner = task.inner_exclusive_access();
+        last.min(inner.fd_table.len().saturating_sub(1))
+    };
     if first > last {
         return 0;
     }
     if flags & CLOSE_RANGE_CLOEXEC != 0 {
         for fd in first..=last {
-            if fd < inner.fd_cloexec.len()
-                && inner.fd_table.get(fd).and_then(|f| f.as_ref()).is_some()
-            {
-                inner.fd_cloexec[fd] = true;
-            }
+            let _ = set_fd_cloexec_shared(&task, fd, true);
         }
     } else {
-        let tgid = inner.tgid;
-        let mut files = alloc::vec::Vec::new();
         for fd in first..=last {
-            if let Some(file) = inner.take_fd_for_close(fd) {
-                files.push(file);
-            }
-        }
-        drop(inner);
-        for file in files {
-            file.close_ref();
-        }
-        for fd in first..=last {
-            close_fd_for_thread_group(task.getpid(), tgid, fd);
+            let _ = close_fd_shared(&task, fd);
         }
     }
     0
@@ -4022,6 +4463,70 @@ pub fn sys_close_range(first: usize, last: usize, flags: usize) -> isize {
 
 // ---- socketpair (199) ----
 
-pub fn sys_socketpair(_domain: usize, _typ: usize, _protocol: usize, _sv: *mut usize) -> isize {
+pub fn sys_socketpair(domain: usize, typ: usize, protocol: usize, sv: *mut usize) -> isize {
+    const AF_UNIX: usize = 1;
+    const SOCK_STREAM: usize = 1;
+    const SOCK_SEQPACKET: usize = 5;
+    const SOCK_TYPE_MASK: usize = 0x0f;
+    const SOCK_NONBLOCK: usize = 0x800;
+    const SOCK_CLOEXEC: usize = 0x80000;
+
+    if sv.is_null() || !valid_user_write_buf(sv as *mut u8, 2 * core::mem::size_of::<u32>()) {
+        return -14;
+    }
+    if domain != AF_UNIX {
+        return -97;
+    }
+    if protocol != 0 {
+        return -93;
+    }
+    if typ & !(SOCK_TYPE_MASK | SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
+        return -22;
+    }
+    let kind = match typ & SOCK_TYPE_MASK {
+        SOCK_STREAM => UnixSocketKind::Stream,
+        SOCK_SEQPACKET => UnixSocketKind::SeqPacket,
+        _ => return -94,
+    };
+
+    let nonblock = typ & SOCK_NONBLOCK != 0;
+    let cloexec = typ & SOCK_CLOEXEC != 0;
+    let (first, second) = make_unix_socket_pair(kind, nonblock);
+    let first: Arc<dyn File + Send + Sync> = first;
+    let second: Arc<dyn File + Send + Sync> = second;
+    let task = current_task().unwrap();
+    let first_fd = match install_fd_shared(&task, first, cloexec) {
+        Ok(fd) => fd,
+        Err(errno) => return errno,
+    };
+    let second_fd = match install_fd_shared(&task, second, cloexec) {
+        Ok(fd) => fd,
+        Err(errno) => {
+            let _ = close_fd_shared(&task, first_fd);
+            return errno;
+        }
+    };
+    #[cfg(feature = "smp-diagnostics")]
+    {
+        let tgid = task.inner_exclusive_access().tgid;
+        crate::println!(
+            "[socketpair-diag] create tid={} tgid={} first_fd={} second_fd={} cloexec={} nonblock={}",
+            task.getpid(),
+            tgid,
+            first_fd,
+            second_fd,
+            cloexec,
+            nonblock,
+        );
+    }
+
+    let mut result = [0u8; 8];
+    result[..4].copy_from_slice(&(first_fd as u32).to_ne_bytes());
+    result[4..].copy_from_slice(&(second_fd as u32).to_ne_bytes());
+    if !super::process::copy_to_task_user(&task, sv as usize, &result) {
+        let _ = close_fd_shared(&task, first_fd);
+        let _ = close_fd_shared(&task, second_fd);
+        return -14;
+    }
     0
 }

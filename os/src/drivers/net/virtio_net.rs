@@ -1,3 +1,4 @@
+#[cfg(not(target_arch = "loongarch64"))]
 use core::ptr::NonNull;
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
@@ -7,18 +8,37 @@ use alloc::vec::Vec;
 
 use crate::drivers::block::VirtioHal;
 use crate::sync::DeviceLock;
+#[cfg(target_arch = "loongarch64")]
+use polyhal::consts::VIRT_ADDR_START;
+#[cfg(not(target_arch = "loongarch64"))]
 use polyhal::PhysAddr;
 use virtio_drivers::device::net::VirtIONet;
+#[cfg(not(target_arch = "loongarch64"))]
 use virtio_drivers::transport::mmio::MmioTransport;
+#[cfg(target_arch = "loongarch64")]
+use virtio_drivers::transport::{
+    pci::{
+        bus::{BarInfo, Cam, Command, MemoryBarType, PciRoot},
+        virtio_device_type, PciTransport,
+    },
+    DeviceType,
+};
 
 #[cfg(target_arch = "aarch64")]
 const VIRTIO2: usize = 0xa00_0300;
 
 const NET_BUF_SIZE: usize = 1536; // must be multiple of 8 for RxBuffer alignment
 const QUEUE_SIZE: usize = 64;
+#[cfg(target_arch = "loongarch64")]
+const PCI_ECAM_BASE: usize = 0x2000_0000;
+
+#[cfg(not(target_arch = "loongarch64"))]
+type NetTransport = MmioTransport;
+#[cfg(target_arch = "loongarch64")]
+type NetTransport = PciTransport;
 
 struct VirtIONetInner {
-    net: VirtIONet<VirtioHal, MmioTransport, QUEUE_SIZE>,
+    net: VirtIONet<VirtioHal, NetTransport, QUEUE_SIZE>,
 }
 
 unsafe impl Send for VirtIONetInner {}
@@ -38,43 +58,49 @@ pub struct VirtIONetAdapter {
 
 impl VirtIONetAdapter {
     pub fn new() -> Option<Self> {
-        #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
-        const BASES: &[usize] = &[
-            0x1000_1000,
-            0x1000_2000,
-            0x1000_3000,
-            0x1000_4000,
-            0x1000_5000,
-            0x1000_6000,
-            0x1000_7000,
-            0x1000_8000,
-        ];
-        #[cfg(target_arch = "aarch64")]
-        const BASES: &[usize] = &[VIRTIO2];
+        #[cfg(not(target_arch = "loongarch64"))]
+        let transport = {
+            #[cfg(target_arch = "riscv64")]
+            const BASES: &[usize] = &[
+                0x1000_1000,
+                0x1000_2000,
+                0x1000_3000,
+                0x1000_4000,
+                0x1000_5000,
+                0x1000_6000,
+                0x1000_7000,
+                0x1000_8000,
+            ];
+            #[cfg(target_arch = "aarch64")]
+            const BASES: &[usize] = &[VIRTIO2];
 
-        let mut transport = None;
-        for &base in BASES {
-            let ptr = PhysAddr::new(base).get_mut_ptr();
-            let device_id =
-                unsafe { core::ptr::read_volatile((ptr as usize + 0x08) as *const u32) };
-            println!(
-                "[net] probing VirtIO at {:#x}: device_id={}",
-                base, device_id
-            );
-            if device_id != 1 {
-                continue;
-            }
-            match unsafe { MmioTransport::new(NonNull::new_unchecked(ptr)) } {
-                Ok(t) => {
-                    transport = Some(t);
-                    break;
+            let mut transport = None;
+            for &base in BASES {
+                let ptr = PhysAddr::new(base).get_mut_ptr();
+                let device_id =
+                    unsafe { core::ptr::read_volatile((ptr as usize + 0x08) as *const u32) };
+                println!(
+                    "[net] probing VirtIO at {:#x}: device_id={}",
+                    base, device_id
+                );
+                if device_id != 1 {
+                    continue;
                 }
-                Err(e) => {
-                    println!("[net] MmioTransport::new at {:#x} failed: {:?}", base, e);
+                match unsafe { MmioTransport::new(NonNull::new_unchecked(ptr)) } {
+                    Ok(t) => {
+                        transport = Some(t);
+                        break;
+                    }
+                    Err(e) => {
+                        println!("[net] MmioTransport::new at {:#x} failed: {:?}", base, e);
+                    }
                 }
             }
-        }
-        let transport = transport?;
+            transport?
+        };
+        #[cfg(target_arch = "loongarch64")]
+        let transport = Self::new_pci_transport()?;
+
         let net = match VirtIONet::new(transport, NET_BUF_SIZE) {
             Ok(n) => n,
             Err(e) => {
@@ -107,6 +133,72 @@ impl VirtIONetAdapter {
             ),
             mac_addr: mac,
         })
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    fn new_pci_transport() -> Option<PciTransport> {
+        let mut root =
+            unsafe { PciRoot::new((PCI_ECAM_BASE | VIRT_ADDR_START) as *mut u8, Cam::Ecam) };
+        for (device_function, info) in root.enumerate_bus(0) {
+            if virtio_device_type(&info) != Some(DeviceType::Network) {
+                continue;
+            }
+            let (_, command) = root.get_status_command(device_function);
+            Self::alloc_pci_bars(&mut root, device_function);
+            root.set_command(
+                device_function,
+                command | Command::MEMORY_SPACE | Command::BUS_MASTER,
+            );
+            match PciTransport::new::<VirtioHal>(&mut root, device_function) {
+                Ok(transport) => {
+                    println!(
+                        "[net] VirtIO PCI network device {:?} found",
+                        device_function
+                    );
+                    return Some(transport);
+                }
+                Err(error) => {
+                    println!(
+                        "[net] VirtIO PCI transport {:?} failed: {:?}",
+                        device_function, error
+                    );
+                }
+            }
+        }
+        println!("[net] no VirtIO PCI network device found");
+        None
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    fn alloc_pci_bars(
+        root: &mut PciRoot,
+        device_function: virtio_drivers::transport::pci::bus::DeviceFunction,
+    ) {
+        // Block-device BARs occupy 0x4000_0000; keep network mappings separate.
+        let mut next = 0x5000_0000u64;
+        let mut bar_index = 0u8;
+        while bar_index < 6 {
+            let info = root.bar_info(device_function, bar_index).unwrap();
+            let takes_two = info.takes_two_entries();
+            if let BarInfo::Memory {
+                address_type,
+                address,
+                size,
+                ..
+            } = info
+            {
+                if address == 0 && size != 0 {
+                    let align = size as u64;
+                    next = (next + align - 1) & !(align - 1);
+                    match address_type {
+                        MemoryBarType::Width64 => root.set_bar_64(device_function, bar_index, next),
+                        _ => root.set_bar_32(device_function, bar_index, next as u32),
+                    }
+                    next += align;
+                }
+            }
+            bar_index += if takes_two { 2 } else { 1 };
+        }
     }
 
     pub fn ack_interrupt(&self) {

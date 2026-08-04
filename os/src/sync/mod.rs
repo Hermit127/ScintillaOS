@@ -5,8 +5,8 @@ mod up;
 #[allow(unused_imports)]
 pub use lock::{
     assert_no_spin_locks_held, dump_lockdep_state, CpuLocalLock, DentryLock, DeviceLock,
-    FrameAllocatorLock, FrameRefLock, FsAuxLock, FsGlobalGuard, FsGlobalLock, FsGuard, FsLock,
-    FutexLock, PidRegistryLock, SchedulerLock, SignalActionsLock, SpinNoIrq, TaskGuard, TaskLock,
-    VfsLock, VmLock,
+    FilesLock, FrameAllocatorLock, FrameRefLock, FsAuxLock, FsGlobalGuard, FsGlobalLock, FsGuard,
+    FsLock, FutexLock, PidRegistryLock, SchedulerLock, SignalActionsLock, SpinNoIrq, TaskGuard,
+    TaskLock, VfsLock, VmLock,
 };
 pub use up::UPSafeCell;

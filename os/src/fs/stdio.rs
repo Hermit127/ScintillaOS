@@ -137,9 +137,7 @@ impl File for Stdout {
         while STDOUT_BUSY.swap(true, Ordering::Acquire) {
             core::hint::spin_loop();
         }
-        for byte in user_buf.iter() {
-            DebugConsole::putchar(*byte);
-        }
+        crate::console::write_bytes(user_buf);
         STDOUT_BUSY.store(false, Ordering::Release);
         // stdout 所有权保留到进程让出 CPU，减少多次 write 组成的输出被打断。
         user_buf.len() as isize

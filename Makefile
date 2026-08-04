@@ -2,8 +2,8 @@
 export LOG ?= error
 ARCH ?= riscv64
 COMMA := ,
-# Keep the baseline runnable.  Set QEMU_SMP=4 only after the SMP lock audit
-# and regression suite have passed.
+# Keep the baseline runnable.  Higher core counts are selected explicitly by
+# the SMP run targets or with QEMU_SMP=<n>.
 QEMU_SMP ?= 1
 QEMU_CPU ?= max
 SMP_DIAGNOSTICS ?= 0
@@ -378,11 +378,26 @@ run: run-inner
 run-smp4:
 	@$(MAKE) run-inner ARCH=riscv64 QEMU_SMP=4 SMP_DIAGNOSTICS=$(SMP_DIAGNOSTICS)
 
+run-smp8:
+	@$(MAKE) run-inner ARCH=riscv64 QEMU_SMP=8 SMP_DIAGNOSTICS=$(SMP_DIAGNOSTICS)
+
 run-dual-smp4:
 	@$(MAKE) run-dual ARCH=riscv64 QEMU_SMP=4 SMP_DIAGNOSTICS=$(SMP_DIAGNOSTICS) TEST_DISK="$(TEST_DISK)" ROOT_DISK="$(ROOT_DISK)"
 
 run-dual-smp4-prebuilt:
 	@$(MAKE) run-dual-prebuilt ARCH=riscv64 QEMU_SMP=4 SMP_DIAGNOSTICS=$(SMP_DIAGNOSTICS) TEST_DISK="$(TEST_DISK)" ROOT_DISK="$(ROOT_DISK)"
+
+run-la-smp2:
+	@$(MAKE) run-inner ARCH=loongarch64 QEMU_SMP=2 SMP_DIAGNOSTICS=$(SMP_DIAGNOSTICS)
+
+run-la-smp8:
+	@$(MAKE) run-inner ARCH=loongarch64 QEMU_SMP=8 SMP_DIAGNOSTICS=$(SMP_DIAGNOSTICS)
+
+run-la-dual-smp2:
+	@$(MAKE) run-dual ARCH=loongarch64 QEMU_SMP=2 SMP_DIAGNOSTICS=$(SMP_DIAGNOSTICS) TEST_DISK="$(TEST_DISK)" ROOT_DISK=disk-la.img
+
+run-la-dual-smp2-prebuilt:
+	@$(MAKE) run-dual-prebuilt ARCH=loongarch64 QEMU_SMP=2 SMP_DIAGNOSTICS=$(SMP_DIAGNOSTICS) TEST_DISK="$(TEST_DISK)" ROOT_DISK=disk-la.img
 
 QEMU_EXEC += -nographic \
 				-m $(QEMU_MEM) \
@@ -409,7 +424,7 @@ QEMU_ARGS_DUAL := -drive file=$(TEST_DISK),if=none,format=raw,id=x0 \
 			-drive file=$(ROOT_DISK),if=none,format=raw,id=x1 \
 			-device $(VIRTIO_BLK_DEVICE),drive=x1$(if $(filter loongarch64,$(ARCH)),,$(COMMA)bus=$(VIRTIO_BLK_BUS2))
 
-# virtio-net network configuration (SLIRP user-mode, riscv64/aarch64)
+# virtio-net network configuration (SLIRP user-mode)
 QEMU_NET_HOSTFWD ?= hostfwd=tcp::5555-:5001$(COMMA)hostfwd=tcp::5556-:5201
 QEMU_NETDEV_USER := user$(COMMA)id=net0$(if $(QEMU_NET_HOSTFWD),$(COMMA)$(QEMU_NET_HOSTFWD))
 ifeq ($(ARCH), riscv64)
@@ -418,6 +433,9 @@ ifeq ($(ARCH), riscv64)
 else ifeq ($(ARCH), aarch64)
   QEMU_NET_ARGS := -netdev $(QEMU_NETDEV_USER) \
 			-device virtio-net-device,netdev=net0,bus=virtio-mmio-bus.2
+else ifeq ($(ARCH), loongarch64)
+  QEMU_NET_ARGS := -netdev $(QEMU_NETDEV_USER) \
+			-device virtio-net-pci,netdev=net0
 else
   QEMU_NET_ARGS :=
 endif
@@ -453,4 +471,4 @@ gdbserver: build
 gdbclient:
 	@gdb -ex 'file $(KERNEL_ELF)' -ex 'set arch riscv:rv64' -ex 'target remote localhost:1234'
 
-.PHONY: all prepare-vendor kernel-rv kernel-la disk.img disk-rv.img disk-la.img build env kernel clean disasm disasm-vim run run-smp4 run-inner run-dual run-dual-smp4 run-dual-prebuilt run-dual-smp4-prebuilt fs-img gdbserver gdbclient
+.PHONY: all prepare-vendor kernel-rv kernel-la disk.img disk-rv.img disk-la.img build env kernel clean disasm disasm-vim run run-smp4 run-smp8 run-la-smp2 run-la-smp8 run-inner run-dual run-dual-smp4 run-la-dual-smp2 run-dual-prebuilt run-dual-smp4-prebuilt run-la-dual-smp2-prebuilt fs-img gdbserver gdbclient

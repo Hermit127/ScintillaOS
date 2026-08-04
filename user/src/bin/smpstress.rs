@@ -12,7 +12,10 @@ use user_lib::{
 const CLONE_VM: usize = 0x100;
 const SIGCHLD: usize = 17;
 const CPUSET_BYTES: usize = core::mem::size_of::<usize>();
-const WORKERS: usize = 6;
+// Keep one runnable worker per secondary CPU when QEMU exposes the supported
+// eight-hart topology. This makes the stress check exercise every scheduler
+// queue instead of relying on incidental migration.
+const WORKERS: usize = 8;
 const ITERATIONS: usize = 100_000;
 const CHILD_STACK_SIZE: usize = 16 * 1024;
 
