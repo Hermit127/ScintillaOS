@@ -6,7 +6,7 @@ extern crate user_lib;
 use user_lib::{chdir, chroot, exec, exit, fork, mount, shutdown, waitpid, write, yield_};
 
 const BUILDSTORM_Q21: &[u8] = b"\
-echo '#### OS COMP TEST GROUP START buildstorm-glibc ####'\n\
+echo '#### OS COMP TEST GROUP START buildstorm ####'\n\
 mount -t proc proc /proc 2>/dev/null\n\
 mount -t sysfs sysfs /sys 2>/dev/null\n\
 mount -t devtmpfs devtmpfs /dev 2>/dev/null\n\
@@ -24,7 +24,7 @@ if cargo new --vcs none /tmp/minibuild >/dev/null 2>&1 && (cd /tmp/minibuild && 
 else\n\
     echo 'BUILDSTORM_MINIBUILD fail'\n\
 fi\n\
-echo '#### OS COMP TEST GROUP END buildstorm-glibc ####'\n\0";
+echo '#### OS COMP TEST GROUP END buildstorm ####'\n\0";
 
 fn shutdown_now() -> ! {
     shutdown();

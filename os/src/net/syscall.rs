@@ -254,7 +254,7 @@ fn add_to_socket_set(st: SocketType) -> Option<(SocketHandle, SocketType)> {
     })
 }
 
-fn sock_lookup(sockfd: usize) -> Option<(SocketHandle, SocketType, bool)> {
+fn sock_lookup(sockfd: usize) -> Option<(Option<SocketHandle>, SocketType, bool)> {
     let task = current_task()?;
     let inner = task.inner_exclusive_access();
     if sockfd >= inner.fd_table.len() {
@@ -1000,11 +1000,12 @@ pub fn sys_bind(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
             endpoint.addr
         };
         set_socket_local_endpoint(sockfd, IpEndpoint::new(local_addr, port));
-        if st == SocketType::Tcp {
-            local_tcp_listen(port);
-        }
         return 0;
     }
+
+    let Some(handle) = handle else {
+        return -22;
+    };
 
     let ret = crate::net::with_net_iface(|iface| match st {
         SocketType::Tcp => {
@@ -1043,9 +1044,6 @@ pub fn sys_bind(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
             endpoint.addr
         };
         set_socket_local_endpoint(sockfd, IpEndpoint::new(local_addr, port));
-        if st == SocketType::Tcp {
-            local_tcp_listen(port);
-        }
     }
     ret
 }
@@ -1136,6 +1134,10 @@ pub fn sys_connect(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
         return -97;
     }
 
+    let Some(handle) = handle else {
+        return -107;
+    };
+
     let local = IpListenEndpoint {
         addr: None,
         port: 32768 + ((sockfd as u16).wrapping_mul(7919) % 32767), // non-zero ephemeral port
@@ -1206,6 +1208,10 @@ pub fn sys_listen(sockfd: usize, _backlog: usize) -> isize {
         return -22;
     }
 
+    let Some(handle) = handle else {
+        return -22;
+    };
+
     let listening = crate::net::with_net_iface(|iface| {
         let sock: &TcpSocket = iface.sockets.get(handle);
         sock.is_listening()
@@ -1246,17 +1252,8 @@ pub fn sys_accept(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
     if let Some(port) = local_port {
         loop {
             if let Some(conn_id) = local_tcp_accept(port) {
-                let new_handle = if net_ready() {
-                    match add_to_socket_set(SocketType::Tcp) {
-                        Some((handle, _)) => handle,
-                        None => return -105,
-                    }
-                } else {
-                    dummy_socket_handle()
-                };
                 let task = current_task().unwrap();
-                let new_sock = Arc::new(SocketFile::new(new_handle, SocketType::Tcp, nonblock));
-                new_sock.set_local_tcp(conn_id, true);
+                let new_sock = Arc::new(SocketFile::new_local_tcp(conn_id, true, nonblock));
                 if let Some(local) = local_tcp_server_endpoint(conn_id) {
                     new_sock.set_local_endpoint(local);
                 }
@@ -1283,6 +1280,10 @@ pub fn sys_accept(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
     if !net_ready() {
         return -22;
     }
+
+    let Some(handle) = handle else {
+        return -22;
+    };
 
     crate::net::net_poll();
 
@@ -1427,11 +1428,16 @@ pub fn sys_sendto(
         SocketType::Tcp => {
             if let Some((conn_id, server_side, _)) = socket_local_tcp(sockfd) {
                 local_tcp_send(conn_id, server_side, dontwait, data)
-            } else {
+            } else if let Some(handle) = handle {
                 tcp_send(handle, dontwait, data)
+            } else {
+                -107
             }
         }
         SocketType::Udp => {
+            let Some(handle) = handle else {
+                return -107;
+            };
             let (ip, port) = match parse_sockaddr_in(dest_addr) {
                 Some(v) => v,
                 None => return -22,
@@ -1482,33 +1488,49 @@ pub fn sys_recvfrom(
         SocketType::Tcp => {
             if let Some((conn_id, server_side, _)) = socket_local_tcp(sockfd) {
                 local_tcp_recv(conn_id, server_side, dontwait, peek, recv_buf)
-            } else {
+            } else if let Some(handle) = handle {
                 tcp_recv(handle, dontwait, recv_buf)
+            } else {
+                -107
             }
         }
-        SocketType::Udp => loop {
-            if let Some(ret) = try_recv_local_udp(sockfd, handle, recv_buf, src_addr, addrlen, peek)
-            {
-                return ret;
-            }
-            let ret = if net_ready() {
-                udp_recv(handle, true, recv_buf)
-            } else {
-                -11
+        SocketType::Udp => {
+            let Some(handle) = handle else {
+                return -107;
             };
-            if ret != -11 || dontwait {
-                break ret;
+            loop {
+                if let Some(ret) =
+                    try_recv_local_udp(sockfd, handle, recv_buf, src_addr, addrlen, peek)
+                {
+                    return ret;
+                }
+                let ret = if net_ready() {
+                    udp_recv(handle, true, recv_buf)
+                } else {
+                    -11
+                };
+                if ret != -11 || dontwait {
+                    break ret;
+                }
+                let reason = BlockReason::UdpRecv(unsafe { core::mem::transmute(handle) });
+                block_current_and_run_next_if(reason, || {
+                    !local_udp_ready(sockfd, handle) && !udp_handle_can_recv(handle)
+                });
             }
-            let reason = BlockReason::UdpRecv(unsafe { core::mem::transmute(handle) });
-            block_current_and_run_next_if(reason, || {
-                !local_udp_ready(sockfd, handle) && !udp_handle_can_recv(handle)
-            });
-        },
+        }
         SocketType::Unix => -107,
     };
 
     // Fill source address for UDP if requested
-    if result > 0 && !src_addr.is_null() && !addrlen.is_null() && st == SocketType::Udp && !peek {
+    if result > 0
+        && !src_addr.is_null()
+        && !addrlen.is_null()
+        && st == SocketType::Udp
+        && !peek
+    {
+        let Some(handle) = handle else {
+            return result;
+        };
         let token = current_user_token();
         let endpoint = crate::net::with_net_iface(|iface| {
             let sock: &UdpSocket = iface.sockets.get(handle);
@@ -1566,11 +1588,16 @@ pub fn sys_sendmsg(sockfd: usize, msg: *const u8, flags: usize) -> isize {
         SocketType::Tcp => {
             if let Some((conn_id, server_side, _)) = socket_local_tcp(sockfd) {
                 local_tcp_send(conn_id, server_side, dontwait, &buf[..copied])
-            } else {
+            } else if let Some(handle) = handle {
                 tcp_send(handle, dontwait, &buf[..copied])
+            } else {
+                -107
             }
         }
         SocketType::Udp => {
+            let Some(handle) = handle else {
+                return -107;
+            };
             let dest = if !msghdr.msg_name.is_null() && msghdr.msg_namelen as usize >= 8 {
                 match parse_sockaddr_in(msghdr.msg_name) {
                     Some((ip, port)) => Some(IpEndpoint::new(
@@ -1641,34 +1668,41 @@ pub fn sys_recvmsg(sockfd: usize, msg: *mut u8, flags: usize) -> isize {
         SocketType::Tcp => {
             if let Some((conn_id, server_side, _)) = socket_local_tcp(sockfd) {
                 local_tcp_recv(conn_id, server_side, dontwait, peek, &mut buf)
-            } else {
+            } else if let Some(handle) = handle {
                 tcp_recv(handle, dontwait, &mut buf)
+            } else {
+                -107
             }
         }
-        SocketType::Udp => loop {
-            if let Some(ret) = try_recv_local_udp(
-                sockfd,
-                handle,
-                &mut buf,
-                core::ptr::null_mut(),
-                core::ptr::null_mut(),
-                peek,
-            ) {
-                break ret;
-            }
-            let ret = if net_ready() {
-                udp_recv(handle, true, &mut buf)
-            } else {
-                -11
+        SocketType::Udp => {
+            let Some(handle) = handle else {
+                return -107;
             };
-            if ret != -11 || dontwait {
-                break ret;
+            loop {
+                if let Some(ret) = try_recv_local_udp(
+                    sockfd,
+                    handle,
+                    &mut buf,
+                    core::ptr::null_mut(),
+                    core::ptr::null_mut(),
+                    peek,
+                ) {
+                    break ret;
+                }
+                let ret = if net_ready() {
+                    udp_recv(handle, true, &mut buf)
+                } else {
+                    -11
+                };
+                if ret != -11 || dontwait {
+                    break ret;
+                }
+                let reason = BlockReason::UdpRecv(unsafe { core::mem::transmute(handle) });
+                block_current_and_run_next_if(reason, || {
+                    !local_udp_ready(sockfd, handle) && !udp_handle_can_recv(handle)
+                });
             }
-            let reason = BlockReason::UdpRecv(unsafe { core::mem::transmute(handle) });
-            block_current_and_run_next_if(reason, || {
-                !local_udp_ready(sockfd, handle) && !udp_handle_can_recv(handle)
-            });
-        },
+        }
         SocketType::Unix => -107,
     };
 
@@ -1682,6 +1716,9 @@ pub fn sys_recvmsg(sockfd: usize, msg: *mut u8, flags: usize) -> isize {
 
         // Fill msg_name with peer address for UDP
         if st == SocketType::Udp && !peek {
+            let Some(handle) = handle else {
+                return result;
+            };
             let endpoint = crate::net::with_net_iface(|iface| {
                 let sock: &UdpSocket = iface.sockets.get(handle);
                 sock.endpoint()
@@ -1731,6 +1768,9 @@ pub fn sys_setsockopt(
                             false
                         };
                         if net_ready() {
+                            let Some(handle) = handle else {
+                                return 0;
+                            };
                             crate::net::with_net_iface(|iface| {
                                 let sock: &mut TcpSocket = iface.sockets.get_mut(handle);
                                 if val {
@@ -1761,6 +1801,9 @@ pub fn sys_setsockopt(
                     false
                 };
                 if net_ready() {
+                    let Some(handle) = handle else {
+                        return 0;
+                    };
                     crate::net::with_net_iface(|iface| {
                         let sock: &mut TcpSocket = iface.sockets.get_mut(handle);
                         sock.set_nagle_enabled(!val);
@@ -1807,11 +1850,14 @@ pub fn sys_getsockopt(
             if st != SocketType::Tcp {
                 return -95;
             }
-            let nagle = crate::net::with_net_iface(|iface| {
-                let sock: &TcpSocket = iface.sockets.get(handle);
-                !sock.nagle_enabled()
-            })
-            .unwrap_or(false);
+            let nagle = handle
+                .and_then(|handle| {
+                    crate::net::with_net_iface(|iface| {
+                        let sock: &TcpSocket = iface.sockets.get(handle);
+                        !sock.nagle_enabled()
+                    })
+                })
+                .unwrap_or(false);
             *translated_refmut(token, optlen as *mut u32) = 4;
             *translated_refmut(token, optval as *mut i32) = if nagle { 1 } else { 0 };
             0
@@ -1857,6 +1903,10 @@ pub fn sys_sock_shutdown(sockfd: usize, how: usize) -> isize {
         return -97;
     }
 
+    let Some(handle) = handle else {
+        return -107;
+    };
+
     crate::net::with_net_iface(|iface| {
         let sock: &mut TcpSocket = iface.sockets.get_mut(handle);
         match how {
@@ -1881,22 +1931,27 @@ pub fn sys_getpeername(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isi
     };
 
     let peer: Option<IpEndpoint> = match st {
-        SocketType::Tcp => crate::net::with_net_iface(|iface| {
-            let sock: &TcpSocket = iface.sockets.get(handle);
-            sock.remote_endpoint()
-        })
-        .flatten()
-        .or_else(|| get_socket_peer_endpoint(sockfd)),
-        SocketType::Udp => get_socket_peer_endpoint(sockfd).or_else(|| {
-            crate::net::with_net_iface(|iface| {
-                let sock: &UdpSocket = iface.sockets.get(handle);
-                sock.endpoint()
+        SocketType::Tcp => get_socket_peer_endpoint(sockfd).or_else(|| {
+            handle.and_then(|handle| {
+                crate::net::with_net_iface(|iface| {
+                    let sock: &TcpSocket = iface.sockets.get(handle);
+                    sock.remote_endpoint()
+                })
+                .flatten()
             })
-            .map(|ep| {
-                IpEndpoint::new(
-                    ep.addr.unwrap_or(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED)),
-                    ep.port,
-                )
+        }),
+        SocketType::Udp => get_socket_peer_endpoint(sockfd).or_else(|| {
+            handle.and_then(|handle| {
+                crate::net::with_net_iface(|iface| {
+                    let sock: &UdpSocket = iface.sockets.get(handle);
+                    sock.endpoint()
+                })
+                .map(|ep| {
+                    IpEndpoint::new(
+                        ep.addr.unwrap_or(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED)),
+                        ep.port,
+                    )
+                })
             })
         }),
         SocketType::Unix => None,
@@ -1929,23 +1984,29 @@ pub fn sys_getsockname(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isi
     };
 
     let local: Option<IpEndpoint> = match st {
-        SocketType::Tcp => crate::net::with_net_iface(|iface| {
-            let sock: &TcpSocket = iface.sockets.get(handle);
-            sock.local_endpoint()
-        })
-        .flatten()
-        .or_else(|| get_socket_local_endpoint(sockfd)),
-        SocketType::Udp => crate::net::with_net_iface(|iface| {
-            let sock: &UdpSocket = iface.sockets.get(handle);
-            sock.endpoint()
-        })
-        .map(|ep| {
-            IpEndpoint::new(
-                ep.addr.unwrap_or(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED)),
-                ep.port,
-            )
-        })
-        .or_else(|| get_socket_local_endpoint(sockfd)),
+        SocketType::Tcp => get_socket_local_endpoint(sockfd).or_else(|| {
+            handle.and_then(|handle| {
+                crate::net::with_net_iface(|iface| {
+                    let sock: &TcpSocket = iface.sockets.get(handle);
+                    sock.local_endpoint()
+                })
+                .flatten()
+            })
+        }),
+        SocketType::Udp => get_socket_local_endpoint(sockfd).or_else(|| {
+            handle.and_then(|handle| {
+                crate::net::with_net_iface(|iface| {
+                    let sock: &UdpSocket = iface.sockets.get(handle);
+                    sock.endpoint()
+                })
+                .map(|ep| {
+                    IpEndpoint::new(
+                        ep.addr.unwrap_or(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED)),
+                        ep.port,
+                    )
+                })
+            })
+        }),
         SocketType::Unix => None,
     };
 

@@ -15,7 +15,7 @@ pub enum SocketType {
 }
 
 struct SocketFileState {
-    handle: SocketHandle,
+    handle: Option<SocketHandle>,
     ref_count: usize,
     peer_endpoint: Option<IpEndpoint>,
     local_endpoint: Option<IpEndpoint>,
@@ -36,7 +36,7 @@ impl SocketFile {
         Self {
             inner: DeviceLock::new_named(
                 SocketFileState {
-                    handle,
+                    handle: Some(handle),
                     ref_count: 1,
                     peer_endpoint: None,
                     local_endpoint: None,
@@ -50,12 +50,30 @@ impl SocketFile {
         }
     }
 
-    pub fn get_handle(&self) -> SocketHandle {
+    pub fn new_local_tcp(conn_id: usize, server_side: bool, nonblock: bool) -> Self {
+        Self {
+            inner: DeviceLock::new_named(
+                SocketFileState {
+                    handle: None,
+                    ref_count: 1,
+                    peer_endpoint: None,
+                    local_endpoint: None,
+                    local_tcp: Some((conn_id, server_side)),
+                },
+                "SocketFile",
+            ),
+            socket_type: SocketType::Tcp,
+            nonblock: AtomicBool::new(nonblock),
+            was_listening: AtomicBool::new(false),
+        }
+    }
+
+    pub fn get_handle(&self) -> Option<SocketHandle> {
         self.inner.exclusive_access().handle
     }
 
     pub fn set_handle(&self, handle: SocketHandle) {
-        self.inner.exclusive_access().handle = handle;
+        self.inner.exclusive_access().handle = Some(handle);
     }
 
     pub fn get_nonblock(&self) -> bool {
@@ -107,7 +125,9 @@ impl File for SocketFile {
             );
         }
         let nonblock = self.get_nonblock();
-        let handle = self.get_handle();
+        let Some(handle) = self.get_handle() else {
+            return -107;
+        };
         match self.socket_type {
             SocketType::Tcp => super::syscall::tcp_recv(handle, nonblock, buf),
             SocketType::Udp => super::syscall::udp_read_socket(self, handle, nonblock, buf),
@@ -120,7 +140,9 @@ impl File for SocketFile {
             return super::syscall::local_tcp_send(conn_id, server_side, self.get_nonblock(), buf);
         }
         let nonblock = self.get_nonblock();
-        let handle = self.get_handle();
+        let Some(handle) = self.get_handle() else {
+            return -107;
+        };
         let data: &[u8] = buf;
         let result = match self.socket_type {
             SocketType::Tcp => super::syscall::tcp_send(handle, nonblock, data),
@@ -197,7 +219,9 @@ impl File for SocketFile {
         {
             use smoltcp::socket::tcp::Socket as TcpSocket;
             use smoltcp::socket::udp::Socket as UdpSocket;
-            let handle = self.get_handle();
+            let Some(handle) = self.get_handle() else {
+                return (false, false, true);
+            };
             crate::net::with_net_iface(|iface| match self.socket_type {
                 SocketType::Tcp => {
                     let sock: &TcpSocket = iface.sockets.get(handle);
@@ -252,7 +276,9 @@ impl File for SocketFile {
             super::syscall::local_udp_close(self.get_local_endpoint(), self.get_peer_endpoint());
         }
 
-        let handle = self.get_handle();
+        let Some(handle) = self.get_handle() else {
+            return;
+        };
         #[cfg(any(
             target_arch = "riscv64",
             target_arch = "aarch64",

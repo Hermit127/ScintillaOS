@@ -491,7 +491,10 @@ pub fn wake_net_blocked_tasks() {
                     if sock.socket_type != crate::net::socket::SocketType::Tcp {
                         return false;
                     }
-                    let socket_handle: usize = unsafe { core::mem::transmute(sock.get_handle()) };
+                    let Some(socket_set_handle) = sock.get_handle() else {
+                        return false;
+                    };
+                    let socket_handle: usize = unsafe { core::mem::transmute(socket_set_handle) };
                     socket_handle == handle
                         && sock
                             .get_local_endpoint()
