@@ -553,11 +553,18 @@ pub fn mark_current_task_address_space_active() {
         .enter_cpu(current_hart_id());
 }
 
-/// Account a timer interrupt on the current hart.  The counter is deliberately
-/// per-CPU so the old global mutable tick cannot race once secondary harts run.
-pub fn record_timer_tick() {
+#[cfg(target_arch = "loongarch64")]
+const TIMER_TICKS_PER_USER_SLICE: usize = 10;
+#[cfg(not(target_arch = "loongarch64"))]
+const TIMER_TICKS_PER_USER_SLICE: usize = 1;
+
+/// Account a timer interrupt and report whether the current user time slice
+/// has expired. LoongArch keeps its 1 ms timer resolution for deadlines but
+/// uses a 10 ms scheduling quantum, matching the RISC-V timer cadence.
+pub fn record_timer_tick() -> bool {
     let mut cpu = current_cpu().exclusive_access();
     cpu.ticks = cpu.ticks.wrapping_add(1);
+    cpu.ticks % TIMER_TICKS_PER_USER_SLICE == 0
 }
 
 // 返回当前任务的用户页表 token。
@@ -575,6 +582,10 @@ static BOOT_PAGE_TABLE: LazyInit<PageTable> = LazyInit::new();
 // 执行时取出 idle 上下文指针，并用启动时记录的内核页表切回调度主循环。
 pub fn schedule(switched_task_cx_ptr: *mut KContext) {
     assert_no_spin_locks_held("schedule");
+    // Keep the current-task ownership handoff atomic with local interrupt
+    // handlers while context_switch_pt saves or restores the task context.
+    let restore_interrupts = IRQ::int_enabled();
+    IRQ::int_disable();
     let idle_task_cx_ptr = current_cpu().exclusive_access().get_idle_task_cx_ptr();
     // 当前任务主动让出或退出时，先切回 idle，并恢复启动时记录的内核页表。
     unsafe {
@@ -584,6 +595,9 @@ pub fn schedule(switched_task_cx_ptr: *mut KContext) {
     // been restored with its user page table.  Mark it active before returning
     // to the syscall/trap path, which may resume userspace immediately.
     mark_current_task_address_space_active();
+    if restore_interrupts {
+        IRQ::int_enable();
+    }
 }
 
 // 记录启动时的内核页表，之后调度回 idle 时使用。

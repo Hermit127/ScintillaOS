@@ -424,7 +424,7 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             let _ = task::handle_ipi();
         }
         Timer => {
-            task::record_timer_tick();
+            let user_slice_expired = task::record_timer_tick();
             #[cfg(feature = "mount-watchdog")]
             fs::vfs::mount_watchdog_poll();
             // Sleep queues, interval timers, and the network device are global
@@ -439,7 +439,7 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             }
             // Kernel code is non-preemptible: switching only from a user trap
             // keeps lock ownership and kernel stacks local to the current hart.
-            if from_user && current_task().is_some() {
+            if user_slice_expired && from_user && current_task().is_some() {
                 suspend_current_and_run_next();
             }
         }

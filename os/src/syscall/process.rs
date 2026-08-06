@@ -1251,12 +1251,6 @@ pub fn sys_fork() -> isize {
     let Some(new_task) = current_task.fork() else {
         return -12;
     };
-    // initproc creates exactly one interactive shell.  QEMU's UART input is
-    // serviced by the bootstrap hart, so keep that shell on CPU0 while leaving
-    // normal shell-command children with the default migratable mask.
-    if current_task.getpid() == 1 {
-        new_task.set_allowed_cpus(1);
-    }
     let new_pid = new_task.pid.0;
     {
         let mut inner = new_task.inner_exclusive_access();
@@ -3081,8 +3075,11 @@ pub fn sys_nanosleep(req_ptr: usize, rem_ptr: usize) -> isize {
         if now >= wakeup_time {
             break;
         }
-        stdout_release_if_owner();
-        crate::task::suspend_current_and_run_next();
+        crate::task::sleep_current_until_if(wakeup_time as usize, || {
+            let now = polyhal::time::Time::now().to_nsec() as u64;
+            let inner = task.inner_exclusive_access();
+            now < wakeup_time && !inner.killed && !has_interrupting_signal(&inner)
+        });
     }
     if rem_ptr != 0 {
         let rem = crate::mm::translated_refmut(token, rem_ptr as *mut crate::task::TimeSpec);

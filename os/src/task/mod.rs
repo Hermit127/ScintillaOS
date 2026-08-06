@@ -277,6 +277,26 @@ pub fn sleep_current_and_run_next() {
     task.record_time_resume();
 }
 
+pub fn sleep_current_until_if<F>(wakeup_time: usize, should_sleep: F) -> bool
+where
+    F: FnOnce() -> bool,
+{
+    crate::fs::stdio::stdout_release_if_owner();
+    let task = current_task().unwrap();
+    task.record_time_suspend();
+    let task_cx_ptr =
+        manager::begin_block(&task, None, manager::BlockQueue::None, Some(wakeup_time));
+    if !should_sleep() {
+        manager::cancel_block_before_switch(&task);
+        task.record_time_resume();
+        return false;
+    }
+    schedule(task_cx_ptr);
+    task.record_time_resume();
+    let _ = manager::remove_sleep(task.getpid());
+    true
+}
+
 pub fn block_current_and_run_next(block_reason: BlockReason) {
     let _ = block_current_and_run_next_if(block_reason, || true);
 }

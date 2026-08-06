@@ -802,6 +802,7 @@ impl TaskControlBlock {
     }
     pub fn fork(self: &Arc<TaskControlBlock>) -> Option<Arc<TaskControlBlock>> {
         trace!("os::task::TaskControlBlock::fork");
+        let inherited_affinity = self.allowed_cpus();
         // Copy the user address space before collecting the remaining task state.
         // `from_existed_user` write-protects the parent's present writable
         // mappings for COW. A parent which is already a CLONE_VM group can be
@@ -975,6 +976,7 @@ impl TaskControlBlock {
                 "TaskInner",
             ),
         });
+        task_control_block.set_allowed_cpus(inherited_affinity);
         // add child to parent's children list
         {
             let mut parent_inner = self.inner_exclusive_access();
@@ -989,6 +991,7 @@ impl TaskControlBlock {
         materialize_writable_pages: bool,
     ) -> Option<Arc<TaskControlBlock>> {
         trace!("os::task::TaskControlBlock::clone_shared_vm");
+        let inherited_affinity = self.allowed_cpus();
         let _files_guard = super::FILE_TABLE_LOCK.lock();
         let mut parent_activity = None;
         let mut remapped_shared_pages = false;
@@ -1188,6 +1191,7 @@ impl TaskControlBlock {
                 "TaskInner",
             ),
         });
+        task_control_block.set_allowed_cpus(inherited_affinity);
         {
             let mut parent_inner = self.inner_exclusive_access();
             parent_inner.children.push(task_control_block.clone());

@@ -21,15 +21,14 @@ pub const SIGNAL_RETURN_TRAMPOLINE: usize = 0x7_fc00_0000;
 /// CPU0 is always present. Secondary harts become schedulable only after they
 /// register in the online mask, so the same kernel remains usable with
 /// `-smp 1` for compatibility checks.
-pub const MAX_CPUS: usize = 8;
+pub const MAX_CPUS: usize = 12;
 
 /// Maximum number of application CPUs used by each supported contest
-/// platform. Both QEMU virt targets expose up to eight harts; a smaller
-/// `-smp` value remains supported because secondary CPUs register online
-/// dynamically during boot.
+/// platform. A smaller `-smp` value remains supported because secondary CPUs
+/// register online dynamically during boot.
 #[cfg(target_arch = "riscv64")]
 pub const PLATFORM_CPUS: usize = 8;
 #[cfg(target_arch = "loongarch64")]
-pub const PLATFORM_CPUS: usize = 8;
+pub const PLATFORM_CPUS: usize = 12;
 #[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
 pub const PLATFORM_CPUS: usize = 1;
