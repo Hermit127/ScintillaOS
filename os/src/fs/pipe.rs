@@ -68,6 +68,7 @@ impl Pipe {
 // baseline avoids deadlocking a parent that waits for a child whose bounded
 // diagnostic output has not yet been drained.
 const RING_BUFFER_SIZE: usize = 16 * crate::config::PAGE_SIZE;
+const PIPE_BUF: usize = crate::config::PAGE_SIZE;
 
 #[derive(Copy, Clone, PartialEq)]
 enum RingBufferStatus {
@@ -273,19 +274,32 @@ impl File for Pipe {
         // See read(): faulting user memory must never be accessed under the
         // pipe lock.  Fill this scratch buffer before entering the ring.
         let mut scratch = vec![0u8; want_to_write.min(RING_BUFFER_SIZE)];
+        let atomic_write = want_to_write <= PIPE_BUF;
+        if atomic_write {
+            scratch[..want_to_write].copy_from_slice(buf);
+        }
         let mut already_write = 0usize;
         loop {
             if current_task_interrupted() {
-                return -4;
+                return if already_write == 0 {
+                    -4
+                } else {
+                    already_write as isize
+                };
             }
-            let (loop_write, read_end_closed) = {
-                let ring_buffer = self.buffer.exclusive_access();
-                (
-                    ring_buffer.available_write(),
-                    ring_buffer.all_read_ends_closed(),
-                )
+            let staged = if atomic_write {
+                want_to_write
+            } else {
+                let staged = (want_to_write - already_write).min(scratch.len());
+                scratch[..staged]
+                    .copy_from_slice(&buf[already_write..already_write + staged]);
+                staged
             };
+            let mut ring_buffer = self.buffer.exclusive_access();
+            let loop_write = ring_buffer.available_write();
+            let read_end_closed = ring_buffer.all_read_ends_closed();
             if read_end_closed {
+                drop(ring_buffer);
                 #[cfg(feature = "smp-diagnostics")]
                 {
                     let diagnostic_id = self.buffer.exclusive_access().diagnostic_id;
@@ -297,11 +311,25 @@ impl File for Pipe {
                     );
                 }
                 current_add_signal(SignalFlags::SIGPIPE);
-                return -32;
+                return if already_write == 0 {
+                    -32
+                } else {
+                    already_write as isize
+                };
             }
-            if loop_write == 0 {
+            let can_write = if atomic_write {
+                loop_write >= want_to_write
+            } else {
+                loop_write != 0
+            };
+            if !can_write {
+                drop(ring_buffer);
                 if self.is_nonblock() {
-                    return -11;
+                    return if already_write == 0 {
+                        -11
+                    } else {
+                        already_write as isize
+                    };
                 }
                 #[cfg(feature = "smp-diagnostics")]
                 {
@@ -319,17 +347,17 @@ impl File for Pipe {
                 let key = self.wait_key();
                 block_current_and_run_next_if(BlockReason::PipeWrite(key), || {
                     let ring_buffer = self.buffer.exclusive_access();
-                    ring_buffer.available_write() == 0
-                        && !ring_buffer.all_read_ends_closed()
+                    let available = ring_buffer.available_write();
+                    let unavailable = if atomic_write {
+                        available < want_to_write
+                    } else {
+                        available == 0
+                    };
+                    unavailable && !ring_buffer.all_read_ends_closed()
                 });
                 continue;
             }
-            let chunk = loop_write
-                .min(want_to_write - already_write)
-                .min(scratch.len());
-            scratch[..chunk]
-                .copy_from_slice(&buf[already_write..already_write + chunk]);
-            let mut ring_buffer = self.buffer.exclusive_access();
+            let chunk = loop_write.min(staged);
             let n = ring_buffer.write_buf(&scratch[..chunk]);
             already_write += n;
             drop(ring_buffer);
@@ -347,7 +375,7 @@ impl File for Pipe {
         if self.readable {
             let has_data = ring_buffer.available_read() > 0;
             let write_closed = ring_buffer.all_write_ends_closed();
-            (has_data || write_closed, false, false)
+            (has_data || write_closed, false, write_closed)
         } else {
             let has_space = ring_buffer.available_write() > 0;
             let read_closed = ring_buffer.all_read_ends_closed();

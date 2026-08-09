@@ -251,20 +251,34 @@ pub mod syscall {
     target_arch = "loongarch64"
 ))]
 use imp::NetworkState;
-#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+#[cfg(any(
+    target_arch = "riscv64",
+    target_arch = "aarch64",
+    target_arch = "loongarch64"
+))]
 use imp::NET_IFACE;
-#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+#[cfg(any(
+    target_arch = "riscv64",
+    target_arch = "aarch64",
+    target_arch = "loongarch64"
+))]
 use imp::NET_INITED;
 
-#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
+#[cfg(target_arch = "riscv64")]
 const VIRTIO_NET_MMIO: usize = 0x10003000;
 #[cfg(target_arch = "aarch64")]
 const VIRTIO_NET_MMIO: usize = 0xa00_0300;
+#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
 const VIRTIO_MMIO_DEVICE_ID: usize = 0x08;
+#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
 const VIRTIO_NET_DEVICE_ID: u32 = 1;
 
 pub fn net_init() {
-    #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+    #[cfg(any(
+        target_arch = "riscv64",
+        target_arch = "aarch64",
+        target_arch = "loongarch64"
+    ))]
     {
         // Console output may issue SBI calls; collect the result while the
         // network lock is held and log only after releasing it.
@@ -289,7 +303,11 @@ pub fn net_init() {
 }
 
 pub fn net_poll() {
-    #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+    #[cfg(any(
+        target_arch = "riscv64",
+        target_arch = "aarch64",
+        target_arch = "loongarch64"
+    ))]
     {
         if !NET_INITED.load(core::sync::atomic::Ordering::Relaxed) {
             return;
@@ -302,8 +320,8 @@ pub fn net_poll() {
             if !state.inited {
                 return;
             }
-            state.clock_ms += 10;
-            let clock = state.clock_ms;
+            let clock = polyhal::time::Time::now().to_msec() as u64;
+            state.clock_ms = clock;
             let timestamp = smoltcp::time::Instant::from_millis(clock as i64);
             let NetworkState {
                 ref mut iface,
@@ -337,18 +355,30 @@ pub fn net_device_present() -> bool {
     device_id == VIRTIO_NET_DEVICE_ID
 }
 
-#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+#[cfg(any(
+    target_arch = "riscv64",
+    target_arch = "aarch64",
+    target_arch = "loongarch64"
+))]
 pub fn net_available() -> bool {
     let guard = NET_IFACE.exclusive_access();
     guard.as_ref().map(|state| state.inited).unwrap_or(false)
 }
 
-#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+#[cfg(any(
+    target_arch = "riscv64",
+    target_arch = "aarch64",
+    target_arch = "loongarch64"
+))]
 pub fn net_available_fast() -> bool {
     NET_INITED.load(core::sync::atomic::Ordering::Relaxed)
 }
 
-#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+#[cfg(any(
+    target_arch = "riscv64",
+    target_arch = "aarch64",
+    target_arch = "loongarch64"
+))]
 pub fn with_net_iface<F, R>(f: F) -> Option<R>
 where
     F: FnOnce(&mut NetworkState) -> R,
@@ -357,7 +387,11 @@ where
     guard.as_mut().map(|state| f(state))
 }
 
-#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+#[cfg(any(
+    target_arch = "riscv64",
+    target_arch = "aarch64",
+    target_arch = "loongarch64"
+))]
 pub fn with_net_iface_tcp_connect(
     handle: smoltcp::iface::SocketHandle,
     remote: smoltcp::wire::IpEndpoint,
@@ -378,34 +412,7 @@ pub fn with_net_iface_tcp_connect(
 
 #[cfg(target_arch = "loongarch64")]
 pub fn net_device_present() -> bool {
-    false
-}
-
-#[cfg(target_arch = "loongarch64")]
-pub fn net_available() -> bool {
-    false
-}
-
-#[cfg(target_arch = "loongarch64")]
-pub fn net_available_fast() -> bool {
-    false
-}
-
-#[cfg(target_arch = "loongarch64")]
-pub fn with_net_iface<F, R>(_f: F) -> Option<R>
-where
-    F: FnOnce(&mut NetworkState) -> R,
-{
-    None
-}
-
-#[cfg(target_arch = "loongarch64")]
-pub fn with_net_iface_tcp_connect(
-    _handle: smoltcp::iface::SocketHandle,
-    _remote: smoltcp::wire::IpEndpoint,
-    _local: smoltcp::wire::IpListenEndpoint,
-) -> isize {
-    -97
+    NET_IFACE.exclusive_access().is_some()
 }
 
 #[cfg(not(any(
@@ -451,7 +458,11 @@ pub fn with_net_iface_tcp_connect(
     -97
 }
 
-#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+#[cfg(any(
+    target_arch = "riscv64",
+    target_arch = "aarch64",
+    target_arch = "loongarch64"
+))]
 pub fn wake_net_blocked_tasks() {
     use crate::task::{net_blocked_snapshot, wake_task, BlockReason};
     use smoltcp::iface::SocketHandle;
@@ -550,9 +561,6 @@ pub fn wake_net_blocked_tasks() {
         let _ = wake_task(task);
     }
 }
-
-#[cfg(target_arch = "loongarch64")]
-pub fn wake_net_blocked_tasks() {}
 
 #[cfg(not(any(
     target_arch = "riscv64",

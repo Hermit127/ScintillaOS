@@ -1,8 +1,11 @@
 use super::vfs::{
-    dentry_parent, read_dentry_symlink, vfs_create, vfs_resolve_parent_and_name, vfs_resolve_path,
-    vfs_resolve_with_fallback, vfs_tmpfs_can_resize, vfs_tmpfs_commit_resize, Dentry, DirEntry,
+    begin_cached_child_mutation, dentry_parent, invalidate_cached_child,
+    invalidate_cached_child_during_mutation, mark_cached_child_absent, read_dentry_symlink,
+    vfs_create, vfs_create_during_mutation, vfs_lookup, vfs_resolve_parent_and_name,
+    vfs_resolve_path, vfs_resolve_with_fallback, vfs_tmpfs_can_resize,
+    vfs_tmpfs_commit_resize, Dentry, DirEntry,
 };
-use super::{File, Kstat, S_IFDIR, S_IFLNK, S_IFREG};
+use super::{File, FilePageCacheKey, Kstat, S_IFDIR, S_IFLNK, S_IFREG};
 use crate::sync::VfsLock;
 use alloc::collections::BTreeMap;
 use alloc::ffi::CString;
@@ -106,6 +109,36 @@ fn unlinked_file_path(dentry: &Dentry, inode: u32) -> String {
     }
 }
 
+fn replacement_orphan_path(parent: &Dentry) -> String {
+    let sequence = NEXT_UNLINKED_FILE.fetch_add(1, Ordering::Relaxed);
+    if parent.fs_path == "/" {
+        alloc::format!("/{}rename-{}", UNLINKED_FILE_PREFIX, sequence)
+    } else if parent.fs_path.ends_with('/') {
+        alloc::format!("{}{}rename-{}", parent.fs_path, UNLINKED_FILE_PREFIX, sequence)
+    } else {
+        alloc::format!("{}/{}rename-{}", parent.fs_path, UNLINKED_FILE_PREFIX, sequence)
+    }
+}
+
+fn retain_replaced_open_inode(
+    super_block: usize,
+    inode: u32,
+    orphan_path: &str,
+) -> bool {
+    let key = OpenInodeKey { super_block, inode };
+    let mut open = OPEN_INODES.exclusive_access();
+    let Some(state) = open.get_mut(&key) else {
+        return false;
+    };
+    if state.count == 0 {
+        open.remove(&key);
+        return false;
+    }
+    state.orphan_path = Some(String::from(orphan_path));
+    state.unlink_in_progress = false;
+    true
+}
+
 /// Rename an open file to a hidden orphan and defer physical removal until
 /// the last open handle closes.
 ///
@@ -143,7 +176,6 @@ fn defer_open_file_unlink(dentry: &Arc<Dentry>) -> Option<bool> {
             ) == EOK as i32
         }
     };
-
     let cleanup_path = {
         let mut open = OPEN_INODES.exclusive_access();
         let mut remove_state = false;
@@ -239,6 +271,61 @@ pub fn path_fs_flags(fs_path: &str) -> usize {
 
 // ==================== OSInode ====================
 
+pub fn stat_dentry(dentry: &Arc<Dentry>) -> Kstat {
+    let info = dentry.inode_info();
+    let mut st = match info {
+        Some(info) => {
+            let file_type = if dentry.is_dir || info.is_dir {
+                S_IFDIR
+            } else if dentry.is_link || info.is_link {
+                S_IFLNK
+            } else if let Some(mode_type) = path_special_mode(&dentry.fs_path) {
+                mode_type
+            } else {
+                info.mode & 0o170000
+            };
+            let file_type = if file_type == 0 { S_IFREG } else { file_type };
+            let mut st = Kstat::new(file_type | (info.mode & 0o7777));
+            st.st_ino = info.inode_num as u64;
+            st.st_size = info.size as i64;
+            st.st_blksize = EXT4_BLOCK_SIZE;
+            st.st_blocks = info.blocks_count;
+            st.st_nlink = info.links_count.max(1);
+            st.st_uid = info.uid;
+            st.st_gid = info.gid;
+            if file_type == S_IFDIR {
+                st.st_nlink = st.st_nlink.max(2);
+            }
+            st.st_atime_sec = info.atime as i64;
+            st.st_mtime_sec = info.mtime as i64;
+            st.st_ctime_sec = info.ctime as i64;
+            let cached_times = path_cached_times(&dentry.fs_path);
+            let now_sec = crate::time::realtime_sec();
+            st.st_atime_sec = cached_times
+                .atime
+                .unwrap_or_else(|| st.st_atime_sec.min(now_sec));
+            st.st_mtime_sec = cached_times
+                .mtime
+                .unwrap_or_else(|| st.st_mtime_sec.min(now_sec));
+            st.st_ctime_sec = cached_times
+                .ctime
+                .unwrap_or_else(|| st.st_ctime_sec.min(now_sec));
+            st
+        }
+        None => {
+            if dentry.is_dir {
+                Kstat::new(S_IFDIR | 0o755)
+            } else {
+                Kstat::new(S_IFREG | 0o644)
+            }
+        }
+    };
+    if dentry.is_dir {
+        st.st_nlink = st.st_nlink.max(2);
+    }
+    st
+}
+
 pub struct OSInode {
     readable: bool,
     writable: bool,
@@ -272,12 +359,28 @@ impl Drop for OSInode {
             }
         }
         if let Some(orphan_path) = self.open_key.and_then(unregister_open_inode) {
-            let _ = self.dentry.super_block.unlink_file(&orphan_path);
+            if self.dentry.super_block.unlink_file(&orphan_path) {
+                if let (Some(parent), Some(orphan_name)) = (
+                    dentry_parent(&self.dentry),
+                    orphan_path.rsplit('/').next(),
+                ) {
+                    mark_cached_child_absent(&parent, orphan_name);
+                }
+            }
         }
     }
 }
 
 impl OSInode {
+    fn invalidate_cached_file_pages(&self) {
+        if let Some(key) = self.open_key {
+            crate::mm::invalidate_file_page_cache(FilePageCacheKey {
+                super_block: key.super_block,
+                inode: key.inode,
+            });
+        }
+    }
+
     pub fn get_dentry(&self) -> &Arc<Dentry> {
         &self.dentry
     }
@@ -367,8 +470,24 @@ impl OSInode {
             inner.file_handle = Some(file);
             true
         } else {
+            drop(inner);
+            #[cfg(feature = "buildstorm-diagnostics")]
+            if fs_path.contains("/target/debug/") {
+                crate::println!(
+                    "[buildstorm-fs] open-handle-failed rc={} writable={} path={}",
+                    rc,
+                    self.writable,
+                    fs_path,
+                );
+            }
             false
         }
+    }
+
+    fn has_backing_handle(&self) -> bool {
+        self.dentry.is_dir
+            || self.dentry.is_link
+            || self.inner.exclusive_access().file_handle.is_some()
     }
 
     pub fn read_all(&self) -> alloc::vec::Vec<u8> {
@@ -399,16 +518,20 @@ impl OSInode {
     }
 
     fn stat_inner(&self) -> Kstat {
+        let dentry_size = self
+            .dentry
+            .inode_info()
+            .map(|info| info.size as i64)
+            .unwrap_or(0);
         {
             let mut inner = self.inner.exclusive_access();
-            let _fs_lock = self.dentry.super_block.lock_fs();
             if let Some(mut st) = inner.cached_stat {
                 if let Some(ref mut file) = inner.file_handle {
                     st.st_ino = file.inode as u64;
-                    st.st_size = (unsafe { ext4_fsize(file) as i64 }).max(inner.offset as i64);
+                    st.st_size = (unsafe { ext4_fsize(file) as i64 })
+                        .max(dentry_size);
                     st.st_blocks = ((st.st_size.max(0) as u64) + 511) / 512;
                     inner.cached_stat = Some(st);
-                    self.dentry.update_cached_size(st.st_size.max(0) as u64);
                     return st;
                 }
                 if self.dentry.is_dir || (st.st_mode & S_IFREG) != S_IFREG {
@@ -416,57 +539,8 @@ impl OSInode {
                 }
             }
         }
-        let info = self.dentry.inode_info();
-        let mut st = match info {
-            Some(info) => {
-                let file_type = if self.dentry.is_dir || info.is_dir {
-                    S_IFDIR
-                } else if self.dentry.is_link || info.is_link {
-                    S_IFLNK
-                } else if let Some(mode_type) = path_special_mode(&self.dentry.fs_path) {
-                    mode_type
-                } else {
-                    info.mode & 0o170000
-                };
-                let file_type = if file_type == 0 { S_IFREG } else { file_type };
-                let mut st = Kstat::new(file_type | (info.mode & 0o7777));
-                st.st_ino = info.inode_num as u64;
-                st.st_size = info.size as i64;
-                st.st_blksize = EXT4_BLOCK_SIZE;
-                st.st_blocks = info.blocks_count;
-                st.st_nlink = info.links_count.max(1);
-                st.st_uid = info.uid;
-                st.st_gid = info.gid;
-                if file_type == S_IFDIR {
-                    st.st_nlink = st.st_nlink.max(2);
-                }
-                st.st_atime_sec = info.atime as i64;
-                st.st_mtime_sec = info.mtime as i64;
-                st.st_ctime_sec = info.ctime as i64;
-                let cached_times = path_cached_times(&self.dentry.fs_path);
-                let now_sec = (polyhal::time::Time::now().to_msec() / 1000) as i64;
-                st.st_atime_sec = cached_times
-                    .atime
-                    .unwrap_or_else(|| st.st_atime_sec.min(now_sec));
-                st.st_mtime_sec = cached_times
-                    .mtime
-                    .unwrap_or_else(|| st.st_mtime_sec.min(now_sec));
-                st.st_ctime_sec = cached_times
-                    .ctime
-                    .unwrap_or_else(|| st.st_ctime_sec.min(now_sec));
-                st
-            }
-            None => {
-                if self.dentry.is_dir {
-                    Kstat::new(S_IFDIR | 0o755)
-                } else {
-                    Kstat::new(S_IFREG | 0o644)
-                }
-            }
-        };
+        let mut st = stat_dentry(&self.dentry);
         if !self.dentry.is_dir {
-            let inner = self.inner.exclusive_access();
-            st.st_size = st.st_size.max(inner.offset as i64);
             st.st_blocks = ((st.st_size.max(0) as u64) + 511) / 512;
         } else {
             st.st_nlink = st.st_nlink.max(2);
@@ -487,6 +561,7 @@ impl OSInode {
     }
 
     pub fn refresh_after_truncate(&self, size: i64) {
+        self.invalidate_cached_file_pages();
         let mut inner = self.inner.exclusive_access();
         if let Some(mut file) = inner.file_handle.take() {
             let _fs_lock = self.dentry.super_block.lock_fs();
@@ -505,6 +580,7 @@ impl OSInode {
         if !self.writable || !self.open_handle() {
             return false;
         }
+        self.invalidate_cached_file_pages();
         let mut inner = self.inner.exclusive_access();
         let Some(ref mut file) = inner.file_handle else {
             return false;
@@ -565,7 +641,7 @@ impl OSInode {
     }
 
     fn now_sec() -> i64 {
-        (polyhal::time::Time::now().to_msec() / 1000) as i64
+        crate::time::realtime_sec()
     }
 
     fn update_cached_data_time(inner: &mut OSInodeInner, now_sec: i64) {
@@ -575,10 +651,8 @@ impl OSInode {
         }
     }
 
-    fn update_path_data_time(&self, now_sec: i64) {
+    fn update_cached_path_data_time(&self, now_sec: i64) {
         let now = now_sec.clamp(0, u32::MAX as i64) as u32;
-        self.dentry.super_block.set_mtime(&self.dentry.fs_path, now);
-        self.dentry.super_block.set_ctime(&self.dentry.fs_path, now);
         update_path_cached_times(&self.dentry.fs_path, None, Some(now_sec), Some(now_sec));
         self.dentry.update_cached_times(None, Some(now), Some(now));
     }
@@ -717,13 +791,41 @@ fn open_file_new(
 ) -> Option<Arc<OSInode>> {
     let start = base.unwrap_or_else(|| crate::fs::vfs::ROOT_DENTRY.clone());
     let want_dir = flags.directory_requested();
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let diagnose_buildstorm =
+        path.contains("/target/debug/") || start.fs_path.contains("/target/debug/");
 
     if flags.create_requested() {
         if want_dir {
             return None;
         }
 
-        let existing = vfs_resolve_with_fallback(&start, path);
+        let (parent, name) = match vfs_resolve_parent_and_name(&start, path) {
+            Some(parts) => parts,
+            None => {
+                #[cfg(feature = "buildstorm-diagnostics")]
+                if diagnose_buildstorm {
+                    crate::println!("[buildstorm-fs] create-parent-missing path={}", path);
+                }
+                return None;
+            }
+        };
+        // Linux open creates or acquires the target inode atomically with
+        // respect to rename/unlink in the parent directory. Keep the directory
+        // mutation generation odd until the live lwext4 handle is registered.
+        let _mutation = begin_cached_child_mutation(&parent);
+        let existing = vfs_lookup(&parent, &name);
+        #[cfg(feature = "buildstorm-diagnostics")]
+        if name == "invoked.timestamp" || name.ends_with("build-script-build-script-build") {
+            crate::println!(
+                "[buildstorm-fs] traced-open-create name={} parent={} existing={:?}",
+                name,
+                parent.fs_path,
+                existing
+                    .as_ref()
+                    .map(|dentry| (dentry.inode_num, dentry.is_dir, dentry.is_link)),
+            );
+        }
         if let Some(dentry) = existing.and_then(|d| {
             if flags.nofollow_requested() && d.is_link {
                 if flags.path_requested() {
@@ -735,32 +837,68 @@ fn open_file_new(
                 follow_symlink(&start, d, 0)
             }
         }) {
-            if !dentry.is_dir {
-                if flags.excl_requested() {
+            if flags.excl_requested() || dentry.is_dir {
+                #[cfg(feature = "buildstorm-diagnostics")]
+                if diagnose_buildstorm {
+                    crate::println!(
+                        "[buildstorm-fs] create-existing-rejected excl={} dir={} inode={} path={}",
+                        flags.excl_requested(),
+                        dentry.is_dir,
+                        dentry.inode_num,
+                        dentry.fs_path,
+                    );
+                }
+                return None;
+            }
+            if flags.trunc_requested() {
+                let truncated = dentry.super_block.truncate_file(&dentry.fs_path, 0);
+                if !truncated {
+                    #[cfg(feature = "buildstorm-diagnostics")]
+                    if diagnose_buildstorm {
+                        crate::println!(
+                            "[buildstorm-fs] create-existing-truncate-failed path={} resolved={}",
+                            path,
+                            dentry.fs_path,
+                        );
+                    }
                     return None;
                 }
-                if flags.trunc_requested() {
-                    let truncated = dentry.super_block.truncate_file(&dentry.fs_path, 0);
-                    if !truncated {
-                        return None;
-                    }
-                    dentry.update_cached_size(0);
-                }
-                let (readable, writable) = flags.read_write();
-                let append = flags.contains(OpenFlags::APPEND);
-                return Some(Arc::new(OSInode::new(readable, writable, append, dentry)));
+                dentry.update_cached_size(0);
             }
+            let (readable, writable) = flags.read_write();
+            let append = flags.contains(OpenFlags::APPEND);
+            let inode = Arc::new(OSInode::new(readable, writable, append, dentry));
+            return inode.has_backing_handle().then_some(inode);
         }
 
-        let (parent, name) = vfs_resolve_parent_and_name(&start, path)?;
-        let dentry = vfs_create(&parent, &name, false, mode)?;
+        let dentry = match vfs_create_during_mutation(&parent, &name, false, mode) {
+            Some(dentry) => dentry,
+            None => {
+                #[cfg(feature = "buildstorm-diagnostics")]
+                if diagnose_buildstorm {
+                    crate::println!("[buildstorm-fs] create-file-failed path={}", path);
+                }
+                return None;
+            }
+        };
+        #[cfg(feature = "buildstorm-diagnostics")]
+        if name == "invoked.timestamp" || name.ends_with("build-script-build-script-build") {
+            crate::println!(
+                "[buildstorm-fs] traced-open-created name={} inode={} dir={} path={}",
+                name,
+                dentry.inode_num,
+                dentry.is_dir,
+                dentry.fs_path,
+            );
+        }
         let (readable, writable) = flags.read_write();
-        return Some(Arc::new(OSInode::new(
+        let inode = Arc::new(OSInode::new(
             readable,
             writable,
             flags.contains(OpenFlags::APPEND),
             dentry,
-        )));
+        ));
+        return inode.has_backing_handle().then_some(inode);
     }
 
     let raw_dentry = vfs_resolve_with_fallback(&start, path)?;
@@ -790,7 +928,8 @@ fn open_file_new(
         flags.read_write()
     };
     let append = !dentry.is_dir && flags.contains(OpenFlags::APPEND);
-    Some(Arc::new(OSInode::new(readable, writable, append, dentry)))
+    let inode = Arc::new(OSInode::new(readable, writable, append, dentry));
+    inode.has_backing_handle().then_some(inode)
 }
 
 pub fn follow_symlink(
@@ -840,21 +979,31 @@ pub fn mkdir_at(base: Option<Arc<Dentry>>, path: &str, mode: u32) -> bool {
     vfs_create(&parent, &name, true, mode).is_some()
 }
 
-pub fn unlink_at(base: Option<Arc<Dentry>>, path: &str, is_dir: bool) -> bool {
+pub fn unlink_at_result(
+    base: Option<Arc<Dentry>>,
+    path: &str,
+    is_dir: bool,
+) -> Result<(), isize> {
     let start = base.unwrap_or_else(|| crate::fs::vfs::ROOT_DENTRY.clone());
-    let dentry = match vfs_resolve_path(&start, path) {
-        Some(d) => d,
-        None => return false,
+    let (parent, name) = match vfs_resolve_parent_and_name(&start, path) {
+        Some(parts) => parts,
+        None => return Err(-2),
     };
 
-    if dentry.is_dir != is_dir {
-        return false;
+    // Resolve the target only after owning the parent mutation generation.
+    // Two concurrent unlink calls then observe either the current inode or a
+    // real ENOENT, rather than both operating on one stale positive dentry.
+    let _mutation = begin_cached_child_mutation(&parent);
+    let dentry = match vfs_lookup(&parent, &name) {
+        Some(dentry) => dentry,
+        None => return Err(-2),
+    };
+    if dentry.is_dir && !is_dir {
+        return Err(-21);
     }
-
-    let parent = match dentry_parent(&dentry) {
-        Some(p) => p,
-        None => return false,
-    };
+    if !dentry.is_dir && is_dir {
+        return Err(-20);
+    }
 
     root_make_accessible(&parent, 0o777);
     root_make_accessible(&dentry, 0o777);
@@ -868,12 +1017,15 @@ pub fn unlink_at(base: Option<Arc<Dentry>>, path: &str, is_dir: bool) -> bool {
     };
 
     if ok {
-        let mut children = parent.children.exclusive_access();
-        if let Some(list) = children.as_mut() {
-            list.retain(|c| c.name != dentry.name);
-        }
+        invalidate_cached_child_during_mutation(&parent, &dentry.name);
+        Ok(())
+    } else {
+        Err(-1)
     }
-    ok
+}
+
+pub fn unlink_at(base: Option<Arc<Dentry>>, path: &str, is_dir: bool) -> bool {
+    unlink_at_result(base, path, is_dir).is_ok()
 }
 
 // ==================== File Trait for OSInode ====================
@@ -1017,6 +1169,9 @@ impl File for OSInode {
         if !self.writable {
             return -1;
         }
+        if !buf.is_empty() {
+            self.invalidate_cached_file_pages();
+        }
         let need_open = {
             let inner = self.inner.exclusive_access();
             inner.file_handle.is_none()
@@ -1026,6 +1181,8 @@ impl File for OSInode {
         }
         let mut inner = self.inner.exclusive_access();
         let saved_offset = inner.offset;
+        let now_sec = Self::now_sec();
+        let write_time = now_sec.clamp(0, u32::MAX as i64) as u32;
         if let Some(ref mut file) = inner.file_handle {
             let _fs_lock = self.dentry.super_block.lock_fs();
             let size = unsafe { ext4_fsize(file) as usize };
@@ -1051,14 +1208,27 @@ impl File for OSInode {
             while total < buf.len() {
                 let mut rw_count: usize = 0;
                 let rc = unsafe {
-                    ext4_fwrite(
+                    ext4_fwrite_with_times(
                         file,
                         buf[total..].as_ptr() as *const core::ffi::c_void,
                         buf.len() - total,
                         &mut rw_count,
+                        write_time,
+                        write_time,
                     )
                 };
                 if rc != EOK as i32 || rw_count == 0 {
+                    #[cfg(feature = "buildstorm-diagnostics")]
+                    if self.dentry.fs_path.contains("/target/debug/") {
+                        crate::println!(
+                            "[buildstorm-fs] pwrite-failed rc={} off={} len={} written={} path={}",
+                            rc,
+                            offset + total,
+                            buf.len() - total,
+                            rw_count,
+                            self.dentry.fs_path,
+                        );
+                    }
                     break;
                 }
                 total += rw_count;
@@ -1067,9 +1237,8 @@ impl File for OSInode {
                 ext4_fseek(file, saved_offset as i64, SEEK_SET as u32);
             }
             let new_size = unsafe { ext4_fsize(file) as i64 };
-            // The remaining cache and timestamp updates may call path-based
-            // VFS helpers, which acquire this same FsLock.  Release it before
-            // leaving the direct-handle transaction.
+            // Cache publication and tmpfs accounting use independent VFS
+            // state. Release FsLock before entering those domains.
             drop(_fs_lock);
             if let Some(ref mut st) = inner.cached_stat {
                 st.st_size = new_size;
@@ -1077,10 +1246,9 @@ impl File for OSInode {
             }
             self.dentry.update_cached_size(new_size.max(0) as u64);
             if total > 0 {
-                let now_sec = Self::now_sec();
                 Self::update_cached_data_time(&mut inner, now_sec);
                 drop(inner);
-                self.update_path_data_time(now_sec);
+                self.update_cached_path_data_time(now_sec);
                 crate::fs::record_block_write_bytes(total);
                 vfs_tmpfs_commit_resize(
                     &self.dentry.path,
@@ -1096,14 +1264,13 @@ impl File for OSInode {
                 let written = self
                     .dentry
                     .super_block
-                    .write_at(&self.dentry.fs_path, offset, buf);
+                    .write_at(&self.dentry.fs_path, offset, buf, write_time);
                 if written > 0 {
                     crate::fs::record_block_write_bytes(written);
                     let new_size = (offset + written) as i64;
                     self.update_cached_size(new_size);
-                    let now_sec = Self::now_sec();
                     self.update_cached_times(None, Some(now_sec), Some(now_sec));
-                    self.update_path_data_time(now_sec);
+                    self.update_cached_path_data_time(now_sec);
                     vfs_tmpfs_commit_resize(
                         &self.dentry.path,
                         &self.dentry.fs_path,
@@ -1136,14 +1303,13 @@ impl File for OSInode {
         let written = self
             .dentry
             .super_block
-            .write_at(&self.dentry.fs_path, offset, buf);
+            .write_at(&self.dentry.fs_path, offset, buf, write_time);
         if written > 0 {
             crate::fs::record_block_write_bytes(written);
             let new_size = (offset + written) as i64;
             self.update_cached_size(new_size);
-            let now_sec = Self::now_sec();
             self.update_cached_times(None, Some(now_sec), Some(now_sec));
-            self.update_path_data_time(now_sec);
+            self.update_cached_path_data_time(now_sec);
             vfs_tmpfs_commit_resize(
                 &self.dentry.path,
                 &self.dentry.fs_path,
@@ -1155,6 +1321,9 @@ impl File for OSInode {
     }
 
     fn write(&self, buf: &mut [u8]) -> isize {
+        if !buf.is_empty() {
+            self.invalidate_cached_file_pages();
+        }
         let need_open = {
             let inner = self.inner.exclusive_access();
             inner.file_handle.is_none()
@@ -1165,6 +1334,8 @@ impl File for OSInode {
         let mut inner = self.inner.exclusive_access();
         let append = inner.append;
         let cur_offset = inner.offset;
+        let now_sec = Self::now_sec();
+        let write_time = now_sec.clamp(0, u32::MAX as i64) as u32;
         if let Some(ref mut file) = inner.file_handle {
             let _fs_lock = self.dentry.super_block.lock_fs();
             let off = if append {
@@ -1196,22 +1367,34 @@ impl File for OSInode {
             while total < buf.len() {
                 let mut rw_count: usize = 0;
                 let rc = unsafe {
-                    ext4_fwrite(
+                    ext4_fwrite_with_times(
                         file,
                         buf[total..].as_ptr() as *const core::ffi::c_void,
                         buf.len() - total,
                         &mut rw_count,
+                        write_time,
+                        write_time,
                     )
                 };
                 if rc != EOK as i32 || rw_count == 0 {
+                    #[cfg(feature = "buildstorm-diagnostics")]
+                    if self.dentry.fs_path.contains("/target/debug/") {
+                        crate::println!(
+                            "[buildstorm-fs] write-failed rc={} off={} len={} written={} path={}",
+                            rc,
+                            off + total,
+                            buf.len() - total,
+                            rw_count,
+                            self.dentry.fs_path,
+                        );
+                    }
                     break;
                 }
                 total += rw_count;
             }
             let new_size = unsafe { ext4_fsize(file) as i64 };
-            // `update_path_data_time` takes the superblock FsLock itself.
-            // Do not recursively acquire it while this handle transaction is
-            // still protected by the same lock.
+            // Cache publication and tmpfs accounting must happen after the
+            // direct-handle transaction releases FsLock.
             drop(_fs_lock);
             inner.offset = off + total;
             if let Some(ref mut st) = inner.cached_stat {
@@ -1220,10 +1403,9 @@ impl File for OSInode {
             }
             self.dentry.update_cached_size(new_size.max(0) as u64);
             if total > 0 {
-                let now_sec = Self::now_sec();
                 Self::update_cached_data_time(&mut inner, now_sec);
                 drop(inner);
-                self.update_path_data_time(now_sec);
+                self.update_cached_path_data_time(now_sec);
                 crate::fs::record_block_write_bytes(total);
                 vfs_tmpfs_commit_resize(
                     &self.dentry.path,
@@ -1239,7 +1421,7 @@ impl File for OSInode {
                 let rw_count = self
                     .dentry
                     .super_block
-                    .write_at(&self.dentry.fs_path, off, buf);
+                    .write_at(&self.dentry.fs_path, off, buf, write_time);
                 let mut inner = self.inner.exclusive_access();
                 inner.offset = off + rw_count;
                 if let Some(ref mut st) = inner.cached_stat {
@@ -1248,10 +1430,9 @@ impl File for OSInode {
                 }
                 self.dentry.update_cached_size((off + rw_count) as u64);
                 if rw_count > 0 {
-                    let now_sec = Self::now_sec();
                     Self::update_cached_data_time(&mut inner, now_sec);
                     drop(inner);
-                    self.update_path_data_time(now_sec);
+                    self.update_cached_path_data_time(now_sec);
                     crate::fs::record_block_write_bytes(rw_count);
                     vfs_tmpfs_commit_resize(
                         &self.dentry.path,
@@ -1293,7 +1474,7 @@ impl File for OSInode {
         let rw_count = self
             .dentry
             .super_block
-            .write_at(&self.dentry.fs_path, off, buf);
+            .write_at(&self.dentry.fs_path, off, buf, write_time);
         let mut inner = self.inner.exclusive_access();
         inner.offset = off + rw_count;
         if let Some(ref mut st) = inner.cached_stat {
@@ -1302,10 +1483,9 @@ impl File for OSInode {
         }
         self.dentry.update_cached_size((off + rw_count) as u64);
         if rw_count > 0 {
-            let now_sec = Self::now_sec();
             Self::update_cached_data_time(&mut inner, now_sec);
             drop(inner);
-            self.update_path_data_time(now_sec);
+            self.update_cached_path_data_time(now_sec);
             crate::fs::record_block_write_bytes(rw_count);
             vfs_tmpfs_commit_resize(
                 &self.dentry.path,
@@ -1327,6 +1507,13 @@ impl File for OSInode {
 
     fn path(&self) -> Option<String> {
         Some(self.dentry.path.clone())
+    }
+
+    fn page_cache_key(&self) -> Option<FilePageCacheKey> {
+        self.open_key.map(|key| FilePageCacheKey {
+            super_block: key.super_block,
+            inode: key.inode,
+        })
     }
 
     fn getdents64(&self, buf: &mut [u8]) -> isize {
@@ -1432,26 +1619,68 @@ pub fn rename_at(
     old_path: &str,
     new_base: Option<Arc<Dentry>>,
     new_path: &str,
-) -> bool {
+    flags: u32,
+) -> Result<(), isize> {
     use alloc::ffi::CString;
-    use lwext4_rust::bindings::{ext4_frename, EOK};
+    use lwext4_rust::bindings::{ext4_frename2, EOK, EXT4_RENAME_NOREPLACE};
+
+    const RENAME_NOREPLACE: u32 = 1;
+
+    if flags & !RENAME_NOREPLACE != 0 {
+        return Err(-22);
+    }
 
     let start = old_base.unwrap_or_else(|| crate::fs::vfs::ROOT_DENTRY.clone());
+    #[cfg(feature = "buildstorm-diagnostics")]
+    let diagnose_buildstorm = old_path.contains("/target/debug/")
+        || new_path.contains("/target/debug/")
+        || start.fs_path.contains("/target/debug/");
+    // Keep the source parent alive independently of the dentry cache.  A child
+    // stores only a Weak parent link, so relying on dentry_parent() can turn a
+    // cache eviction into a spurious EBUSY during a perfectly valid rename.
+    let (old_parent, old_name) = match vfs_resolve_parent_and_name(&start, old_path) {
+        Some(parts) => parts,
+        None => return Err(-2),
+    };
     let old_dentry = match vfs_resolve_path(&start, old_path) {
         Some(d) => d,
-        None => return false,
+        None => {
+            #[cfg(feature = "buildstorm-diagnostics")]
+            if diagnose_buildstorm {
+                crate::println!(
+                    "[buildstorm-fs] rename-source-missing old={} new={}",
+                    old_path,
+                    new_path,
+                );
+            }
+            return Err(-2);
+        }
     };
 
     let old_cpath = match CString::new(old_dentry.fs_path.as_bytes()) {
         Ok(s) => s,
-        Err(_) => return false,
+        Err(_) => return Err(-22),
     };
 
     let new_start = new_base.unwrap_or_else(|| crate::fs::vfs::ROOT_DENTRY.clone());
     let (new_parent, new_name) = match vfs_resolve_parent_and_name(&new_start, new_path) {
         Some(x) => x,
-        None => return false,
+        None => {
+            #[cfg(feature = "buildstorm-diagnostics")]
+            if diagnose_buildstorm || new_start.fs_path.contains("/target/debug/") {
+                crate::println!(
+                    "[buildstorm-fs] rename-parent-missing old={} new={}",
+                    old_path,
+                    new_path,
+                );
+            }
+            return Err(-2);
+        }
     };
+
+    if !Arc::ptr_eq(&old_dentry.super_block, &new_parent.super_block) {
+        return Err(-18);
+    }
 
     let new_fs_path = if new_parent.fs_path == "/" {
         alloc::format!("/{}", new_name)
@@ -1463,33 +1692,131 @@ pub fn rename_at(
 
     let new_cpath = match CString::new(new_fs_path.as_bytes()) {
         Ok(s) => s,
-        Err(_) => return false,
+        Err(_) => return Err(-22),
     };
 
+    let orphan_fs_path = replacement_orphan_path(&new_parent);
+    let orphan_cpath = match CString::new(orphan_fs_path.as_bytes()) {
+        Ok(s) => s,
+        Err(_) => return Err(-22),
+    };
+
+    if old_dentry.is_dir {
+        let source_inode = old_dentry
+            .inode_info()
+            .map(|info| info.inode_num)
+            .unwrap_or(old_dentry.inode_num);
+        let mut ancestor = Some(new_parent.clone());
+        while let Some(candidate) = ancestor {
+            let candidate_inode = candidate
+                .inode_info()
+                .map(|info| info.inode_num)
+                .unwrap_or(candidate.inode_num);
+            if Arc::ptr_eq(&candidate.super_block, &old_dentry.super_block)
+                && candidate_inode == source_inode
+            {
+                #[cfg(feature = "buildstorm-diagnostics")]
+                if diagnose_buildstorm || new_fs_path.contains("/target/debug/") {
+                    crate::println!(
+                        "[buildstorm-fs] rename-directory-cycle source={} inode={} parent={} parent_inode={}",
+                        old_dentry.fs_path,
+                        source_inode,
+                        candidate.fs_path,
+                        candidate_inode,
+                    );
+                }
+                return Err(-22);
+            }
+            ancestor = dentry_parent(&candidate);
+        }
+    }
+    let same_parent = Arc::ptr_eq(&old_parent, &new_parent);
+    let old_key = Arc::as_ptr(&old_parent) as usize;
+    let new_key = Arc::as_ptr(&new_parent) as usize;
+    let (first_parent, second_parent) = if same_parent || old_key < new_key {
+        (old_parent.clone(), (!same_parent).then(|| new_parent.clone()))
+    } else {
+        (new_parent.clone(), Some(old_parent.clone()))
+    };
+    let _first_mutation = begin_cached_child_mutation(&first_parent);
+    let _second_mutation = second_parent
+        .as_ref()
+        .map(begin_cached_child_mutation);
+
+    let mut replaced_inode = 0u32;
+    let mut replaced_is_dir = false;
+    let lwext4_flags = if flags & RENAME_NOREPLACE != 0 {
+        EXT4_RENAME_NOREPLACE
+    } else {
+        0
+    };
     let rc = {
         let _fs_lock = old_dentry.super_block.lock_fs();
         unsafe {
-            ext4_frename(
+            ext4_frename2(
                 old_cpath.as_ptr() as *const core::ffi::c_char,
                 new_cpath.as_ptr() as *const core::ffi::c_char,
+                orphan_cpath.as_ptr() as *const core::ffi::c_char,
+                lwext4_flags,
+                &mut replaced_inode,
+                &mut replaced_is_dir,
             )
         }
     };
 
+    #[cfg(feature = "buildstorm-diagnostics")]
+    if old_dentry.fs_path.contains("build-script-build")
+        || new_fs_path.contains("build-script-build")
+    {
+        crate::println!(
+            "[buildstorm-link] rename rc={} inode={} replaced={} old={} new={}",
+            rc,
+            old_dentry.inode_num,
+            replaced_inode,
+            old_dentry.fs_path,
+            new_fs_path,
+        );
+    }
+
     if rc == EOK as i32 {
-        if let Some(old_parent) = dentry_parent(&old_dentry) {
-            let mut children = old_parent.children.exclusive_access();
-            if let Some(list) = children.as_mut() {
-                list.retain(|c| c.name != old_dentry.name);
+        invalidate_cached_child_during_mutation(&old_parent, &old_name);
+        invalidate_cached_child_during_mutation(&new_parent, &new_name);
+        if replaced_inode != 0 {
+            let super_block_key = Arc::as_ptr(&old_dentry.super_block) as usize;
+            let retained = !replaced_is_dir
+                && retain_replaced_open_inode(
+                    super_block_key,
+                    replaced_inode,
+                    &orphan_fs_path,
+                );
+            if !retained {
+                let cleaned = if replaced_is_dir {
+                    old_dentry.super_block.unlink_dir(&orphan_fs_path)
+                } else {
+                    old_dentry.super_block.unlink_file(&orphan_fs_path)
+                };
+                #[cfg(feature = "buildstorm-diagnostics")]
+                if !cleaned {
+                    crate::println!(
+                        "[buildstorm-fs] rename-orphan-cleanup-failed inode={} path={}",
+                        replaced_inode,
+                        orphan_fs_path,
+                    );
+                }
             }
         }
-        let mut children = new_parent.children.exclusive_access();
-        if let Some(list) = children.as_mut() {
-            list.retain(|c| c.name != new_name);
-        }
-        true
+        Ok(())
     } else {
-        false
+        #[cfg(feature = "buildstorm-diagnostics")]
+        if diagnose_buildstorm || new_fs_path.contains("/target/debug/") {
+            crate::println!(
+                "[buildstorm-fs] rename-failed rc={} old={} new={}",
+                rc,
+                old_dentry.fs_path,
+                new_fs_path,
+            );
+        }
+        Err(-(rc as isize))
     }
 }
 
@@ -1531,8 +1858,12 @@ pub fn symlink_at(base: Option<Arc<Dentry>>, target: &str, linkpath: &str) -> bo
             )
         }
     };
-
-    rc == EOK as i32
+    if rc == EOK as i32 {
+        invalidate_cached_child(&parent, &name);
+        true
+    } else {
+        false
+    }
 }
 
 // ==================== link_at ====================
@@ -1582,11 +1913,20 @@ pub fn link_at(
             )
         }
     };
+    #[cfg(feature = "buildstorm-diagnostics")]
+    if old_dentry.fs_path.contains("build-script-build")
+        || new_fs_path.contains("build-script-build")
+    {
+        crate::println!(
+            "[buildstorm-link] link rc={} inode={} old={} new={}",
+            rc,
+            old_dentry.inode_num,
+            old_dentry.fs_path,
+            new_fs_path,
+        );
+    }
     if rc == EOK as i32 {
-        let mut children = new_parent.children.exclusive_access();
-        if let Some(list) = children.as_mut() {
-            list.retain(|c| c.name != new_name);
-        }
+        invalidate_cached_child(&new_parent, &new_name);
         true
     } else {
         false

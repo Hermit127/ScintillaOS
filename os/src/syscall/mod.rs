@@ -110,6 +110,10 @@ const SYSCALL_STATX: usize = 291;
 const SYSCALL_EVENTFD2: usize = 19;
 const SYSCALL_RSEQ: usize = 293;
 const SYSCALL_RISCV_HWPROBE: usize = 258;
+#[cfg(any(feature = "smp-diagnostics", feature = "buildstorm-diagnostics"))]
+const SYSCALL_FSOPEN: usize = 430;
+#[cfg(any(feature = "smp-diagnostics", feature = "buildstorm-diagnostics"))]
+const SYSCALL_CLONE3: usize = 435;
 const SYSCALL_CLONE: usize = 220;
 const SYSCALL_FORK: usize = 401;
 pub(crate) const SYSCALL_EXEC: usize = 221;
@@ -183,6 +187,100 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use fs::*;
 use process::*;
 
+#[cfg(feature = "buildstorm-diagnostics")]
+struct ActiveSyscall {
+    id: AtomicUsize,
+    pid: AtomicUsize,
+    args: [AtomicUsize; 6],
+}
+
+#[cfg(feature = "buildstorm-diagnostics")]
+impl ActiveSyscall {
+    const fn new() -> Self {
+        Self {
+            id: AtomicUsize::new(usize::MAX),
+            pid: AtomicUsize::new(0),
+            args: [const { AtomicUsize::new(0) }; 6],
+        }
+    }
+}
+
+#[cfg(feature = "buildstorm-diagnostics")]
+static ACTIVE_SYSCALLS: [ActiveSyscall; crate::config::MAX_CPUS] =
+    [const { ActiveSyscall::new() }; crate::config::MAX_CPUS];
+
+#[cfg(feature = "buildstorm-diagnostics")]
+fn record_active_syscall(pid: usize, id: usize, args: &[usize; 6]) {
+    let Some(cpu) = crate::task::try_current_hart_id() else {
+        return;
+    };
+    let Some(active) = ACTIVE_SYSCALLS.get(cpu) else {
+        return;
+    };
+    active.pid.store(pid, Ordering::Relaxed);
+    for (slot, value) in active.args.iter().zip(args.iter()) {
+        slot.store(*value, Ordering::Relaxed);
+    }
+    active.id.store(id, Ordering::Release);
+}
+
+#[cfg(feature = "buildstorm-diagnostics")]
+fn clear_active_syscall() {
+    let Some(cpu) = crate::task::try_current_hart_id() else {
+        return;
+    };
+    if let Some(active) = ACTIVE_SYSCALLS.get(cpu) {
+        active.id.store(usize::MAX, Ordering::Release);
+    }
+}
+
+#[cfg(feature = "buildstorm-diagnostics")]
+pub(crate) fn dump_active_syscall_for_oom() {
+    let cpu = crate::task::try_current_hart_id().unwrap_or(usize::MAX);
+    let Some(active) = ACTIVE_SYSCALLS.get(cpu) else {
+        crate::println!("[heap-debug] active-syscall cpu={} unavailable", cpu);
+        return;
+    };
+    let id = active.id.load(Ordering::Acquire);
+    crate::println!(
+        "[heap-debug] active-syscall cpu={} pid={} nr={} a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x}",
+        cpu,
+        active.pid.load(Ordering::Relaxed),
+        id,
+        active.args[0].load(Ordering::Relaxed),
+        active.args[1].load(Ordering::Relaxed),
+        active.args[2].load(Ordering::Relaxed),
+        active.args[3].load(Ordering::Relaxed),
+        active.args[4].load(Ordering::Relaxed),
+        active.args[5].load(Ordering::Relaxed),
+    );
+}
+
+#[cfg(feature = "buildstorm-diagnostics")]
+pub(crate) fn dump_all_active_syscalls(reason: &str) {
+    let current_cpu = crate::task::try_current_hart_id().unwrap_or(usize::MAX);
+    for (cpu, active) in ACTIVE_SYSCALLS.iter().enumerate() {
+        let id = active.id.load(Ordering::Acquire);
+        if id == usize::MAX {
+            continue;
+        }
+        crate::println!(
+            "[buildstorm-diag] active-syscall reason={} cpu={} current={} pid={} nr={} a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x}",
+            reason,
+            cpu,
+            cpu == current_cpu,
+            active.pid.load(Ordering::Relaxed),
+            id,
+            active.args[0].load(Ordering::Relaxed),
+            active.args[1].load(Ordering::Relaxed),
+            active.args[2].load(Ordering::Relaxed),
+            active.args[3].load(Ordering::Relaxed),
+            active.args[4].load(Ordering::Relaxed),
+            active.args[5].load(Ordering::Relaxed),
+        );
+    }
+}
+
 #[no_mangle]
 pub static LAST_SYSCALL_ID: AtomicUsize = AtomicUsize::new(0);
 #[no_mangle]
@@ -217,11 +315,16 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     let current_pid = crate::task::current_task()
         .map(|task| task.getpid())
         .unwrap_or(0);
-    LAST_SYSCALL_ID.store(syscall_id, Ordering::Relaxed);
-    LAST_SYSCALL_ARG0.store(args[0], Ordering::Relaxed);
-    LAST_SYSCALL_ARG1.store(args[1], Ordering::Relaxed);
-    LAST_SYSCALL_ARG2.store(args[2], Ordering::Relaxed);
-    LAST_SYSCALL_PID.store(current_pid, Ordering::Relaxed);
+    #[cfg(feature = "buildstorm-diagnostics")]
+    record_active_syscall(current_pid, syscall_id, &args);
+    #[cfg(any(debug_assertions, feature = "smp-diagnostics", feature = "timeout-trace"))]
+    {
+        LAST_SYSCALL_ID.store(syscall_id, Ordering::Relaxed);
+        LAST_SYSCALL_ARG0.store(args[0], Ordering::Relaxed);
+        LAST_SYSCALL_ARG1.store(args[1], Ordering::Relaxed);
+        LAST_SYSCALL_ARG2.store(args[2], Ordering::Relaxed);
+        LAST_SYSCALL_PID.store(current_pid, Ordering::Relaxed);
+    }
     #[cfg(feature = "smp-diagnostics")]
     let trace_this = current_pid >= 3
         && matches!(
@@ -594,9 +697,15 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_CLOSE_RANGE => sys_close_range(args[0], args[1], args[2]),
         _ => -38,
     };
+    #[cfg(any(debug_assertions, feature = "smp-diagnostics", feature = "timeout-trace"))]
     LAST_SYSCALL_RET.store(ret as usize, Ordering::Relaxed);
-    #[cfg(feature = "smp-diagnostics")]
-    if ret == -38 {
+    #[cfg(any(feature = "smp-diagnostics", feature = "buildstorm-diagnostics"))]
+    if ret == -38
+        && !matches!(
+            syscall_id,
+            SYSCALL_RSEQ | SYSCALL_RISCV_HWPROBE | SYSCALL_FSOPEN | SYSCALL_CLONE3
+        )
+    {
         crate::println!(
             "[syscall-diag] ENOSYS tid={} nr={} a0={:#x} a1={:#x} a2={:#x}",
             current_pid,
@@ -604,6 +713,34 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[0],
             args[1],
             args[2],
+        );
+    }
+    #[cfg(feature = "buildstorm-diagnostics")]
+    if ret == -16 {
+        crate::println!(
+            "[buildstorm-diag] EBUSY tid={} nr={} a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x}",
+            current_pid,
+            syscall_id,
+            args[0],
+            args[1],
+            args[2],
+            args[3],
+            args[4],
+            args[5],
+        );
+    }
+    #[cfg(feature = "buildstorm-diagnostics")]
+    if ret == -14 {
+        crate::println!(
+            "[buildstorm-diag] EFAULT tid={} nr={} a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x}",
+            current_pid,
+            syscall_id,
+            args[0],
+            args[1],
+            args[2],
+            args[3],
+            args[4],
+            args[5],
         );
     }
     #[cfg(feature = "smp-diagnostics")]
@@ -615,6 +752,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             ret,
         );
     }
+    #[cfg(feature = "buildstorm-diagnostics")]
+    clear_active_syscall();
     ret
 }
 

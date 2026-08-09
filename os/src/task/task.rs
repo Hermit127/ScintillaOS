@@ -49,6 +49,9 @@ struct TaskSchedulingMeta {
     running_cpu: AtomicUsize,
     allowed_cpus: AtomicUsize,
     enqueued: AtomicBool,
+    /// Stable task-list identity used by exec/exit group walks without taking
+    /// another task's broad inner lock.
+    thread_group_id: AtomicUsize,
     /// Published with release ordering when begin_exit has committed the
     /// terminal status and exit code.  A parent may reap this zombie before
     /// the deferred idle-context resource cleanup completes.
@@ -61,11 +64,12 @@ struct TaskSchedulingMeta {
 }
 
 impl TaskSchedulingMeta {
-    const fn new() -> Self {
+    const fn new(thread_group_id: usize) -> Self {
         Self {
             running_cpu: AtomicUsize::new(NO_RUNNING_CPU),
             allowed_cpus: AtomicUsize::new(DEFAULT_TASK_CPU_MASK),
             enqueued: AtomicBool::new(false),
+            thread_group_id: AtomicUsize::new(thread_group_id),
             waitable_zombie: AtomicBool::new(false),
             exit_cleanup_done: AtomicBool::new(false),
             vfork_parent: AtomicUsize::new(0),
@@ -266,6 +270,10 @@ fn task_entry() {
             trap_cx
         };
         let ctx_mut = unsafe { trap_cx.as_mut().unwrap() };
+        // sscratch identifies a user trap frame while user_restore is loading
+        // registers. Keep that handoff non-reentrant; sret restores the user
+        // interrupt state from the trap frame.
+        IRQ::int_disable();
         run_user_task(ctx_mut);
     }
 }
@@ -284,9 +292,10 @@ impl TaskControlBlock {
         self.inner.exclusive_access()
     }
     pub fn from_raw(pid: PidHandle, inner: TaskControlBlockInner) -> Self {
+        let thread_group_id = inner.tgid;
         Self {
             pid,
-            scheduling: TaskSchedulingMeta::new(),
+            scheduling: TaskSchedulingMeta::new(thread_group_id),
             inner: TaskLock::new_named(inner, "TaskInner"),
         }
     }
@@ -336,7 +345,7 @@ impl TaskControlBlock {
         let kstack = KernelStack::new();
         let task_control_block = Self {
             pid: pid_handle,
-            scheduling: TaskSchedulingMeta::new(),
+            scheduling: TaskSchedulingMeta::new(pid_value),
             inner: TaskLock::new_named(
                 TaskControlBlockInner {
                     trap_cx: TrapFrame::new(),
@@ -798,6 +807,9 @@ impl TaskControlBlock {
     }
     pub fn fork(self: &Arc<TaskControlBlock>) -> Option<Arc<TaskControlBlock>> {
         trace!("os::task::TaskControlBlock::fork");
+        // Linux inherits the parent's CPU affinity across fork.  Snapshot the
+        // atomic mask before publishing the child to any scheduler queue.
+        let inherited_affinity = self.allowed_cpus();
         // Copy the user address space before collecting the remaining task state.
         // `from_existed_user` write-protects the parent's present writable
         // mappings for COW. A parent which is already a CLONE_VM group can be
@@ -814,7 +826,6 @@ impl TaskControlBlock {
             "fork COW remote TLB shootdown failed"
         );
 
-        let _files_guard = super::FILE_TABLE_LOCK.lock();
         let (
             trap_cx_clone,
             base_size,
@@ -845,13 +856,18 @@ impl TaskControlBlock {
             heap_bottom,
             program_brk,
             fp_state,
-        ) = {
-            let parent_inner = self.inner_exclusive_access();
+        ) = loop {
+            let files_guard = super::FILE_TABLE_LOCK.lock();
+            let Some(parent_inner) = self.try_inner_exclusive_access() else {
+                drop(files_guard);
+                super::suspend_current_and_run_next();
+                continue;
+            };
             let fork_signal_actions = Arc::new(SignalActionsLock::new_named(
                 parent_inner.signal_actions.lock().clone(),
                 "SignalActions",
             ));
-            (
+            let snapshot = (
                 parent_inner.trap_cx.clone(),
                 parent_inner.base_size,
                 parent_inner
@@ -890,16 +906,18 @@ impl TaskControlBlock {
                 parent_inner.heap_bottom,
                 parent_inner.program_brk,
                 parent_inner.fp_state,
-            )
+            );
+            drop(parent_inner);
+            drop(files_guard);
+            break snapshot;
         };
-        drop(_files_guard);
 
         let pid_handle = pid_alloc();
         let pid_value = pid_handle.0;
         let kstack = KernelStack::new();
         let task_control_block = Arc::new(TaskControlBlock {
             pid: pid_handle,
-            scheduling: TaskSchedulingMeta::new(),
+            scheduling: TaskSchedulingMeta::new(pid_value),
             inner: TaskLock::new_named(
                 TaskControlBlockInner {
                     trap_cx: trap_cx_clone,
@@ -971,6 +989,7 @@ impl TaskControlBlock {
                 "TaskInner",
             ),
         });
+        task_control_block.set_allowed_cpus(inherited_affinity);
         // add child to parent's children list
         {
             let mut parent_inner = self.inner_exclusive_access();
@@ -985,7 +1004,7 @@ impl TaskControlBlock {
         materialize_writable_pages: bool,
     ) -> Option<Arc<TaskControlBlock>> {
         trace!("os::task::TaskControlBlock::clone_shared_vm");
-        let _files_guard = super::FILE_TABLE_LOCK.lock();
+        let inherited_affinity = self.allowed_cpus();
         let mut parent_activity = None;
         let mut remapped_shared_pages = false;
         let (
@@ -1019,8 +1038,13 @@ impl TaskControlBlock {
             heap_bottom,
             program_brk,
             fp_state,
-        ) = {
-            let mut parent_inner = self.inner_exclusive_access();
+        ) = loop {
+            let files_guard = super::FILE_TABLE_LOCK.lock();
+            let Some(mut parent_inner) = self.try_inner_exclusive_access() else {
+                drop(files_guard);
+                super::suspend_current_and_run_next();
+                continue;
+            };
             // COW mappings require normalization only when this is the first
             // CLONE_VM conversion of a private address space. Rewriting an
             // already shared page table would race with its running siblings.
@@ -1058,7 +1082,7 @@ impl TaskControlBlock {
                     parent_inner.fd_cloexec.clone(),
                 )
             };
-            (
+            let snapshot = (
                 memory_set,
                 parent_inner.trap_cx.clone(),
                 parent_inner.base_size,
@@ -1089,12 +1113,11 @@ impl TaskControlBlock {
                 parent_inner.heap_bottom,
                 parent_inner.program_brk,
                 parent_inner.fp_state,
-            )
+            );
+            drop(parent_inner);
+            drop(files_guard);
+            break snapshot;
         };
-
-        // Do not retain the descriptor-table serialization lock while sending
-        // an inter-processor TLB fence.
-        drop(_files_guard);
 
         if remapped_shared_pages {
             assert!(
@@ -1112,7 +1135,7 @@ impl TaskControlBlock {
         let kstack = KernelStack::new();
         let task_control_block = Arc::new(TaskControlBlock {
             pid: pid_handle,
-            scheduling: TaskSchedulingMeta::new(),
+            scheduling: TaskSchedulingMeta::new(pid_value),
             inner: TaskLock::new_named(
                 TaskControlBlockInner {
                     trap_cx: trap_cx_clone,
@@ -1184,41 +1207,56 @@ impl TaskControlBlock {
                 "TaskInner",
             ),
         });
+        task_control_block.set_allowed_cpus(inherited_affinity);
+        if share_files {
+            loop {
+                let mut files = super::FILE_TABLE_LOCK.lock();
+                if !task_control_block.try_initialize_shared_files_from(self) {
+                    drop(files);
+                    super::suspend_current_and_run_next();
+                    continue;
+                }
+                super::register_files_task_locked(
+                    &mut files,
+                    &task_control_block,
+                    parent_files_id,
+                );
+                break;
+            }
+        }
         {
             let mut parent_inner = self.inner_exclusive_access();
             parent_inner.children.push(task_control_block.clone());
         }
-        if share_files {
-            let mut files = super::FILE_TABLE_LOCK.lock();
-            task_control_block.initialize_shared_files_from(self);
-            super::register_files_task_locked(&mut files, &task_control_block);
-        }
         Some(task_control_block)
     }
-    pub(crate) fn initialize_shared_files_from(&self, parent: &Arc<TaskControlBlock>) {
-        let (files_id, fd_table, fd_cloexec) = {
-            let parent_inner = parent.inner_exclusive_access();
-            (
-                parent_inner.files_id,
-                parent_inner
-                    .fd_table
-                    .iter()
-                    .map(|file| {
-                        file.as_ref().map(|file| {
-                            file.dup_ref();
-                            file.clone()
-                        })
-                    })
-                    .collect::<Vec<_>>(),
-                parent_inner.fd_cloexec.clone(),
-            )
+    pub(crate) fn try_initialize_shared_files_from(
+        &self,
+        parent: &Arc<TaskControlBlock>,
+    ) -> bool {
+        let Some(parent_inner) = parent.try_inner_exclusive_access() else {
+            return false;
         };
+        let files_id = parent_inner.files_id;
+        let fd_table = parent_inner
+            .fd_table
+            .iter()
+            .map(|file| {
+                file.as_ref().map(|file| {
+                    file.dup_ref();
+                    file.clone()
+                })
+            })
+            .collect::<Vec<_>>();
+        let fd_cloexec = parent_inner.fd_cloexec.clone();
+        drop(parent_inner);
         let mut inner = self.inner_exclusive_access();
         debug_assert!(inner.fd_table.is_empty());
         debug_assert!(inner.fd_cloexec.is_empty());
         debug_assert_eq!(inner.files_id, files_id);
         inner.fd_table = fd_table;
         inner.fd_cloexec = fd_cloexec;
+        true
     }
     pub fn getpid(&self) -> usize {
         self.pid.0
@@ -1231,6 +1269,16 @@ impl TaskControlBlock {
     /// The hart currently running this task, or [`NO_RUNNING_CPU`].
     pub fn running_cpu(&self) -> usize {
         self.scheduling.running_cpu.load(Ordering::Acquire)
+    }
+
+    pub fn thread_group_id(&self) -> usize {
+        self.scheduling.thread_group_id.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn publish_thread_group_id(&self, tgid: usize) {
+        self.scheduling
+            .thread_group_id
+            .store(tgid, Ordering::Release);
     }
 
     pub fn is_enqueued(&self) -> bool {

@@ -1,17 +1,18 @@
 use crate::fs::stdio::stdout_release_if_owner;
 use crate::fs::{open_file, open_file_at, File, OpenFlags};
 use crate::mm::{
-    frames_alloc, get_elf_interp_file, translated_byte_buffer, translated_ref, translated_refmut,
-    translated_str, FrameTracker, MapArea, MapPermission, PageFaultAccess, PageFaultResult,
+    frames_alloc, get_elf_interp_file, FrameTracker, MapArea, MapPermission, PageFaultAccess,
+    PageFaultResult,
 };
 use crate::sync::{FutexLock, VmLock};
 use crate::task::{
-    add_priority_task, add_task, blank_kcontext, block_current_and_run_next, block_current_until,
-    current_task, current_user_token, exit_current_and_run_next, flush_remote_tlb, force_exit_task,
+    add_priority_task, add_task, blank_kcontext, block_current_and_run_next,
+    block_current_and_run_next_if, block_current_until, block_current_until_if, current_task,
+    current_user_token, exit_current_and_run_next, flush_remote_tlb, force_exit_task,
     force_exit_task_group, has_interrupting_signal, online_cpu_mask, pid2task, pid_alloc, schedule,
-    suspend_current_and_run_next, task_snapshot, terminate_other_threads_for_exec, wake_blocked_task, wake_signal_wait_task,
-    BlockReason, KernelStack, PendingSignalInfo, SignalAction, SignalFlags, TaskControlBlock,
-    TaskControlBlockInner, TaskStatus, MAX_SIG,
+    suspend_current_and_run_next, task_snapshot, terminate_other_threads_for_exec,
+    wake_blocked_task, wake_signal_wait_task, BlockReason, KernelStack, PendingSignalInfo,
+    SignalAction, SignalFlags, TaskControlBlock, TaskControlBlockInner, TaskStatus, MAX_SIG,
 };
 use alloc::collections::BTreeMap;
 use alloc::format;
@@ -98,7 +99,7 @@ const NSEC_PER_SEC: usize = 1_000_000_000;
 const NSEC_PER_USEC: usize = 1_000;
 
 #[cfg(feature = "smp-diagnostics")]
-const FUTEX_EVENT_CAPACITY: usize = 128;
+const FUTEX_EVENT_CAPACITY: usize = 1024;
 #[cfg(feature = "smp-diagnostics")]
 static FUTEX_EVENT_NEXT: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "smp-diagnostics")]
@@ -311,10 +312,19 @@ pub(crate) fn sync_thread_group_vm_metadata(
     let Some(owner) = pid2task(owner_pid) else {
         return;
     };
-    let owner_address_space = {
+    let (owner_address_space, canonical_metadata) = {
         let inner = owner.inner_exclusive_access();
-        inner.memory_set.address_space_id()
+        (
+            inner.memory_set.address_space_id(),
+            inner.memory_set.is_shared(),
+        )
     };
+    // CLONE_VM users now share the same page table, VMA vector and brk atomics.
+    // The old per-TCB propagation path would only reacquire every sibling's
+    // TaskLock and then hit MemorySet's canonical-metadata no-op.
+    if canonical_metadata {
+        return;
+    }
     let tasks = task_snapshot();
     for task in tasks {
         if task.getpid() == owner_pid {
@@ -343,10 +353,16 @@ pub(crate) fn sync_thread_group_vm_frame(
     let Some(owner) = pid2task(owner_pid) else {
         return;
     };
-    let owner_address_space = {
+    let (owner_address_space, canonical_metadata) = {
         let inner = owner.inner_exclusive_access();
-        inner.memory_set.address_space_id()
+        (
+            inner.memory_set.address_space_id(),
+            inner.memory_set.is_shared(),
+        )
     };
+    if canonical_metadata {
+        return;
+    }
     let tasks = task_snapshot();
     for task in tasks {
         if task.getpid() == owner_pid {
@@ -376,10 +392,16 @@ fn sync_thread_group_vm_frames(
     let Some(owner) = pid2task(owner_pid) else {
         return;
     };
-    let owner_address_space = {
+    let (owner_address_space, canonical_metadata) = {
         let inner = owner.inner_exclusive_access();
-        inner.memory_set.address_space_id()
+        (
+            inner.memory_set.address_space_id(),
+            inner.memory_set.is_shared(),
+        )
     };
+    if canonical_metadata {
+        return;
+    }
     let tasks = task_snapshot();
     for task in tasks {
         if task.getpid() == owner_pid {
@@ -407,10 +429,16 @@ fn sync_thread_group_vm_area_metadata(owner_pid: usize, tgid: usize, areas: &[Ma
     let Some(owner) = pid2task(owner_pid) else {
         return;
     };
-    let owner_address_space = {
+    let (owner_address_space, canonical_metadata) = {
         let inner = owner.inner_exclusive_access();
-        inner.memory_set.address_space_id()
+        (
+            inner.memory_set.address_space_id(),
+            inner.memory_set.is_shared(),
+        )
     };
+    if canonical_metadata {
+        return;
+    }
     let tasks = task_snapshot();
     for task in tasks {
         if task.getpid() == owner_pid {
@@ -438,10 +466,16 @@ fn sync_thread_group_vm_unmap_metadata(
     let Some(owner) = pid2task(owner_pid) else {
         return;
     };
-    let owner_address_space = {
+    let (owner_address_space, canonical_metadata) = {
         let inner = owner.inner_exclusive_access();
-        inner.memory_set.address_space_id()
+        (
+            inner.memory_set.address_space_id(),
+            inner.memory_set.is_shared(),
+        )
     };
+    if canonical_metadata {
+        return;
+    }
     let tasks = task_snapshot();
     for task in tasks {
         if task.getpid() == owner_pid {
@@ -465,11 +499,7 @@ fn thread_group_has_peer(owner_pid: usize, tgid: usize) -> bool {
         if task.getpid() == owner_pid {
             return false;
         }
-        // Membership must not depend on a transient TaskLock contention: a
-        // caller deciding whether it may replace shared VM state needs a
-        // stable answer, not a best-effort snapshot.
-        let inner = task.inner_exclusive_access();
-        inner.tgid == tgid && inner.task_status != TaskStatus::Zombie
+        task.thread_group_id() == tgid && !task.is_waitable_zombie()
     })
 }
 
@@ -501,9 +531,7 @@ fn shared_vm_sync_snapshot(inner: &TaskControlBlockInner) -> Option<(usize, usiz
 
 fn sync_thread_group_vm_snapshot(owner_pid: usize, snapshot: Option<(usize, usize, Vec<MapArea>)>) {
     if let Some((tgid, program_brk, areas)) = snapshot {
-        if thread_group_has_peer(owner_pid, tgid) {
-            sync_thread_group_vm_metadata(owner_pid, tgid, program_brk, &areas);
-        }
+        sync_thread_group_vm_metadata(owner_pid, tgid, program_brk, &areas);
     }
 }
 
@@ -565,11 +593,11 @@ fn read_exec_prefix(inode: &Arc<crate::fs::inode::OSInode>) -> Vec<u8> {
 }
 
 pub fn user_realtime_sec() -> i64 {
-    (monotonic_user_time_us() / 1_000_000) as i64
+    crate::time::realtime_sec()
 }
 
 pub fn user_realtime_sec_ceil() -> i64 {
-    ((monotonic_user_time_us() + 999_999) / 1_000_000) as i64
+    ((crate::time::realtime_us() + 999_999) / 1_000_000) as i64
 }
 
 fn nsec_to_timeval(ns: usize) -> TimeVal {
@@ -748,7 +776,10 @@ pub(crate) fn prepare_task_user_access(
                 };
                 let result = inner.memory_set.handle_page_fault(vaddr, access);
                 match result {
-                    Some(PageFaultResult::SharedMetadataChanged) => {
+                    Some(
+                        PageFaultResult::SharedMetadataChanged
+                        | PageFaultResult::SharedTranslationChanged,
+                    ) => {
                         if let Some(frame) = inner.memory_set.clone_frame_metadata(vaddr.floor()) {
                             changed_frames.push((inner.tgid, vaddr.floor(), frame));
                         }
@@ -778,6 +809,50 @@ pub(crate) fn prepare_task_user_access(
     true
 }
 
+#[cfg(any(
+    feature = "buildstorm-diagnostics",
+    feature = "buildstorm-mm-diagnostics"
+))]
+pub(crate) fn diagnose_task_user_access(
+    task: &Arc<TaskControlBlock>,
+    addr: usize,
+    len: usize,
+    need_write: bool,
+    stage: &str,
+) {
+    let last = addr.checked_add(len.saturating_sub(1)).unwrap_or(usize::MAX);
+    let (tgid, vma_valid, first_mapping, last_mapping) = {
+        let inner = task.inner_exclusive_access();
+        let vma_valid = inner
+            .memory_set
+            .valid_user_buf(addr as *const u8, len, need_write);
+        let first_mapping = inner
+            .memory_set
+            .translate(polyhal::VirtAddr::from(addr))
+            .map(|(paddr, flags)| (paddr.raw(), flags.bits()));
+        let last_mapping = inner
+            .memory_set
+            .translate(polyhal::VirtAddr::from(last))
+            .map(|(paddr, flags)| (paddr.raw(), flags.bits()));
+        (inner.tgid, vma_valid, first_mapping, last_mapping)
+    };
+    crate::println!(
+        "[buildstorm-mm] user-access-failed stage={} tid={} tgid={} addr={:#x} len={} write={} vma={} first={:?} last={:?} fault_reason={} available_frames={} frame_alloc_failures={}",
+        stage,
+        task.getpid(),
+        tgid,
+        addr,
+        len,
+        need_write,
+        vma_valid,
+        first_mapping,
+        last_mapping,
+        crate::mm::last_page_fault_failure(),
+        crate::mm::available_frames(),
+        crate::mm::frame_alloc_failures(),
+    );
+}
+
 pub(crate) fn copy_from_task_user(
     task: &Arc<TaskControlBlock>,
     addr: usize,
@@ -791,11 +866,116 @@ pub(crate) fn copy_from_task_user(
 }
 
 pub(crate) fn copy_to_task_user(task: &Arc<TaskControlBlock>, addr: usize, src: &[u8]) -> bool {
-    if !prepare_task_user_access(task, addr, src.len(), true) {
+    let mut retries = 0usize;
+    loop {
+        if !prepare_task_user_access(task, addr, src.len(), true) {
+            return false;
+        }
+        let copied = {
+            let inner = task.inner_exclusive_access();
+            inner.memory_set.copy_to_user(addr, src)
+        };
+        if copied {
+            return true;
+        }
+
+        // A concurrent fork can write-protect the shared address space after
+        // fault preparation but before the VM-locked copy. Re-fault and retry
+        // instead of exposing that internal COW transition as EFAULT.
+        retries = retries.wrapping_add(1);
+        #[cfg(feature = "buildstorm-diagnostics")]
+        if retries <= 4 {
+            crate::println!(
+                "[buildstorm-mm] copy-to-user-retry tid={} addr={:#x} len={} retry={}",
+                task.getpid(),
+                addr,
+                src.len(),
+                retries,
+            );
+        }
+        if retries & 7 == 0 {
+            suspend_current_and_run_next();
+        }
+    }
+}
+
+pub(crate) fn copy_user_value<T: Copy>(
+    task: &Arc<TaskControlBlock>,
+    ptr: *const T,
+) -> Option<T> {
+    if ptr.is_null() {
+        return None;
+    }
+    let mut value = core::mem::MaybeUninit::<T>::uninit();
+    let bytes = unsafe {
+        core::slice::from_raw_parts_mut(
+            value.as_mut_ptr() as *mut u8,
+            core::mem::size_of::<T>(),
+        )
+    };
+    if !copy_from_task_user(task, ptr as usize, bytes) {
+        return None;
+    }
+    Some(unsafe { value.assume_init() })
+}
+
+pub(crate) fn write_user_value<T>(
+    task: &Arc<TaskControlBlock>,
+    ptr: *mut T,
+    value: &T,
+) -> bool {
+    if ptr.is_null() {
         return false;
     }
-    let inner = task.inner_exclusive_access();
-    inner.memory_set.copy_to_user(addr, src)
+    let bytes = unsafe {
+        core::slice::from_raw_parts(value as *const T as *const u8, core::mem::size_of::<T>())
+    };
+    copy_to_task_user(task, ptr as usize, bytes)
+}
+
+fn copy_user_c_string(
+    task: &Arc<TaskControlBlock>,
+    ptr: *const u8,
+    max_len: usize,
+    stage: &'static str,
+) -> Result<String, isize> {
+    if ptr.is_null() {
+        return Err(-14);
+    }
+    let mut bytes = Vec::new();
+    let mut page = [0u8; crate::config::PAGE_SIZE];
+    while bytes.len() < max_len {
+        let Some(addr) = (ptr as usize).checked_add(bytes.len()) else {
+            return Err(-14);
+        };
+        let page_left = crate::config::PAGE_SIZE - (addr & (crate::config::PAGE_SIZE - 1));
+        let chunk_len = page_left.min(max_len - bytes.len());
+        let chunk = &mut page[..chunk_len];
+        if !copy_from_task_user(task, addr, chunk) {
+            #[cfg(any(
+                feature = "buildstorm-diagnostics",
+                feature = "buildstorm-mm-diagnostics"
+            ))]
+            {
+                crate::println!(
+                    "[exec-diag] cstring-copy-failed stage={} tid={} base={:#x} addr={:#x} len={}",
+                    stage,
+                    task.getpid(),
+                    ptr as usize,
+                    addr,
+                    chunk_len,
+                );
+                diagnose_task_user_access(task, addr, chunk_len, false, stage);
+            }
+            return Err(-14);
+        }
+        if let Some(nul) = chunk.iter().position(|byte| *byte == 0) {
+            bytes.extend_from_slice(&chunk[..nul]);
+            return Ok(unsafe { String::from_utf8_unchecked(bytes) });
+        }
+        bytes.extend_from_slice(chunk);
+    }
+    Err(-7)
 }
 
 fn user_usize(task: &Arc<TaskControlBlock>, addr: usize) -> Option<usize> {
@@ -842,6 +1022,15 @@ fn futex_private_key(inner: &TaskControlBlockInner, addr: usize) -> FutexKey {
 }
 
 fn futex_shared_key(inner: &TaskControlBlockInner, addr: usize) -> FutexKey {
+    // FUTEX_PRIVATE_FLAG is only a fast-path hint.  Linux still keys a futex
+    // in a private VMA by mm and virtual address when the flag is absent;
+    // using its physical page would lose waiters if COW remaps that page.
+    if !inner
+        .memory_set
+        .mapping_is_shared(polyhal::VirtAddr::from(addr))
+    {
+        return futex_private_key(inner, addr);
+    }
     if let Some((paddr, _)) = inner.memory_set.translate(polyhal::VirtAddr::from(addr)) {
         FutexKey {
             namespace: 0,
@@ -875,7 +1064,9 @@ fn futex_all_keys_for_addr(inner: &TaskControlBlockInner, addr: usize) -> Vec<Fu
 
 fn wake_futex_keys(keys: &[FutexKey]) {
     for &key in keys {
-        let _ = futex_wake_key(key, 1);
+        let woke = futex_wake_key(key, 1);
+        #[cfg(feature = "smp-diagnostics")]
+        record_futex_event(0x203, key, 1, woke);
     }
 }
 
@@ -987,6 +1178,10 @@ fn clear_task_tid_ptr(task: &Arc<TaskControlBlock>) {
     }
     #[cfg(feature = "smp-diagnostics")]
     record_futex_event(0x202, _diagnostic_key, 0, tid as isize);
+    #[cfg(feature = "smp-diagnostics")]
+    for &key in wake_keys.iter() {
+        record_futex_event(0x204, key, 0, user_u32(task, tid).unwrap_or(u32::MAX) as isize);
+    }
     {
         let mut inner = task.inner_exclusive_access();
         if inner.tid_ptr == tid {
@@ -1012,44 +1207,29 @@ pub fn sys_yield() -> isize {
 }
 
 pub fn sys_get_time(ts_ptr: usize, tz_ptr: usize) -> isize {
-    let now_us = monotonic_user_time_us();
+    let now_us = crate::time::realtime_us();
     if ts_ptr == 0 && tz_ptr == 0 {
         return (now_us / 1000) as isize;
     }
 
     let task = current_task().unwrap();
-    let inner = task.inner_exclusive_access();
-    if ts_ptr != 0
-        && !inner.memory_set.valid_user_buf(
-            ts_ptr as *const u8,
-            core::mem::size_of::<TimeVal>(),
-            true,
-        )
-    {
-        return -14;
-    }
-    if tz_ptr != 0
-        && !inner.memory_set.valid_user_buf(
-            tz_ptr as *const u8,
-            core::mem::size_of::<TimeZone>(),
-            true,
-        )
-    {
-        return -14;
-    }
-    let token = inner.get_user_token();
-    drop(inner);
-
     if ts_ptr != 0 {
-        let ts = translated_refmut(token, ts_ptr as *mut TimeVal);
-        ts.sec = (now_us / 1_000_000) as isize;
-        ts.usec = (now_us % 1_000_000) as isize;
+        let ts = TimeVal {
+            sec: (now_us / 1_000_000) as isize,
+            usec: (now_us % 1_000_000) as isize,
+        };
+        if !write_user_value(&task, ts_ptr as *mut TimeVal, &ts) {
+            return -14;
+        }
     }
     if tz_ptr != 0 {
-        *translated_refmut(token, tz_ptr as *mut TimeZone) = TimeZone {
+        let timezone = TimeZone {
             minuteswest: 0,
             dsttime: 0,
         };
+        if !write_user_value(&task, tz_ptr as *mut TimeZone, &timezone) {
+            return -14;
+        }
     }
     0
 }
@@ -1083,7 +1263,10 @@ const CLONE_PARENT_SETTID: usize = 0x100000;
 const CLONE_CHILD_CLEARTID: usize = 0x200000;
 const CLONE_CHILD_SETTID: usize = 0x01000000;
 
-#[cfg(feature = "smp-diagnostics")]
+#[cfg(any(
+    feature = "smp-diagnostics",
+    feature = "buildstorm-mm-diagnostics"
+))]
 static CLONE_DIAG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 // The legacy clone syscall has an architecture-specific register layout.
@@ -1101,10 +1284,16 @@ pub fn sys_clone(
     let (ctid, tls) = (fifth, fourth);
     #[cfg(not(target_arch = "riscv64"))]
     let (ctid, tls) = (fourth, fifth);
-    #[cfg(feature = "smp-diagnostics")]
-    let clone_diag = flags & CLONE_THREAD != 0
-        && CLONE_DIAG_COUNT.fetch_add(1, Ordering::Relaxed) < 128;
-    #[cfg(feature = "smp-diagnostics")]
+    #[cfg(any(
+        feature = "smp-diagnostics",
+        feature = "buildstorm-mm-diagnostics"
+    ))]
+    let clone_diag = flags & (CLONE_VM | CLONE_VFORK | CLONE_THREAD) != 0
+        && CLONE_DIAG_COUNT.fetch_add(1, Ordering::Relaxed) < 512;
+    #[cfg(any(
+        feature = "smp-diagnostics",
+        feature = "buildstorm-mm-diagnostics"
+    ))]
     if clone_diag {
         crate::println!(
             "[clone-diag] enter tid={} flags={:#x} stack={:#x} ptid={:#x} ctid={:#x} tls={:#x}",
@@ -1122,7 +1311,10 @@ pub fn sys_clone(
         && (ptid & (core::mem::align_of::<u32>() - 1) != 0
             || !prepare_task_user_access(&current_task, ptid, core::mem::size_of::<i32>(), true))
     {
-        #[cfg(feature = "smp-diagnostics")]
+        #[cfg(any(
+            feature = "smp-diagnostics",
+            feature = "buildstorm-mm-diagnostics"
+        ))]
         if clone_diag {
             crate::println!("[clone-diag] reject invalid parent_tid");
         }
@@ -1137,7 +1329,10 @@ pub fn sys_clone(
         && (ctid & (core::mem::align_of::<u32>() - 1) != 0
             || !prepare_task_user_access(&current_task, ctid, core::mem::size_of::<i32>(), true))
     {
-        #[cfg(feature = "smp-diagnostics")]
+        #[cfg(any(
+            feature = "smp-diagnostics",
+            feature = "buildstorm-mm-diagnostics"
+        ))]
         if clone_diag {
             crate::println!("[clone-diag] reject invalid child_tid");
         }
@@ -1152,6 +1347,11 @@ pub fn sys_clone(
         inner.tgid
     };
     let is_thread = flags & CLONE_THREAD != 0;
+    let thread_parent = if is_thread {
+        current_task.inner_exclusive_access().parent.clone()
+    } else {
+        None
+    };
     let is_vfork = flags & CLONE_VFORK != 0;
     let new_task = if flags & CLONE_VM != 0 {
         let Some(new_task) = current_task.clone_shared_vm(
@@ -1159,7 +1359,10 @@ pub fn sys_clone(
             flags & CLONE_FILES != 0,
             !is_vfork,
         ) else {
-            #[cfg(feature = "smp-diagnostics")]
+            #[cfg(any(
+                feature = "smp-diagnostics",
+                feature = "buildstorm-mm-diagnostics"
+            ))]
             if clone_diag {
                 crate::println!("[clone-diag] reject shared-vm allocation");
             }
@@ -1182,6 +1385,9 @@ pub fn sys_clone(
         }
         if is_thread {
             inner.tgid = parent_tgid;
+            // CLONE_THREAD implies CLONE_PARENT: every thread has the same
+            // real parent as the caller instead of parenting one another.
+            inner.parent = thread_parent;
         }
         if flags & CLONE_SETTLS != 0 && tls != 0 {
             inner.trap_cx[TrapFrameArgs::TLS] = tls;
@@ -1190,13 +1396,19 @@ pub fn sys_clone(
             inner.tid_ptr = ctid;
         }
     }
+    if is_thread {
+        new_task.publish_thread_group_id(parent_tgid);
+    }
 
     if flags & CLONE_CHILD_SETTID != 0 && ctid != 0 {
         // A non-CLONE_VM child owns a COW copy, so write through the child's
         // page table instead of dereferencing its virtual address under the
         // parent's active address space.
         if !copy_to_task_user(&new_task, ctid, &(new_pid as u32).to_ne_bytes()) {
-            #[cfg(feature = "smp-diagnostics")]
+            #[cfg(any(
+                feature = "smp-diagnostics",
+                feature = "buildstorm-mm-diagnostics"
+            ))]
             if clone_diag {
                 crate::println!("[clone-diag] reject child_tid write");
             }
@@ -1205,7 +1417,10 @@ pub fn sys_clone(
     }
     if flags & CLONE_PARENT_SETTID != 0 && ptid != 0 {
         if !copy_to_task_user(&current_task, ptid, &(new_pid as u32).to_ne_bytes()) {
-            #[cfg(feature = "smp-diagnostics")]
+            #[cfg(any(
+                feature = "smp-diagnostics",
+                feature = "buildstorm-mm-diagnostics"
+            ))]
             if clone_diag {
                 crate::println!("[clone-diag] reject parent_tid write");
             }
@@ -1232,7 +1447,10 @@ pub fn sys_clone(
             new_task.vfork_pending()
         });
     }
-    #[cfg(feature = "smp-diagnostics")]
+    #[cfg(any(
+        feature = "smp-diagnostics",
+        feature = "buildstorm-mm-diagnostics"
+    ))]
     if clone_diag {
         crate::println!(
             "[clone-diag] success parent={} child={} tgid={} tls={:#x} clear_tid={:#x}",
@@ -1251,12 +1469,6 @@ pub fn sys_fork() -> isize {
     let Some(new_task) = current_task.fork() else {
         return -12;
     };
-    // initproc creates exactly one interactive shell.  QEMU's UART input is
-    // serviced by the bootstrap hart, so keep that shell on CPU0 while leaving
-    // normal shell-command children with the default migratable mask.
-    if current_task.getpid() == 1 {
-        new_task.set_allowed_cpus(1);
-    }
     let new_pid = new_task.pid.0;
     {
         let mut inner = new_task.inner_exclusive_access();
@@ -1285,9 +1497,13 @@ fn executable_path_visible_from_root(root_path: &str, file: &dyn File, fallback:
     }
 }
 
-pub fn sys_exec(path: *const u8, mut args: *const usize, mut envp: *const usize) -> isize {
+pub fn sys_exec(path: *const u8, args: *const usize, envp: *const usize) -> isize {
     const ENOENT: isize = -2;
     const ENOEXEC: isize = -8;
+    const EXEC_PATH_MAX: usize = 4096;
+    const EXEC_STRING_MAX: usize = 128 * 1024;
+    const EXEC_VECTOR_MAX: usize = 4096;
+    const EXEC_TOTAL_BYTES_MAX: usize = 2 * 1024 * 1024;
 
     let exec_task = current_task().unwrap();
     let (shared_vm, tgid) = {
@@ -1302,31 +1518,118 @@ pub fn sys_exec(path: *const u8, mut args: *const usize, mut envp: *const usize)
             suspend_current_and_run_next();
         }
     }
-    let token = current_user_token();
-    let path = translated_str(token, path);
+    let path = match copy_user_c_string(&exec_task, path, EXEC_PATH_MAX, "exec-path") {
+        Ok(path) => path,
+        Err(errno) => return errno,
+    };
     let mut args_vec: Vec<String> = Vec::new();
+    let mut copied_bytes = path.len();
     if !args.is_null() {
-        loop {
-            let arg_str_ptr = *translated_ref(token, args);
+        for index in 0..EXEC_VECTOR_MAX {
+            let Some(slot_addr) = (args as usize)
+                .checked_add(index * core::mem::size_of::<usize>())
+            else {
+                return -14;
+            };
+            let Some(arg_str_ptr) = copy_user_value(&exec_task, slot_addr as *const usize) else {
+                #[cfg(any(
+                    feature = "buildstorm-diagnostics",
+                    feature = "buildstorm-mm-diagnostics"
+                ))]
+                {
+                    crate::println!(
+                        "[exec-diag] vector-copy-failed stage=exec-argv-slot tid={} index={} addr={:#x}",
+                        exec_task.getpid(),
+                        index,
+                        slot_addr,
+                    );
+                    diagnose_task_user_access(
+                        &exec_task,
+                        slot_addr,
+                        core::mem::size_of::<usize>(),
+                        false,
+                        "exec-argv-slot",
+                    );
+                }
+                return -14;
+            };
             if arg_str_ptr == 0 {
                 break;
             }
-            args_vec.push(translated_str(token, arg_str_ptr as *const u8));
-            unsafe {
-                args = args.add(1);
+            let arg = match copy_user_c_string(
+                &exec_task,
+                arg_str_ptr as *const u8,
+                EXEC_STRING_MAX,
+                "exec-argv-string",
+            ) {
+                Ok(arg) => arg,
+                Err(errno) => return errno,
+            };
+            let Some(total) = copied_bytes.checked_add(arg.len() + 1) else {
+                return -7;
+            };
+            if total > EXEC_TOTAL_BYTES_MAX {
+                return -7;
+            }
+            copied_bytes = total;
+            args_vec.push(arg);
+            if index + 1 == EXEC_VECTOR_MAX {
+                return -7;
             }
         }
     }
     let mut env_vec: Vec<String> = Vec::new();
     if !envp.is_null() {
-        loop {
-            let env_str_ptr = *translated_ref(token, envp);
+        for index in 0..EXEC_VECTOR_MAX {
+            let Some(slot_addr) = (envp as usize)
+                .checked_add(index * core::mem::size_of::<usize>())
+            else {
+                return -14;
+            };
+            let Some(env_str_ptr) = copy_user_value(&exec_task, slot_addr as *const usize) else {
+                #[cfg(any(
+                    feature = "buildstorm-diagnostics",
+                    feature = "buildstorm-mm-diagnostics"
+                ))]
+                {
+                    crate::println!(
+                        "[exec-diag] vector-copy-failed stage=exec-envp-slot tid={} index={} addr={:#x}",
+                        exec_task.getpid(),
+                        index,
+                        slot_addr,
+                    );
+                    diagnose_task_user_access(
+                        &exec_task,
+                        slot_addr,
+                        core::mem::size_of::<usize>(),
+                        false,
+                        "exec-envp-slot",
+                    );
+                }
+                return -14;
+            };
             if env_str_ptr == 0 {
                 break;
             }
-            env_vec.push(translated_str(token, env_str_ptr as *const u8));
-            unsafe {
-                envp = envp.add(1);
+            let env = match copy_user_c_string(
+                &exec_task,
+                env_str_ptr as *const u8,
+                EXEC_STRING_MAX,
+                "exec-envp-string",
+            ) {
+                Ok(env) => env,
+                Err(errno) => return errno,
+            };
+            let Some(total) = copied_bytes.checked_add(env.len() + 1) else {
+                return -7;
+            };
+            if total > EXEC_TOTAL_BYTES_MAX {
+                return -7;
+            }
+            copied_bytes = total;
+            env_vec.push(env);
+            if index + 1 == EXEC_VECTOR_MAX {
+                return -7;
             }
         }
     }
@@ -1497,19 +1800,69 @@ fn wait_child_matches(pid: isize, child_pid: usize) -> bool {
     pid <= 0 || pid as usize == child_pid
 }
 
-fn wait_child_event_pending(task: &Arc<TaskControlBlock>, pid: isize) -> bool {
-    let inner = task.inner_exclusive_access();
-    let mut has_child = false;
-    for child in inner.children.iter() {
-        if !wait_child_matches(pid, child.getpid()) {
-            continue;
+fn wait_owner_tasks(task: &Arc<TaskControlBlock>, group_wide: bool) -> Vec<Arc<TaskControlBlock>> {
+    let mut owners = Vec::new();
+    owners.push(task.clone());
+    if !group_wide {
+        return owners;
+    }
+
+    let tgid = task.thread_group_id();
+    for candidate in task_snapshot() {
+        if !Arc::ptr_eq(&candidate, task) && candidate.thread_group_id() == tgid {
+            owners.push(candidate);
         }
-        has_child = true;
-        if child.is_waitable_zombie() {
-            return true;
+    }
+    owners
+}
+
+fn wait_child_event_pending(owners: &[Arc<TaskControlBlock>], pid: isize) -> bool {
+    let mut has_child = false;
+    for owner in owners {
+        let inner = owner.inner_exclusive_access();
+        for child in inner.children.iter() {
+            if !wait_child_matches(pid, child.getpid()) {
+                continue;
+            }
+            has_child = true;
+            if child.is_waitable_zombie() {
+                return true;
+            }
         }
     }
     !has_child
+}
+
+fn take_waitable_child(
+    task: &Arc<TaskControlBlock>,
+    pid: isize,
+    group_wide: bool,
+    remove: bool,
+) -> (bool, Option<Arc<TaskControlBlock>>) {
+    let mut has_child = false;
+    for owner in wait_owner_tasks(task, group_wide) {
+        let mut inner = owner.inner_exclusive_access();
+        let mut zombie_idx = None;
+        for (idx, child) in inner.children.iter().enumerate() {
+            if !wait_child_matches(pid, child.getpid()) {
+                continue;
+            }
+            has_child = true;
+            if child.is_waitable_zombie() {
+                zombie_idx = Some(idx);
+                break;
+            }
+        }
+        if let Some(idx) = zombie_idx {
+            let child = if remove {
+                inner.children.remove(idx)
+            } else {
+                inner.children[idx].clone()
+            };
+            return (true, Some(child));
+        }
+    }
+    (has_child, None)
 }
 
 fn wait_cancel_block(task: &Arc<TaskControlBlock>) {
@@ -1517,7 +1870,12 @@ fn wait_cancel_block(task: &Arc<TaskControlBlock>) {
     task.record_time_resume();
 }
 
-fn wait_block_current_or_retry(task: Arc<TaskControlBlock>, pid: isize) -> bool {
+fn wait_block_current_or_retry(
+    task: Arc<TaskControlBlock>,
+    pid: isize,
+    group_wide: bool,
+) -> bool {
+    let owners = wait_owner_tasks(&task, group_wide);
     stdout_release_if_owner();
     task.record_time_suspend();
     let task_cx_ptr = {
@@ -1527,7 +1885,7 @@ fn wait_block_current_or_retry(task: Arc<TaskControlBlock>, pid: isize) -> bool 
         // A SIGALRM may arrive after sys_waitpid's first signal check but
         // before this task is registered as blocked.  Recheck it after the
         // registration so a timeout waiter cannot miss its only wakeup.
-        if wait_child_event_pending(&task, pid)
+        if wait_child_event_pending(&owners, pid)
             || has_interrupting_signal(&task.inner_exclusive_access())
         {
             wait_cancel_block(&task);
@@ -1570,31 +1928,29 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: usize) -> isize
     if pid == i32::MIN as isize {
         return -3;
     }
+    let task = current_task().unwrap();
+    // Linux waits for children owned by any thread in the caller's thread
+    // group unless the internal __WNOTHREAD option explicitly narrows it.
+    let group_wide = options & __WNOTHREAD == 0;
+    if !exit_code_ptr.is_null()
+        && !prepare_task_user_access(
+            &task,
+            exit_code_ptr as usize,
+            core::mem::size_of::<i32>(),
+            true,
+        )
+    {
+        return -14;
+    }
     loop {
-        let task = current_task().unwrap();
-        let zombie = {
-            let mut inner = task.inner_exclusive_access();
-            let mut has_child = false;
-            let mut zombie_idx = None;
-            for (idx, child) in inner.children.iter().enumerate() {
-                if !wait_child_matches(pid, child.getpid()) {
-                    continue;
-                }
-                has_child = true;
-                if child.is_waitable_zombie() {
-                    zombie_idx = Some(idx);
-                    break;
-                }
-            }
-            if !has_child {
-                // The in-tree Rust and C user libraries expose the historic
-                // rCore waitpid ABI: no matching child is reported as -1.
-                // Keep that compatibility boundary here; `waitid` retains
-                // its Linux-style ECHILD result independently.
-                return -1;
-            }
-            zombie_idx.map(|idx| inner.children.remove(idx))
-        };
+        let (has_child, zombie) = take_waitable_child(&task, pid, group_wide, true);
+        if !has_child {
+            // The in-tree Rust and C user libraries expose the historic
+            // rCore waitpid ABI: no matching child is reported as -1.
+            // Keep that compatibility boundary here; `waitid` retains
+            // its Linux-style ECHILD result independently.
+            return -1;
+        }
 
         if let Some(child) = zombie {
             let found_pid = child.getpid();
@@ -1609,7 +1965,7 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: usize) -> isize
                     child_inner.cstime,
                 )
             };
-            let token = {
+            {
                 let mut inner = task.inner_exclusive_access();
                 inner.cutime = inner
                     .cutime
@@ -1619,8 +1975,7 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: usize) -> isize
                     .cstime
                     .saturating_add(child_stime)
                     .saturating_add(child_cstime);
-                inner.memory_set.token()
-            };
+            }
             crate::task::reap_exited_task(found_pid);
             #[cfg(any(feature = "smp-diagnostics", feature = "timeout-trace"))]
             if task.getpid() >= 3 {
@@ -1633,8 +1988,10 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: usize) -> isize
                 );
             }
             if !exit_code_ptr.is_null() {
-                *translated_refmut(token, exit_code_ptr) =
-                    wait_status_from_exit(exit_code, exit_signal);
+                let status = wait_status_from_exit(exit_code, exit_signal);
+                if !write_user_value(&task, exit_code_ptr, &status) {
+                    return -14;
+                }
             }
             return found_pid as isize;
         }
@@ -1649,7 +2006,7 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: usize) -> isize
         if has_interrupting_signal(&task.inner_exclusive_access()) {
             return -4;
         }
-        let _ = wait_block_current_or_retry(task, pid);
+        let _ = wait_block_current_or_retry(task.clone(), pid, group_wide);
         // Loop back to check again
     }
 }
@@ -1688,9 +2045,15 @@ struct WaitSigInfo {
     _pad: [u8; 128 - 40],
 }
 
-fn write_wait_siginfo(info_ptr: *mut u8, pid: i32, exit_code: i32, exit_signal: i32) {
+fn write_wait_siginfo(
+    task: &Arc<TaskControlBlock>,
+    info_ptr: *mut u8,
+    pid: i32,
+    exit_code: i32,
+    exit_signal: i32,
+) -> bool {
     if info_ptr.is_null() {
-        return;
+        return true;
     }
     const SIGCHLD: i32 = 17;
     const CLD_EXITED: i32 = 1;
@@ -1700,8 +2063,7 @@ fn write_wait_siginfo(info_ptr: *mut u8, pid: i32, exit_code: i32, exit_signal: 
     } else {
         (CLD_EXITED, (exit_code as u8) as i32)
     };
-    let token = current_user_token();
-    *translated_refmut(token, info_ptr as *mut WaitSigInfo) = WaitSigInfo {
+    let info = WaitSigInfo {
         si_signo: if pid == 0 { 0 } else { SIGCHLD },
         si_errno: 0,
         si_code: if pid == 0 { 0 } else { code },
@@ -1714,6 +2076,7 @@ fn write_wait_siginfo(info_ptr: *mut u8, pid: i32, exit_code: i32, exit_signal: 
         si_stime: 0,
         _pad: [0; 128 - 40],
     };
+    write_user_value(task, info_ptr as *mut WaitSigInfo, &info)
 }
 
 pub fn sys_waitid(
@@ -1727,6 +2090,7 @@ pub fn sys_waitid(
     const P_PID: usize = 1;
     const WNOHANG: usize = 1;
     const WNOWAIT: usize = 0x01000000;
+    const __WNOTHREAD: usize = 0x2000_0000;
 
     let pid = match which {
         P_ALL => -1,
@@ -1736,31 +2100,12 @@ pub fn sys_waitid(
 
     loop {
         let task = current_task().unwrap();
-        let zombie = {
-            let mut inner = task.inner_exclusive_access();
-            let mut has_child = false;
-            let mut zombie_idx = None;
-            for (idx, child) in inner.children.iter().enumerate() {
-                if !wait_child_matches(pid, child.getpid()) {
-                    continue;
-                }
-                has_child = true;
-                if child.is_waitable_zombie() {
-                    zombie_idx = Some(idx);
-                    break;
-                }
-            }
-            if !has_child {
-                return -10;
-            }
-            zombie_idx.map(|idx| {
-                if options & WNOWAIT != 0 {
-                    inner.children[idx].clone()
-                } else {
-                    inner.children.remove(idx)
-                }
-            })
-        };
+        let group_wide = options & __WNOTHREAD == 0;
+        let (has_child, zombie) =
+            take_waitable_child(&task, pid, group_wide, options & WNOWAIT == 0);
+        if !has_child {
+            return -10;
+        }
 
         if let Some(child) = zombie {
             let found_pid = child.getpid();
@@ -1786,7 +2131,9 @@ pub fn sys_waitid(
                     .saturating_add(child_stime)
                     .saturating_add(child_cstime);
             }
-            write_wait_siginfo(info_ptr, found_pid as i32, exit_code, exit_signal);
+            if !write_wait_siginfo(&task, info_ptr, found_pid as i32, exit_code, exit_signal) {
+                return -14;
+            }
             if options & WNOWAIT == 0 {
                 crate::task::reap_exited_task(found_pid);
             }
@@ -1794,10 +2141,12 @@ pub fn sys_waitid(
         }
 
         if options & WNOHANG != 0 {
-            write_wait_siginfo(info_ptr, 0, 0, 0);
+            if !write_wait_siginfo(&task, info_ptr, 0, 0, 0) {
+                return -14;
+            }
             return 0;
         }
-        let _ = wait_block_current_or_retry(task, pid);
+        let _ = wait_block_current_or_retry(task, pid, group_wide);
     }
 }
 
@@ -2094,23 +2443,31 @@ fn flags_to_user_sigset(flags: SignalFlags) -> u64 {
     raw
 }
 
-pub fn sys_sigprocmask(how: i32, set: *const u8, old_set: *mut u8, _sigsetsize: usize) -> isize {
+pub fn sys_sigprocmask(how: i32, set: *const u8, old_set: *mut u8, sigsetsize: usize) -> isize {
     const SIG_BLOCK: i32 = 0;
     const SIG_UNBLOCK: i32 = 1;
     const SIG_SETMASK: i32 = 2;
+    if sigsetsize != core::mem::size_of::<u64>() {
+        return -22;
+    }
     if let Some(task) = current_task() {
-        let token = current_user_token();
         let new_mask_raw = if set.is_null() {
             None
         } else {
-            Some(*translated_ref(token, set as *const u64))
+            match copy_user_value(&task, set as *const u64) {
+                Some(mask) => Some(mask),
+                None => return -14,
+            }
         };
         let old_mask = {
             let inner = task.inner_exclusive_access();
             inner.signal_mask
         };
         if !old_set.is_null() {
-            *translated_refmut(token, old_set as *mut u64) = flags_to_user_sigset(old_mask);
+            let old_mask_raw = flags_to_user_sigset(old_mask);
+            if !write_user_value(&task, old_set as *mut u64, &old_mask_raw) {
+                return -14;
+            }
         }
         let Some(raw_mask) = new_mask_raw else {
             return 0;
@@ -2182,11 +2539,13 @@ pub fn sys_sigaction(
 
     // User pointers may demand-fault.  Snapshot them before TaskLock so the
     // synchronous fault handler never re-enters the same task lock.
-    let token = current_user_token();
+    let task = current_task().unwrap();
     let new_action = if action.is_null() {
         None
     } else {
-        let raw = *translated_ref(token, action as *const UserSignalAction);
+        let Some(raw) = copy_user_value(&task, action as *const UserSignalAction) else {
+            return -14;
+        };
         Some(SignalAction {
             handler: raw.handler,
             flags: raw.flags,
@@ -2194,7 +2553,6 @@ pub fn sys_sigaction(
             mask: user_sigset_to_flags(raw.mask),
         })
     };
-    let task = current_task().unwrap();
     let actions = {
         let inner = task.inner_exclusive_access();
         inner.signal_actions.clone()
@@ -2226,12 +2584,15 @@ pub fn sys_sigaction(
         );
     }
     if !old_action.is_null() {
-        *translated_refmut(token, old_action as *mut UserSignalAction) = UserSignalAction {
+        let old = UserSignalAction {
             handler: previous.handler,
             flags: previous.flags,
             restorer: previous.restorer,
             mask: flags_to_user_sigset(previous.mask),
         };
+        if !write_user_value(&task, old_action as *mut UserSignalAction, &old) {
+            return -14;
+        }
     }
     0
 }
@@ -2299,9 +2660,7 @@ pub fn sys_brk(brk_addr: usize) -> isize {
     if let Some(address_space_id) = shared_address_space {
         sync_shared_address_space_brk(pid, address_space_id, brk_addr);
     } else if let Some(snapshot) = snapshot {
-        if thread_group_has_peer(pid, tgid) {
-            sync_thread_group_vm_metadata(pid, tgid, brk_addr, &snapshot);
-        }
+        sync_thread_group_vm_metadata(pid, tgid, brk_addr, &snapshot);
     }
     if let Some((activity, start, len, retired)) = retired_pages {
         let _ = flush_remote_tlb(&activity, start, len);
@@ -2419,7 +2778,7 @@ pub fn sys_mmap(
                 Vec::new()
             };
             drop(inner);
-            if may_sync && thread_group_has_peer(pid, tgid) {
+            if may_sync {
                 sync_thread_group_vm_area_metadata(pid, tgid, &areas);
             }
             finish_fixed_unmap!();
@@ -2708,8 +3067,11 @@ pub fn sys_mmap(
 
 pub fn sys_munmap(start: usize, len: usize) -> isize {
     if start % crate::config::PAGE_SIZE != 0 || len == 0 {
-        return -1;
+        return -22;
     }
+    let Some(end) = start.checked_add(len) else {
+        return -22;
+    };
 
     let task = crate::task::current_task().unwrap();
     let pid = task.getpid();
@@ -2725,7 +3087,7 @@ pub fn sys_munmap(start: usize, len: usize) -> isize {
     let mut inner = task.inner_exclusive_access();
 
     let start_addr = polyhal::VirtAddr::from(start);
-    let end_addr = polyhal::VirtAddr::from(start + len);
+    let end_addr = polyhal::VirtAddr::from(end);
 
     let unmap = inner.memory_set.munmap(start_addr, end_addr);
     if unmap.unmapped() {
@@ -2733,7 +3095,7 @@ pub fn sys_munmap(start: usize, len: usize) -> isize {
         let may_sync = inner.memory_set.is_shared();
         let activity = inner.memory_set.activity_handle();
         drop(inner);
-        if may_sync && thread_group_has_peer(pid, tgid) {
+        if may_sync {
             sync_thread_group_vm_unmap_metadata(pid, tgid, start_addr, end_addr);
         }
         let _ = flush_remote_tlb(&activity, start, len);
@@ -2741,7 +3103,9 @@ pub fn sys_munmap(start: usize, len: usize) -> isize {
         0
     } else {
         unmap.release();
-        -1
+        // Linux treats holes in an otherwise valid munmap range as already
+        // unmapped, so callers may safely use munmap for allocator cleanup.
+        0
     }
 }
 
@@ -2896,21 +3260,16 @@ pub fn sys_times(tms_ptr: usize) -> isize {
 
     if tms_ptr != 0 {
         let inner = task.inner_exclusive_access();
-        if !inner
-            .memory_set
-            .valid_user_buf(tms_ptr as *const u8, core::mem::size_of::<Tms>(), true)
-        {
-            return -14;
-        }
         let tms = Tms {
             tms_utime: nsec_to_clock_ticks(inner.utime),
             tms_stime: nsec_to_clock_ticks(inner.stime),
             tms_cutime: nsec_to_clock_ticks(inner.cutime),
             tms_cstime: nsec_to_clock_ticks(inner.cstime),
         };
-        let token = inner.get_user_token();
         drop(inner);
-        *crate::mm::translated_refmut(token, tms_ptr as *mut Tms) = tms;
+        if !write_user_value(&task, tms_ptr as *mut Tms, &tms) {
+            return -14;
+        }
     }
 
     monotonic_user_times_tick() as isize
@@ -2922,18 +3281,7 @@ pub fn sys_uname(uts_ptr: usize) -> isize {
     }
 
     let task = crate::task::current_task().unwrap();
-    let inner = task.inner_exclusive_access();
-    if !inner
-        .memory_set
-        .valid_user_buf(uts_ptr as *const u8, core::mem::size_of::<UtsName>(), true)
-    {
-        return -14;
-    }
-    let token = inner.get_user_token();
-    drop(inner);
-    let uts = crate::mm::translated_refmut(token, uts_ptr as *mut UtsName);
-
-    *uts = UtsName {
+    let mut uts = UtsName {
         sysname: [0; UTSNAME_LEN],
         nodename: [0; UTSNAME_LEN],
         release: [0; UTSNAME_LEN],
@@ -2955,36 +3303,25 @@ pub fn sys_uname(uts_ptr: usize) -> isize {
     UtsName::set_str(&mut uts.machine, "loongarch64");
 
     UtsName::set_str(&mut uts.domainname, "localdomain");
-
-    0
+    if write_user_value(&task, uts_ptr as *mut UtsName, &uts) {
+        0
+    } else {
+        -14
+    }
 }
 
 pub fn sys_getcpu(cpu_ptr: *mut u32, node_ptr: *mut u32, _cache: usize) -> isize {
     let task = current_task().unwrap();
-    let inner = task.inner_exclusive_access();
-    if !cpu_ptr.is_null()
-        && !inner
-            .memory_set
-            .valid_user_buf(cpu_ptr as *const u8, core::mem::size_of::<u32>(), true)
-    {
-        return -14;
-    }
-    if !node_ptr.is_null()
-        && !inner.memory_set.valid_user_buf(
-            node_ptr as *const u8,
-            core::mem::size_of::<u32>(),
-            true,
-        )
-    {
-        return -14;
-    }
-    let token = inner.get_user_token();
-    drop(inner);
     if !cpu_ptr.is_null() {
-        *translated_refmut(token, cpu_ptr) = crate::task::current_hart_id() as u32;
+        let cpu = crate::task::current_hart_id() as u32;
+        if !write_user_value(&task, cpu_ptr, &cpu) {
+            return -14;
+        }
     }
     if !node_ptr.is_null() {
-        *translated_refmut(token, node_ptr) = 0;
+        if !write_user_value(&task, node_ptr, &0u32) {
+            return -14;
+        }
     }
     0
 }
@@ -3031,24 +3368,19 @@ pub fn sys_syslog(action: usize, buf: *mut u8, len: usize) -> isize {
 
 pub fn sys_nanosleep(req_ptr: usize, rem_ptr: usize) -> isize {
     let task = crate::task::current_task().unwrap();
-    let inner = task.inner_exclusive_access();
-    let ts_size = core::mem::size_of::<crate::task::TimeSpec>();
-    if !inner
-        .memory_set
-        .valid_user_buf(req_ptr as *const u8, ts_size, false)
-    {
+    let Some(req) = copy_user_value(&task, req_ptr as *const crate::task::TimeSpec) else {
         return -14;
-    }
+    };
     if rem_ptr != 0
-        && !inner
-            .memory_set
-            .valid_user_buf(rem_ptr as *const u8, ts_size, true)
+        && !prepare_task_user_access(
+            &task,
+            rem_ptr,
+            core::mem::size_of::<crate::task::TimeSpec>(),
+            true,
+        )
     {
         return -14;
     }
-    let token = inner.get_user_token();
-    drop(inner);
-    let req = *crate::mm::translated_refmut(token, req_ptr as *mut crate::task::TimeSpec);
     if req.tv_nsec >= 1_000_000_000 {
         return -22;
     }
@@ -3070,10 +3402,17 @@ pub fn sys_nanosleep(req_ptr: usize, rem_ptr: usize) -> isize {
             if has_interrupting_signal(&inner) {
                 if rem_ptr != 0 {
                     let rem_ns = wakeup_time.saturating_sub(now) as usize;
-                    let rem =
-                        crate::mm::translated_refmut(token, rem_ptr as *mut crate::task::TimeSpec);
-                    rem.tv_sec = rem_ns / 1_000_000_000;
-                    rem.tv_nsec = rem_ns % 1_000_000_000;
+                    let rem = crate::task::TimeSpec {
+                        tv_sec: rem_ns / 1_000_000_000,
+                        tv_nsec: rem_ns % 1_000_000_000,
+                    };
+                    if !write_user_value(
+                        &task,
+                        rem_ptr as *mut crate::task::TimeSpec,
+                        &rem,
+                    ) {
+                        return -14;
+                    }
                 }
                 return -4;
             }
@@ -3081,13 +3420,20 @@ pub fn sys_nanosleep(req_ptr: usize, rem_ptr: usize) -> isize {
         if now >= wakeup_time {
             break;
         }
-        stdout_release_if_owner();
-        crate::task::suspend_current_and_run_next();
+        crate::task::sleep_current_until_if(wakeup_time as usize, || {
+            let now = polyhal::time::Time::now().to_nsec() as u64;
+            let inner = task.inner_exclusive_access();
+            now < wakeup_time && !inner.killed && !has_interrupting_signal(&inner)
+        });
     }
     if rem_ptr != 0 {
-        let rem = crate::mm::translated_refmut(token, rem_ptr as *mut crate::task::TimeSpec);
-        rem.tv_sec = 0;
-        rem.tv_nsec = 0;
+        let rem = crate::task::TimeSpec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        if !write_user_value(&task, rem_ptr as *mut crate::task::TimeSpec, &rem) {
+            return -14;
+        }
     }
     0
 }
@@ -3226,19 +3572,25 @@ pub fn sys_getrandom(buf: *mut u8, len: usize, flags: usize) -> isize {
         return -14;
     }
     let task = current_task().unwrap();
-    let inner = task.inner_exclusive_access();
-    if !inner.memory_set.valid_user_buf(buf, len, true) {
-        return -14;
-    }
-    let token = inner.get_user_token();
-    drop(inner);
-    let user_buf = crate::mm::translated_byte_buffer(token, buf, len);
     let seed = polyhal::time::Time::now().to_nsec() as u64 ^ (task.getpid() as u64);
-    for (i, byte) in user_buf.iter_mut().enumerate() {
-        let x = seed
-            .wrapping_add((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
-            .rotate_left((i & 31) as u32);
-        *byte = (x ^ (x >> 32)) as u8;
+    let mut bytes = [0u8; 256];
+    let mut offset = 0usize;
+    while offset < len {
+        let chunk_len = bytes.len().min(len - offset);
+        for (index, byte) in bytes[..chunk_len].iter_mut().enumerate() {
+            let absolute = offset + index;
+            let x = seed
+                .wrapping_add((absolute as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+                .rotate_left((absolute & 31) as u32);
+            *byte = (x ^ (x >> 32)) as u8;
+        }
+        let Some(addr) = (buf as usize).checked_add(offset) else {
+            return -14;
+        };
+        if !copy_to_task_user(&task, addr, &bytes[..chunk_len]) {
+            return -14;
+        }
+        offset += chunk_len;
     }
     len as isize
 }
@@ -3267,79 +3619,140 @@ pub fn sys_ppoll(
     _sigmask: *const u8,
     _sigsetsize: usize,
 ) -> isize {
-    let token = current_user_token();
-    let buf = translated_byte_buffer(token, fds, nfds * core::mem::size_of::<PollFd>());
-    let pollfds: &mut [PollFd] =
-        unsafe { core::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut PollFd, nfds) };
+    const POLL_MAX_FDS: usize = 4096;
+    if nfds > POLL_MAX_FDS {
+        return -22;
+    }
+    let Some(poll_bytes) = nfds.checked_mul(core::mem::size_of::<PollFd>()) else {
+        return -22;
+    };
+    if poll_bytes > 0 && fds.is_null() {
+        return -14;
+    }
 
-    let start_ms = polyhal::time::Time::now().to_msec() as usize;
+    let task = current_task().unwrap();
+    let mut pollfds = Vec::with_capacity(nfds);
+    pollfds.resize(
+        nfds,
+        PollFd {
+            fd: -1,
+            events: 0,
+            revents: 0,
+        },
+    );
+    if poll_bytes > 0 {
+        let bytes = unsafe {
+            core::slice::from_raw_parts_mut(pollfds.as_mut_ptr() as *mut u8, poll_bytes)
+        };
+        if !copy_from_task_user(&task, fds as usize, bytes) {
+            return -14;
+        }
+    }
+
+    let deadline_ns = if tmo_p.is_null() {
+        None
+    } else {
+        let mut timeout = crate::task::TimeSpec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let timeout_bytes = unsafe {
+            core::slice::from_raw_parts_mut(
+                &mut timeout as *mut crate::task::TimeSpec as *mut u8,
+                core::mem::size_of::<crate::task::TimeSpec>(),
+            )
+        };
+        if !copy_from_task_user(&task, tmo_p as usize, timeout_bytes) {
+            return -14;
+        }
+        if timeout.tv_nsec >= NSEC_PER_SEC {
+            return -22;
+        }
+        let duration = timeout
+            .tv_sec
+            .saturating_mul(NSEC_PER_SEC)
+            .saturating_add(timeout.tv_nsec);
+        Some(
+            (polyhal::time::Time::now().to_nsec() as usize).saturating_add(duration),
+        )
+    };
 
     loop {
         crate::task::check_itimers();
         crate::net::net_poll();
-        let mut ready = 0i32;
-        let task = current_task().unwrap();
-        let mut inner = task.inner_exclusive_access();
-        if has_interrupting_signal(&inner) {
-            return -4;
+        let mut files: Vec<Option<Arc<dyn File + Send + Sync>>> = Vec::with_capacity(nfds);
+        {
+            let inner = task.inner_exclusive_access();
+            if has_interrupting_signal(&inner) {
+                return -4;
+            }
+            for pfd in pollfds.iter() {
+                let file = usize::try_from(pfd.fd)
+                    .ok()
+                    .and_then(|fd| inner.fd_table.get(fd))
+                    .and_then(|file| file.clone());
+                files.push(file);
+            }
         }
 
-        for pfd in pollfds.iter_mut() {
+        let mut ready = 0usize;
+        for (pfd, file) in pollfds.iter_mut().zip(files.iter()) {
             pfd.revents = 0;
             if pfd.fd < 0 {
                 continue;
             }
-            let fd = pfd.fd as usize;
+            if let Some(file) = file {
+                let (readable, writable, error) = file.poll();
+                if (pfd.events & POLLIN) != 0 && readable {
+                    pfd.revents |= POLLIN;
+                }
+                if (pfd.events & POLLOUT) != 0 && writable {
+                    pfd.revents |= POLLOUT;
+                }
+                if error {
+                    pfd.revents |= POLLHUP;
+                }
+            } else {
+                pfd.revents = POLLNVAL;
+            }
+            if pfd.revents != 0 {
+                ready += 1;
+            }
+        }
 
-            if fd < inner.fd_table.len() {
-                if let Some(file) = &inner.fd_table[fd] {
-                    let file = file.clone();
-                    drop(inner);
-                    let (readable, writable, error) = file.poll();
-                    if (pfd.events & POLLIN) != 0 && readable {
-                        pfd.revents |= POLLIN;
-                    }
-                    if (pfd.events & POLLOUT) != 0 && writable {
-                        pfd.revents |= POLLOUT;
-                    }
-                    if error {
-                        pfd.revents |= POLLHUP;
-                    }
-                    if pfd.revents != 0 {
-                        ready += 1;
-                    }
-                    inner = task.inner_exclusive_access();
-                    continue;
+        let now_ns = polyhal::time::Time::now().to_nsec() as usize;
+        if ready > 0 || deadline_ns.is_some_and(|deadline| now_ns >= deadline) {
+            if poll_bytes > 0 {
+                let bytes = unsafe {
+                    core::slice::from_raw_parts(pollfds.as_ptr() as *const u8, poll_bytes)
+                };
+                if !copy_to_task_user(&task, fds as usize, bytes) {
+                    return -14;
                 }
             }
-
-            pfd.revents |= POLLERR;
-            ready += 1;
-        }
-        drop(inner);
-        drop(task);
-
-        if ready > 0 {
-            stdout_release_if_owner();
-            suspend_current_and_run_next();
             return ready as isize;
         }
 
-        if !tmo_p.is_null() {
-            let tmo: &crate::task::TimeSpec =
-                translated_ref(token, tmo_p as *const crate::task::TimeSpec);
-            let timeout_ms = tmo.tv_sec * 1000 + tmo.tv_nsec / 1_000_000;
-            if timeout_ms == 0 {
-                return 0;
-            }
-            let now_ms = polyhal::time::Time::now().to_msec() as usize;
-            if now_ms - start_ms >= timeout_ms {
-                return 0;
-            }
+        let still_not_ready = || {
+            crate::net::net_poll();
+            pollfds.iter().zip(files.iter()).all(|(pfd, file)| {
+                if pfd.fd < 0 {
+                    return true;
+                }
+                let Some(file) = file else {
+                    return false;
+                };
+                let (readable, writable, error) = file.poll();
+                !error
+                    && ((pfd.events & POLLIN) == 0 || !readable)
+                    && ((pfd.events & POLLOUT) == 0 || !writable)
+            })
+        };
+        if let Some(deadline) = deadline_ns {
+            block_current_until_if(BlockReason::PollWait, deadline, still_not_ready);
+        } else {
+            block_current_and_run_next_if(BlockReason::PollWait, still_not_ready);
         }
-
-        stdout_release_if_owner();
-        suspend_current_and_run_next();
     }
 }
 
@@ -3497,10 +3910,6 @@ pub fn sys_mincore(start: usize, len: usize, vec: *mut u8) -> isize {
     if !inner.memory_set.user_range_mapped(start, len) {
         return -12;
     }
-    if !inner.memory_set.valid_user_buf(vec, npages, true) {
-        return -14;
-    }
-
     let mut residency = Vec::new();
     residency.resize(npages, 0u8);
     let mut page = start;
@@ -3515,10 +3924,8 @@ pub fn sys_mincore(start: usize, len: usize, vec: *mut u8) -> isize {
         page += crate::config::PAGE_SIZE;
     }
     drop(inner);
-    let token = current_user_token();
-    let buf = crate::mm::translated_byte_buffer(token, vec, npages);
-    for (dst, src) in buf.iter_mut().zip(residency.iter()) {
-        *dst = *src;
+    if !copy_to_task_user(&task, vec as usize, &residency) {
+        return -14;
     }
     0
 }
@@ -3661,6 +4068,7 @@ const RLIM_NLIMITS: usize = 16;
 const RLIM_INFINITY: usize = usize::MAX;
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct RLimit {
     rlim_cur: usize,
     rlim_max: usize,
@@ -3674,30 +4082,28 @@ pub fn sys_getrlimit(resource: usize, rlim_ptr: *mut u8) -> isize {
         return -14;
     }
     let task = current_task().unwrap();
-    let inner = task.inner_exclusive_access();
-    if !inner
-        .memory_set
-        .valid_user_buf(rlim_ptr, core::mem::size_of::<RLimit>(), true)
-    {
-        return -14;
+    let rlim = {
+        let inner = task.inner_exclusive_access();
+        match resource {
+            RLIMIT_NOFILE => RLimit {
+                rlim_cur: inner.rlimit_nofile,
+                rlim_max: inner.rlimit_nofile_max,
+            },
+            RLIMIT_MEMLOCK => RLimit {
+                rlim_cur: inner.rlimit_memlock,
+                rlim_max: inner.rlimit_memlock_max,
+            },
+            _ => RLimit {
+                rlim_cur: RLIM_INFINITY,
+                rlim_max: RLIM_INFINITY,
+            },
+        }
+    };
+    if write_user_value(&task, rlim_ptr as *mut RLimit, &rlim) {
+        0
+    } else {
+        -14
     }
-    let token = inner.get_user_token();
-    let rlim = crate::mm::translated_refmut(token, rlim_ptr as *mut RLimit);
-    match resource {
-        RLIMIT_NOFILE => {
-            rlim.rlim_cur = inner.rlimit_nofile;
-            rlim.rlim_max = inner.rlimit_nofile_max;
-        }
-        RLIMIT_MEMLOCK => {
-            rlim.rlim_cur = inner.rlimit_memlock;
-            rlim.rlim_max = inner.rlimit_memlock_max;
-        }
-        _ => {
-            rlim.rlim_cur = RLIM_INFINITY;
-            rlim.rlim_max = RLIM_INFINITY;
-        }
-    }
-    0
 }
 
 pub fn sys_setrlimit(resource: usize, rlim_ptr: *const u8) -> isize {
@@ -3708,16 +4114,9 @@ pub fn sys_setrlimit(resource: usize, rlim_ptr: *const u8) -> isize {
         return -14;
     }
     let task = current_task().unwrap();
-    let inner = task.inner_exclusive_access();
-    if !inner
-        .memory_set
-        .valid_user_buf(rlim_ptr, core::mem::size_of::<RLimit>(), false)
-    {
+    let Some(rlim) = copy_user_value(&task, rlim_ptr as *const RLimit) else {
         return -14;
-    }
-    let token = inner.get_user_token();
-    drop(inner);
-    let rlim = translated_ref(token, rlim_ptr as *const RLimit);
+    };
     let mut inner = task.inner_exclusive_access();
     match resource {
         RLIMIT_NOFILE => {
@@ -3751,43 +4150,37 @@ pub fn sys_prlimit64(
         }
     };
     let caller = current_task().unwrap();
-    let caller_inner = caller.inner_exclusive_access();
-    if !old_limit.is_null()
-        && !caller_inner
-            .memory_set
-            .valid_user_buf(old_limit, core::mem::size_of::<RLimit>(), true)
-    {
-        return -14;
-    }
-    if !new_limit.is_null()
-        && !caller_inner
-            .memory_set
-            .valid_user_buf(new_limit, core::mem::size_of::<RLimit>(), false)
-    {
-        return -14;
-    }
-    let token = caller_inner.get_user_token();
-    drop(caller_inner);
+    let new = if new_limit.is_null() {
+        None
+    } else {
+        match copy_user_value(&caller, new_limit as *const RLimit) {
+            Some(limit) => Some(limit),
+            None => return -14,
+        }
+    };
     if !old_limit.is_null() {
-        let old = translated_refmut(token, old_limit as *mut RLimit);
-        let inner = task.inner_exclusive_access();
-        match resource {
-            RLIMIT_NOFILE => {
-                old.rlim_cur = inner.rlimit_nofile;
-                old.rlim_max = inner.rlimit_nofile_max;
+        let old = {
+            let inner = task.inner_exclusive_access();
+            match resource {
+                RLIMIT_NOFILE => RLimit {
+                    rlim_cur: inner.rlimit_nofile,
+                    rlim_max: inner.rlimit_nofile_max,
+                },
+                RLIMIT_MEMLOCK => RLimit {
+                    rlim_cur: inner.rlimit_memlock,
+                    rlim_max: inner.rlimit_memlock_max,
+                },
+                _ => RLimit {
+                    rlim_cur: RLIM_INFINITY,
+                    rlim_max: RLIM_INFINITY,
+                },
             }
-            RLIMIT_MEMLOCK => {
-                old.rlim_cur = inner.rlimit_memlock;
-                old.rlim_max = inner.rlimit_memlock_max;
-            }
-            _ => {
-                old.rlim_cur = RLIM_INFINITY;
-                old.rlim_max = RLIM_INFINITY;
-            }
+        };
+        if !write_user_value(&caller, old_limit as *mut RLimit, &old) {
+            return -14;
         }
     }
-    if !new_limit.is_null() {
-        let new = translated_ref(token, new_limit as *const RLimit);
+    if let Some(new) = new {
         let mut inner = task.inner_exclusive_access();
         match resource {
             RLIMIT_NOFILE => {
@@ -3831,31 +4224,28 @@ pub fn sys_sysinfo(info_ptr: *mut u8) -> isize {
         return -14;
     }
     let task = current_task().unwrap();
-    let inner = task.inner_exclusive_access();
-    if !inner
-        .memory_set
-        .valid_user_buf(info_ptr, core::mem::size_of::<SysInfo>(), true)
-    {
-        return -14;
-    }
-    let token = inner.get_user_token();
-    drop(inner);
-    let info = crate::mm::translated_refmut(token, info_ptr as *mut SysInfo);
     let now = polyhal::time::Time::now().to_msec() as isize / 1000;
-    info.uptime = now;
-    info.loads = [0, 0, 0];
-    info.totalram = 256 * 1024 * 1024;
-    info.freeram = 128 * 1024 * 1024;
-    info.sharedram = 0;
-    info.bufferram = 0;
-    info.totalswap = 0;
-    info.freeswap = 0;
-    info.procs = 0;
-    info.pad = 0;
-    info.totalhigh = 0;
-    info.freehigh = 0;
-    info.mem_unit = 1;
-    0
+    let info = SysInfo {
+        uptime: now,
+        loads: [0, 0, 0],
+        totalram: 256 * 1024 * 1024,
+        freeram: 128 * 1024 * 1024,
+        sharedram: 0,
+        bufferram: 0,
+        totalswap: 0,
+        freeswap: 0,
+        procs: 0,
+        pad: 0,
+        totalhigh: 0,
+        freehigh: 0,
+        mem_unit: 1,
+        _f: [],
+    };
+    if write_user_value(&task, info_ptr as *mut SysInfo, &info) {
+        0
+    } else {
+        -14
+    }
 }
 
 // ---- sigaltstack (132) ----
@@ -3864,6 +4254,7 @@ const SS_DISABLE: u32 = 2;
 const SS_ONSTACK: u32 = 1;
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct StackT {
     ss_sp: usize,
     ss_flags: i32,
@@ -3871,25 +4262,33 @@ struct StackT {
 }
 
 pub fn sys_sigaltstack(ss: *const u8, old_ss: *mut u8) -> isize {
-    let token = current_user_token();
     let task = current_task().unwrap();
-    let mut inner = task.inner_exclusive_access();
-
-    if !old_ss.is_null() {
-        let old = crate::mm::translated_refmut(token, old_ss as *mut StackT);
-        old.ss_sp = inner.alt_stack;
-        old.ss_size = inner.alt_stack_size;
-        old.ss_flags = inner.alt_stack_flags as i32;
-        if inner.alt_stack_flags & SS_ONSTACK != 0 {
-            old.ss_flags = SS_ONSTACK as i32;
+    let new = if ss.is_null() {
+        None
+    } else {
+        match copy_user_value(&task, ss as *const StackT) {
+            Some(stack) => Some(stack),
+            None => return -14,
         }
+    };
+    let mut old = {
+        let inner = task.inner_exclusive_access();
+        StackT {
+            ss_sp: inner.alt_stack,
+            ss_flags: inner.alt_stack_flags as i32,
+            ss_size: inner.alt_stack_size,
+        }
+    };
+    if old.ss_flags as u32 & SS_ONSTACK != 0 {
+        old.ss_flags = SS_ONSTACK as i32;
     }
-
-    if ss.is_null() {
+    if !old_ss.is_null() && !write_user_value(&task, old_ss as *mut StackT, &old) {
+        return -14;
+    }
+    let Some(new) = new else {
         return 0;
-    }
-
-    let new = crate::mm::translated_ref(token, ss as *const StackT);
+    };
+    let mut inner = task.inner_exclusive_access();
     if (new.ss_flags as u32 & SS_DISABLE) != 0 {
         inner.alt_stack_flags = SS_DISABLE;
         inner.alt_stack = 0;
@@ -3911,12 +4310,13 @@ pub fn sys_rt_sigpending(set: *mut u8, _sigsize: usize) -> isize {
     if set.is_null() {
         return -14;
     }
-    let token = current_user_token();
     let task = current_task().unwrap();
-    let inner = task.inner_exclusive_access();
-    let dst = crate::mm::translated_refmut(token, set as *mut u64);
-    *dst = flags_to_user_sigset(inner.signals);
-    0
+    let pending = flags_to_user_sigset(task.inner_exclusive_access().signals);
+    if write_user_value(&task, set as *mut u64, &pending) {
+        0
+    } else {
+        -14
+    }
 }
 
 // ---- sigsuspend / rt_sigsuspend (133) ----
@@ -3929,19 +4329,12 @@ pub fn sys_rt_sigsuspend(mask: *const u8, sigsize: usize) -> isize {
         return -14;
     }
 
-    let token = current_user_token();
     let task = current_task().unwrap();
-    let mut inner = task.inner_exclusive_access();
-
-    if !inner
-        .memory_set
-        .valid_user_buf(mask, core::mem::size_of::<u64>(), false)
-    {
+    let Some(new_mask_u64) = copy_user_value(&task, mask as *const u64) else {
         return -14;
-    }
-
+    };
+    let mut inner = task.inner_exclusive_access();
     let saved_mask = inner.signal_mask;
-    let new_mask_u64 = *crate::mm::translated_ref(token, mask as *const u64);
     let mut new_mask = user_sigset_to_flags(new_mask_u64);
     // Linux never permits applications to block SIGKILL or SIGSTOP.
     new_mask.remove(SignalFlags::SIGKILL | SignalFlags::SIGSTOP);
@@ -3995,12 +4388,11 @@ struct RtSignalInfo {
     _pad: [u8; 128 - 40],
 }
 
-fn write_signal_siginfo(info_ptr: *mut u8, signum: i32) {
+fn write_signal_siginfo(task: &Arc<TaskControlBlock>, info_ptr: *mut u8, signum: i32) -> bool {
     if info_ptr.is_null() {
-        return;
+        return true;
     }
-    let token = current_user_token();
-    *translated_refmut(token, info_ptr as *mut RtSignalInfo) = RtSignalInfo {
+    let info = RtSignalInfo {
         si_signo: signum,
         si_errno: 0,
         si_code: 0,
@@ -4013,6 +4405,7 @@ fn write_signal_siginfo(info_ptr: *mut u8, signum: i32) {
         si_stime: 0,
         _pad: [0; 128 - 40],
     };
+    write_user_value(task, info_ptr as *mut RtSignalInfo, &info)
 }
 
 pub fn sys_rt_sigtimedwait(
@@ -4024,8 +4417,10 @@ pub fn sys_rt_sigtimedwait(
     if set.is_null() {
         return -14;
     }
-    let token = current_user_token();
-    let raw_set = *translated_ref(token, set as *const u64);
+    let task = current_task().unwrap();
+    let Some(raw_set) = copy_user_value(&task, set as *const u64) else {
+        return -14;
+    };
     let mut wanted = user_sigset_to_flags(raw_set);
     wanted.remove(SignalFlags::SIGKILL | SignalFlags::SIGSTOP);
     if wanted.is_empty() {
@@ -4035,7 +4430,9 @@ pub fn sys_rt_sigtimedwait(
     let timeout_ns = if timeout.is_null() {
         None
     } else {
-        let ts = *translated_ref(token, timeout as *const crate::task::TimeSpec);
+        let Some(ts) = copy_user_value(&task, timeout as *const crate::task::TimeSpec) else {
+            return -14;
+        };
         if ts.tv_nsec >= 1_000_000_000 {
             return -22;
         }
@@ -4049,7 +4446,6 @@ pub fn sys_rt_sigtimedwait(
     let deadline_ns = timeout_ns.map(|limit| start_ns.saturating_add(limit));
 
     loop {
-        let task = current_task().unwrap();
         let found = {
             let mut inner = task.inner_exclusive_access();
             if inner.killed {
@@ -4071,7 +4467,9 @@ pub fn sys_rt_sigtimedwait(
 
         if let Some(signal) = found {
             let signum = signal_number(signal);
-            write_signal_siginfo(info, signum);
+            if !write_signal_siginfo(&task, info, signum) {
+                return -14;
+            }
             return signum as isize;
         }
 
@@ -4105,19 +4503,15 @@ pub fn sys_clock_getres(clk_id: usize, res: *mut u8) -> isize {
         return 0;
     }
     let task = current_task().unwrap();
-    let inner = task.inner_exclusive_access();
-    if !inner
-        .memory_set
-        .valid_user_buf(res, core::mem::size_of::<crate::task::TimeSpec>(), true)
-    {
-        return -14;
+    let ts = crate::task::TimeSpec {
+        tv_sec: 0,
+        tv_nsec: 1_000_000,
+    };
+    if write_user_value(&task, res as *mut crate::task::TimeSpec, &ts) {
+        0
+    } else {
+        -14
     }
-    let token = inner.get_user_token();
-    drop(inner);
-    let ts = crate::mm::translated_refmut(token, res as *mut crate::task::TimeSpec);
-    ts.tv_sec = 0;
-    ts.tv_nsec = 1_000_000; // 1ms resolution
-    0
 }
 
 // ---- getgroups/setgroups (158/159) ----
@@ -4125,8 +4519,7 @@ pub fn sys_clock_getres(clk_id: usize, res: *mut u8) -> isize {
 pub fn sys_getgroups(size: usize, list: *mut u32) -> isize {
     const NGROUPS_MAX: usize = 65536;
     let task = current_task().unwrap();
-    let inner = task.inner_exclusive_access();
-    let groups = inner.supplementary_groups.clone();
+    let groups = task.inner_exclusive_access().supplementary_groups.clone();
     let count = groups.len();
     if size > NGROUPS_MAX {
         return -22;
@@ -4140,17 +4533,13 @@ pub fn sys_getgroups(size: usize, list: *mut u32) -> isize {
     if list.is_null() {
         return -14;
     }
-    let bytes = count * core::mem::size_of::<u32>();
-    if !inner
-        .memory_set
-        .valid_user_buf(list as *const u8, bytes, true)
-    {
-        return -14;
-    }
-    let token = inner.get_user_token();
-    drop(inner);
     for (idx, gid) in groups.iter().enumerate() {
-        *crate::mm::translated_refmut(token, unsafe { list.add(idx) }) = *gid;
+        let Some(addr) = (list as usize).checked_add(idx * core::mem::size_of::<u32>()) else {
+            return -14;
+        };
+        if !write_user_value(&task, addr as *mut u32, gid) {
+            return -14;
+        }
     }
     count as isize
 }
@@ -4158,8 +4547,7 @@ pub fn sys_getgroups(size: usize, list: *mut u32) -> isize {
 pub fn sys_setgroups(size: usize, list: *const u32) -> isize {
     const NGROUPS_MAX: usize = 65536;
     let task = current_task().unwrap();
-    let mut inner = task.inner_exclusive_access();
-    if inner.euid != 0 {
+    if task.inner_exclusive_access().euid != 0 {
         return -1;
     }
     if size > NGROUPS_MAX {
@@ -4168,19 +4556,15 @@ pub fn sys_setgroups(size: usize, list: *const u32) -> isize {
     if size > 0 && list.is_null() {
         return -14;
     }
-    let bytes = size * core::mem::size_of::<u32>();
-    if size > 0
-        && !inner
-            .memory_set
-            .valid_user_buf(list as *const u8, bytes, false)
-    {
-        return -14;
-    }
-    let token = inner.get_user_token();
-    drop(inner);
     let mut groups = Vec::with_capacity(size);
     for idx in 0..size {
-        groups.push(*translated_ref(token, unsafe { list.add(idx) }));
+        let Some(addr) = (list as usize).checked_add(idx * core::mem::size_of::<u32>()) else {
+            return -14;
+        };
+        let Some(gid) = copy_user_value(&task, addr as *const u32) else {
+            return -14;
+        };
+        groups.push(gid);
     }
     let mut inner = task.inner_exclusive_access();
     inner.supplementary_groups = groups;
@@ -4191,41 +4575,29 @@ pub fn sys_setgroups(size: usize, list: *const u32) -> isize {
 
 pub fn sys_getresuid(ruid: *mut u32, euid: *mut u32, suid: *mut u32) -> isize {
     let task = current_task().unwrap();
-    let inner = task.inner_exclusive_access();
-    let word = core::mem::size_of::<u32>();
-    for ptr in [ruid, euid, suid] {
-        if ptr.is_null()
-            || !inner
-                .memory_set
-                .valid_user_buf(ptr as *const u8, word, true)
-        {
+    let ids = {
+        let inner = task.inner_exclusive_access();
+        [inner.uid, inner.euid, inner.suid]
+    };
+    for (ptr, value) in [ruid, euid, suid].into_iter().zip(ids) {
+        if !write_user_value(&task, ptr, &value) {
             return -14;
         }
     }
-    let token = inner.get_user_token();
-    *crate::mm::translated_refmut(token, ruid) = inner.uid;
-    *crate::mm::translated_refmut(token, euid) = inner.euid;
-    *crate::mm::translated_refmut(token, suid) = inner.suid;
     0
 }
 
 pub fn sys_getresgid(rgid: *mut u32, egid: *mut u32, sgid: *mut u32) -> isize {
     let task = current_task().unwrap();
-    let inner = task.inner_exclusive_access();
-    let word = core::mem::size_of::<u32>();
-    for ptr in [rgid, egid, sgid] {
-        if ptr.is_null()
-            || !inner
-                .memory_set
-                .valid_user_buf(ptr as *const u8, word, true)
-        {
+    let ids = {
+        let inner = task.inner_exclusive_access();
+        [inner.gid, inner.egid, inner.sgid]
+    };
+    for (ptr, value) in [rgid, egid, sgid].into_iter().zip(ids) {
+        if !write_user_value(&task, ptr, &value) {
             return -14;
         }
     }
-    let token = inner.get_user_token();
-    *crate::mm::translated_refmut(token, rgid) = inner.gid;
-    *crate::mm::translated_refmut(token, egid) = inner.egid;
-    *crate::mm::translated_refmut(token, sgid) = inner.sgid;
     0
 }
 
@@ -4389,23 +4761,26 @@ pub fn sys_sched_setaffinity(pid: usize, len: usize, mask: *const u8) -> isize {
             None => return -3,
         }
     };
-    let inner = caller.inner_exclusive_access();
-    if !inner.memory_set.valid_user_buf(mask, len, false) {
-        return -14;
-    }
-    let token = inner.get_user_token();
-    drop(inner);
-
     let mut requested = 0usize;
-    for (index, byte) in translated_byte_buffer(token, mask as *mut u8, len)
-        .iter()
-        .enumerate()
-    {
-        if index < core::mem::size_of::<usize>() {
-            requested |= (*byte as usize) << (index * 8);
-        } else if *byte != 0 {
-            return -22;
+    let mut offset = 0usize;
+    let mut staging = [0u8; 64];
+    while offset < len {
+        let chunk_len = staging.len().min(len - offset);
+        let Some(addr) = (mask as usize).checked_add(offset) else {
+            return -14;
+        };
+        if !copy_from_task_user(&caller, addr, &mut staging[..chunk_len]) {
+            return -14;
         }
+        for (index, byte) in staging[..chunk_len].iter().enumerate() {
+            let absolute = offset + index;
+            if absolute < core::mem::size_of::<usize>() {
+                requested |= (*byte as usize) << (absolute * 8);
+            } else if *byte != 0 {
+                return -22;
+            }
+        }
+        offset += chunk_len;
     }
     if requested == 0 || requested & !online_cpu_mask() != 0 {
         return -22;
@@ -4434,26 +4809,28 @@ pub fn sys_sched_getaffinity(pid: usize, len: usize, mask: *mut u8) -> isize {
             None => return -3,
         }
     };
-    let inner = caller.inner_exclusive_access();
-    if !inner
-        .memory_set
-        .valid_user_buf(mask as *const u8, len, true)
-    {
-        return -14;
-    }
-    let token = inner.get_user_token();
-    drop(inner);
     // Do not expose unavailable harts on a QEMU_SMP=1 boot. The stored mask
     // remains useful when the same image is later booted with four CPUs, but
     // userspace must receive the CPUs it can actually run on now.
     let affinity = target.allowed_cpus() & online_cpu_mask();
-    let buf = translated_byte_buffer(token, mask, len);
-    for (index, byte) in buf.iter_mut().enumerate() {
-        *byte = if index < core::mem::size_of::<usize>() {
-            ((affinity >> (index * 8)) & 0xff) as u8
-        } else {
-            0
+    let mut bytes = [0u8; 64];
+    let mut offset = 0usize;
+    while offset < len {
+        let chunk_len = bytes.len().min(len - offset);
+        bytes[..chunk_len].fill(0);
+        for (index, byte) in bytes[..chunk_len].iter_mut().enumerate() {
+            let absolute = offset + index;
+            if absolute < core::mem::size_of::<usize>() {
+                *byte = ((affinity >> (absolute * 8)) & 0xff) as u8;
+            }
+        }
+        let Some(addr) = (mask as usize).checked_add(offset) else {
+            return -14;
         };
+        if !copy_to_task_user(&caller, addr, &bytes[..chunk_len]) {
+            return -14;
+        }
+        offset += chunk_len;
     }
     cpuset_bytes as isize
 }
@@ -4594,15 +4971,24 @@ fn fd_clr(set: &mut FdSet, fd: usize) {
     }
 }
 
-fn copy_fdset(dst: &mut FdSet, src_ptr: *const u8) {
-    let token = current_user_token();
-    let src: &FdSet = translated_ref(token, src_ptr as *const FdSet);
-    *dst = *src;
+fn copy_fdset(task: &Arc<TaskControlBlock>, dst: &mut FdSet, src_ptr: *const u8) -> bool {
+    let dst_bytes = unsafe {
+        core::slice::from_raw_parts_mut(
+            dst.as_mut_ptr() as *mut u8,
+            core::mem::size_of::<FdSet>(),
+        )
+    };
+    copy_from_task_user(task, src_ptr as usize, dst_bytes)
 }
 
-fn write_fdset(dst_ptr: *mut u8, src: &FdSet) {
-    let token = current_user_token();
-    *translated_refmut(token, dst_ptr as *mut FdSet) = *src;
+fn write_fdset(task: &Arc<TaskControlBlock>, dst_ptr: *mut u8, src: &FdSet) -> bool {
+    let src_bytes = unsafe {
+        core::slice::from_raw_parts(
+            src.as_ptr() as *const u8,
+            core::mem::size_of::<FdSet>(),
+        )
+    };
+    copy_to_task_user(task, dst_ptr as usize, src_bytes)
 }
 
 pub fn sys_pselect6(
@@ -4616,57 +5002,49 @@ pub fn sys_pselect6(
     if nfds > FD_SETSIZE {
         return -22;
     }
-    let token = current_user_token();
     let task = current_task().unwrap();
-    let inner = task.inner_exclusive_access();
-    let fdset_size = core::mem::size_of::<FdSet>();
-    if !readfds.is_null() && !inner.memory_set.valid_user_buf(readfds, fdset_size, true) {
-        return -14;
-    }
-    if !writefds.is_null() && !inner.memory_set.valid_user_buf(writefds, fdset_size, true) {
-        return -14;
-    }
-    if !exceptfds.is_null() && !inner.memory_set.valid_user_buf(exceptfds, fdset_size, true) {
-        return -14;
-    }
-    if !timeout.is_null()
-        && !inner.memory_set.valid_user_buf(
-            timeout,
-            core::mem::size_of::<crate::task::TimeSpec>(),
-            false,
-        )
-    {
-        return -14;
-    }
-    drop(inner);
-
-    let token = current_user_token();
     let mut rfds = [0u64; FD_SET_LONGS];
     let mut wfds = [0u64; FD_SET_LONGS];
     let mut efds = [0u64; FD_SET_LONGS];
 
-    if !readfds.is_null() {
-        copy_fdset(&mut rfds, readfds);
+    if !readfds.is_null() && !copy_fdset(&task, &mut rfds, readfds) {
+        return -14;
     }
-    if !writefds.is_null() {
-        copy_fdset(&mut wfds, writefds);
+    if !writefds.is_null() && !copy_fdset(&task, &mut wfds, writefds) {
+        return -14;
     }
-    if !exceptfds.is_null() {
-        copy_fdset(&mut efds, exceptfds);
+    if !exceptfds.is_null() && !copy_fdset(&task, &mut efds, exceptfds) {
+        return -14;
     }
     let orig_rfds = rfds;
     let orig_wfds = wfds;
     let orig_efds = efds;
 
-    let timeout_ms = if !timeout.is_null() {
-        let ts: &crate::task::TimeSpec =
-            translated_ref(token, timeout as *const crate::task::TimeSpec);
-        ts.tv_sec * 1000 + ts.tv_nsec / 1_000_000
+    let deadline_ns = if timeout.is_null() {
+        None
     } else {
-        usize::MAX
+        let mut ts = crate::task::TimeSpec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let ts_bytes = unsafe {
+            core::slice::from_raw_parts_mut(
+                &mut ts as *mut crate::task::TimeSpec as *mut u8,
+                core::mem::size_of::<crate::task::TimeSpec>(),
+            )
+        };
+        if !copy_from_task_user(&task, timeout as usize, ts_bytes) {
+            return -14;
+        }
+        if ts.tv_nsec >= NSEC_PER_SEC {
+            return -22;
+        }
+        let duration = ts
+            .tv_sec
+            .saturating_mul(NSEC_PER_SEC)
+            .saturating_add(ts.tv_nsec);
+        Some((polyhal::time::Time::now().to_nsec() as usize).saturating_add(duration))
     };
-
-    let start_ms = polyhal::time::Time::now().to_msec() as usize;
 
     loop {
         crate::task::check_itimers();
@@ -4674,118 +5052,89 @@ pub fn sys_pselect6(
         wfds = orig_wfds;
         efds = orig_efds;
         crate::net::net_poll();
-        let mut ready = 0i32;
+        let mut ready = 0usize;
         let n = nfds.min(FD_SETSIZE);
-
-        let task = current_task().unwrap();
-        let mut inner = task.inner_exclusive_access();
-        if has_interrupting_signal(&inner) {
-            return -4;
+        let mut files: Vec<Option<Arc<dyn File + Send + Sync>>> = Vec::with_capacity(n);
+        {
+            let inner = task.inner_exclusive_access();
+            if has_interrupting_signal(&inner) {
+                return -4;
+            }
+            for fd in 0..n {
+                let watched = fd_isset(&orig_rfds, fd)
+                    || fd_isset(&orig_wfds, fd)
+                    || fd_isset(&orig_efds, fd);
+                if !watched {
+                    files.push(None);
+                    continue;
+                }
+                let Some(file) = inner.fd_table.get(fd).and_then(|file| file.clone()) else {
+                    return -9;
+                };
+                files.push(Some(file));
+            }
         }
 
-        let mut fd = 0usize;
-        while fd < n {
-            let check_read = fd_isset(&rfds, fd);
-            let check_write = fd_isset(&wfds, fd);
-            let check_except = fd_isset(&efds, fd);
-
-            if !check_read && !check_write && !check_except {
-                fd += 1;
+        for (fd, file) in files.iter().enumerate() {
+            let check_read = fd_isset(&orig_rfds, fd);
+            let check_write = fd_isset(&orig_wfds, fd);
+            let check_except = fd_isset(&orig_efds, fd);
+            let Some(file) = file else {
                 continue;
-            }
-
-            let mut readable = false;
-            let mut writable = false;
-            let mut error = false;
-
-            if fd < inner.fd_table.len() {
-                if let Some(file) = &inner.fd_table[fd] {
-                    let file = file.clone();
-                    drop(inner);
-                    let (r, w, e) = file.poll();
-                    readable = r;
-                    writable = w;
-                    error = e;
-                    inner = task.inner_exclusive_access();
-                } else {
-                    drop(inner);
-                    return -9;
-                }
-            } else {
-                drop(inner);
-                return -9;
-            }
-
+            };
+            let (readable, writable, error) = file.poll();
+            let mut fd_ready = false;
             if check_read && readable {
                 fd_set(&mut rfds, fd);
-                ready += 1;
+                fd_ready = true;
             } else {
                 fd_clr(&mut rfds, fd);
             }
             if check_write && writable {
                 fd_set(&mut wfds, fd);
-                ready += 1;
+                fd_ready = true;
             } else {
                 fd_clr(&mut wfds, fd);
             }
             if check_except && error {
                 fd_set(&mut efds, fd);
-                ready += 1;
+                fd_ready = true;
             } else {
                 fd_clr(&mut efds, fd);
             }
-
-            fd += 1;
+            if fd_ready {
+                ready += 1;
+            }
         }
 
-        drop(inner);
-        drop(task);
-
-        if ready > 0 {
-            if !readfds.is_null() {
-                write_fdset(readfds, &rfds);
+        let now_ns = polyhal::time::Time::now().to_nsec() as usize;
+        if ready > 0 || deadline_ns.is_some_and(|deadline| now_ns >= deadline) {
+            if (!readfds.is_null() && !write_fdset(&task, readfds, &rfds))
+                || (!writefds.is_null() && !write_fdset(&task, writefds, &wfds))
+                || (!exceptfds.is_null() && !write_fdset(&task, exceptfds, &efds))
+            {
+                return -14;
             }
-            if !writefds.is_null() {
-                write_fdset(writefds, &wfds);
-            }
-            if !exceptfds.is_null() {
-                write_fdset(exceptfds, &efds);
-            }
-            stdout_release_if_owner();
-            suspend_current_and_run_next();
             return ready as isize;
         }
 
-        if timeout_ms == 0 {
-            if !readfds.is_null() {
-                write_fdset(readfds, &rfds);
-            }
-            if !writefds.is_null() {
-                write_fdset(writefds, &wfds);
-            }
-            if !exceptfds.is_null() {
-                write_fdset(exceptfds, &efds);
-            }
-            return 0;
+        let still_not_ready = || {
+            crate::net::net_poll();
+            files.iter().enumerate().all(|(fd, file)| {
+                let Some(file) = file else {
+                    return true;
+                };
+                let (readable, writable, error) = file.poll();
+                (!fd_isset(&orig_rfds, fd) || !readable)
+                    && (!fd_isset(&orig_wfds, fd) || !writable)
+                    && (!fd_isset(&orig_efds, fd) || !error)
+            })
+        };
+        if let Some(deadline) = deadline_ns {
+            block_current_until_if(BlockReason::PollWait, deadline, still_not_ready);
+        } else {
+            block_current_and_run_next_if(BlockReason::PollWait, still_not_ready);
         }
-        if timeout_ms != usize::MAX {
-            let now_ms = polyhal::time::Time::now().to_msec() as usize;
-            if now_ms - start_ms >= timeout_ms {
-                if !readfds.is_null() {
-                    write_fdset(readfds, &rfds);
-                }
-                if !writefds.is_null() {
-                    write_fdset(writefds, &wfds);
-                }
-                if !exceptfds.is_null() {
-                    write_fdset(exceptfds, &efds);
-                }
-                return 0;
-            }
-        }
-
-        stdout_release_if_owner();
-        suspend_current_and_run_next();
     }
 }
 
@@ -4803,22 +5152,38 @@ pub fn sys_futex(
     if (uaddr as usize) % core::mem::align_of::<u32>() != 0 {
         return -22;
     }
+    let task = current_task().unwrap();
+    if !prepare_task_user_access(
+        &task,
+        uaddr as usize,
+        core::mem::size_of::<u32>(),
+        false,
+    ) {
+        return -14;
+    }
     let cur = futex_word_load(uaddr);
     let op = futex_op & 0x7F;
     let shared = futex_op & 128 == 0;
     let key = {
-        let task = current_task().unwrap();
         let inner = task.inner_exclusive_access();
         futex_keys_for_addr(&inner, uaddr as usize, shared)[0]
     };
     #[cfg(feature = "smp-diagnostics")]
-    record_futex_event(0x100 | futex_op, key, val, cur as isize);
+    let record_call = !matches!(op, 0 | 9) || val2 == 0;
+    #[cfg(feature = "smp-diagnostics")]
+    if record_call {
+        record_futex_event(0x100 | futex_op, key, val, cur as isize);
+    }
     let result = match op {
         0 => {
             if cur != val as u32 {
                 return -11;
             }
-            match futex_wait_current(key, uaddr, val as u32, futex_relative_timeout_ns(val2)) {
+            let timeout = match futex_timeout_ns(&task, val2, false) {
+                Ok(timeout) => timeout,
+                Err(errno) => return errno,
+            };
+            match futex_wait_current(key, uaddr, val as u32, timeout) {
                 FutexWaitResult::Woken => 0,
                 FutexWaitResult::TimedOut => -110,
                 FutexWaitResult::Interrupted => -4,
@@ -4829,7 +5194,11 @@ pub fn sys_futex(
             if cur != val as u32 {
                 return -11;
             }
-            match futex_wait_current(key, uaddr, val as u32, futex_absolute_timeout_ns(val2)) {
+            let timeout = match futex_timeout_ns(&task, val2, true) {
+                Ok(timeout) => timeout,
+                Err(errno) => return errno,
+            };
+            match futex_wait_current(key, uaddr, val as u32, timeout) {
                 FutexWaitResult::Woken => 0,
                 FutexWaitResult::TimedOut => -110,
                 FutexWaitResult::Interrupted => -4,
@@ -4866,7 +5235,9 @@ pub fn sys_futex(
         _ => -38,
     };
     #[cfg(feature = "smp-diagnostics")]
-    record_futex_event(op, key, val, result);
+    if record_call {
+        record_futex_event(op, key, val, result);
+    }
     result
 }
 
@@ -4888,36 +5259,31 @@ fn futex_word_load(uaddr: *const u32) -> u32 {
     unsafe { (&*(uaddr as *const AtomicU32)).load(Ordering::Acquire) }
 }
 
-fn futex_relative_timeout_ns(timeout_ptr: usize) -> Option<usize> {
+fn futex_timeout_ns(
+    task: &Arc<TaskControlBlock>,
+    timeout_ptr: usize,
+    absolute: bool,
+) -> Result<Option<usize>, isize> {
     if timeout_ptr == 0 {
-        return None;
+        return Ok(None);
     }
-    let token = current_user_token();
-    let ts = *translated_ref(token, timeout_ptr as *const crate::task::TimeSpec);
+    let Some(ts) = copy_user_value(task, timeout_ptr as *const crate::task::TimeSpec) else {
+        return Err(-14);
+    };
     if ts.tv_nsec >= 1_000_000_000 {
-        return Some(polyhal::time::Time::now().to_nsec() as usize);
+        return Err(-22);
     }
     let duration = ts
         .tv_sec
         .saturating_mul(1_000_000_000)
         .saturating_add(ts.tv_nsec);
-    Some((polyhal::time::Time::now().to_nsec() as usize).saturating_add(duration))
-}
-
-fn futex_absolute_timeout_ns(timeout_ptr: usize) -> Option<usize> {
-    if timeout_ptr == 0 {
-        return None;
+    if absolute {
+        Ok(Some(duration))
+    } else {
+        Ok(Some(
+            (polyhal::time::Time::now().to_nsec() as usize).saturating_add(duration),
+        ))
     }
-    let token = current_user_token();
-    let ts = *translated_ref(token, timeout_ptr as *const crate::task::TimeSpec);
-    if ts.tv_nsec >= 1_000_000_000 {
-        return Some(polyhal::time::Time::now().to_nsec() as usize);
-    }
-    Some(
-        ts.tv_sec
-            .saturating_mul(1_000_000_000)
-            .saturating_add(ts.tv_nsec),
-    )
 }
 
 pub(crate) fn remove_futex_waiter(pid: usize) -> bool {
@@ -4934,7 +5300,10 @@ pub(crate) fn remove_futex_waiter(pid: usize) -> bool {
     removed
 }
 
-#[cfg(feature = "smp-diagnostics")]
+#[cfg(any(
+    feature = "smp-diagnostics",
+    feature = "scheduler-stall-diagnostics"
+))]
 pub(crate) fn dump_futex_waiters() {
     let snapshot: Vec<(usize, usize, Vec<usize>)> = {
         let waiters = FUTEX_WAITERS.exclusive_access();
@@ -4957,20 +5326,23 @@ pub(crate) fn dump_futex_waiters() {
             tids,
         );
     }
-    let end = FUTEX_EVENT_NEXT.load(Ordering::Acquire);
-    let start = end.saturating_sub(FUTEX_EVENT_CAPACITY);
-    for sequence in start..end {
-        let slot = sequence % FUTEX_EVENT_CAPACITY;
-        crate::println!(
-            "[futex-event] seq={} tid={} op={} namespace={:#x} addr={:#x} val={} ret={}",
-            sequence,
-            FUTEX_EVENT_TID[slot].load(Ordering::Relaxed),
-            FUTEX_EVENT_OP[slot].load(Ordering::Relaxed),
-            FUTEX_EVENT_NAMESPACE[slot].load(Ordering::Relaxed),
-            FUTEX_EVENT_ADDR[slot].load(Ordering::Relaxed),
-            FUTEX_EVENT_VAL[slot].load(Ordering::Relaxed),
-            FUTEX_EVENT_RET[slot].load(Ordering::Relaxed) as isize,
-        );
+    #[cfg(feature = "smp-diagnostics")]
+    {
+        let end = FUTEX_EVENT_NEXT.load(Ordering::Acquire);
+        let start = end.saturating_sub(FUTEX_EVENT_CAPACITY);
+        for sequence in start..end {
+            let slot = sequence % FUTEX_EVENT_CAPACITY;
+            crate::println!(
+                "[futex-event] seq={} tid={} op={} namespace={:#x} addr={:#x} val={} ret={}",
+                sequence,
+                FUTEX_EVENT_TID[slot].load(Ordering::Relaxed),
+                FUTEX_EVENT_OP[slot].load(Ordering::Relaxed),
+                FUTEX_EVENT_NAMESPACE[slot].load(Ordering::Relaxed),
+                FUTEX_EVENT_ADDR[slot].load(Ordering::Relaxed),
+                FUTEX_EVENT_VAL[slot].load(Ordering::Relaxed),
+                FUTEX_EVENT_RET[slot].load(Ordering::Relaxed) as isize,
+            );
+        }
     }
 }
 
@@ -5076,18 +5448,9 @@ fn futex_wait_current(
     };
     crate::task::schedule(task_cx_ptr);
     task.record_time_resume();
-    let mut still_waiting = false;
-    {
-        let mut waiters = FUTEX_WAITERS.exclusive_access();
-        if let Some(queue) = waiters.get_mut(&key) {
-            let old_len = queue.len();
-            queue.retain(|queued| queued.getpid() != pid);
-            still_waiting = queue.len() != old_len;
-            if queue.is_empty() {
-                waiters.remove(&key);
-            }
-        }
-    }
+    // FUTEX_REQUEUE may have moved this waiter away from its original key.
+    // A timeout must remove it from the queue where it currently resides.
+    let still_waiting = remove_futex_waiter(pid);
     if deadline_ns.is_some() {
         let _ = crate::task::remove_sleep(pid);
     }
@@ -5157,16 +5520,28 @@ pub fn sys_madvise(start: usize, len: usize, advice: usize) -> isize {
         return -12;
     }
 
-    let ret = match advice {
+    let (ret, retired_frames) = match advice {
         MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED | MADV_DONTFORK
         | MADV_DOFORK | MADV_HUGEPAGE | MADV_NOHUGEPAGE | MADV_DONTDUMP | MADV_DODUMP
-        | MADV_KEEPONFORK | MADV_COLD | MADV_PAGEOUT => 0,
+        | MADV_KEEPONFORK | MADV_COLD | MADV_PAGEOUT => (0, Vec::new()),
         MADV_DONTNEED => inner
             .memory_set
             .madvise_private_anonymous_dontneed(polyhal::VirtAddr::from(start), len),
-        MADV_FREE | MADV_REMOVE | MADV_MERGEABLE | MADV_UNMERGEABLE | MADV_WIPEONFORK => -22,
-        _ => -22,
+        MADV_FREE | MADV_REMOVE | MADV_MERGEABLE | MADV_UNMERGEABLE | MADV_WIPEONFORK => {
+            (-22, Vec::new())
+        }
+        _ => (-22, Vec::new()),
     };
+    let retired_mapping = if retired_frames.is_empty() {
+        None
+    } else {
+        Some((inner.memory_set.activity_handle(), retired_frames))
+    };
+    drop(inner);
+    if let Some((activity, retired_frames)) = retired_mapping {
+        let _ = flush_remote_tlb(&activity, start, len);
+        drop(retired_frames);
+    }
     #[cfg(feature = "smp-diagnostics")]
     if ret != 0 || len >= 0x10_0000 {
         crate::println!(
@@ -5190,14 +5565,8 @@ pub fn sys_set_robust_list(head: usize, len: usize) -> isize {
         return 0;
     }
     let task = current_task().unwrap();
-    {
-        let inner = task.inner_exclusive_access();
-        if !inner
-            .memory_set
-            .valid_user_buf(head as *const u8, ROBUST_LIST_LEN, false)
-        {
-            return -14;
-        }
+    if !prepare_task_user_access(&task, head, ROBUST_LIST_LEN, false) {
+        return -14;
     }
     clear_stale_musl_killlock(&task, head);
     let mut inner = task.inner_exclusive_access();
@@ -5211,22 +5580,8 @@ pub fn sys_get_robust_list(pid: usize, head_ptr: *mut usize, len_ptr: *mut usize
         return -14;
     }
     let current = current_task().unwrap();
-    {
-        let inner = current.inner_exclusive_access();
-        if !inner.memory_set.valid_user_buf(
-            head_ptr as *const u8,
-            core::mem::size_of::<usize>(),
-            true,
-        ) || !inner.memory_set.valid_user_buf(
-            len_ptr as *const u8,
-            core::mem::size_of::<usize>(),
-            true,
-        ) {
-            return -14;
-        }
-    }
     let target = if pid == 0 || pid == current.getpid() {
-        current
+        current.clone()
     } else {
         match pid2task(pid) {
             Some(task) => task,
@@ -5237,10 +5592,14 @@ pub fn sys_get_robust_list(pid: usize, head_ptr: *mut usize, len_ptr: *mut usize
         let inner = target.inner_exclusive_access();
         (inner.robust_list_head, inner.robust_list_len)
     };
-    let token = current_user_token();
-    *translated_refmut(token, head_ptr) = head;
-    *translated_refmut(token, len_ptr) = if len == 0 { ROBUST_LIST_LEN } else { len };
-    0
+    let reported_len = if len == 0 { ROBUST_LIST_LEN } else { len };
+    if !write_user_value(&current, head_ptr, &head)
+        || !write_user_value(&current, len_ptr, &reported_len)
+    {
+        -14
+    } else {
+        0
+    }
 }
 
 const ITIMER_REAL: usize = 0;
@@ -5263,13 +5622,6 @@ pub fn sys_getitimer(which: usize, curr_value_ptr: *mut u8) -> isize {
     }
     let task = current_task().unwrap();
     let inner = task.inner_exclusive_access();
-    if !inner
-        .memory_set
-        .valid_user_buf(curr_value_ptr, core::mem::size_of::<ITimerVal>(), true)
-    {
-        return -14;
-    }
-    let token = inner.get_user_token();
     let now = polyhal::time::Time::now().to_usec() as u64;
     let remaining_usec = if inner.itimer_expire > now {
         inner.itimer_expire - now
@@ -5299,8 +5651,11 @@ pub fn sys_getitimer(which: usize, curr_value_ptr: *mut u8) -> isize {
         }
     };
     drop(inner);
-    *translated_refmut(token, curr_value_ptr as *mut ITimerVal) = itv;
-    0
+    if write_user_value(&task, curr_value_ptr as *mut ITimerVal, &itv) {
+        0
+    } else {
+        -14
+    }
 }
 
 pub fn sys_setitimer(which: usize, new_value: *const u8, old_value: *mut u8) -> isize {
@@ -5308,21 +5663,11 @@ pub fn sys_setitimer(which: usize, new_value: *const u8, old_value: *mut u8) -> 
         return -22;
     }
 
-    let token = current_user_token();
     let task = current_task().unwrap();
     let now = polyhal::time::Time::now().to_usec() as u64;
 
     if !old_value.is_null() {
-        {
-            let inner = task.inner_exclusive_access();
-            if !inner
-                .memory_set
-                .valid_user_buf(old_value, core::mem::size_of::<ITimerVal>(), true)
-            {
-                return -14;
-            }
-        }
-        let mut inner = task.inner_exclusive_access();
+        let inner = task.inner_exclusive_access();
         let remaining_usec = if inner.itimer_expire > now {
             inner.itimer_expire - now
         } else {
@@ -5350,23 +5695,18 @@ pub fn sys_setitimer(which: usize, new_value: *const u8, old_value: *mut u8) -> 
             }
         };
         drop(inner);
-        *translated_refmut(token, old_value as *mut ITimerVal) = old_itv;
+        if !write_user_value(&task, old_value as *mut ITimerVal, &old_itv) {
+            return -14;
+        }
     }
 
     if new_value.is_null() {
         return 0;
     }
 
-    {
-        let inner = task.inner_exclusive_access();
-        if !inner
-            .memory_set
-            .valid_user_buf(new_value, core::mem::size_of::<ITimerVal>(), false)
-        {
-            return -14;
-        }
-    }
-    let new_itv: &ITimerVal = translated_ref(token, new_value as *const ITimerVal);
+    let Some(new_itv) = copy_user_value(&task, new_value as *const ITimerVal) else {
+        return -14;
+    };
     if new_itv.it_value.sec < 0
         || new_itv.it_value.usec < 0
         || new_itv.it_value.usec >= 1_000_000
@@ -5402,6 +5742,7 @@ pub fn sys_setitimer(which: usize, new_value: *const u8, old_value: *mut u8) -> 
         inner.itimer_interval_us = new_interval_usec;
         inner.itimer_expire
     };
+    crate::task::publish_itimer_deadline(expire);
     #[cfg(feature = "smp-diagnostics")]
     crate::println!(
         "[itimer-diag] set tid={} which={} now={} expire={} interval={}",
@@ -5423,36 +5764,65 @@ pub fn sys_clock_gettime(clk_id: usize, ts: *mut u8) -> isize {
     }
 
     let task = current_task().unwrap();
-    let inner = task.inner_exclusive_access();
-    if !inner
-        .memory_set
-        .valid_user_buf(ts, core::mem::size_of::<crate::task::TimeSpec>(), true)
-    {
-        return -14;
+    let now_us = if matches!(clk_id, 0 | 5) {
+        crate::time::realtime_us()
+    } else {
+        monotonic_user_time_us()
+    };
+    let ts_out = crate::task::TimeSpec {
+        tv_sec: (now_us / 1_000_000) as usize,
+        tv_nsec: ((now_us % 1_000_000) * 1000) as usize,
+    };
+    if write_user_value(&task, ts as *mut crate::task::TimeSpec, &ts_out) {
+        0
+    } else {
+        -14
     }
-    let token = inner.get_user_token();
-    drop(inner);
-    let now_us = monotonic_user_time_us();
-    let ts_out: &mut crate::task::TimeSpec =
-        translated_refmut(token, ts as *mut crate::task::TimeSpec);
-    ts_out.tv_sec = (now_us / 1_000_000) as usize;
-    ts_out.tv_nsec = ((now_us % 1_000_000) * 1000) as usize;
-    0
 }
 
 pub fn sys_clock_nanosleep(_clk_id: usize, _flags: usize, req: usize, rem: usize) -> isize {
     sys_nanosleep(req, rem)
 }
 
-pub fn sys_readv(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
-    use crate::mm::translated_ref;
-    const IOV_MAX: usize = 1024;
-    let token = current_user_token();
-    #[repr(C)]
-    struct IoVec {
-        iov_base: usize,
-        iov_len: usize,
+const IOV_MAX: usize = 1024;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct UserIoVec {
+    iov_base: usize,
+    iov_len: usize,
+}
+
+fn load_user_iovecs(
+    task: &Arc<TaskControlBlock>,
+    iov: *const u8,
+    iovcnt: usize,
+) -> Result<(Vec<UserIoVec>, usize), isize> {
+    let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(iovcnt)
+        .map_err(|_| -12isize)?;
+    let mut total = 0usize;
+    for index in 0..iovcnt {
+        let address = index
+            .checked_mul(core::mem::size_of::<UserIoVec>())
+            .and_then(|offset| (iov as usize).checked_add(offset))
+            .ok_or(-14isize)?;
+        let entry = copy_user_value(task, address as *const UserIoVec).ok_or(-14isize)?;
+        total = total
+            .checked_add(entry.iov_len)
+            .filter(|total| *total <= isize::MAX as usize)
+            .ok_or(-22isize)?;
+        entries.push(entry);
     }
+    Ok((entries, total))
+}
+
+fn vectored_staging(len: usize) -> Result<super::fs::IoStaging, isize> {
+    super::fs::IoStaging::zeroed(len)
+}
+
+pub fn sys_readv(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
     if iovcnt > IOV_MAX {
         return -22;
     }
@@ -5461,12 +5831,6 @@ pub fn sys_readv(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
     }
     let task = current_task().unwrap();
     let inner = task.inner_exclusive_access();
-    if !inner
-        .memory_set
-        .valid_user_buf(iov, iovcnt * core::mem::size_of::<IoVec>(), false)
-    {
-        return -14;
-    }
     if fd >= inner.fd_table.len() || inner.fd_table[fd].is_none() {
         return -9;
     }
@@ -5478,62 +5842,58 @@ pub fn sys_readv(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
         return -9;
     }
     drop(inner);
-    let mut total = 0isize;
-    let mut requested = 0usize;
-    for i in 0..iovcnt {
-        let iov_ptr = unsafe { iov.add(i * core::mem::size_of::<IoVec>()) };
-        let iov: &IoVec = translated_ref(token, iov_ptr as *const IoVec);
-        if iov.iov_len == 0 {
-            continue;
+    let (entries, requested) = match load_user_iovecs(&task, iov, iovcnt) {
+        Ok(entries) => entries,
+        Err(errno) => return errno,
+    };
+    if requested == 0 {
+        return 0;
+    }
+    let staging_len = requested.min(super::fs::MAX_IO_STAGING_SIZE);
+    let mut remaining = staging_len;
+    for entry in entries.iter() {
+        let len = entry.iov_len.min(remaining);
+        if len != 0 && !prepare_task_user_access(&task, entry.iov_base, len, true) {
+            return -14;
         }
-        if iov.iov_len > isize::MAX as usize {
-            return -22;
-        }
-        requested = match requested.checked_add(iov.iov_len) {
-            Some(sum) if sum <= isize::MAX as usize => sum,
-            _ => return -22,
-        };
-        let mut staging = match super::fs::copy_to_user_after_io(
-            &task,
-            token,
-            iov.iov_base as *mut u8,
-            iov.iov_len,
-        ) {
-            Ok(staging) => staging,
-            Err(errno) => return if total > 0 { total } else { errno },
-        };
-        let n = file.read(staging.as_mut_slice());
-        if n < 0 {
-            return if total > 0 { total } else { n };
-        }
-        if n as usize > iov.iov_len {
-            return if total > 0 { total } else { -5 };
-        }
-        if let Err(errno) = super::fs::copy_staged_output_to_user(
-            &task,
-            token,
-            iov.iov_base as *mut u8,
-            &staging.as_slice()[..n as usize],
-        ) {
-            return if total > 0 { total } else { errno };
-        }
-        total += n as isize;
-        if (n as usize) < iov.iov_len {
+        remaining -= len;
+        if remaining == 0 {
             break;
         }
     }
-    total
+    let mut staging = match vectored_staging(staging_len) {
+        Ok(staging) => staging,
+        Err(errno) => return errno,
+    };
+    let read = file.read(staging.as_mut_slice());
+    if read <= 0 {
+        return read;
+    }
+    let read = read as usize;
+    if read > staging.as_slice().len() {
+        return -5;
+    }
+    let mut copied = 0usize;
+    for entry in entries {
+        let len = entry.iov_len.min(read - copied);
+        if len != 0
+            && !copy_to_task_user(
+                &task,
+                entry.iov_base,
+                &staging.as_slice()[copied..copied + len],
+            )
+        {
+            return if copied == 0 { -14 } else { copied as isize };
+        }
+        copied += len;
+        if copied == read {
+            break;
+        }
+    }
+    copied as isize
 }
 
 pub fn sys_writev(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
-    use crate::mm::translated_ref;
-    const IOV_MAX: usize = 1024;
-    let token = current_user_token();
-    #[repr(C)]
-    struct IoVec {
-        iov_base: usize,
-        iov_len: usize,
-    }
     if iovcnt > IOV_MAX {
         return -22;
     }
@@ -5542,12 +5902,6 @@ pub fn sys_writev(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
     }
     let task = current_task().unwrap();
     let inner = task.inner_exclusive_access();
-    if !inner
-        .memory_set
-        .valid_user_buf(iov, iovcnt * core::mem::size_of::<IoVec>(), false)
-    {
-        return -14;
-    }
     if fd >= inner.fd_table.len() || inner.fd_table[fd].is_none() {
         return -9;
     }
@@ -5559,47 +5913,54 @@ pub fn sys_writev(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
         return -9;
     }
     drop(inner);
-    let mut buffers = Vec::new();
-    let mut requested = 0usize;
-    for i in 0..iovcnt {
-        let iov_ptr = unsafe { iov.add(i * core::mem::size_of::<IoVec>()) };
-        let iov: &IoVec = translated_ref(token, iov_ptr as *const IoVec);
-        if iov.iov_len == 0 {
-            continue;
-        }
-        requested = match requested.checked_add(iov.iov_len) {
-            Some(sum) if sum <= isize::MAX as usize => sum,
-            _ => return -22,
-        };
-        let staging = match super::fs::copy_from_user_for_io(
-            &task,
-            token,
-            iov.iov_base as *mut u8,
-            iov.iov_len,
-        ) {
-            Ok(staging) => staging,
-            Err(errno) => return errno,
-        };
-        buffers.push(staging);
+    let (entries, requested) = match load_user_iovecs(&task, iov, iovcnt) {
+        Ok(entries) => entries,
+        Err(errno) => return errno,
+    };
+    if requested == 0 {
+        return 0;
     }
-    let mut total = 0isize;
-    for mut staging in buffers {
-        let len = staging.as_slice().len();
-        let n = file.write(staging.as_mut_slice());
-        if n < 0 {
-            return if total > 0 { total } else { n };
+    let staging_len = requested.min(super::fs::MAX_IO_STAGING_SIZE);
+    let mut staging = match vectored_staging(staging_len) {
+        Ok(staging) => staging,
+        Err(errno) => return errno,
+    };
+    let mut copied = 0usize;
+    for entry in entries {
+        let len = entry.iov_len.min(staging_len - copied);
+        if len != 0
+            && !copy_from_task_user(
+                &task,
+                entry.iov_base,
+                &mut staging.as_mut_slice()[copied..copied + len],
+            )
+        {
+            return -14;
         }
-        total += n as isize;
-        if (n as usize) < len {
+        copied += len;
+        if copied == staging_len {
             break;
         }
     }
-    total
+    let written = file.write(staging.as_mut_slice());
+    if written > staging_len as isize {
+        -5
+    } else {
+        written
+    }
 }
 
 pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset_ptr: *mut usize, count: usize) -> isize {
-    let token = current_user_token();
     let task = current_task().unwrap();
+    let requested_offset = if offset_ptr.is_null() {
+        None
+    } else {
+        match copy_user_value(&task, offset_ptr as *const usize) {
+            Some(offset) if offset <= isize::MAX as usize => Some(offset),
+            Some(_) => return -22,
+            None => return -14,
+        }
+    };
     let inner = task.inner_exclusive_access();
 
     if in_fd >= inner.fd_table.len() || inner.fd_table[in_fd].is_none() {
@@ -5608,16 +5969,6 @@ pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset_ptr: *mut usize, count: 
     if out_fd >= inner.fd_table.len() || inner.fd_table[out_fd].is_none() {
         return -9;
     }
-    if !offset_ptr.is_null()
-        && !inner.memory_set.valid_user_buf(
-            offset_ptr as *const u8,
-            core::mem::size_of::<usize>(),
-            true,
-        )
-    {
-        return -14;
-    }
-
     let in_file = inner.fd_table[in_fd].as_ref().unwrap().clone();
     let out_file = inner.fd_table[out_fd].as_ref().unwrap().clone();
 
@@ -5625,12 +5976,8 @@ pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset_ptr: *mut usize, count: 
         return -9;
     }
 
-    let offset_state = if !offset_ptr.is_null() {
+    let offset_state = if let Some(user_off) = requested_offset {
         let off = in_file.get_offset();
-        let user_off = *translated_ref(token, offset_ptr);
-        if user_off > isize::MAX as usize {
-            return -22;
-        }
         in_file.seek(user_off);
         Some((off, user_off))
     } else {
@@ -5658,8 +6005,12 @@ pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset_ptr: *mut usize, count: 
     }
 
     if let Some((saved_off, user_off)) = offset_state {
-        *translated_refmut(token, offset_ptr) = user_off.saturating_add(total.max(0) as usize);
+        let updated = user_off.saturating_add(total.max(0) as usize);
+        let copied = write_user_value(&task, offset_ptr, &updated);
         in_file.seek(saved_off);
+        if !copied {
+            return -14;
+        }
     }
 
     total
@@ -5676,16 +6027,6 @@ pub fn sys_getrusage(who: usize, usage: *mut u8) -> isize {
         return -14;
     }
     let task = current_task().unwrap();
-    {
-        let inner = task.inner_exclusive_access();
-        if !inner.memory_set.valid_user_buf(
-            usage as *const u8,
-            core::mem::size_of::<RUsage>(),
-            true,
-        ) {
-            return -14;
-        }
-    }
     task.record_time_suspend();
     task.record_time_resume();
     let inner = task.inner_exclusive_access();
@@ -5694,7 +6035,6 @@ pub fn sys_getrusage(who: usize, usage: *mut u8) -> isize {
     } else {
         (inner.cutime, inner.cstime)
     };
-    let token = inner.get_user_token();
     drop(inner);
     let rusage = RUsage {
         ru_utime: nsec_to_timeval(utime),
@@ -5714,6 +6054,9 @@ pub fn sys_getrusage(who: usize, usage: *mut u8) -> isize {
         ru_nvcsw: 0,
         ru_nivcsw: 0,
     };
-    *translated_refmut(token, usage as *mut RUsage) = rusage;
-    0
+    if write_user_value(&task, usage as *mut RUsage, &rusage) {
+        0
+    } else {
+        -14
+    }
 }

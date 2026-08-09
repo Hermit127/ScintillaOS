@@ -1,5 +1,11 @@
 # BuildStorm 题二第一问（Q2.1）适配与验证记录
 
+> 2026-08-04 状态更新：本文主体保留 2026-07-30 的阶段性排障记录。此后相关
+> 修改已从 `main` 合并到 `finalsubmission`，并在 RISC-V64、LoongArch64 的
+> `-smp 8` 环境中同时完成 CAgent 与 BuildStorm Q2.1 全链路验证。最新实现、
+> VirtIO-Net 兼容方案、官方 judge 结果和复现方式见
+> [决赛提交分支迁移与双架构验证记录](./决赛提交分支迁移与双架构验证记录.md)。
+
 ## 1. 文档目的、范围和当前结论
 
 本文记录 ScintillaOS 为 2026 年全国大学生操作系统大赛线上决赛 BuildStorm

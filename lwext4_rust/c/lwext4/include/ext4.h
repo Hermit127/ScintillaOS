@@ -291,6 +291,26 @@ int ext4_flink(const char *path, const char *hardlink_path);
  * @return  Standard error code. */
 int ext4_frename(const char *path, const char *new_path);
 
+#define EXT4_RENAME_NOREPLACE 1U
+
+/**@brief Rename a file or directory with Linux replacement semantics.
+ *
+ * If new_path exists and replacement is allowed, its directory entry is
+ * atomically moved to replaced_path in the same journal transaction.  The
+ * caller can then keep that inode alive for open handles or remove it after
+ * the namespace transaction commits.
+ *
+ * @param path Source.
+ * @param new_path Destination.
+ * @param replaced_path Hidden path used for a replaced destination.
+ * @param flags EXT4_RENAME_NOREPLACE or zero.
+ * @param replaced_inode Replaced inode number, or zero if none.
+ * @param replaced_is_dir Whether the replaced inode is a directory.
+ * @return Standard error code. */
+int ext4_frename2(const char *path, const char *new_path,
+		 const char *replaced_path, uint32_t flags,
+		 uint32_t *replaced_inode, bool *replaced_is_dir);
+
 /**@brief   File open function.
  *
  * @param   file  File handle.
@@ -357,6 +377,20 @@ int ext4_fread(ext4_file *file, void *buf, size_t size, size_t *rcnt);
  *
  * @return  Standard error code.*/
 int ext4_fwrite(ext4_file *file, const void *buf, size_t size, size_t *wcnt);
+
+/**@brief   Write data and update modification/change timestamps in the same
+ *          inode transaction.
+ *
+ * @param   file  File handle.
+ * @param   buf   Data to write.
+ * @param   size  Write length.
+ * @param   wcnt  Bytes written (NULL allowed).
+ * @param   mtime Modification timestamp.
+ * @param   ctime Change timestamp.
+ *
+ * @return  Standard error code.*/
+int ext4_fwrite_with_times(ext4_file *file, const void *buf, size_t size,
+			   size_t *wcnt, uint32_t mtime, uint32_t ctime);
 
 /**@brief   File seek operation.
  *

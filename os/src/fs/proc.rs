@@ -4,6 +4,11 @@ use crate::sync::VfsLock;
 use crate::task::{online_cpu_mask, task_snapshot};
 use alloc::string::String;
 use alloc::vec::Vec;
+#[cfg(feature = "smp-diagnostics")]
+use core::sync::atomic::{AtomicBool, Ordering};
+
+#[cfg(feature = "smp-diagnostics")]
+static FUTEX_DIAGNOSTIC_DUMPED: AtomicBool = AtomicBool::new(false);
 
 const DT_DIR: u8 = 4;
 const DT_REG: u8 = 8;
@@ -27,6 +32,14 @@ fn read_with_offset(offset: &VfsLock<usize>, content: &[u8], buf: &mut [u8]) -> 
     buf[..len].copy_from_slice(&content[*offset..*offset + len]);
     *offset += len;
     len as isize
+}
+
+fn task_comm(executable_path: &str) -> String {
+    let basename = executable_path
+        .rsplit('/')
+        .find(|component| !component.is_empty())
+        .unwrap_or("initproc");
+    basename.chars().take(15).collect()
 }
 
 pub struct ProcDirFile {
@@ -155,10 +168,7 @@ impl ProcPidStatFile {
     fn build_content(&self) -> String {
         use alloc::format;
         if let Some(task) = crate::task::pid2task(self.pid) {
-            // Take only cheap task-state snapshots under TaskLock.  In
-            // particular, `File::path` may enter VFS, so use the cloned Arc
-            // only after dropping the TCB lock.
-            let (state, stdin, parent, pgid, sid, utime, stime) = {
+            let (state, executable_path, parent, pgid, sid, utime, stime) = {
                 let inner = task.inner_exclusive_access();
                 (
                     match inner.task_status {
@@ -166,7 +176,7 @@ impl ProcPidStatFile {
                         crate::task::TaskStatus::Zombie => 'Z',
                         _ => 'S',
                     },
-                    inner.fd_table.first().and_then(|file| file.as_ref()).cloned(),
+                    inner.executable_path.clone(),
                     inner.parent.clone(),
                     inner.pgid,
                     inner.sid,
@@ -174,9 +184,7 @@ impl ProcPidStatFile {
                     inner.stime,
                 )
             };
-            let cmd = stdin
-                .and_then(|file| file.path())
-                .unwrap_or_else(|| String::from("initproc"));
+            let cmd = task_comm(&executable_path);
             let ppid = parent
                 .and_then(|parent| parent.upgrade())
                 .map(|parent| parent.getpid())
@@ -242,7 +250,19 @@ impl ProcPidStatusFile {
     fn build_content(&self) -> String {
         use alloc::format;
         if let Some(task) = crate::task::pid2task(self.pid) {
-            let (state, parent, tgid, uid, euid, suid, gid, egid, sgid) = {
+            let (
+                state,
+                executable_path,
+                parent,
+                tgid,
+                uid,
+                euid,
+                suid,
+                gid,
+                egid,
+                sgid,
+                block_reason,
+            ) = {
                 let inner = task.inner_exclusive_access();
                 (
                     match inner.task_status {
@@ -250,6 +270,7 @@ impl ProcPidStatusFile {
                         crate::task::TaskStatus::Zombie => "Z (zombie)",
                         _ => "S (sleeping)",
                     },
+                    inner.executable_path.clone(),
                     inner.parent.clone(),
                     inner.tgid,
                     inner.uid,
@@ -258,15 +279,24 @@ impl ProcPidStatusFile {
                     inner.gid,
                     inner.egid,
                     inner.sgid,
+                    inner.block_reason,
                 )
             };
+            let name = task_comm(&executable_path);
             let ppid = parent
                 .and_then(|parent| parent.upgrade())
                 .map(|parent| parent.getpid())
                 .unwrap_or(0);
             let allowed = task.allowed_cpus() & online_cpu_mask();
-            format!(
-                "Name:\tinitproc\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t{} {} {} {}\nGid:\t{} {} {} {}\nVmLck:\t       0 kB\nVmSwap:\t       0 kB\nThreads:\t1\nCpus_allowed:\t{:x}\nMems_allowed:\t1\n",
+            let threads = task_snapshot()
+                .iter()
+                .filter(|member| {
+                    member.thread_group_id() == tgid && !member.is_waitable_zombie()
+                })
+                .count();
+            let mut content = format!(
+                "Name:\t{}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t{} {} {} {}\nGid:\t{} {} {} {}\nVmLck:\t       0 kB\nVmSwap:\t       0 kB\nThreads:\t{}\nCpus_allowed:\t{:x}\nMems_allowed:\t1\n",
+                name,
                 state,
                 tgid,
                 self.pid,
@@ -279,8 +309,29 @@ impl ProcPidStatusFile {
                 egid,
                 sgid,
                 egid,
+                threads,
                 allowed,
-            )
+            );
+            #[cfg(any(
+                feature = "smp-diagnostics",
+                feature = "scheduler-stall-diagnostics"
+            ))]
+            content.push_str(&format!("ScintillaBlock:\t{:?}\n", block_reason));
+            #[cfg(feature = "smp-diagnostics")]
+            if name == "rustc"
+                && self.pid == tgid
+                && threads <= 3
+                && matches!(block_reason, Some(crate::task::BlockReason::Futex(_, _)))
+                && !FUTEX_DIAGNOSTIC_DUMPED.swap(true, Ordering::AcqRel)
+            {
+                crate::syscall::process::dump_futex_waiters();
+            }
+            #[cfg(not(any(
+                feature = "smp-diagnostics",
+                feature = "scheduler-stall-diagnostics"
+            )))]
+            let _ = block_reason;
+            content
         } else {
             String::new()
         }
@@ -573,6 +624,49 @@ impl File for ProcStaticFile {
         let mut st = Kstat::new(super::S_IFREG);
         st.st_size = self.content.len() as i64;
         st.st_mode = super::S_IFREG | 0o444;
+        st
+    }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+pub struct ProcUptimeFile {
+    offset: VfsLock<usize>,
+    content: String,
+}
+
+impl ProcUptimeFile {
+    pub fn new() -> Self {
+        let uptime_centiseconds = crate::time::uptime_us() / 10_000;
+        let content = alloc::format!(
+            "{}.{:02} 0.00\n",
+            uptime_centiseconds / 100,
+            uptime_centiseconds % 100
+        );
+        Self {
+            offset: VfsLock::new_named(0, "ProcUptimeOffset"),
+            content,
+        }
+    }
+}
+
+impl File for ProcUptimeFile {
+    fn readable(&self) -> bool {
+        true
+    }
+    fn writable(&self) -> bool {
+        false
+    }
+    fn read(&self, buf: &mut [u8]) -> isize {
+        read_with_offset(&self.offset, self.content.as_bytes(), buf)
+    }
+    fn write(&self, _buf: &mut [u8]) -> isize {
+        -1
+    }
+    fn stat(&self) -> Kstat {
+        let mut st = Kstat::new(super::S_IFREG | 0o444);
+        st.st_size = self.content.len() as i64;
         st
     }
     fn as_any(&self) -> &dyn core::any::Any {

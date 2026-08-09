@@ -4,7 +4,7 @@ use crate::sync::{PidRegistryLock, SchedulerLock};
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use lazy_static::*;
 use log::*;
 
@@ -12,6 +12,7 @@ use log::*;
 /// boot; each secondary hart registers itself only after completing its local
 /// scheduler initialization.
 static ONLINE_CPU_MASK: AtomicUsize = AtomicUsize::new(1);
+static NEXT_ITIMER_DEADLINE_US: AtomicU64 = AtomicU64::new(u64::MAX);
 
 pub fn online_cpu_mask() -> usize {
     ONLINE_CPU_MASK.load(Ordering::Acquire)
@@ -24,6 +25,41 @@ pub fn online_cpu_mask() -> usize {
 pub fn register_online_cpu(cpu: usize) -> usize {
     assert!(cpu < MAX_CPUS, "invalid scheduler CPU {}", cpu);
     ONLINE_CPU_MASK.fetch_or(1usize << cpu, Ordering::AcqRel) | (1usize << cpu)
+}
+
+pub fn itimer_scan_due(now_us: u64) -> bool {
+    NEXT_ITIMER_DEADLINE_US.load(Ordering::Acquire) <= now_us
+}
+
+/// Publish a possibly earlier process-timer deadline.
+///
+/// Replacing or disarming the current earliest timer may leave an old,
+/// conservative deadline in the hint.  That only triggers one harmless scan;
+/// the scan recomputes the exact minimum.  Publishing and recomputation both
+/// pass through SchedulerLock so a concurrent setter cannot be overwritten by
+/// a stale scan result.
+pub fn publish_itimer_deadline(deadline_us: u64) {
+    if deadline_us == 0 {
+        return;
+    }
+    let _scheduler = SCHEDULER.exclusive_access();
+    NEXT_ITIMER_DEADLINE_US.fetch_min(deadline_us, Ordering::AcqRel);
+}
+
+pub fn scan_itimers_if_due<R>(
+    now_us: u64,
+    scan: impl FnOnce() -> (R, u64),
+) -> Option<R> {
+    if !itimer_scan_due(now_us) {
+        return None;
+    }
+    let _scheduler = SCHEDULER.exclusive_access();
+    if !itimer_scan_due(now_us) {
+        return None;
+    }
+    let (result, next_deadline) = scan();
+    NEXT_ITIMER_DEADLINE_US.store(next_deadline, Ordering::Release);
+    Some(result)
 }
 /// A timer waiter owned by the scheduler.
 ///
@@ -355,12 +391,16 @@ pub fn cancel_block_before_switch(task: &Arc<TaskControlBlock>) {
     inner.block_reason = None;
 }
 
-/// Wake a task through the scheduler state machine.
-///
-/// If the task is already fully blocked, it is made Ready immediately.  If it
-/// is still switching out, only `WakePending` is recorded and the idle loop
-/// will perform the eventual Ready enqueue after the context has been saved.
-pub fn wake_task(task: Arc<TaskControlBlock>) -> bool {
+#[derive(Clone, Copy)]
+enum WakeFilter {
+    Any,
+    Vfork(usize),
+    WaitPid,
+}
+
+/// Wake a task through the scheduler state machine when its current wait
+/// still matches the event being published.
+fn wake_task_filtered(task: Arc<TaskControlBlock>, filter: WakeFilter) -> bool {
     loop {
         let mut scheduler = SCHEDULER.exclusive_access();
         let Some(mut inner) = task.try_inner_exclusive_access() else {
@@ -372,6 +412,19 @@ pub fn wake_task(task: Arc<TaskControlBlock>) -> bool {
             continue;
         };
         let pid = task.getpid();
+        let matches = match filter {
+            WakeFilter::Any => true,
+            WakeFilter::Vfork(child_pid) => {
+                matches!(inner.block_reason, Some(BlockReason::Vfork(waited)) if waited == child_pid)
+            }
+            WakeFilter::WaitPid => scheduler
+                .waitpid_blocked
+                .iter()
+                .any(|waiter| waiter.getpid() == pid),
+        };
+        if !matches {
+            return false;
+        }
         let _ = remove_task(&mut scheduler.net_blocked, pid);
         let _ = remove_task(&mut scheduler.waitpid_blocked, pid);
         if let Some(index) = scheduler
@@ -419,6 +472,25 @@ pub fn wake_task(task: Arc<TaskControlBlock>) -> bool {
         }
         return enqueue_now;
     }
+}
+
+/// Unconditional wakeup used by events which are authoritative for every
+/// blocking state, such as process termination.
+pub fn wake_task(task: Arc<TaskControlBlock>) -> bool {
+    wake_task_filtered(task, WakeFilter::Any)
+}
+
+/// Complete only the vfork wait associated with `child_pid`.  An older child
+/// exiting must not release a parent currently sharing memory with a newer
+/// vfork child.
+pub fn wake_vfork_parent(task: Arc<TaskControlBlock>, child_pid: usize) -> bool {
+    wake_task_filtered(task, WakeFilter::Vfork(child_pid))
+}
+
+/// Publish a child-state change only to a parent currently registered in the
+/// waitpid queue. Other blocked syscalls recheck their own signal conditions.
+pub fn wake_waitpid_parent(task: Arc<TaskControlBlock>) -> bool {
+    wake_task_filtered(task, WakeFilter::WaitPid)
 }
 
 /// Wake every pipe waiter matching one endpoint direction in one scheduler

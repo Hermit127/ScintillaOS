@@ -40,6 +40,11 @@ impl IrqSafeHeap {
         self.inner.lock().init(start, size);
     }
 
+    unsafe fn add_region(&self, start: usize, size: usize) {
+        let _irq = IrqGuard::disable();
+        self.inner.lock().add_to_heap(start, start + size);
+    }
+
     fn stats(&self) -> (usize, usize, usize) {
         let _irq = IrqGuard::disable();
         let heap = self.inner.lock();
@@ -76,6 +81,8 @@ pub fn handle_alloc_error(layout: core::alloc::Layout) -> ! {
         user, actual, total
     );
     crate::task::dump_task_stats_for_oom("heap_alloc_error");
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::syscall::dump_active_syscall_for_oom();
     panic!("Heap allocation error, layout = {:#x?}", layout);
 }
 
@@ -86,5 +93,19 @@ static mut HEAP_SPACE: [u8; KERNEL_HEAP_SIZE] = [0; KERNEL_HEAP_SIZE];
 pub fn init_heap() {
     unsafe {
         HEAP_ALLOCATOR.init(HEAP_SPACE.as_ptr() as usize, KERNEL_HEAP_SIZE);
+    }
+}
+
+/// Add a boot-reserved physical-memory range to the kernel allocator.
+///
+/// The caller must remove this range from the frame allocator.  PolyHAL's
+/// direct map makes the physical range permanently addressable by the kernel.
+pub fn add_heap_region(phys_start: usize, size: usize) {
+    if size == 0 {
+        return;
+    }
+    let virt_start = polyhal::PhysAddr::new(phys_start).get_mut_ptr::<u8>() as usize;
+    unsafe {
+        HEAP_ALLOCATOR.add_region(virt_start, size);
     }
 }

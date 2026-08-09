@@ -91,7 +91,7 @@ pub const CONFIG_HAVE_OWN_OFLAGS: u32 = 1;
 pub const CONFIG_HAVE_OWN_ERRNO: u32 = 1;
 pub const CONFIG_HAVE_OWN_ASSERT: u32 = 1;
 pub const CONFIG_USE_USER_MALLOC: u32 = 0;
-pub const CONFIG_BLOCK_DEV_CACHE_SIZE: u32 = 16;
+pub const CONFIG_BLOCK_DEV_CACHE_SIZE: u32 = 256;
 pub const F_SET_EXT2: u32 = 2;
 pub const F_SET_EXT3: u32 = 3;
 pub const F_SET_EXT4: u32 = 4;
@@ -286,6 +286,7 @@ pub const ENOTEMPTY: u32 = 39;
 pub const ENODATA: u32 = 61;
 pub const ENOTSUP: u32 = 95;
 pub const EOK: u32 = 0;
+pub const EXT4_RENAME_NOREPLACE: u32 = 1;
 pub const O_RDONLY: u32 = 0;
 pub const O_WRONLY: u32 = 1;
 pub const O_RDWR: u32 = 2;
@@ -1788,6 +1789,17 @@ unsafe extern "C" {
     ) -> ::core::ffi::c_int;
 }
 unsafe extern "C" {
+    #[doc = "@brief Rename with atomic destination replacement semantics."]
+    pub fn ext4_frename2(
+        path: *const ::core::ffi::c_char,
+        new_path: *const ::core::ffi::c_char,
+        replaced_path: *const ::core::ffi::c_char,
+        flags: u32,
+        replaced_inode: *mut u32,
+        replaced_is_dir: *mut bool,
+    ) -> ::core::ffi::c_int;
+}
+unsafe extern "C" {
     #[doc = "@brief   File open function.\n\n @param   file  File handle.\n @param   path  File path, has to start from mount point:/my_partition/file.\n @param   flags File open flags.\n  |---------------------------------------------------------------|\n  |   r or rb                 O_RDONLY                            |\n  |---------------------------------------------------------------|\n  |   w or wb                 O_WRONLY|O_CREAT|O_TRUNC            |\n  |---------------------------------------------------------------|\n  |   a or ab                 O_WRONLY|O_CREAT|O_APPEND           |\n  |---------------------------------------------------------------|\n  |   r+ or rb+ or r+b        O_RDWR                              |\n  |---------------------------------------------------------------|\n  |   w+ or wb+ or w+b        O_RDWR|O_CREAT|O_TRUNC              |\n  |---------------------------------------------------------------|\n  |   a+ or ab+ or a+b        O_RDWR|O_CREAT|O_APPEND             |\n  |---------------------------------------------------------------|\n\n @return  Standard error code."]
     pub fn ext4_fopen(
         file: *mut ext4_file,
@@ -1827,6 +1839,17 @@ unsafe extern "C" {
         buf: *const ::core::ffi::c_void,
         size: usize,
         wcnt: *mut usize,
+    ) -> ::core::ffi::c_int;
+}
+unsafe extern "C" {
+    #[doc = "@brief   Write data and update modification/change timestamps in the same inode transaction."]
+    pub fn ext4_fwrite_with_times(
+        file: *mut ext4_file,
+        buf: *const ::core::ffi::c_void,
+        size: usize,
+        wcnt: *mut usize,
+        mtime: u32,
+        ctime: u32,
     ) -> ::core::ffi::c_int;
 }
 unsafe extern "C" {

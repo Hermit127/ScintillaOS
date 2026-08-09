@@ -1,5 +1,5 @@
 use super::vpn_range::VAddrRange;
-use super::{frame_alloc, FrameTracker};
+use super::{file_page_cache::load_file_page, frame_alloc, FrameTracker};
 use crate::config::{PAGE_SIZE, USER_STACK_SIZE};
 use crate::fs::File;
 use crate::sync::VmLock;
@@ -147,6 +147,7 @@ fn retired_user_page_table() -> Arc<PageTableWrapper> {
 pub enum PageFaultResult {
     Handled,
     SharedMetadataChanged,
+    SharedTranslationChanged,
 }
 
 pub const PAGE_FAULT_INVALID_ADDRESS: usize = 1;
@@ -997,7 +998,7 @@ impl MemorySet {
                         MappingSize::Page4KB,
                     );
                     area.data_frames.insert(vpn, f);
-                    return Some(PageFaultResult::SharedMetadataChanged);
+                    return Some(PageFaultResult::SharedTranslationChanged);
                 }
                 self.page_table.unmap_page(vpn);
                 self.page_table.map_page(
@@ -1011,23 +1012,23 @@ impl MemorySet {
         }
         let in_frames = area.data_frames.contains_key(&vpn);
         if !in_frames {
-            let f = match frame_alloc() {
-                Some(f) => f,
-                None => return page_fault_failure(PAGE_FAULT_FRAME_ALLOC),
-            };
             #[cfg(feature = "smp-diagnostics")]
             let mut trace_rustc_driver_page = false;
-            if let Some(ref file) = area.file {
+            let f = if let Some(ref file) = area.file {
                 let off = area.file_offset + (vpn.raw() - area.vaddr_range.get_start().raw());
-                let buf = f.paddr.slice_mut_with_len(crate::config::PAGE_SIZE);
-                let read = file.read_at(off, buf);
-                // A partial final page in a file mapping is defined to have a
-                // zero-filled tail.  Keeping that explicit also prevents a
-                // recycled physical page from leaking bytes into userspace.
-                let copied = read.max(0) as usize;
-                if copied < buf.len() {
-                    buf[copied..].fill(0);
-                }
+                // Only immutable mappings share physical file pages. Writable
+                // MAP_PRIVATE pages remain private until a complete COW policy
+                // can preserve Linux's per-process modification semantics.
+                let cacheable = !area.map_perm.contains(MapPermission::W);
+                let (f, copied) = match load_file_page(file.as_ref(), off, cacheable) {
+                    Some(loaded) => loaded,
+                    None => return page_fault_failure(PAGE_FAULT_FRAME_ALLOC),
+                };
+                debug_assert!(copied <= crate::config::PAGE_SIZE);
+                #[cfg(feature = "smp-diagnostics")]
+                let buf = f
+                    .paddr
+                    .slice_with_len::<u8>(crate::config::PAGE_SIZE);
                 #[cfg(feature = "smp-diagnostics")]
                 if area.map_perm.contains(MapPermission::X) && copied < buf.len() {
                     crate::println!(
@@ -1061,9 +1062,16 @@ impl MemorySet {
                     crate::mm::watch_frame(f.paddr, 0xe18, head, instruction);
                     trace_rustc_driver_page = true;
                 }
-            }
+                f
+            } else {
+                match frame_alloc() {
+                    Some(f) => f,
+                    None => return page_fault_failure(PAGE_FAULT_FRAME_ALLOC),
+                }
+            };
+            let permission = Self::pte_permission_for_frame(area, &f);
             self.page_table
-                .map_page(vpn, f.paddr, area.map_perm.into(), MappingSize::Page4KB);
+                .map_page(vpn, f.paddr, permission.into(), MappingSize::Page4KB);
             #[cfg(feature = "smp-diagnostics")]
             if trace_rustc_driver_page {
                 let head = unsafe { core::ptr::read_unaligned(f.paddr.get_ptr() as *const u32) };
@@ -1156,7 +1164,22 @@ impl MemorySet {
             .map(|(pa, flags)| (pa.into(), flags))
     }
 
-    #[cfg(feature = "smp-diagnostics")]
+    pub fn mapping_is_shared(&self, vaddr: VirtAddr) -> bool {
+        let vpn = vaddr.floor();
+        self.areas
+            .exclusive_access()
+            .iter()
+            .find(|area| {
+                area.vaddr_range.get_start() <= vpn && vpn < area.vaddr_range.get_end()
+            })
+            .map(|area| area.shared)
+            .unwrap_or(false)
+    }
+
+    #[cfg(any(
+        feature = "smp-diagnostics",
+        feature = "buildstorm-mm-diagnostics"
+    ))]
     pub fn print_fault_mapping(&self, vaddr: VirtAddr) {
         let vpn = vaddr.floor();
         let areas = self.areas.exclusive_access();
@@ -1938,9 +1961,9 @@ impl MemorySet {
         &mut self,
         start_addr: polyhal::VirtAddr,
         len: usize,
-    ) -> isize {
+    ) -> (isize, Vec<FrameTracker>) {
         if len == 0 {
-            return 0;
+            return (0, Vec::new());
         }
         let end_addr = polyhal::VirtAddr::from(start_addr.raw().saturating_add(len)).ceil();
         let start_vpn = start_addr.floor();
@@ -1950,14 +1973,15 @@ impl MemorySet {
             let Some(area) = areas.iter().find(|area| {
                 area.vaddr_range.get_start() <= cursor && cursor < area.vaddr_range.get_end()
             }) else {
-                return -12;
+                return (-12, Vec::new());
             };
             if area.file.is_some() || area.shared {
-                return -22;
+                return (-22, Vec::new());
             }
             cursor = area.vaddr_range.get_end().min(end_addr);
         }
 
+        let mut retired_frames = Vec::new();
         for area in areas.iter_mut() {
             let area_start = area.vaddr_range.get_start();
             let area_end = area.vaddr_range.get_end();
@@ -1972,42 +1996,16 @@ impl MemorySet {
                 .map(|(&vpn, _)| vpn)
                 .collect();
             for vpn in vpns {
-                let needs_private = area
-                    .data_frames
-                    .get(&vpn)
-                    .map(|frame| frame.is_shared())
-                    .unwrap_or(false);
-                if needs_private {
-                    let Some(frame) = frame_alloc() else {
-                        return -12;
-                    };
-                    if self.page_table.translate(vpn).is_some() {
-                        self.page_table.unmap_page(vpn);
-                    }
-                    self.page_table.map_page(
-                        vpn,
-                        frame.paddr,
-                        area.map_perm.into(),
-                        MappingSize::Page4KB,
-                    );
-                    area.data_frames.insert(vpn, frame);
-                } else if let Some(frame) = area.data_frames.get(&vpn) {
-                    if self.page_table.translate(vpn).is_none() {
-                        self.page_table.map_page(
-                            vpn,
-                            frame.paddr,
-                            area.map_perm.into(),
-                            MappingSize::Page4KB,
-                        );
-                    }
+                if self.page_table.translate(vpn).is_some() {
+                    self.page_table.unmap_page(vpn);
                 }
-                if let Some(frame) = area.data_frames.get(&vpn) {
+                if let Some(frame) = area.data_frames.remove(&vpn) {
                     #[cfg(feature = "smp-diagnostics")]
                     if crate::mm::watched_frame_paddr()
                         .is_some_and(|watched| watched.raw() == frame.paddr.raw())
                     {
                         crate::println!(
-                            "[frame-diag] madvise-zero va={:#x} range={:#x}-{:#x} perm={:#x} shared={} file={:?}",
+                            "[frame-diag] madvise-discard va={:#x} range={:#x}-{:#x} perm={:#x} shared={} file={:?}",
                             vpn.raw(),
                             area.vaddr_range.get_start().raw(),
                             area.vaddr_range.get_end().raw(),
@@ -2016,15 +2014,12 @@ impl MemorySet {
                             area.file.as_ref().and_then(|file| file.path()),
                         );
                     }
-                    frame
-                        .paddr
-                        .slice_mut_with_len::<u8>(PAGE_SIZE)
-                        .fill(0);
+                    retired_frames.push(frame);
                 }
                 area.dirty.remove(&vpn);
             }
         }
-        0
+        (0, retired_frames)
     }
 
     pub fn msync(&mut self, start_addr: polyhal::VirtAddr, len: usize, flags: usize) -> isize {

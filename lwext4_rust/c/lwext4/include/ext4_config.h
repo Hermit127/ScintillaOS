@@ -126,7 +126,7 @@ extern "C" {
 
 /**@brief   Cache size of block device.*/
 #ifndef CONFIG_BLOCK_DEV_CACHE_SIZE
-#define CONFIG_BLOCK_DEV_CACHE_SIZE 8
+#define CONFIG_BLOCK_DEV_CACHE_SIZE 256
 #endif
 
 

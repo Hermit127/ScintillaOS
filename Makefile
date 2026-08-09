@@ -102,9 +102,9 @@ prepare-vendor:
 	@find vendor -name cargo-checksum.json -exec sh -c \
 		'cp "$$1" "$$(dirname "$$1")/.cargo-checksum.json"' _ {} \;
 
-all: kernel-rv disk.img disk-rv.img kernel-la disk-la.img
+all: kernel-rv disk.img kernel-la disk-la.img
 	@echo "===== Build complete ====="
-	@ls -lh kernel-rv kernel-la disk.img disk-rv.img disk-la.img 2>/dev/null || true
+	@ls -lh kernel-rv kernel-la disk.img disk-la.img 2>/dev/null || true
 
 kernel-rv:
 	@echo "===== Building kernel-rv (riscv64) ====="
@@ -115,7 +115,6 @@ kernel-rv:
 
 kernel-la:
 	@echo "===== Building kernel-la (loongarch64) ====="
-	@$(MAKE) fs-img ARCH=loongarch64
 	@$(MAKE) kernel ARCH=loongarch64
 	@cp target/loongarch64-unknown-none/release/os kernel-la
 	@echo "kernel-la ready"
@@ -425,7 +424,7 @@ QEMU_ARGS_DUAL := -drive file=$(TEST_DISK),if=none,format=raw,id=x0 \
 			-drive file=$(ROOT_DISK),if=none,format=raw,id=x1 \
 			-device $(VIRTIO_BLK_DEVICE),drive=x1$(if $(filter loongarch64,$(ARCH)),,$(COMMA)bus=$(VIRTIO_BLK_BUS2))
 
-# virtio-net network configuration (SLIRP user-mode, riscv64/aarch64)
+# virtio-net network configuration (SLIRP user-mode)
 QEMU_NET_HOSTFWD ?= hostfwd=tcp::5555-:5001$(COMMA)hostfwd=tcp::5556-:5201
 QEMU_NETDEV_USER := user$(COMMA)id=net0$(if $(QEMU_NET_HOSTFWD),$(COMMA)$(QEMU_NET_HOSTFWD))
 ifeq ($(ARCH), riscv64)
@@ -434,6 +433,9 @@ ifeq ($(ARCH), riscv64)
 else ifeq ($(ARCH), aarch64)
   QEMU_NET_ARGS := -netdev $(QEMU_NETDEV_USER) \
 			-device virtio-net-device,netdev=net0,bus=virtio-mmio-bus.2
+else ifeq ($(ARCH), loongarch64)
+  QEMU_NET_ARGS := -netdev $(QEMU_NETDEV_USER) \
+			-device virtio-net-pci,netdev=net0
 else
   QEMU_NET_ARGS :=
 endif

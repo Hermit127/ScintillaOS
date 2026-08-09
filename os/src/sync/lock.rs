@@ -52,14 +52,15 @@ pub enum LockClass {
     Task = 5,
     SignalActions = 6,
     Vm = 7,
-    FrameRef = 8,
-    FrameAllocator = 9,
-    Vfs = 10,
-    FsGlobal = 11,
-    Fs = 12,
-    Dentry = 13,
-    FsAux = 14,
-    Device = 15,
+    PageCache = 8,
+    FrameRef = 9,
+    FrameAllocator = 10,
+    Vfs = 11,
+    FsGlobal = 12,
+    Fs = 13,
+    Dentry = 14,
+    FsAux = 15,
+    Device = 16,
 }
 
 impl LockClass {
@@ -505,6 +506,7 @@ define_domain_lock!(
     LockClass::SignalActions
 );
 define_domain_lock!(VmLock, VmGuard, LockClass::Vm);
+define_domain_lock!(PageCacheLock, PageCacheGuard, LockClass::PageCache);
 define_domain_lock!(FrameRefLock, FrameRefGuard, LockClass::FrameRef);
 define_domain_lock!(
     FrameAllocatorLock,

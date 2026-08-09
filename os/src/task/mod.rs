@@ -78,9 +78,9 @@ pub use fp::UserFloatState;
 pub use manager::{
     add_priority_task, add_task, begin_block, begin_exit, cancel_block_before_switch,
     net_blocked_snapshot, online_cpu_mask, pid2task, register_online_cpu, remove_sleep,
-    take_waitpid, task_snapshot, update_task_affinity, wake_local_tcp_acceptors,
-    wake_local_tcp_connection_waiters, wake_local_tcp_readers, wake_local_tcp_writers,
-    wake_pipe_waiters, wake_task, wake_udp_waiters, BlockQueue,
+    publish_itimer_deadline, take_waitpid, task_snapshot, update_task_affinity,
+    wake_local_tcp_acceptors, wake_local_tcp_connection_waiters, wake_local_tcp_readers,
+    wake_local_tcp_writers, wake_pipe_waiters, wake_task, wake_udp_waiters, BlockQueue,
 };
 pub use pid::{pid_alloc, PidHandle};
 pub use processor::{
@@ -116,15 +116,16 @@ pub(crate) static FILE_TABLE_LOCK: FilesLock<FileTableState> =
     FilesLock::new_named(FileTableState::new(), "Files.descriptor_tables");
 
 pub(crate) fn register_files_task(task: &Arc<TaskControlBlock>) {
+    let files_id = task.inner_exclusive_access().files_id;
     let mut state = FILE_TABLE_LOCK.lock();
-    register_files_task_locked(&mut state, task);
+    register_files_task_locked(&mut state, task, files_id);
 }
 
 pub(crate) fn register_files_task_locked(
     state: &mut FileTableState,
     task: &Arc<TaskControlBlock>,
+    files_id: usize,
 ) {
-    let files_id = task.inner_exclusive_access().files_id;
     let group = if let Some(group) = state
         .groups
         .iter_mut()
@@ -152,9 +153,9 @@ pub(crate) fn register_files_task_locked(
 pub(crate) fn file_group_tasks_locked(
     state: &mut FileTableState,
     task: &Arc<TaskControlBlock>,
+    files_id: usize,
 ) -> Vec<Arc<TaskControlBlock>> {
-    register_files_task_locked(state, task);
-    let files_id = task.inner_exclusive_access().files_id;
+    register_files_task_locked(state, task, files_id);
     let group = state
         .groups
         .iter_mut()
@@ -165,10 +166,7 @@ pub(crate) fn file_group_tasks_locked(
         let Some(task) = member.upgrade() else {
             return false;
         };
-        let live = {
-            let inner = task.inner_exclusive_access();
-            inner.files_id == files_id && inner.task_status != TaskStatus::Zombie
-        };
+        let live = !task.is_waitable_zombie();
         if live {
             tasks.push(task);
         }
@@ -199,7 +197,7 @@ pub fn complete_vfork(task: &Arc<TaskControlBlock>) {
         return;
     };
     if let Some(parent) = pid2task(parent_tid) {
-        manager::wake_task(parent);
+        manager::wake_vfork_parent(parent, task.getpid());
     }
 }
 
@@ -230,7 +228,7 @@ pub(super) fn reap_exited_tasks() {
             println!("[reap-diag] cleanup-done tid={}", task.getpid());
         }
         if let Some(parent) = parent {
-            wake_parent_waiter(&parent);
+            wake_parent_group_waiters(&parent);
             #[cfg(feature = "smp-diagnostics")]
             if task.getpid() >= 20 {
                 println!("[reap-diag] parent-woken tid={}", task.getpid());
@@ -275,6 +273,41 @@ pub fn sleep_current_and_run_next() {
     let task_cx_ptr = manager::begin_block(&task, None, manager::BlockQueue::None, None);
     schedule(task_cx_ptr);
     task.record_time_resume();
+}
+
+pub fn sleep_current_until(wakeup_time: usize) {
+    crate::fs::stdio::stdout_release_if_owner();
+    let task = current_task().unwrap();
+    task.record_time_suspend();
+    let task_cx_ptr = manager::begin_block(
+        &task,
+        None,
+        manager::BlockQueue::None,
+        Some(wakeup_time),
+    );
+    schedule(task_cx_ptr);
+    task.record_time_resume();
+    let _ = manager::remove_sleep(task.getpid());
+}
+
+pub fn sleep_current_until_if<F>(wakeup_time: usize, should_sleep: F) -> bool
+where
+    F: FnOnce() -> bool,
+{
+    crate::fs::stdio::stdout_release_if_owner();
+    let task = current_task().unwrap();
+    task.record_time_suspend();
+    let task_cx_ptr =
+        manager::begin_block(&task, None, manager::BlockQueue::None, Some(wakeup_time));
+    if !should_sleep() {
+        manager::cancel_block_before_switch(&task);
+        task.record_time_resume();
+        return false;
+    }
+    schedule(task_cx_ptr);
+    task.record_time_resume();
+    let _ = manager::remove_sleep(task.getpid());
+    true
 }
 
 pub fn block_current_and_run_next(block_reason: BlockReason) {
@@ -417,36 +450,48 @@ pub fn wake_blocked_task(task: &Arc<TaskControlBlock>) {
 
 pub fn check_itimers() {
     let now = polyhal::time::Time::now().to_usec() as u64;
+    if !manager::itimer_scan_due(now) {
+        return;
+    }
     let tasks = task_snapshot();
-    for task in tasks {
-        let expired = {
-            let Some(mut inner) = task.try_inner_exclusive_access() else {
+    let expired = Vec::with_capacity(tasks.len());
+    let Some(expired) = manager::scan_itimers_if_due(now, move || {
+        let mut expired = expired;
+        let mut next_deadline = u64::MAX;
+        for task in tasks {
+            let mut inner = task.inner_exclusive_access();
+            if inner.task_status == TaskStatus::Zombie || inner.itimer_expire == 0 {
                 continue;
-            };
-            if inner.task_status == TaskStatus::Zombie
-                || inner.itimer_expire == 0
-                || now < inner.itimer_expire
-            {
-                false
-            } else {
+            }
+            let expired_now = now >= inner.itimer_expire;
+            if expired_now {
                 inner.signals.insert(SignalFlags::SIGALRM);
                 if inner.itimer_interval_us > 0 {
-                    inner.itimer_expire = now + inner.itimer_interval_us;
+                    inner.itimer_expire = now.saturating_add(inner.itimer_interval_us);
                 } else {
                     inner.itimer_expire = 0;
                 }
-                true
             }
-        };
-        if expired {
-            #[cfg(any(feature = "smp-diagnostics", feature = "timeout-trace"))]
-            crate::println!(
-                "[itimer-diag] expire tid={} now={}",
-                task.getpid(),
-                now,
-            );
-            wake_blocked_task(&task);
+            if inner.itimer_expire != 0 {
+                next_deadline = next_deadline.min(inner.itimer_expire);
+            }
+            drop(inner);
+            if expired_now {
+                expired.push(task);
+            }
         }
+        (expired, next_deadline)
+    }) else {
+        return;
+    };
+    for task in expired {
+        #[cfg(any(feature = "smp-diagnostics", feature = "timeout-trace"))]
+        crate::println!(
+            "[itimer-diag] expire tid={} now={}",
+            task.getpid(),
+            now,
+        );
+        wake_blocked_task(&task);
     }
 }
 
@@ -456,11 +501,16 @@ fn notify_parent_sigchld(parent: &Arc<TaskControlBlock>) {
         inner.signals.insert(SignalFlags::SIGCHLD);
     }
     let woke_signal_waiter = wake_signal_wait_task(parent, SignalFlags::SIGCHLD);
-    let should_interrupt = parent
+    let (should_interrupt, waiting_for_vfork) = parent
         .try_inner_borrow()
-        .map(|inner| has_interrupting_signal(&inner))
-        .unwrap_or(false);
-    if should_interrupt && !woke_signal_waiter {
+        .map(|inner| {
+            (
+                has_interrupting_signal(&inner),
+                matches!(inner.block_reason, Some(BlockReason::Vfork(_))),
+            )
+        })
+        .unwrap_or((false, false));
+    if should_interrupt && !waiting_for_vfork && !woke_signal_waiter {
         wake_blocked_task(parent);
     }
 }
@@ -469,7 +519,7 @@ fn wake_parent_waiter(parent: &Arc<TaskControlBlock>) {
     let before = parent
         .try_inner_borrow()
         .map(|inner| inner.task_status);
-    let woke = manager::wake_task(parent.clone());
+    let woke = manager::wake_waitpid_parent(parent.clone());
     if LIFECYCLE_TRACE_ENABLED {
         let after = parent
             .try_inner_borrow()
@@ -481,6 +531,14 @@ fn wake_parent_waiter(parent: &Arc<TaskControlBlock>) {
             after,
             woke
         );
+    }
+}
+
+fn wake_parent_group_waiters(parent: &Arc<TaskControlBlock>) {
+    let tgid = parent.thread_group_id();
+    wake_parent_waiter(parent);
+    for peer in collect_thread_group_tasks(parent.getpid(), tgid) {
+        wake_parent_waiter(&peer);
     }
 }
 
@@ -577,10 +635,10 @@ pub fn force_exit_task(task: &Arc<TaskControlBlock>, exit_code: i32) {
         if let Some(parent) = parent {
             if parent_auto_reaps_sigchld(&parent) {
                 detach_child_from_parent(&parent, pid);
-                wake_parent_waiter(&parent);
+                wake_parent_group_waiters(&parent);
             } else {
                 notify_parent_sigchld(&parent);
-                wake_parent_waiter(&parent);
+                wake_parent_group_waiters(&parent);
             }
         }
     }
@@ -620,15 +678,10 @@ fn collect_thread_group_tasks(pid: usize, tgid: usize) -> Vec<Arc<TaskControlBlo
         if other.getpid() == pid {
             continue;
         }
-        // A sibling can hold TaskLock while completing a syscall such as
-        // munmap. Group teardown must wait for a stable membership decision;
-        // skipping that contender would leave it executing after its leader
-        // has started destroying the process.
-        let same_group = {
-            let inner = other.inner_exclusive_access();
-            inner.tgid == tgid && inner.task_status != TaskStatus::Zombie
-        };
-        if same_group {
+        // Linux task-list membership is independent of a thread's mutable
+        // syscall state. The published TGID and terminal-state bit provide a
+        // stable snapshot without waiting behind file-backed page faults.
+        if other.thread_group_id() == tgid && !other.is_waitable_zombie() {
             group_tasks.push(other);
         }
     }
@@ -728,7 +781,10 @@ static STALL_SNAPSHOT_PRINTED: core::sync::atomic::AtomicBool =
 #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
 static STALL_SNAPSHOT_TICKS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
-const SCHED_STALL_DIAGNOSTICS: bool = cfg!(feature = "smp-diagnostics");
+const SCHED_STALL_DIAGNOSTICS: bool = cfg!(any(
+    feature = "smp-diagnostics",
+    feature = "scheduler-stall-diagnostics"
+));
 // Lifecycle state remains available through the diagnostic snapshot.  Per
 // exit logging is disabled during acceptance so independent harts cannot
 // splice text into official test markers.
@@ -829,9 +885,10 @@ pub fn diagnose_scheduler_stall() {
     for task in tasks {
         if let Some(inner) = task.try_inner_borrow() {
             println!(
-                "[sched-stall] tid={} tgid={} tcb={:#x} owner={} queued={} state={:?} reason={:?} children={}",
+                "[sched-stall] tid={} tgid={} exe={} tcb={:#x} owner={} queued={} state={:?} reason={:?} children={}",
                 task.getpid(),
                 inner.tgid,
+                inner.executable_path,
                 Arc::as_ptr(&task) as usize,
                 task.running_cpu(),
                 task.is_enqueued(),
@@ -841,7 +898,10 @@ pub fn diagnose_scheduler_stall() {
             );
         }
     }
-    #[cfg(feature = "smp-diagnostics")]
+    #[cfg(any(
+        feature = "smp-diagnostics",
+        feature = "scheduler-stall-diagnostics"
+    ))]
     crate::syscall::process::dump_futex_waiters();
 }
 
@@ -924,10 +984,10 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
         if let Some(parent) = parent.as_ref() {
             if parent_auto_reaps_sigchld(&parent) {
                 detach_child_from_parent(&parent, pid);
-                wake_parent_waiter(&parent);
+                wake_parent_group_waiters(&parent);
             } else {
                 notify_parent_sigchld(&parent);
-                wake_parent_waiter(&parent);
+                wake_parent_group_waiters(&parent);
             }
         }
     }

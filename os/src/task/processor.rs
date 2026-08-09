@@ -95,6 +95,12 @@ static TLB_REQUEST_SEQ: [AtomicUsize; MAX_CPUS] =
 #[cfg(target_arch = "loongarch64")]
 static TLB_ACK_SEQ: [AtomicUsize; MAX_CPUS] =
     [const { AtomicUsize::new(0) }; MAX_CPUS];
+#[cfg(target_arch = "loongarch64")]
+const TLB_WAIT_YIELD_INTERVAL: usize = 1 << 16;
+#[cfg(target_arch = "loongarch64")]
+const TLB_IPI_RETRY_INTERVAL: usize = 1 << 22;
+#[cfg(all(target_arch = "loongarch64", feature = "smp-diagnostics"))]
+const TLB_DIAGNOSTIC_INTERVAL: usize = 1 << 25;
 #[cfg(all(target_arch = "loongarch64", feature = "smp-diagnostics"))]
 static IPI_HANDLER_COUNT: [AtomicUsize; MAX_CPUS] =
     [const { AtomicUsize::new(0) }; MAX_CPUS];
@@ -256,6 +262,18 @@ fn service_local_ipi_while_waiting() {
 }
 
 #[cfg(target_arch = "loongarch64")]
+fn relax_tlb_wait(spins: usize) {
+    if spins & (TLB_WAIT_YIELD_INTERVAL - 1) == 0 && IRQ::int_enabled() {
+        // A periodic timer will wake this hart. Sleeping here gives a remote
+        // vCPU which temporarily has interrupts masked a chance to leave its
+        // critical section and acknowledge the shootdown.
+        unsafe { loongArch64::asm::idle() };
+    } else {
+        core::hint::spin_loop();
+    }
+}
+
+#[cfg(target_arch = "loongarch64")]
 struct TlbShootdownGuard;
 
 #[cfg(target_arch = "loongarch64")]
@@ -268,14 +286,19 @@ impl TlbShootdownGuard {
         {
             service_local_ipi_while_waiting();
             spins = spins.wrapping_add(1);
-            if spins == 100_000_000 {
-                panic!(
-                    "LoongArch TLB shootdown gate timeout: cpu={}, online={:#x}",
-                    current_hart_id(),
-                    super::manager::online_cpu_mask()
+            #[cfg(feature = "smp-diagnostics")]
+            if spins & (TLB_DIAGNOSTIC_INTERVAL - 1) == 0 {
+                let cpu = current_hart_id();
+                crate::println!(
+                    "[tlb-guard-wait] cpu={} spins={} irq={} pending={:#x} ipi_status={:#x}",
+                    cpu,
+                    spins,
+                    IRQ::int_enabled(),
+                    PENDING_IPI[cpu].load(Ordering::Acquire),
+                    loongArch64::ipi::ipi_status(),
                 );
             }
-            core::hint::spin_loop();
+            relax_tlb_wait(spins);
         }
         Self
     }
@@ -371,38 +394,56 @@ pub fn flush_remote_tlb(
                 break;
             }
             spins = spins.wrapping_add(1);
-            if spins == 100_000_000 {
-                let snapshot = scheduler_cpu_snapshots()[waiting];
-                #[cfg(feature = "smp-diagnostics")]
-                {
-                    let caller = core::panic::Location::caller();
-                    println!(
-                        "[tlb-diag] target={} handled={} last_actions={:#x} request={} ack={} caller={}:{}",
-                        waiting,
-                        IPI_HANDLER_COUNT[waiting].load(Ordering::Acquire),
-                        LAST_IPI_ACTIONS[waiting].load(Ordering::Acquire),
-                        TLB_REQUEST_SEQ[waiting].load(Ordering::Acquire),
-                        TLB_ACK_SEQ[waiting].load(Ordering::Acquire),
-                        caller.file(),
-                        caller.line(),
-                    );
+            if spins & (TLB_IPI_RETRY_INTERVAL - 1) == 0 {
+                // IPI action bits are level-like and may be coalesced. Re-send
+                // outstanding requests after a long interrupt-masked section;
+                // the sequence acknowledgement remains the sole completion
+                // condition.
+                fence(Ordering::SeqCst);
+                for cpu in 0..MAX_CPUS {
+                    if remote & active_cpus & (1usize << cpu) != 0
+                        && TLB_ACK_SEQ[cpu].load(Ordering::Acquire) != sequence
+                    {
+                        loongArch64::ipi::send_ipi_single(cpu, LA_IPI_TLB_FLUSH);
+                    }
                 }
-                panic!(
-                    "LoongArch TLB shootdown timeout: requester={}, target={}, seq={}, start={:#x}, size={:#x}, online={:#x}, active={:#x}, phase={}, pid={}, tgid={}, pending={:#x}",
+            }
+            #[cfg(feature = "smp-diagnostics")]
+            if spins & (TLB_DIAGNOSTIC_INTERVAL - 1) == 0 {
+                let requests = core::array::from_fn::<_, MAX_CPUS, _>(|cpu| {
+                    TLB_REQUEST_SEQ[cpu].load(Ordering::Acquire)
+                });
+                let acknowledgements = core::array::from_fn::<_, MAX_CPUS, _>(|cpu| {
+                    TLB_ACK_SEQ[cpu].load(Ordering::Acquire)
+                });
+                let pending = core::array::from_fn::<_, MAX_CPUS, _>(|cpu| {
+                    PENDING_IPI[cpu].load(Ordering::Acquire)
+                });
+                let handlers = core::array::from_fn::<_, MAX_CPUS, _>(|cpu| {
+                    IPI_HANDLER_COUNT[cpu].load(Ordering::Acquire)
+                });
+                let actions = core::array::from_fn::<_, MAX_CPUS, _>(|cpu| {
+                    LAST_IPI_ACTIONS[cpu].load(Ordering::Acquire)
+                });
+                crate::println!(
+                    "[tlb-shootdown-wait] sender={} seq={} spins={} remote={:#x} active={:#x} waiting={} start={:#x} size={:#x} irq={} req={:?} ack={:?} pending={:?} handlers={:?} actions={:?}",
                     current,
-                    waiting,
                     sequence,
+                    spins,
+                    remote,
+                    active_cpus,
+                    waiting,
                     start_addr,
                     size,
-                    super::manager::online_cpu_mask(),
-                    active_cpus,
-                    snapshot.phase,
-                    snapshot.pid,
-                    snapshot.tgid,
-                    snapshot.pending_ipi,
+                    IRQ::int_enabled(),
+                    requests,
+                    acknowledgements,
+                    pending,
+                    handlers,
+                    actions,
                 );
             }
-            core::hint::spin_loop();
+            relax_tlb_wait(spins);
         }
     }
 
@@ -553,11 +594,18 @@ pub fn mark_current_task_address_space_active() {
         .enter_cpu(current_hart_id());
 }
 
-/// Account a timer interrupt on the current hart.  The counter is deliberately
-/// per-CPU so the old global mutable tick cannot race once secondary harts run.
-pub fn record_timer_tick() {
+#[cfg(target_arch = "loongarch64")]
+const TIMER_TICKS_PER_USER_SLICE: usize = 10;
+#[cfg(not(target_arch = "loongarch64"))]
+const TIMER_TICKS_PER_USER_SLICE: usize = 1;
+
+/// Account a timer interrupt and report whether the current user time slice
+/// has expired. LoongArch keeps its 1 ms timer resolution for deadlines but
+/// uses a 10 ms scheduling quantum, matching the RISC-V timer cadence.
+pub fn record_timer_tick() -> bool {
     let mut cpu = current_cpu().exclusive_access();
     cpu.ticks = cpu.ticks.wrapping_add(1);
+    cpu.ticks % TIMER_TICKS_PER_USER_SLICE == 0
 }
 
 // 返回当前任务的用户页表 token。
@@ -575,6 +623,12 @@ static BOOT_PAGE_TABLE: LazyInit<PageTable> = LazyInit::new();
 // 执行时取出 idle 上下文指针，并用启动时记录的内核页表切回调度主循环。
 pub fn schedule(switched_task_cx_ptr: *mut KContext) {
     assert_no_spin_locks_held("schedule");
+    // A task remains published as this CPU's current task until the switch
+    // reaches the idle context.  Keep that ownership handoff atomic with
+    // respect to local timer/IPI handlers; otherwise an interrupt can observe
+    // a task context while context_switch_pt is still saving it.
+    let restore_interrupts = IRQ::int_enabled();
+    IRQ::int_disable();
     let idle_task_cx_ptr = current_cpu().exclusive_access().get_idle_task_cx_ptr();
     // 当前任务主动让出或退出时，先切回 idle，并恢复启动时记录的内核页表。
     unsafe {
@@ -584,6 +638,9 @@ pub fn schedule(switched_task_cx_ptr: *mut KContext) {
     // been restored with its user page table.  Mark it active before returning
     // to the syscall/trap path, which may resume userspace immediately.
     mark_current_task_address_space_active();
+    if restore_interrupts {
+        IRQ::int_enable();
+    }
 }
 
 // 记录启动时的内核页表，之后调度回 idle 时使用。

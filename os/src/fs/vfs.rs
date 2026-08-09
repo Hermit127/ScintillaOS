@@ -7,8 +7,9 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::ffi::c_char;
 use core::ops::{Deref, DerefMut};
+use core::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "mount-watchdog")]
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize};
 use lazy_static::*;
 
 use super::block_device_stream::{BlockDeviceStream, BlockDeviceStreamOp, Ext4Wrapper};
@@ -320,130 +321,76 @@ impl VfsSuperBlock {
         })
     }
 
-    pub fn get_inode_info(&self, fs_path: &str) -> Option<InodeInfo> {
+    fn get_inode_info_result(&self, fs_path: &str) -> Result<InodeInfo, i32> {
         // The owner cache is VFS metadata. Take this snapshot before
         // `with_fs` acquires the superblock FsLock, preserving the documented
         // `VfsLock -> FsLock` order.
         let cached_owner = cached_path_owner(fs_path);
         self.with_fs(|_fs| {
-            let mut mode: u32 = 0;
-            let c_path2 = CString::new(fs_path).ok()?;
-            let _mode_rc = unsafe { ext4_mode_get(c_path2.as_ptr() as *const c_char, &mut mode) };
+            let c_path = CString::new(fs_path).map_err(|_| EINVAL as i32)?;
             let mut raw_ino: u32 = 0;
             let mut raw_inode: ext4_inode = unsafe { core::mem::zeroed() };
             let raw_rc = unsafe {
                 ext4_raw_inode_fill(
-                    c_path2.as_ptr() as *const c_char,
+                    c_path.as_ptr() as *const c_char,
                     &mut raw_ino,
                     &mut raw_inode,
                 )
             };
-            let links_count = if raw_rc == EOK as i32 {
-                raw_inode.links_count as u32
-            } else {
-                1
-            };
-
-            let mut uid: u32 = 0;
-            let mut gid: u32 = 0;
-            let c_path_owner = CString::new(fs_path).ok()?;
-            unsafe {
-                ext4_owner_get(c_path_owner.as_ptr() as *const c_char, &mut uid, &mut gid);
+            #[cfg(feature = "buildstorm-diagnostics")]
+            if fs_path.contains("/target/debug/")
+                && raw_rc != EOK as i32
+                && raw_rc != ENOENT as i32
+            {
+                crate::println!(
+                    "[buildstorm-fs] inode-query-failed raw_rc={} path={}",
+                    raw_rc,
+                    fs_path,
+                );
             }
+            if raw_rc != EOK as i32 {
+                return Err(raw_rc);
+            }
+
+            // ext4_raw_inode_fill resolves the path once and copies a coherent
+            // on-disk inode snapshot. Decoding that snapshot avoids repeating
+            // the same path walk for mode, owner, three timestamps and size.
+            let mode = u16::from_le(raw_inode.mode) as u32;
+            let file_type = mode & 0o170000;
+            let is_dir = file_type == 0o040000;
+            let is_link = file_type == 0o120000;
+            let size_lo = u32::from_le(raw_inode.size_lo) as u64;
+            let size = if file_type == 0o100000 {
+                size_lo | ((u32::from_le(raw_inode.size_hi) as u64) << 32)
+            } else {
+                size_lo
+            };
+            let mut uid = u16::from_le(raw_inode.uid) as u32;
+            let mut gid = u16::from_le(raw_inode.gid) as u32;
             if let Some((cached_uid, cached_gid)) = cached_owner {
                 uid = cached_uid;
                 gid = cached_gid;
             }
 
-            let mut atime: u32 = 0;
-            let mut mtime: u32 = 0;
-            let mut ctime: u32 = 0;
-            let c_path3 = CString::new(fs_path).ok()?;
-            unsafe {
-                ext4_atime_get(c_path3.as_ptr() as *const c_char, &mut atime);
-                ext4_mtime_get(c_path3.as_ptr() as *const c_char, &mut mtime);
-                ext4_ctime_get(c_path3.as_ptr() as *const c_char, &mut ctime);
-            }
-
-            let file_type = mode & 0o170000;
-            let is_link = file_type == 0o120000;
-            let is_dir_mode = file_type == 0o040000;
-            let is_regular_mode = file_type == 0 || file_type == 0o100000;
-
-            let (inode_num, size, is_dir) = if is_dir_mode {
-                let mut dir: ext4_dir = unsafe { core::mem::zeroed() };
-                let c_path_dir = CString::new(fs_path).ok()?;
-                let dir_rc =
-                    unsafe { ext4_dir_open(&mut dir, c_path_dir.as_ptr() as *const c_char) };
-                if dir_rc == EOK as i32 {
-                    let inode_num = dir.f.inode;
-                    let size = dir.f.fsize;
-                    unsafe {
-                        ext4_dir_close(&mut dir);
-                    }
-                    mode = (mode & 0o7777) | 0o040000;
-                    (inode_num, size, true)
-                } else {
-                    return None;
-                }
-            } else if !is_regular_mode && raw_rc == EOK as i32 {
-                let size = ((raw_inode.size_hi as u64) << 32) | raw_inode.size_lo as u64;
-                (raw_ino, size, false)
-            } else {
-                let mut file: ext4_file = unsafe { core::mem::zeroed() };
-                let c_path_file = CString::new(fs_path).ok()?;
-                let flags = CString::new("rb").ok()?;
-                let file_rc = unsafe {
-                    ext4_fopen(
-                        &mut file,
-                        c_path_file.as_ptr() as *const c_char,
-                        flags.as_ptr() as *const c_char,
-                    )
-                };
-
-                if file_rc == EOK as i32 {
-                    let inode_num = file.inode;
-                    let size = unsafe { ext4_fsize(&mut file) };
-                    unsafe {
-                        ext4_fclose(&mut file);
-                    }
-                    (inode_num, size, false)
-                } else if is_link {
-                    // Symlink lookup only needs the link flag and path.
-                    (0, 0, false)
-                } else {
-                    let mut dir: ext4_dir = unsafe { core::mem::zeroed() };
-                    let c_path_dir = CString::new(fs_path).ok()?;
-                    let dir_rc =
-                        unsafe { ext4_dir_open(&mut dir, c_path_dir.as_ptr() as *const c_char) };
-                    if dir_rc != EOK as i32 {
-                        return None;
-                    }
-                    let inode_num = dir.f.inode;
-                    let size = dir.f.fsize;
-                    unsafe {
-                        ext4_dir_close(&mut dir);
-                    }
-                    mode = (mode & 0o7777) | 0o040000;
-                    (inode_num, size, true)
-                }
-            };
-
-            Some(InodeInfo {
-                inode_num,
+            Ok(InodeInfo {
+                inode_num: raw_ino,
                 is_dir,
                 is_link,
                 mode,
                 size,
-                atime,
-                mtime,
-                ctime,
-                blocks_count: 0,
-                links_count,
+                atime: u32::from_le(raw_inode.access_time),
+                mtime: u32::from_le(raw_inode.modification_time),
+                ctime: u32::from_le(raw_inode.change_inode_time),
+                blocks_count: u32::from_le(raw_inode.blocks_count_lo) as u64,
+                links_count: u16::from_le(raw_inode.links_count) as u32,
                 uid,
                 gid,
             })
         })
+    }
+
+    pub fn get_inode_info(&self, fs_path: &str) -> Option<InodeInfo> {
+        self.get_inode_info_result(fs_path).ok()
     }
 
     pub fn read_at(&self, fs_path: &str, offset: usize, buf: &mut [u8]) -> usize {
@@ -465,6 +412,16 @@ impl VfsSuperBlock {
                 drop(CString::from_raw(flags_ptr));
             }
             if rc != EOK as i32 {
+                #[cfg(feature = "buildstorm-diagnostics")]
+                if fs_path.contains("/target/debug/") {
+                    crate::println!(
+                        "[buildstorm-fs] fallback-write-open-failed rc={} off={} len={} path={}",
+                        rc,
+                        offset,
+                        buf.len(),
+                        fs_path,
+                    );
+                }
                 return 0;
             }
 
@@ -525,11 +482,11 @@ impl VfsSuperBlock {
         })
     }
 
-    pub fn write_at(&self, fs_path: &str, offset: usize, buf: &[u8]) -> usize {
-        self.write_at_raw(fs_path, offset, buf)
+    pub fn write_at(&self, fs_path: &str, offset: usize, buf: &[u8], timestamp: u32) -> usize {
+        self.write_at_raw(fs_path, offset, buf, timestamp)
     }
 
-    fn write_at_raw(&self, fs_path: &str, offset: usize, buf: &[u8]) -> usize {
+    fn write_at_raw(&self, fs_path: &str, offset: usize, buf: &[u8], timestamp: u32) -> usize {
         self.with_fs(|_fs| {
             let c_path = match CString::new(fs_path) {
                 Ok(s) => s,
@@ -557,11 +514,13 @@ impl VfsSuperBlock {
 
             let mut rw_count: usize = 0;
             let write_rc = unsafe {
-                ext4_fwrite(
+                ext4_fwrite_with_times(
                     &mut file,
                     buf.as_ptr() as *const core::ffi::c_void,
                     buf.len(),
                     &mut rw_count,
+                    timestamp,
+                    timestamp,
                 )
             };
             unsafe {
@@ -569,6 +528,17 @@ impl VfsSuperBlock {
             }
 
             if write_rc != EOK as i32 {
+                #[cfg(feature = "buildstorm-diagnostics")]
+                if fs_path.contains("/target/debug/") {
+                    crate::println!(
+                        "[buildstorm-fs] fallback-write-failed rc={} off={} len={} written={} path={}",
+                        write_rc,
+                        offset,
+                        buf.len(),
+                        rw_count,
+                        fs_path,
+                    );
+                }
                 return 0;
             }
             rw_count
@@ -584,18 +554,41 @@ impl VfsSuperBlock {
             format!("{}/{}", parent_path, name)
         };
 
-        self.with_fs(|_fs| {
+        let (created, raw_rc) = self.with_fs(|_fs| {
             if is_dir {
-                let c_path = CString::new(full_path.as_bytes()).ok()?;
+                let c_path = match CString::new(full_path.as_bytes()) {
+                    Ok(path) => path,
+                    Err(_) => return (None, -(EINVAL as i32)),
+                };
                 let rc = unsafe { ext4_dir_mk(c_path.as_ptr() as *const c_char) };
                 if rc == EOK as i32 {
-                    return Some(0);
+                    let mut inode = 0u32;
+                    let mut raw_inode: ext4_inode = unsafe { core::mem::zeroed() };
+                    let query_rc = unsafe {
+                        ext4_raw_inode_fill(
+                            c_path.as_ptr() as *const c_char,
+                            &mut inode,
+                            &mut raw_inode,
+                        )
+                    };
+                    if query_rc == EOK as i32 {
+                        return (Some(inode), query_rc);
+                    }
+                    return (None, query_rc);
                 }
-                None
+                (None, rc)
             } else {
-                let c_path = CString::new(full_path.as_bytes()).ok()?;
+                let c_path = match CString::new(full_path.as_bytes()) {
+                    Ok(path) => path,
+                    Err(_) => return (None, -(EINVAL as i32)),
+                };
                 let c_path = c_path.into_raw();
-                let flags = CString::new("wb").ok()?;
+                // Creation must not truncate a file installed by a racing
+                // O_CREAT caller. The returned handle is closed immediately.
+                let flags = match CString::new("ab") {
+                    Ok(flags) => flags,
+                    Err(_) => return (None, -(EINVAL as i32)),
+                };
                 let flags_ptr = flags.into_raw();
 
                 let mut file: ext4_file = unsafe { core::mem::zeroed() };
@@ -609,12 +602,22 @@ impl VfsSuperBlock {
                     unsafe {
                         ext4_fclose(&mut file);
                     }
-                    Some(inode)
+                    (Some(inode), rc)
                 } else {
-                    None
+                    (None, rc)
                 }
             }
-        })
+        });
+        #[cfg(feature = "buildstorm-diagnostics")]
+        if created.is_none() && full_path.contains("/target/debug/") {
+            crate::println!(
+                "[buildstorm-fs] create-failed dir={} rc={} path={}",
+                is_dir,
+                raw_rc,
+                full_path,
+            );
+        }
+        created
     }
 
     pub fn truncate_file(&self, fs_path: &str, size: u64) -> bool {
@@ -636,16 +639,28 @@ impl VfsSuperBlock {
                 drop(CString::from_raw(flags_ptr));
             }
             if rc != EOK as i32 {
+                #[cfg(feature = "buildstorm-diagnostics")]
+                if fs_path.contains("/target/debug/") {
+                    crate::println!(
+                        "[buildstorm-fs] truncate-open-failed rc={} size={} path={}",
+                        rc,
+                        size,
+                        fs_path,
+                    );
+                }
                 return false;
             }
 
             let old_size = unsafe { ext4_fsize(&mut file) };
-            let ok = if size <= old_size {
-                (unsafe { ext4_ftruncate(&mut file, size) }) == EOK as i32
+            let inode = file.inode;
+            let (ok, operation_rc) = if size <= old_size {
+                let rc = unsafe { ext4_ftruncate(&mut file, size) };
+                (rc == EOK as i32, rc)
             } else {
                 let zeros = [0u8; 4096];
                 let mut pos = old_size as usize;
                 let target = size as usize;
+                let mut operation_rc = EOK as i32;
                 unsafe {
                     ext4_fseek(&mut file, old_size as i64, SEEK_SET as u32);
                 }
@@ -662,15 +677,27 @@ impl VfsSuperBlock {
                         )
                     };
                     if rc != EOK as i32 || written == 0 {
+                        operation_rc = if rc == EOK as i32 { EIO as i32 } else { rc };
                         ok = false;
                         break;
                     }
                     pos += written;
                 }
-                ok
+                (ok, operation_rc)
             };
             unsafe {
                 ext4_fclose(&mut file);
+            }
+            #[cfg(feature = "buildstorm-diagnostics")]
+            if !ok && fs_path.contains("/target/debug/") {
+                crate::println!(
+                    "[buildstorm-fs] truncate-write-failed rc={} inode={} old_size={} size={} path={}",
+                    operation_rc,
+                    inode,
+                    old_size,
+                    size,
+                    fs_path,
+                );
             }
             ok
         })
@@ -789,6 +816,9 @@ pub struct Dentry {
     /// Cache updates use a two-phase protocol: create/reserve a replacement
     /// list before acquiring this lock, and never call Ext4 while it is held.
     pub children: DentryLock<Option<Vec<Arc<Dentry>>>>,
+    /// Even values describe a stable cache generation. Odd values mean a
+    /// directory mutation is updating the child cache.
+    child_cache_epoch: AtomicU64,
     /// This is only an in-memory metadata cache.  Ext4 lookup happens after
     /// dropping the lock, then the result is stored in a second short phase.
     inode_info: DentryLock<Option<InodeInfo>>,
@@ -806,6 +836,7 @@ impl Dentry {
             parent: None,
             super_block: sb,
             children: DentryLock::new_named(None, "DentryChildren"),
+            child_cache_epoch: AtomicU64::new(0),
             inode_info: DentryLock::new_named(None, "DentryInodeInfo"),
         })
     }
@@ -821,6 +852,7 @@ impl Dentry {
             parent: None,
             super_block: sb,
             children: DentryLock::new_named(None, "DentryChildren"),
+            child_cache_epoch: AtomicU64::new(0),
             inode_info: DentryLock::new_named(None, "DentryInodeInfo"),
         })
     }
@@ -854,6 +886,7 @@ impl Dentry {
             parent: Some(Arc::downgrade(parent)),
             super_block: parent.super_block.clone(),
             children: DentryLock::new_named(None, "DentryChildren"),
+            child_cache_epoch: AtomicU64::new(0),
             inode_info: DentryLock::new_named(None, "DentryInodeInfo"),
         })
     }
@@ -1085,7 +1118,10 @@ fn is_mount_root(dentry: &Arc<Dentry>) -> Option<Arc<Dentry>> {
 
 // ==================== Path Resolution ====================
 
-const DENTRY_CHILD_CACHE_LIMIT: usize = 128;
+// Large build trees routinely contain hundreds of siblings. Grow hot directory
+// caches outside DentryLock while keeping small directories inexpensive.
+const DENTRY_CHILD_CACHE_INITIAL_CAPACITY: usize = 16;
+const DENTRY_CHILD_CACHE_LIMIT: usize = 1024;
 
 pub fn dentry_parent(dentry: &Arc<Dentry>) -> Option<Arc<Dentry>> {
     dentry.parent.as_ref().and_then(Weak::upgrade)
@@ -1101,7 +1137,7 @@ fn vfs_parent(dentry: &Arc<Dentry>) -> Option<Arc<Dentry>> {
 const MAX_SYMLINK_DEPTH: usize = 40;
 const MAX_SYMLINK_TARGET_LEN: usize = 4096;
 
-pub(crate) fn read_dentry_symlink(dentry: &Arc<Dentry>) -> Option<String> {
+pub(crate) fn read_dentry_symlink_bytes(dentry: &Arc<Dentry>) -> Option<Vec<u8>> {
     let info = dentry.inode_info()?;
     if !info.is_link {
         return None;
@@ -1129,51 +1165,233 @@ pub(crate) fn read_dentry_symlink(dentry: &Arc<Dentry>) -> Option<String> {
         return None;
     }
 
-    let target = core::str::from_utf8(&target_buf[..rcnt])
-        .ok()?
-        .trim_matches('\0');
-    if target.is_empty() {
+    target_buf.truncate(rcnt);
+    while target_buf.last() == Some(&0) {
+        target_buf.pop();
+    }
+    if target_buf.is_empty() {
         None
     } else {
-        Some(String::from(target))
+        Some(target_buf)
     }
 }
 
-fn cache_child(parent: &Arc<Dentry>, child: Arc<Dentry>) {
-    // Reserve a complete cache line before taking the Dentry lock.  A second
-    // lookup below handles a racing initializer without calling the allocator
-    // while holding a VfsLock.
+pub(crate) fn read_dentry_symlink(dentry: &Arc<Dentry>) -> Option<String> {
+    String::from_utf8(read_dentry_symlink_bytes(dentry)?).ok()
+}
+
+fn begin_child_cache_mutation(parent: &Dentry) -> u64 {
+    loop {
+        let epoch = parent.child_cache_epoch.load(Ordering::Acquire);
+        if epoch & 1 != 0 {
+            core::hint::spin_loop();
+            continue;
+        }
+        let updating = epoch.wrapping_add(1);
+        if parent
+            .child_cache_epoch
+            .compare_exchange_weak(epoch, updating, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return updating;
+        }
+    }
+}
+
+fn finish_child_cache_mutation(parent: &Dentry, updating: u64) {
+    debug_assert_eq!(updating & 1, 1);
+    parent
+        .child_cache_epoch
+        .store(updating.wrapping_add(1), Ordering::Release);
+}
+
+pub(crate) struct ChildCacheMutation {
+    parent: Arc<Dentry>,
+    updating: u64,
+}
+
+impl Drop for ChildCacheMutation {
+    fn drop(&mut self) {
+        finish_child_cache_mutation(&self.parent, self.updating);
+    }
+}
+
+pub(crate) fn begin_cached_child_mutation(parent: &Arc<Dentry>) -> ChildCacheMutation {
+    ChildCacheMutation {
+        parent: parent.clone(),
+        updating: begin_child_cache_mutation(parent),
+    }
+}
+
+fn child_cache_epoch_matches(parent: &Dentry, expected_epoch: Option<u64>) -> bool {
+    match expected_epoch {
+        Some(epoch) => {
+            epoch & 1 == 0 && parent.child_cache_epoch.load(Ordering::Acquire) == epoch
+        }
+        None => true,
+    }
+}
+
+fn insert_positive_child(
+    parent: &Arc<Dentry>,
+    child: Arc<Dentry>,
+    expected_epoch: Option<u64>,
+) -> Option<Arc<Dentry>> {
+    if !child_cache_epoch_matches(parent, expected_epoch) {
+        return None;
+    }
+
+    // Reserve outside DentryLock. A second lookup handles a racing initializer.
     if parent.children.exclusive_access().is_none() {
-        let mut initial = Vec::with_capacity(DENTRY_CHILD_CACHE_LIMIT);
+        let mut initial = Vec::with_capacity(DENTRY_CHILD_CACHE_INITIAL_CAPACITY);
         initial.push(child.clone());
-        let mut children = parent.children.exclusive_access();
-        if children.is_none() {
-            *children = Some(initial);
-            return;
+        let mut initial = Some(initial);
+        let mut stale = false;
+        let installed = {
+            let mut children = parent.children.exclusive_access();
+            if !child_cache_epoch_matches(parent, expected_epoch) {
+                stale = true;
+                false
+            } else if children.is_none() {
+                *children = initial.take();
+                true
+            } else {
+                false
+            }
+        };
+        drop(initial);
+        if stale {
+            return None;
+        }
+        if installed {
+            return Some(child);
         }
     }
 
-    let mut children = parent.children.exclusive_access();
-    let list = children
-        .as_mut()
-        .expect("Dentry child cache initialized before use");
-    debug_assert!(list.capacity() >= DENTRY_CHILD_CACHE_LIMIT);
+    enum InsertAction {
+        Done(Arc<Dentry>),
+        Grow(usize),
+        Stale,
+        Uncached,
+    }
 
-    if let Some(slot) = list.iter_mut().find(|cached| cached.name == child.name) {
-        *slot = child;
-    } else {
-        if list.len() >= DENTRY_CHILD_CACHE_LIMIT {
-            if let Some(idx) = list
-                .iter()
-                .position(|cached| Arc::strong_count(cached) == 1)
-            {
-                list.remove(idx);
+    loop {
+        let mut retired_child = None;
+        let action = {
+            let mut children = parent.children.exclusive_access();
+            if !child_cache_epoch_matches(parent, expected_epoch) {
+                InsertAction::Stale
+            } else {
+                let list = children
+                    .as_mut()
+                    .expect("Dentry child cache initialized before use");
+                match list
+                    .binary_search_by(|cached| cached.name.as_str().cmp(child.name.as_str()))
+                {
+                    Ok(idx) => {
+                        if list[idx].inode_num == child.inode_num {
+                            InsertAction::Done(list[idx].clone())
+                        } else {
+                            retired_child =
+                                Some(core::mem::replace(&mut list[idx], child.clone()));
+                            InsertAction::Done(child.clone())
+                        }
+                    }
+                    Err(idx) if list.len() < list.capacity() => {
+                        list.insert(idx, child.clone());
+                        InsertAction::Done(child.clone())
+                    }
+                    Err(_) if list.capacity() < DENTRY_CHILD_CACHE_LIMIT => {
+                        let next = list
+                            .capacity()
+                            .max(DENTRY_CHILD_CACHE_INITIAL_CAPACITY)
+                            .saturating_mul(2)
+                            .min(DENTRY_CHILD_CACHE_LIMIT);
+                        InsertAction::Grow(next)
+                    }
+                    Err(_) => {
+                        if let Some(idx) = list
+                            .iter()
+                            .position(|cached| Arc::strong_count(cached) == 1)
+                        {
+                            retired_child = Some(list.remove(idx));
+                            let idx = list
+                                .binary_search_by(|cached| {
+                                    cached.name.as_str().cmp(child.name.as_str())
+                                })
+                                .unwrap_or_else(|idx| idx);
+                            list.insert(idx, child.clone());
+                            InsertAction::Done(child.clone())
+                        } else {
+                            InsertAction::Uncached
+                        }
+                    }
+                }
+            }
+        };
+        drop(retired_child);
+
+        let target_capacity = match action {
+            InsertAction::Done(canonical) => return Some(canonical),
+            InsertAction::Stale | InsertAction::Uncached => return None,
+            InsertAction::Grow(target_capacity) => target_capacity,
+        };
+
+        let mut replacement = Some(Vec::with_capacity(target_capacity));
+        let mut retired_cache = None;
+        let mut stale = false;
+        {
+            let mut children = parent.children.exclusive_access();
+            if !child_cache_epoch_matches(parent, expected_epoch) {
+                stale = true;
+            } else if let Some(list) = children.as_mut() {
+                if list.len() == list.capacity() && list.capacity() < target_capacity {
+                    let mut old = core::mem::replace(
+                        list,
+                        replacement
+                            .take()
+                            .expect("replacement child cache allocated before lock"),
+                    );
+                    list.append(&mut old);
+                    retired_cache = Some(old);
+                }
             }
         }
-        if list.len() < DENTRY_CHILD_CACHE_LIMIT {
-            list.push(child);
+        drop(retired_cache);
+        drop(replacement);
+        if stale {
+            return None;
         }
     }
+}
+
+pub(crate) fn cache_child_during_mutation(
+    parent: &Arc<Dentry>,
+    child: Arc<Dentry>,
+) -> Arc<Dentry> {
+    insert_positive_child(parent, child.clone(), None).unwrap_or(child)
+}
+
+pub(crate) fn invalidate_cached_child_during_mutation(parent: &Arc<Dentry>, name: &str) {
+    let mut retired_positive = None;
+    {
+        let mut children = parent.children.exclusive_access();
+        if let Some(list) = children.as_mut() {
+            if let Ok(idx) = list.binary_search_by(|cached| cached.name.as_str().cmp(name)) {
+                retired_positive = Some(list.remove(idx));
+            }
+        }
+    }
+    drop(retired_positive);
+}
+
+pub(crate) fn invalidate_cached_child(parent: &Arc<Dentry>, name: &str) {
+    let _mutation = begin_cached_child_mutation(parent);
+    invalidate_cached_child_during_mutation(parent, name);
+}
+
+pub(crate) fn mark_cached_child_absent(parent: &Arc<Dentry>, name: &str) {
+    invalidate_cached_child(parent, name);
 }
 
 pub fn vfs_lookup(parent: &Arc<Dentry>, name: &str) -> Option<Arc<Dentry>> {
@@ -1191,18 +1409,29 @@ pub fn vfs_lookup(parent: &Arc<Dentry>, name: &str) -> Option<Arc<Dentry>> {
         _ => {}
     }
 
-    let cached = {
-        let children = parent.children.exclusive_access();
-        children
-            .as_ref()
-            .and_then(|list| list.iter().find(|cached| cached.name == name).cloned())
-    };
-    if let Some(cached) = cached {
-        if let Some(mnt_root) = lookup_mount(&cached) {
-            return Some(mnt_root);
+    let cache_epoch = parent.child_cache_epoch.load(Ordering::Acquire);
+    if cache_epoch & 1 == 0 {
+        let cached = {
+            let children = parent.children.exclusive_access();
+            children.as_ref().and_then(|list| {
+                list.binary_search_by(|cached| cached.name.as_str().cmp(name))
+                    .ok()
+                    .map(|idx| list[idx].clone())
+            })
+        };
+        if parent.child_cache_epoch.load(Ordering::Acquire) == cache_epoch {
+            if let Some(cached) = cached {
+                if let Some(mnt_root) = lookup_mount(&cached) {
+                    return Some(mnt_root);
+                }
+                return Some(cached);
+            }
+
         }
-        return Some(cached);
     }
+
+    let lookup_epoch = parent.child_cache_epoch.load(Ordering::Acquire);
+    let lookup_epoch = (lookup_epoch & 1 == 0).then_some(lookup_epoch);
 
     let child_fs_path = if parent.fs_path == "/" {
         format!("/{}", name)
@@ -1212,13 +1441,18 @@ pub fn vfs_lookup(parent: &Arc<Dentry>, name: &str) -> Option<Arc<Dentry>> {
         format!("{}/{}", parent.fs_path, name)
     };
 
-    let info = parent.super_block.get_inode_info(&child_fs_path)?;
+    let info = match parent.super_block.get_inode_info_result(&child_fs_path) {
+        Ok(info) => info,
+        Err(_) => return None,
+    };
     let (child_inode, is_dir, is_link) = (info.inode_num, info.is_dir, info.is_link);
 
     let child = Dentry::new_child(parent, name, child_inode, is_dir, is_link);
     child.set_cached_inode_info(info);
 
-    cache_child(parent, child.clone());
+    let child = lookup_epoch
+        .and_then(|epoch| insert_positive_child(parent, child.clone(), Some(epoch)))
+        .unwrap_or(child);
 
     if let Some(mnt_root) = lookup_mount(&child) {
         return Some(mnt_root);
@@ -1241,7 +1475,29 @@ fn vfs_resolve_path_inner(
     let root = crate::task::current_task()
         .map(|t| t.inner_exclusive_access().root.clone())
         .unwrap_or_else(|| ROOT_DENTRY.clone());
-    let mut current = if is_abs { root.clone() } else { start.clone() };
+    let initial = if is_abs { root.clone() } else { start.clone() };
+
+    // Most build-system paths contain no symlink. Walk borrowed components
+    // first and only allocate a rewrite queue when a symlink is encountered.
+    let mut current = initial.clone();
+    let mut borrowed_components = path
+        .split('/')
+        .filter(|component| !component.is_empty() && *component != ".")
+        .peekable();
+    let mut needs_symlink_resolution = false;
+    while let Some(component) = borrowed_components.next() {
+        let next = vfs_lookup(&current, component)?;
+        if next.is_link && (follow_final_symlink || borrowed_components.peek().is_some()) {
+            needs_symlink_resolution = true;
+            break;
+        }
+        current = next;
+    }
+    if !needs_symlink_resolution {
+        return lookup_mount(&current).or(Some(current));
+    }
+
+    let mut current = initial;
     let mut components: VecDeque<String> = path
         .split('/')
         .filter(|component| !component.is_empty() && *component != ".")
@@ -1305,35 +1561,22 @@ pub fn vfs_resolve_parent_and_name(
         return None;
     }
 
-    let components: Vec<&str> = path
-        .split('/')
-        .filter(|c| !c.is_empty() && *c != ".")
-        .collect();
-    if components.is_empty() {
-        return None;
-    }
-
-    let filename = String::from(*components.last().unwrap());
-    let parent_path = if components.len() == 1 {
-        if path.starts_with('/') {
-            String::from("/")
-        } else {
-            String::from(".")
-        }
+    let filename = path
+        .rsplit('/')
+        .find(|component| !component.is_empty() && *component != ".")?;
+    let filename_offset = filename.as_ptr() as usize - path.as_ptr() as usize;
+    let parent_path = &path[..filename_offset];
+    let parent_path = if parent_path.is_empty() {
+        if path.starts_with('/') { "/" } else { "." }
     } else {
-        let joined = components[..components.len() - 1].join("/");
-        if path.starts_with('/') {
-            format!("/{}", joined)
-        } else {
-            joined
-        }
+        parent_path
     };
-    let parent = vfs_resolve_path_inner(start, parent_path.as_str(), true)?;
+    let parent = vfs_resolve_path_inner(start, parent_path, true)?;
     if !parent.is_dir {
         return None;
     }
 
-    Some((parent, filename))
+    Some((parent, String::from(filename)))
 }
 
 // ==================== File Creation ====================
@@ -1344,6 +1587,28 @@ pub fn vfs_create(
     is_dir: bool,
     mode: u32,
 ) -> Option<Arc<Dentry>> {
+    // Keep cached lookups non-authoritative from the physical create through
+    // publication of the new canonical dentry.
+    let _mutation = begin_cached_child_mutation(parent);
+    vfs_create_during_mutation(parent, name, is_dir, mode)
+}
+
+pub(crate) fn vfs_create_during_mutation(
+    parent: &Arc<Dentry>,
+    name: &str,
+    is_dir: bool,
+    mode: u32,
+) -> Option<Arc<Dentry>> {
+    #[cfg(feature = "buildstorm-diagnostics")]
+    if name == "invoked.timestamp" || name == "build-script-build-script-build" {
+        crate::println!(
+            "[buildstorm-fs] traced-vfs-create name={} dir={} mode={:#o} parent={}",
+            name,
+            is_dir,
+            mode,
+            parent.fs_path,
+        );
+    }
     let inode_num = parent
         .super_block
         .create_file(&parent.fs_path, name, is_dir)?;
@@ -1386,9 +1651,7 @@ pub fn vfs_create(
         child.set_cached_inode_info(info);
     }
 
-    cache_child(parent, child.clone());
-
-    Some(child)
+    Some(cache_child_during_mutation(parent, child))
 }
 
 // ==================== Mount Operations ====================

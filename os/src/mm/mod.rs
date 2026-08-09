@@ -1,4 +1,5 @@
 // 这里负责操作系统的内存管理：汇总内存管理模块，导出页表、地址空间、堆和物理页分配接口。
+mod file_page_cache;
 mod frame_allocator;
 mod heap_allocator;
 mod memory_set;
@@ -14,7 +15,8 @@ pub use frame_allocator::{
 pub use frame_allocator::{
     take_watched_frame_corruption, watch_frame, watched_frame_is_intact, watched_frame_paddr,
 };
-pub use heap_allocator::init_heap;
+pub use heap_allocator::{add_heap_region, init_heap};
+pub use file_page_cache::invalidate_file_page_cache;
 pub use memory_set::{
     get_elf_interp, get_elf_interp_file, last_page_fault_failure, AddressSpaceActivityHandle,
     LoadedElf, MapArea, MapPermission, MapType, MemorySet, PageFaultAccess, PageFaultResult,

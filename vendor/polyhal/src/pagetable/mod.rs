@@ -218,6 +218,9 @@ impl PageTable {
         }
         // level 1, map page
         let pte = pte_list[vaddr.pn_index(0)];
+        if !pte.is_valid() {
+            return None;
+        }
         Some((
             PhysAddr::new(pte.address().raw() + vaddr.pn_offest(0)),
             pte.flags().into(),

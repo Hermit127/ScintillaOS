@@ -584,9 +584,7 @@ pub(crate) fn local_tcp_send(
                 -11
             } else {
                 let n = room.min(data.len() - offset);
-                for byte in &data[offset..offset + n] {
-                    dst.push_back(*byte);
-                }
+                dst.extend(data[offset..offset + n].iter().copied());
                 n as isize
             }
         };
@@ -631,14 +629,15 @@ pub(crate) fn local_tcp_recv(
                 (&mut conn.server_to_client, conn.server_closed)
             };
             let n = buf.len().min(src.len());
-            if peek {
-                for (out, byte) in buf.iter_mut().zip(src.iter()).take(n) {
-                    *out = *byte;
-                }
-            } else {
-                for out in buf.iter_mut().take(n) {
-                    *out = src.pop_front().unwrap();
-                }
+            {
+                let (first, second) = src.as_slices();
+                let first_len = n.min(first.len());
+                buf[..first_len].copy_from_slice(&first[..first_len]);
+                let second_len = n - first_len;
+                buf[first_len..n].copy_from_slice(&second[..second_len]);
+            }
+            if !peek {
+                src.drain(..n);
             }
             if n > 0 {
                 n as isize

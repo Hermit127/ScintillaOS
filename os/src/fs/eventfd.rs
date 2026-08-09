@@ -5,6 +5,7 @@ use crate::task::{
     block_current_and_run_next_if, current_task, has_interrupting_signal, wake_poll_wait_tasks,
     BlockReason,
 };
+use core::sync::atomic::{AtomicU64, Ordering};
 
 const EFD_COUNTER_MAX: u64 = u64::MAX - 1;
 const EFD_NONBLOCK: usize = 0x800;
@@ -18,6 +19,7 @@ struct EventFdState {
 
 pub struct EventFdFile {
     state: DeviceLock<EventFdState>,
+    readiness_generation: AtomicU64,
 }
 
 impl EventFdFile {
@@ -31,6 +33,7 @@ impl EventFdFile {
                 },
                 "EventFdState",
             ),
+            readiness_generation: AtomicU64::new(0),
         }
     }
 
@@ -55,7 +58,7 @@ impl File for EventFdFile {
     }
 
     fn read(&self, buf: &mut [u8]) -> isize {
-        if buf.len() != core::mem::size_of::<u64>() {
+        if buf.len() < core::mem::size_of::<u64>() {
             return -22;
         }
         loop {
@@ -67,18 +70,25 @@ impl File for EventFdFile {
                 if state.counter == 0 {
                     None
                 } else if state.semaphore {
+                    let old_counter = state.counter;
                     state.counter -= 1;
+                    if (old_counter == 0) != (state.counter == 0)
+                        || (old_counter == EFD_COUNTER_MAX) != (state.counter == EFD_COUNTER_MAX)
+                    {
+                        self.readiness_generation.fetch_add(1, Ordering::Release);
+                    }
                     Some(1)
                 } else {
                     let value = state.counter;
                     state.counter = 0;
+                    self.readiness_generation.fetch_add(1, Ordering::Release);
                     Some(value)
                 }
             };
             if let Some(value) = value {
-                buf.copy_from_slice(&value.to_ne_bytes());
+                buf[..core::mem::size_of::<u64>()].copy_from_slice(&value.to_ne_bytes());
                 wake_poll_wait_tasks();
-                return buf.len() as isize;
+                return core::mem::size_of::<u64>() as isize;
             }
             if self.state.exclusive_access().nonblock {
                 return -11;
@@ -91,7 +101,7 @@ impl File for EventFdFile {
     }
 
     fn write(&self, buf: &mut [u8]) -> isize {
-        if buf.len() != core::mem::size_of::<u64>() {
+        if buf.len() < core::mem::size_of::<u64>() {
             return -22;
         }
         let value = u64::from_ne_bytes([
@@ -108,7 +118,13 @@ impl File for EventFdFile {
             let written = {
                 let mut state = self.state.exclusive_access();
                 if state.counter <= EFD_COUNTER_MAX - value {
+                    let old_counter = state.counter;
                     state.counter += value;
+                    if (old_counter == 0) != (state.counter == 0)
+                        || (old_counter == EFD_COUNTER_MAX) != (state.counter == EFD_COUNTER_MAX)
+                    {
+                        self.readiness_generation.fetch_add(1, Ordering::Release);
+                    }
                     true
                 } else {
                     false
@@ -116,7 +132,7 @@ impl File for EventFdFile {
             };
             if written {
                 wake_poll_wait_tasks();
-                return buf.len() as isize;
+                return core::mem::size_of::<u64>() as isize;
             }
             if self.state.exclusive_access().nonblock {
                 return -11;
@@ -146,6 +162,10 @@ impl File for EventFdFile {
     fn poll(&self) -> (bool, bool, bool) {
         let state = self.state.exclusive_access();
         (state.counter != 0, state.counter != EFD_COUNTER_MAX, false)
+    }
+
+    fn readiness_generation(&self) -> u64 {
+        self.readiness_generation.load(Ordering::Acquire)
     }
 
     fn as_any(&self) -> &dyn core::any::Any {
