@@ -5,31 +5,6 @@ extern crate user_lib;
 
 use user_lib::{chdir, chroot, exec, exit, fork, mount, shutdown, waitpid, write, yield_};
 
-const BUILDSTORM_Q21: &[u8] = b"\
-echo '#### OS COMP TEST GROUP START buildstorm-glibc ####'\n\
-mount -t proc proc /proc 2>/dev/null\n\
-mount -t sysfs sysfs /sys 2>/dev/null\n\
-mount -t devtmpfs devtmpfs /dev 2>/dev/null\n\
-export PATH=/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin\n\
-export HOME=/root RUSTUP_HOME=/root/.rustup CARGO_HOME=/root/.cargo\n\
-export RUSTUP_TOOLCHAIN=nightly-2026-05-28 CARGO_NET_OFFLINE=true\n\
-if rustc --version && cargo --version; then\n\
-    echo 'BUILDSTORM_TOOLCHAIN ok'\n\
-    echo 'TOOLCHAIN_RESULT status=OK'\n\
-else\n\
-    echo 'BUILDSTORM_TOOLCHAIN fail'\n\
-    echo 'TOOLCHAIN_RESULT status=FAIL'\n\
-fi\n\
-rm -rf /tmp/minibuild\n\
-if cargo new --vcs none /tmp/minibuild >/dev/null 2>&1 && (cd /tmp/minibuild && cargo build >/dev/null 2>&1) && [ \"$(/tmp/minibuild/target/debug/minibuild)\" = 'Hello, world!' ]; then\n\
-    echo 'BUILDSTORM_MINIBUILD ok'\n\
-    echo 'MINIBUILD_RESULT status=OK'\n\
-else\n\
-    echo 'BUILDSTORM_MINIBUILD fail'\n\
-    echo 'MINIBUILD_RESULT status=FAIL'\n\
-fi\n\
-echo '#### OS COMP TEST GROUP END buildstorm-glibc ####'\n\0";
-
 fn shutdown_now() -> ! {
     shutdown();
     loop {
@@ -94,6 +69,9 @@ fn main() -> i32 {
     }
 
     run_script(b"./cagent_testcode.sh\0", b"CAgent");
-    run_script(BUILDSTORM_Q21, b"BuildStorm 2.1");
+    run_script(
+        b"./buildstorm_testcode.sh\0",
+        b"BuildStorm 2.1 + 2.2",
+    );
     shutdown_now();
 }
