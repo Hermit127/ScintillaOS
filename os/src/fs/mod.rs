@@ -85,6 +85,12 @@ pub const S_IFREG: u32 = 0o100000;
 pub const S_IFLNK: u32 = 0o120000;
 pub const S_IFSOCK: u32 = 0o140000;
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct FilePageCacheKey {
+    pub super_block: usize,
+    pub inode: u32,
+}
+
 pub trait File: Send + Sync {
     // 这个 fd 是否支持读取。
     // 执行时由具体文件对象返回自己的读权限，不要求访问底层文件内容。
@@ -123,6 +129,10 @@ pub trait File: Send + Sync {
     fn path(&self) -> Option<String> {
         None
     }
+    // Return stable inode identity for clean file-backed mmap page sharing.
+    fn page_cache_key(&self) -> Option<FilePageCacheKey> {
+        None
+    }
     // 默认不支持读目录项。
     // 执行时默认返回 -1 表示不支持 getdents64，目录对象需要自己实现。
     fn getdents64(&self, _buf: &mut [u8]) -> isize {
@@ -157,6 +167,12 @@ pub trait File: Send + Sync {
     fn poll(&self) -> (bool, bool, bool) {
         (true, true, false)
     }
+    // Stateful files can increment this when poll-visible readiness changes,
+    // allowing edge-triggered epoll to observe transitions between samples.
+    // Permanently ready files can keep the default generation.
+    fn readiness_generation(&self) -> u64 {
+        0
+    }
     // fd 复制时的引用钩子，普通文件不需要额外动作。
     // 执行时默认什么都不做，只有管道或 socket 这类需要计数的对象才覆盖。
     fn dup_ref(&self) {}
@@ -170,7 +186,7 @@ pub trait File: Send + Sync {
 
 pub use inode::{
     follow_symlink, link_at, mkdir_at, open_file, open_file_at, rename_at, symlink_at, unlink_at,
-    OpenFlags,
+    unlink_at_result, OpenFlags,
 };
 pub use epoll::{EpollEvent, EpollFile, EPOLL_MAX_INTERESTS};
 pub use eventfd::EventFdFile;

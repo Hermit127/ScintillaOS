@@ -44,6 +44,18 @@
 
 #include "ext4_crc32.h"
 
+#if defined(__loongarch64)
+#include <larchintrin.h>
+#define LOONGARCH_CPUCFG1_CRC32 (1U << 25)
+#endif
+
+typedef uint64_t crc_u64_alias __attribute__((__may_alias__));
+
+static inline uint64_t crc_load_aligned_u64(const uint8_t *p)
+{
+	return *(const crc_u64_alias *)p;
+}
+
 static const uint32_t crc32_tab[] = {
 	0x00000000, 0x77073096, 0xee0e612c, 0x990951ba, 0x076dc419, 0x706af48f,
 	0xe963a535, 0x9e6495a3,	0x0edb8832, 0x79dcb8a4, 0xe0d5e91e, 0x97d2d988,
@@ -172,6 +184,106 @@ static inline uint32_t crc32(uint32_t crc, const void *buf, uint32_t size,
 	return (crc);
 }
 
+#if defined(__loongarch64)
+static uint32_t crc32c_loongarch(uint32_t crc, const void *buf, uint32_t size)
+{
+	const uint8_t *p = (const uint8_t *)buf;
+
+	while (size != 0 && ((uintptr_t)p & (sizeof(uint64_t) - 1)) != 0) {
+		crc = (uint32_t)__crcc_w_b_w((char)*p++, (int)crc);
+		size--;
+	}
+	while (size >= sizeof(uint64_t)) {
+		uint64_t value = crc_load_aligned_u64(p);
+		crc = (uint32_t)__crcc_w_d_w((long)value, (int)crc);
+		p += sizeof(value);
+		size -= sizeof(value);
+	}
+	if (size >= sizeof(uint32_t)) {
+		uint32_t value;
+		__builtin_memcpy(&value, p, sizeof(value));
+		crc = (uint32_t)__crcc_w_w_w((int)value, (int)crc);
+		p += sizeof(value);
+		size -= sizeof(value);
+	}
+	if (size >= sizeof(uint16_t)) {
+		uint16_t value;
+		__builtin_memcpy(&value, p, sizeof(value));
+		crc = (uint32_t)__crcc_w_h_w((short)value, (int)crc);
+		p += sizeof(value);
+		size -= sizeof(value);
+	}
+	if (size != 0)
+		crc = (uint32_t)__crcc_w_b_w((char)*p, (int)crc);
+
+	return crc;
+}
+#endif
+
+static uint32_t crc32c_slice_tab[7][256];
+static uint32_t crc32c_slice_state;
+
+static void crc32c_prepare_slicing(void)
+{
+	uint32_t expected = 0;
+	uint32_t i;
+
+	if (__atomic_load_n(&crc32c_slice_state, __ATOMIC_ACQUIRE) == 2)
+		return;
+	if (__atomic_compare_exchange_n(&crc32c_slice_state, &expected, 1,
+					false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+		for (i = 0; i < 256; i++) {
+			uint32_t crc = crc32c_tab[i];
+			uint32_t slice;
+
+			for (slice = 0; slice < 7; slice++) {
+				crc = crc32c_tab[crc & 0xFF] ^ (crc >> 8);
+				crc32c_slice_tab[slice][i] = crc;
+			}
+		}
+		__atomic_store_n(&crc32c_slice_state, 2, __ATOMIC_RELEASE);
+		return;
+	}
+	while (__atomic_load_n(&crc32c_slice_state, __ATOMIC_ACQUIRE) != 2)
+		;
+}
+
+static uint32_t crc32c_slicing(uint32_t crc, const void *buf, uint32_t size)
+{
+	const uint8_t *p = (const uint8_t *)buf;
+
+	while (size != 0 && ((uintptr_t)p & (sizeof(uint64_t) - 1)) != 0) {
+		crc = crc32c_tab[(crc ^ *p++) & 0xFF] ^ (crc >> 8);
+		size--;
+	}
+	if (size < sizeof(uint64_t))
+		return crc32(crc, p, size, crc32c_tab);
+
+	crc32c_prepare_slicing();
+	while (size >= sizeof(uint64_t)) {
+		uint64_t data = crc_load_aligned_u64(p);
+		uint32_t upper;
+
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+		data = __builtin_bswap64(data);
+#endif
+		crc ^= (uint32_t)data;
+		upper = (uint32_t)(data >> 32);
+		crc = crc32c_slice_tab[6][crc & 0xFF] ^
+		      crc32c_slice_tab[5][(crc >> 8) & 0xFF] ^
+		      crc32c_slice_tab[4][(crc >> 16) & 0xFF] ^
+		      crc32c_slice_tab[3][crc >> 24] ^
+		      crc32c_slice_tab[2][upper & 0xFF] ^
+		      crc32c_slice_tab[1][(upper >> 8) & 0xFF] ^
+		      crc32c_slice_tab[0][(upper >> 16) & 0xFF] ^
+		      crc32c_tab[upper >> 24];
+		p += sizeof(data);
+		size -= sizeof(data);
+	}
+
+	return crc32(crc, p, size, crc32c_tab);
+}
+
 uint32_t ext4_crc32(uint32_t crc, const void *buf, uint32_t size)
 {
 	return crc32(crc, buf, size, crc32_tab);
@@ -179,7 +291,11 @@ uint32_t ext4_crc32(uint32_t crc, const void *buf, uint32_t size)
 
 uint32_t ext4_crc32c(uint32_t crc, const void *buf, uint32_t size)
 {
-	return crc32(crc, buf, size, crc32c_tab);
+#if defined(__loongarch64)
+	if ((__cpucfg(1) & LOONGARCH_CPUCFG1_CRC32) != 0)
+		return crc32c_loongarch(crc, buf, size);
+#endif
+	return crc32c_slicing(crc, buf, size);
 }
 
 /**

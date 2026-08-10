@@ -1,6 +1,14 @@
 use core::ptr::NonNull;
 #[cfg(feature = "mount-trace")]
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::AtomicUsize;
+#[cfg(any(feature = "smp-diagnostics", feature = "lock-stats"))]
+use core::sync::atomic::AtomicU64;
+#[cfg(any(
+    feature = "mount-trace",
+    feature = "smp-diagnostics",
+    feature = "lock-stats"
+))]
+use core::sync::atomic::Ordering;
 
 use super::BlockDevice;
 use crate::mm::{frames_alloc, FrameTracker};
@@ -38,9 +46,29 @@ const VIRTIO0: PhysAddr = polyhal::pa!(0xa00_0000);
 #[cfg(target_arch = "loongarch64")]
 const PCI_ECAM_BASE: PhysAddr = polyhal::pa!(0x20000000);
 
-const DMA_BOUNCE_SIZE: usize = 4096;
+const DMA_BOUNCE_SIZE: usize = 64 * 1024;
 #[cfg(feature = "mount-trace")]
 static MOUNT_TRACE_CAPACITY_COUNT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(any(feature = "smp-diagnostics", feature = "lock-stats"))]
+static BLOCK_READ_REQUESTS: AtomicU64 = AtomicU64::new(0);
+#[cfg(any(feature = "smp-diagnostics", feature = "lock-stats"))]
+static BLOCK_READ_BYTES: AtomicU64 = AtomicU64::new(0);
+#[cfg(any(feature = "smp-diagnostics", feature = "lock-stats"))]
+static BLOCK_WRITE_REQUESTS: AtomicU64 = AtomicU64::new(0);
+#[cfg(any(feature = "smp-diagnostics", feature = "lock-stats"))]
+static BLOCK_WRITE_BYTES: AtomicU64 = AtomicU64::new(0);
+#[cfg(any(feature = "smp-diagnostics", feature = "lock-stats"))]
+static BLOCK_READ_DMA_NS: AtomicU64 = AtomicU64::new(0);
+#[cfg(any(feature = "smp-diagnostics", feature = "lock-stats"))]
+static BLOCK_READ_DMA_MAX_NS: AtomicU64 = AtomicU64::new(0);
+#[cfg(any(feature = "smp-diagnostics", feature = "lock-stats"))]
+static BLOCK_READ_COPY_NS: AtomicU64 = AtomicU64::new(0);
+#[cfg(any(feature = "smp-diagnostics", feature = "lock-stats"))]
+static BLOCK_WRITE_COPY_NS: AtomicU64 = AtomicU64::new(0);
+#[cfg(any(feature = "smp-diagnostics", feature = "lock-stats"))]
+static BLOCK_WRITE_DMA_NS: AtomicU64 = AtomicU64::new(0);
+#[cfg(any(feature = "smp-diagnostics", feature = "lock-stats"))]
+static BLOCK_WRITE_DMA_MAX_NS: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "smp-diagnostics")]
 const RUSTC_DRIVER_TRACE_SECTOR: usize = 715_880 * (PAGE_SIZE / SECTOR_SIZE);
 
@@ -48,13 +76,13 @@ const RUSTC_DRIVER_TRACE_SECTOR: usize = 715_880 * (PAGE_SIZE / SECTOR_SIZE);
 #[repr(C)]
 pub struct VirtIOBlock(
     DeviceLock<VirtIOBlk<VirtioHal, MmioTransport>>,
-    DeviceLock<[u8; DMA_BOUNCE_SIZE]>,
+    DeviceLock<Vec<u8>>,
 );
 #[cfg(target_arch = "loongarch64")]
 #[repr(C)]
 pub struct VirtIOBlock(
     DeviceLock<VirtIOBlk<VirtioHal, PciTransport>>,
-    DeviceLock<[u8; DMA_BOUNCE_SIZE]>,
+    DeviceLock<Vec<u8>>,
 );
 
 lazy_static! {
@@ -79,10 +107,21 @@ impl BlockDevice for VirtIOBlock {
         let mut done = 0;
         while done < buf.len() {
             let chunk = (buf.len() - done).min(DMA_BOUNCE_SIZE);
+            #[cfg(any(feature = "smp-diagnostics", feature = "lock-stats"))]
+            let dma_started_ns = polyhal::time::Time::now().to_nsec() as u64;
             #[cfg(feature = "smp-diagnostics")]
             let watched_before_dma = crate::mm::watched_frame_is_intact();
             blk.read_blocks(block_id + done / SECTOR_SIZE, &mut bounce[..chunk])
                 .expect("Error when reading VirtIOBlk");
+            #[cfg(any(feature = "smp-diagnostics", feature = "lock-stats"))]
+            {
+                let elapsed_ns = (polyhal::time::Time::now().to_nsec() as u64)
+                    .saturating_sub(dma_started_ns);
+                BLOCK_READ_REQUESTS.fetch_add(1, Ordering::Relaxed);
+                BLOCK_READ_BYTES.fetch_add(chunk as u64, Ordering::Relaxed);
+                BLOCK_READ_DMA_NS.fetch_add(elapsed_ns, Ordering::Relaxed);
+                BLOCK_READ_DMA_MAX_NS.fetch_max(elapsed_ns, Ordering::Relaxed);
+            }
             #[cfg(feature = "smp-diagnostics")]
             if watched_before_dma && !crate::mm::watched_frame_is_intact() {
                 crate::println!(
@@ -112,7 +151,14 @@ impl BlockDevice for VirtIOBlock {
             }
             #[cfg(feature = "smp-diagnostics")]
             let watched_before_copy = crate::mm::watched_frame_is_intact();
+            #[cfg(any(feature = "smp-diagnostics", feature = "lock-stats"))]
+            let copy_started_ns = polyhal::time::Time::now().to_nsec() as u64;
             buf[done..done + chunk].copy_from_slice(&bounce[..chunk]);
+            #[cfg(any(feature = "smp-diagnostics", feature = "lock-stats"))]
+            BLOCK_READ_COPY_NS.fetch_add(
+                (polyhal::time::Time::now().to_nsec() as u64).saturating_sub(copy_started_ns),
+                Ordering::Relaxed,
+            );
             #[cfg(feature = "smp-diagnostics")]
             if watched_before_copy && !crate::mm::watched_frame_is_intact() {
                 crate::println!(
@@ -133,11 +179,36 @@ impl BlockDevice for VirtIOBlock {
         let mut done = 0;
         while done < buf.len() {
             let chunk = (buf.len() - done).min(DMA_BOUNCE_SIZE);
+            #[cfg(any(feature = "smp-diagnostics", feature = "lock-stats"))]
+            let copy_started_ns = polyhal::time::Time::now().to_nsec() as u64;
             bounce[..chunk].copy_from_slice(&buf[done..done + chunk]);
+            #[cfg(any(feature = "smp-diagnostics", feature = "lock-stats"))]
+            BLOCK_WRITE_COPY_NS.fetch_add(
+                (polyhal::time::Time::now().to_nsec() as u64).saturating_sub(copy_started_ns),
+                Ordering::Relaxed,
+            );
+            #[cfg(any(feature = "smp-diagnostics", feature = "lock-stats"))]
+            let dma_started_ns = polyhal::time::Time::now().to_nsec() as u64;
             blk.write_blocks(block_id + done / SECTOR_SIZE, &bounce[..chunk])
                 .expect("Error when writing VirtIOBlk");
+            #[cfg(any(feature = "smp-diagnostics", feature = "lock-stats"))]
+            {
+                let elapsed_ns = (polyhal::time::Time::now().to_nsec() as u64)
+                    .saturating_sub(dma_started_ns);
+                BLOCK_WRITE_REQUESTS.fetch_add(1, Ordering::Relaxed);
+                BLOCK_WRITE_BYTES.fetch_add(chunk as u64, Ordering::Relaxed);
+                BLOCK_WRITE_DMA_NS.fetch_add(elapsed_ns, Ordering::Relaxed);
+                BLOCK_WRITE_DMA_MAX_NS.fetch_max(elapsed_ns, Ordering::Relaxed);
+            }
             done += chunk;
         }
+    }
+
+    fn flush(&self) {
+        self.0
+            .exclusive_access()
+            .flush()
+            .expect("Error when flushing VirtIOBlk");
     }
 
     fn capacity_bytes(&self) -> Option<u64> {
@@ -160,6 +231,32 @@ impl BlockDevice for VirtIOBlock {
         );
         Some(capacity)
     }
+}
+
+#[cfg(any(feature = "smp-diagnostics", feature = "lock-stats"))]
+pub fn dump_block_io_stats() {
+    let read_requests = BLOCK_READ_REQUESTS.load(Ordering::Relaxed);
+    let read_bytes = BLOCK_READ_BYTES.load(Ordering::Relaxed);
+    let write_requests = BLOCK_WRITE_REQUESTS.load(Ordering::Relaxed);
+    let write_bytes = BLOCK_WRITE_BYTES.load(Ordering::Relaxed);
+    crate::println!(
+        "[block-stats] reads={} bytes={} avg={} writes={} bytes={} avg={}",
+        read_requests,
+        read_bytes,
+        read_bytes.checked_div(read_requests).unwrap_or(0),
+        write_requests,
+        write_bytes,
+        write_bytes.checked_div(write_requests).unwrap_or(0),
+    );
+    crate::println!(
+        "[block-stats] read_dma_us={} read_dma_max_us={} read_copy_us={} write_copy_us={} write_dma_us={} write_dma_max_us={}",
+        BLOCK_READ_DMA_NS.load(Ordering::Relaxed) / 1_000,
+        BLOCK_READ_DMA_MAX_NS.load(Ordering::Relaxed) / 1_000,
+        BLOCK_READ_COPY_NS.load(Ordering::Relaxed) / 1_000,
+        BLOCK_WRITE_COPY_NS.load(Ordering::Relaxed) / 1_000,
+        BLOCK_WRITE_DMA_NS.load(Ordering::Relaxed) / 1_000,
+        BLOCK_WRITE_DMA_MAX_NS.load(Ordering::Relaxed) / 1_000,
+    );
 }
 
 impl VirtIOBlock {
@@ -187,7 +284,10 @@ impl VirtIOBlock {
             );
             Self(
                 DeviceLock::new_named(blk, "VirtIOBlock"),
-                DeviceLock::new_named([0u8; DMA_BOUNCE_SIZE], "VirtIOBounce"),
+                DeviceLock::new_named(
+                    alloc::vec![0u8; DMA_BOUNCE_SIZE],
+                    "VirtIOBounce",
+                ),
             )
         }
     }
@@ -221,7 +321,10 @@ impl VirtIOBlock {
                         "VirtIOBlock",
                         )
                     },
-                    DeviceLock::new_named([0u8; DMA_BOUNCE_SIZE], "VirtIOBounce"),
+                    DeviceLock::new_named(
+                        alloc::vec![0u8; DMA_BOUNCE_SIZE],
+                        "VirtIOBounce",
+                    ),
                 );
             }
             block_index += 1;
@@ -394,7 +497,10 @@ pub fn probe_all() -> Vec<Arc<dyn BlockDevice>> {
         let dev: Arc<dyn BlockDevice> =
             Arc::new(VirtIOBlock(
                 DeviceLock::new_named(blk, "VirtIOBlock"),
-                DeviceLock::new_named([0u8; DMA_BOUNCE_SIZE], "VirtIOBounce"),
+                DeviceLock::new_named(
+                    alloc::vec![0u8; DMA_BOUNCE_SIZE],
+                    "VirtIOBounce",
+                ),
             ));
         crate::println!("[virtio-blk] probe {:#x}: OK (device #{})", base, out.len());
         out.push(dev);
@@ -450,7 +556,10 @@ pub fn probe_all() -> Vec<Arc<dyn BlockDevice>> {
         out.push(
             Arc::new(VirtIOBlock(
                 DeviceLock::new_named(blk, "VirtIOBlock"),
-                DeviceLock::new_named([0u8; DMA_BOUNCE_SIZE], "VirtIOBounce"),
+                DeviceLock::new_named(
+                    alloc::vec![0u8; DMA_BOUNCE_SIZE],
+                    "VirtIOBounce",
+                ),
             )) as Arc<dyn BlockDevice>,
         );
     }

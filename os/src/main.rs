@@ -6,8 +6,8 @@
 use crate::{
     syscall::{syscall, SYSCALL_EXEC},
     task::{
-        check_and_wake_up_tasks, check_itimers, check_signals_error_of_current, current_add_signal,
-        current_task, exit_current_and_run_next, force_exit_task_group, handle_signals,
+        check_and_wake_up_tasks, check_itimers, current_add_signal, current_task,
+        exit_current_and_run_next, force_exit_task_group, handle_signals,
         suspend_current_and_run_next, SignalFlags,
     },
 };
@@ -39,6 +39,7 @@ mod net;
 mod sync;
 mod syscall;
 mod task;
+mod time;
 
 pub struct ArchInterfaceImpl;
 
@@ -58,6 +59,18 @@ pub(crate) static SMP_FIRST_TASK_ENTERED: AtomicBool = AtomicBool::new(false);
 /// allocator can import and overwrite a late secondary's per-CPU storage.
 #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
 static SMP_PERCPU_READY: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(any(
+    feature = "smp-diagnostics",
+    feature = "buildstorm-mm-diagnostics"
+))]
+static STACK_PAGE_FAULT_DIAG_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(any(
+    feature = "smp-diagnostics",
+    feature = "buildstorm-mm-diagnostics"
+))]
+static USER_PAGE_FAULT_FAILURE_DIAG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
 fn park_secondary_hart() -> ! {
@@ -86,63 +99,121 @@ fn expected_cpu_mask() -> usize {
 fn sync_shared_vm_after_page_fault(
     task: &alloc::sync::Arc<task::TaskControlBlock>,
     vaddr: polyhal::VirtAddr,
+    translation_changed: bool,
 ) {
-    let snapshot = {
+    if !translation_changed {
+        return;
+    }
+    let memory_set = {
         let inner = task.inner_exclusive_access();
-        if !inner.memory_set.is_shared() {
-            return;
-        }
-        let vpn = vaddr.floor();
-        let Some(frame) = inner.memory_set.clone_frame_metadata(vpn) else {
-            return;
-        };
-        (task.getpid(), inner.tgid, vpn, frame)
+        inner.memory_set.fault_view()
     };
-    crate::syscall::process::sync_thread_group_vm_frame(
-        snapshot.0,
-        snapshot.1,
-        snapshot.2,
-        &snapshot.3,
+    if !memory_set.is_shared() {
+        return;
+    }
+    let vpn = vaddr.floor();
+    let activity = memory_set.activity_handle();
+    let _ = crate::task::flush_remote_tlb(
+        &activity,
+        vpn.raw(),
+        crate::config::PAGE_SIZE,
     );
 }
 
 /// Resolve a user page fault and synchronize shared address-space metadata.
 ///
-/// Fault resolution only installs a previously absent mapping or upgrades a
-/// restrictive PTE.  It never retires a frame or revokes access, so a remote
-/// hart may safely retain an older TLB entry until it faults and reloads the
-/// updated PTE.  Requiring an immediate remote acknowledgement here can
-/// deadlock two threads while one holds a local IRQ-masking kernel lock.
-/// Operations that revoke mappings still perform a synchronous shootdown
-/// before releasing frames.
+/// Fault resolution normally installs a previously absent mapping. A
+/// copy-on-write fault is different: it replaces an existing physical page,
+/// so every hart running this address space must discard the old translation
+/// before the faulting thread returns to userspace.
 fn handle_current_user_page_fault(vaddr: polyhal::VirtAddr, access: crate::mm::PageFaultAccess) {
-    let task = crate::task::current_task().unwrap();
-    let fault_result = {
-        let mut inner = task.inner_exclusive_access();
-        inner.memory_set.handle_page_fault(vaddr, access)
+    let task = crate::task::current_task()
+        .expect("user page fault reached resolver without a current task");
+    #[cfg(any(
+        feature = "smp-diagnostics",
+        feature = "buildstorm-mm-diagnostics"
+    ))]
+    let (fault_pc, fault_sp) = {
+        let inner = task.inner_exclusive_access();
+        let ctx = inner.get_trap_cx();
+        (ctx[TrapFrameArgs::SEPC], ctx[TrapFrameArgs::SP])
     };
+    let fault_space = {
+        let inner = task.inner_exclusive_access();
+        inner.memory_set.fault_view()
+    };
+    let fault_result = fault_space.handle_page_fault(vaddr, access);
+
+    #[cfg(any(
+        feature = "smp-diagnostics",
+        feature = "buildstorm-mm-diagnostics"
+    ))]
+    if vaddr.raw() / crate::config::PAGE_SIZE == fault_sp / crate::config::PAGE_SIZE
+        && STACK_PAGE_FAULT_DIAG_COUNT.fetch_add(1, Ordering::Relaxed) < 256
+    {
+        let result = match fault_result {
+            Some(crate::mm::PageFaultResult::Handled) => "handled",
+            Some(crate::mm::PageFaultResult::SharedMetadataChanged) => "shared-metadata",
+            Some(crate::mm::PageFaultResult::SharedTranslationChanged) => "shared-translation",
+            None => "failed",
+        };
+        let (tgid, executable_path, diag_space) = {
+            let inner = task.inner_exclusive_access();
+            (
+                inner.tgid,
+                inner.executable_path.clone(),
+                inner.memory_set.fault_view(),
+            )
+        };
+        println!(
+            "[fault-diag] stack-page tid={} tgid={} exe={} pc={:#x} sp={:#x} bad={:#x} access={} result={}",
+            task.getpid(),
+            tgid,
+            executable_path,
+            fault_pc,
+            fault_sp,
+            vaddr.raw(),
+            match access {
+                crate::mm::PageFaultAccess::Read => "read",
+                crate::mm::PageFaultAccess::Write => "write",
+                crate::mm::PageFaultAccess::Execute => "execute",
+            },
+            result,
+        );
+        diag_space.print_fault_mapping(vaddr);
+    }
 
     let Some(fault_result) = fault_result else {
-        #[cfg(feature = "smp-diagnostics")]
-        {
-            let inner = task.inner_exclusive_access();
-            let ctx = inner.get_trap_cx();
+        #[cfg(any(
+            feature = "smp-diagnostics",
+            feature = "buildstorm-mm-diagnostics"
+        ))]
+        if USER_PAGE_FAULT_FAILURE_DIAG_COUNT.fetch_add(1, Ordering::Relaxed) < 64 {
+            let (tgid, executable_path, ctx) = {
+                let inner = task.inner_exclusive_access();
+                (
+                    inner.tgid,
+                    inner.executable_path.clone(),
+                    inner.get_trap_cx().clone(),
+                )
+            };
             let pc = ctx[TrapFrameArgs::SEPC];
-            let instruction = if inner.memory_set.valid_user_buf(
+            let instruction = if fault_space.valid_user_buf(
                 pc as *const u8,
                 core::mem::size_of::<u32>(),
                 false,
             ) {
-                let token = inner.get_user_token();
+                let token = fault_space.token();
                 Some(*crate::mm::translated_ref(token, pc as *const u32))
             } else {
                 None
             };
             let args = ctx.args();
             println!(
-                "[fault-diag] user page fault tid={} tgid={} access={} sepc={:#x} raw={:#010x} bad={:#x} sp={:#x} tp={:#x} ra={:#x} a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x} reason={} frames={}/{} free={} alloc_failures={}",
+                "[fault-diag] user page fault tid={} tgid={} exe={} access={} sepc={:#x} raw={:#010x} bad={:#x} sp={:#x} tp={:#x} ra={:#x} a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x} reason={} frames={}/{} free={} alloc_failures={}",
                 task.getpid(),
-                inner.tgid,
+                tgid,
+                executable_path,
                 match access {
                     crate::mm::PageFaultAccess::Read => "read",
                     crate::mm::PageFaultAccess::Write => "write",
@@ -181,10 +252,8 @@ fn handle_current_user_page_fault(vaddr: polyhal::VirtAddr, access: crate::mm::P
                 ctx.regs[31],
             );
             #[cfg(target_arch = "loongarch64")]
-            inner
-                .memory_set
-                .print_fault_mapping(polyhal::VirtAddr::from(ctx.regs[28]));
-            inner.memory_set.print_fault_mapping(vaddr);
+            fault_space.print_fault_mapping(polyhal::VirtAddr::from(ctx.regs[28]));
+            fault_space.print_fault_mapping(vaddr);
         }
         // A userspace access-permission fault is delivered through the normal
         // signal path.  The previous unconditional exit bypassed an installed
@@ -193,9 +262,65 @@ fn handle_current_user_page_fault(vaddr: polyhal::VirtAddr, access: crate::mm::P
         current_add_signal(SignalFlags::SIGSEGV);
         return;
     };
-    if fault_result == crate::mm::PageFaultResult::SharedMetadataChanged {
-        sync_shared_vm_after_page_fault(&task, vaddr);
+    match fault_result {
+        crate::mm::PageFaultResult::SharedMetadataChanged => {
+            sync_shared_vm_after_page_fault(&task, vaddr, false);
+        }
+        crate::mm::PageFaultResult::SharedTranslationChanged => {
+            sync_shared_vm_after_page_fault(&task, vaddr, true);
+        }
+        crate::mm::PageFaultResult::Handled => {}
     }
+}
+
+fn dispatch_page_fault(
+    ctx: &TrapFrame,
+    bad_addr: usize,
+    access: crate::mm::PageFaultAccess,
+    from_user: bool,
+) {
+    if from_user && current_task().is_some() {
+        IRQ::int_enable();
+        handle_current_user_page_fault(polyhal::VirtAddr::from(bad_addr), access);
+        return;
+    }
+
+    let access_name = match access {
+        crate::mm::PageFaultAccess::Read => "read",
+        crate::mm::PageFaultAccess::Write => "write",
+        crate::mm::PageFaultAccess::Execute => "execute",
+    };
+    let args = ctx.args();
+    let cpu = crate::task::try_current_hart_id().unwrap_or(usize::MAX);
+    let tid = current_task().map(|task| task.getpid()).unwrap_or(0);
+    println!(
+        "[fault-diag] invalid page-fault dispatch cpu={} tid={} user={} access={} sepc={:#x} bad={:#x} sp={:#x} ra={:#x} a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x}",
+        cpu,
+        tid,
+        from_user,
+        access_name,
+        ctx[TrapFrameArgs::SEPC],
+        bad_addr,
+        ctx[TrapFrameArgs::SP],
+        ctx[TrapFrameArgs::RA],
+        args[0],
+        args[1],
+        args[2],
+        args[3],
+        args[4],
+        args[5],
+    );
+    #[cfg(feature = "buildstorm-diagnostics")]
+    crate::syscall::dump_all_active_syscalls("page-fault");
+    panic!(
+        "{} page fault outside a valid user task: cpu={} tid={} user={} sepc={:#x} bad={:#x}",
+        access_name,
+        cpu,
+        tid,
+        from_user,
+        ctx[TrapFrameArgs::SEPC],
+        bad_addr,
+    );
 }
 
 fn exit_current_on_user_fault(signal: i32) -> ! {
@@ -264,9 +389,6 @@ fn diagnose_watched_frame_corruption(ctx: &TrapFrame, trap_type: TrapType) {
 fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
     let from_user = trap_from_user(ctx);
     if from_user {
-        if let Some(task) = crate::task::current_task() {
-            task.save_user_float_state();
-        }
         // user time accounting
         if let Some(task) = crate::task::current_task() {
             task.record_time_user_to_kernel();
@@ -304,15 +426,24 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             }
         }
         StorePageFault(bad_addr) => {
-            IRQ::int_enable();
-            handle_current_user_page_fault(
-                polyhal::VirtAddr::from(bad_addr),
+            if from_user {
+                // User faults may perform file-backed I/O. Keep that slow path
+                // interruptible so scheduler-aware VM and filesystem locks can
+                // block instead of spinning behind another hart.
+                IRQ::int_enable();
+            }
+            dispatch_page_fault(
+                ctx,
+                bad_addr,
                 crate::mm::PageFaultAccess::Write,
+                from_user,
             );
         }
         InstructionPageFault(bad_addr)
-            if bad_addr == task::SIGNAL_RETURN_TRAMPOLINE
-                || ctx[TrapFrameArgs::SEPC] == task::SIGNAL_RETURN_TRAMPOLINE =>
+            if from_user
+                && current_task().is_some()
+                && (bad_addr == task::SIGNAL_RETURN_TRAMPOLINE
+                    || ctx[TrapFrameArgs::SEPC] == task::SIGNAL_RETURN_TRAMPOLINE) =>
         {
             IRQ::int_enable();
             if let Some(ret) = task::restore_current_signal_context() {
@@ -322,14 +453,20 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             }
         }
         LoadPageFault(bad_addr) => {
-            IRQ::int_enable();
-            handle_current_user_page_fault(
-                polyhal::VirtAddr::from(bad_addr),
+            if from_user {
+                IRQ::int_enable();
+            }
+            dispatch_page_fault(
+                ctx,
+                bad_addr,
                 crate::mm::PageFaultAccess::Read,
+                from_user,
             );
         }
         InstructionPageFault(bad_addr) => {
-            IRQ::int_enable();
+            if from_user {
+                IRQ::int_enable();
+            }
             #[cfg(feature = "smp-diagnostics")]
             if bad_addr == 0 || ctx[TrapFrameArgs::SEPC] == 0 {
                 let args = ctx.args();
@@ -356,9 +493,11 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
                     args[5],
                 );
             }
-            handle_current_user_page_fault(
-                polyhal::VirtAddr::from(bad_addr),
+            dispatch_page_fault(
+                ctx,
+                bad_addr,
                 crate::mm::PageFaultAccess::Execute,
+                from_user,
             );
         }
         IllegalInstruction(bad_addr) => {
@@ -431,7 +570,14 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             // resources. A single timekeeper avoids interrupt-side lock
             // inversion while every hart still receives local timer ticks.
             if task::current_hart_id() == 0 {
-                net::net_poll();
+                // Both architectures use a 10 ms userspace scheduling tick.
+                // LoongArch keeps a 1 ms hardware timer for precise sleep
+                // deadlines, but polling VirtIO/smoltcp ten times per network
+                // tick only adds lock and device traffic and used to advance
+                // smoltcp's clock ten times too quickly.
+                if user_slice_expired {
+                    net::net_poll();
+                }
                 check_and_wake_up_tasks();
                 check_itimers();
                 #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
@@ -440,7 +586,9 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             // Kernel code is non-preemptible: switching only from a user trap
             // keeps lock ownership and kernel stacks local to the current hart.
             if user_slice_expired && from_user && current_task().is_some() {
-                suspend_current_and_run_next();
+                crate::task::suspend_current_and_run_next_reason(
+                    crate::task::SuspendReason::TimerPreempt,
+                );
             }
         }
         _ => {
@@ -450,18 +598,10 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
     if !from_user {
         return;
     }
+    crate::sync::drain_deferred_lock_wakes();
     // handle signals (handle the sent signal)
     // println!("[K] trap_handler:: handle_signals");
     handle_signals();
-
-    // check error signals (if error then exit)
-    if let Some((errno, msg)) = check_signals_error_of_current() {
-        println!("[kernel] {}", msg);
-        if let Some(task) = current_task() {
-            force_exit_task_group(&task, errno);
-        }
-        exit_current_and_run_next(errno);
-    }
 
     // kernel time accounting
     if let Some(task) = crate::task::current_task() {
@@ -533,11 +673,41 @@ fn main(hartid: usize) {
     // polyhal::init_interrupt(); done in polyhal::CPU::rust_main()
 
     polyhal::common::init(&PageAllocImpl);
-    get_mem_areas().iter().for_each(|(start, size)| {
-        println!("init memory region {:#x} - {:#x}", start, start + size);
-        mm::add_frames_range(*start, start + size);
-    });
+    let mem_areas = get_mem_areas();
+    let available_bytes = mem_areas
+        .iter()
+        .fold(0usize, |total, (_, size)| total.saturating_add(*size));
+    let mut heap_growth = (available_bytes / crate::config::KERNEL_HEAP_GROWTH_DIVISOR)
+        .min(crate::config::KERNEL_HEAP_MAX_GROWTH)
+        & !(crate::config::PAGE_SIZE - 1);
+    let requested_heap_growth = heap_growth;
+    for (start, size) in mem_areas.iter().copied() {
+        let region_end = start.saturating_add(size);
+        let aligned_start = start
+            .saturating_add(crate::config::PAGE_SIZE - 1)
+            & !(crate::config::PAGE_SIZE - 1);
+        let aligned_end = region_end & !(crate::config::PAGE_SIZE - 1);
+        let region_bytes = aligned_end.saturating_sub(aligned_start);
+        let reserved = heap_growth.min(region_bytes) & !(crate::config::PAGE_SIZE - 1);
+        if reserved != 0 {
+            mm::add_heap_region(aligned_start, reserved);
+            heap_growth -= reserved;
+        }
+        let frame_start = aligned_start.saturating_add(reserved);
+        if frame_start < aligned_end {
+            println!("init memory region {:#x} - {:#x}", frame_start, aligned_end);
+            mm::add_frames_range(frame_start, aligned_end);
+        }
+    }
+    let added_heap = requested_heap_growth - heap_growth;
+    println!(
+        "[heap] bootstrap={} growth={} total={}",
+        crate::config::KERNEL_HEAP_SIZE,
+        added_heap,
+        crate::config::KERNEL_HEAP_SIZE + added_heap,
+    );
 
+    time::init_realtime_clock();
     fs::mount_root();
     net::net_init();
     fs::list_apps();

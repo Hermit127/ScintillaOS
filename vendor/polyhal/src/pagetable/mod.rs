@@ -105,6 +105,35 @@ impl PageTable {
         TLB::flush_vaddr(vaddr);
     }
 
+    /// Map a set of base pages and perform a single TLB flush afterwards.
+    pub fn map_pages_batch(&self, mappings: &[(VirtAddr, PhysAddr, MappingFlags)]) {
+        for &(vaddr, paddr, flags) in mappings {
+            let mut pte_list = Self::get_pte_list(self.0);
+            if Self::PAGE_LEVEL == 4 {
+                let pte = &mut pte_list[vaddr.pn_index(3)];
+                if !pte.is_valid() {
+                    *pte = PTE::new_table(frame_alloc());
+                }
+                pte_list = Self::get_pte_list(pte.address());
+            }
+            let pte = &mut pte_list[vaddr.pn_index(2)];
+            if !pte.is_valid() {
+                *pte = PTE::new_table(frame_alloc());
+            }
+            pte_list = Self::get_pte_list(pte.address());
+
+            let pte = &mut pte_list[vaddr.pn_index(1)];
+            if !pte.is_valid() {
+                *pte = PTE::new_table(frame_alloc());
+            }
+            pte_list = Self::get_pte_list(pte.address());
+            pte_list[vaddr.pn_index(0)] = PTE::new_page(paddr, flags.into());
+        }
+        if !mappings.is_empty() {
+            TLB::flush_all();
+        }
+    }
+
     /// Mapping a page to specific address(kernel space address).
     ///
     /// TODO: This method is not implemented.
@@ -187,6 +216,158 @@ impl PageTable {
         TLB::flush_vaddr(vaddr);
     }
 
+    /// Unmap base pages with one page-table walk and one final TLB flush.
+    pub fn unmap_pages_batch(&self, pages: &[VirtAddr]) {
+        let mut changed = false;
+        let leaf_span = Self::PAGE_SIZE * Self::PTE_NUM_IN_PAGE;
+        let mut cached_leaf_key = usize::MAX;
+        let mut cached_leaf_table = None;
+        for &vaddr in pages {
+            let leaf_key = vaddr.raw() / leaf_span;
+            if leaf_key != cached_leaf_key {
+                cached_leaf_key = leaf_key;
+                let mut pte_list = Self::get_pte_list(self.0);
+                let mut valid = true;
+                if Self::PAGE_LEVEL == 4 {
+                    let pte = &mut pte_list[vaddr.pn_index(3)];
+                    if !pte.is_table() {
+                        valid = false;
+                    } else {
+                        pte_list = Self::get_pte_list(pte.address());
+                    }
+                }
+                if valid {
+                    let pte = &mut pte_list[vaddr.pn_index(2)];
+                    if !pte.is_table() {
+                        valid = false;
+                    } else {
+                        pte_list = Self::get_pte_list(pte.address());
+                    }
+                }
+                if valid {
+                    let pte = &mut pte_list[vaddr.pn_index(1)];
+                    cached_leaf_table = if pte.is_table() {
+                        Some(pte.address())
+                    } else {
+                        None
+                    };
+                } else {
+                    cached_leaf_table = None;
+                }
+            }
+            let Some(leaf_table) = cached_leaf_table else {
+                continue;
+            };
+            let pte = &mut Self::get_pte_list(leaf_table)[vaddr.pn_index(0)];
+            if pte.is_valid() {
+                *pte = PTE(0);
+                changed = true;
+            }
+        }
+        if changed {
+            TLB::flush_all();
+        }
+    }
+
+    /// Unmap base pages only while they still point at the expected frames.
+    /// Callers can use this after publishing a metadata change without
+    /// clearing a replacement mapping installed by a concurrent page fault.
+    pub fn unmap_pages_if_match_batch(&self, pages: &[(VirtAddr, PhysAddr)]) {
+        let mut changed = false;
+        let leaf_span = Self::PAGE_SIZE * Self::PTE_NUM_IN_PAGE;
+        let mut cached_leaf_key = usize::MAX;
+        let mut cached_leaf_table = None;
+        for &(vaddr, expected_paddr) in pages {
+            let leaf_key = vaddr.raw() / leaf_span;
+            if leaf_key != cached_leaf_key {
+                cached_leaf_key = leaf_key;
+                let mut pte_list = Self::get_pte_list(self.0);
+                let mut valid = true;
+                if Self::PAGE_LEVEL == 4 {
+                    let pte = &mut pte_list[vaddr.pn_index(3)];
+                    if !pte.is_table() {
+                        valid = false;
+                    } else {
+                        pte_list = Self::get_pte_list(pte.address());
+                    }
+                }
+                if valid {
+                    let pte = &mut pte_list[vaddr.pn_index(2)];
+                    if !pte.is_table() {
+                        valid = false;
+                    } else {
+                        pte_list = Self::get_pte_list(pte.address());
+                    }
+                }
+                if valid {
+                    let pte = &mut pte_list[vaddr.pn_index(1)];
+                    cached_leaf_table = if pte.is_table() {
+                        Some(pte.address())
+                    } else {
+                        None
+                    };
+                } else {
+                    cached_leaf_table = None;
+                }
+            }
+            let Some(leaf_table) = cached_leaf_table else {
+                continue;
+            };
+            let pte = &mut Self::get_pte_list(leaf_table)[vaddr.pn_index(0)];
+            if pte.is_valid() && pte.address().raw() == expected_paddr.raw() {
+                *pte = PTE(0);
+                changed = true;
+            }
+        }
+        if changed {
+            TLB::flush_all();
+        }
+    }
+
+    /// Replace leaf permissions only when the physical mapping still matches.
+    pub fn update_pages_flags_batch(
+        &self,
+        updates: &[(VirtAddr, PhysAddr, MappingFlags)],
+    ) -> bool {
+        let mut complete = true;
+        let mut changed = false;
+        for &(vaddr, expected_paddr, flags) in updates {
+            let mut pte_list = Self::get_pte_list(self.0);
+            if Self::PAGE_LEVEL == 4 {
+                let pte = &mut pte_list[vaddr.pn_index(3)];
+                if !pte.is_table() {
+                    complete = false;
+                    continue;
+                }
+                pte_list = Self::get_pte_list(pte.address());
+            }
+            let pte = &mut pte_list[vaddr.pn_index(2)];
+            if !pte.is_table() {
+                complete = false;
+                continue;
+            }
+            pte_list = Self::get_pte_list(pte.address());
+
+            let pte = &mut pte_list[vaddr.pn_index(1)];
+            if !pte.is_table() {
+                complete = false;
+                continue;
+            }
+            pte_list = Self::get_pte_list(pte.address());
+            let pte = &mut pte_list[vaddr.pn_index(0)];
+            if !pte.is_valid() || pte.address().raw() != expected_paddr.raw() {
+                complete = false;
+                continue;
+            }
+            *pte = PTE::new_page(expected_paddr, flags.into());
+            changed = true;
+        }
+        if changed {
+            TLB::flush_all();
+        }
+        complete
+    }
+
     /// Translate a virtual adress to a physical address and mapping flags.
     ///
     /// Return None if the vaddr isn't mapped.
@@ -218,6 +399,9 @@ impl PageTable {
         }
         // level 1, map page
         let pte = pte_list[vaddr.pn_index(0)];
+        if !pte.is_valid() {
+            return None;
+        }
         Some((
             PhysAddr::new(pte.address().raw() + vaddr.pn_offest(0)),
             pte.flags().into(),

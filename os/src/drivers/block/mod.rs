@@ -15,6 +15,15 @@ mod virtio_blk;
     target_arch = "loongarch64"
 ))]
 pub use virtio_blk::{VirtIOBlock, VirtioHal};
+#[cfg(all(
+    any(feature = "smp-diagnostics", feature = "lock-stats"),
+    any(
+        target_arch = "riscv64",
+        target_arch = "aarch64",
+        target_arch = "loongarch64"
+    )
+))]
+pub use virtio_blk::dump_block_io_stats;
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;

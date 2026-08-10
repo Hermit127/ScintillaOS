@@ -1,6 +1,6 @@
 use super::{File, Kstat, S_IFCHR};
 use crate::sync::DeviceLock;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
 pub const EPOLL_MAX_INTERESTS: usize = 1024;
@@ -46,10 +46,11 @@ pub struct EpollEvent {
 #[derive(Clone)]
 struct EpollInterest {
     fd: usize,
-    file: Arc<dyn File + Send + Sync>,
+    file: Weak<dyn File + Send + Sync>,
     event: EpollEvent,
     generation: u64,
     last_ready: u32,
+    last_readiness_generation: u64,
     oneshot_disabled: bool,
 }
 
@@ -65,6 +66,7 @@ struct EpollSample {
     event: EpollEvent,
     generation: u64,
     last_ready: u32,
+    last_readiness_generation: u64,
     oneshot_disabled: bool,
 }
 
@@ -99,60 +101,79 @@ impl EpollFile {
             return Err(-22);
         }
 
-        // A watch pins the open file description just like Linux's epitem.
-        file.dup_ref();
-        let result = {
-            let mut state = self.state.exclusive_access();
-            if state.interests.iter().any(|entry| entry.fd == fd) {
-                Err(-17)
-            } else if state.interests.len() == EPOLL_MAX_INTERESTS {
-                Err(-28)
-            } else {
-                let generation = state.next_generation;
-                state.next_generation = state.next_generation.wrapping_add(1);
-                state.interests.push(EpollInterest {
-                    fd,
-                    file: file.clone(),
-                    event,
-                    generation,
-                    last_ready: 0,
-                    oneshot_disabled: false,
-                });
-                Ok(())
-            }
-        };
-        if result.is_err() {
-            file.close_ref();
+        let mut state = self.state.exclusive_access();
+        state.interests.retain(|entry| entry.file.strong_count() != 0);
+        if state.interests.iter().any(|entry| {
+            entry.fd == fd
+                && entry
+                    .file
+                    .upgrade()
+                    .is_some_and(|watched| Arc::ptr_eq(&watched, &file))
+        }) {
+            Err(-17)
+        } else if state.interests.len() == EPOLL_MAX_INTERESTS {
+            Err(-28)
+        } else {
+            let generation = state.next_generation;
+            state.next_generation = state.next_generation.wrapping_add(1);
+            state.interests.push(EpollInterest {
+                fd,
+                last_readiness_generation: file.readiness_generation(),
+                file: Arc::downgrade(&file),
+                event,
+                generation,
+                last_ready: 0,
+                oneshot_disabled: false,
+            });
+            Ok(())
         }
-        result
     }
 
-    pub fn modify(&self, fd: usize, event: EpollEvent) -> Result<(), isize> {
+    pub fn modify(
+        &self,
+        fd: usize,
+        file: &Arc<dyn File + Send + Sync>,
+        event: EpollEvent,
+    ) -> Result<(), isize> {
         if event.events & !EPOLL_SUPPORTED_EVENTS != 0 {
             return Err(-22);
         }
         let mut state = self.state.exclusive_access();
         let generation = state.next_generation;
         state.next_generation = state.next_generation.wrapping_add(1);
-        let Some(entry) = state.interests.iter_mut().find(|entry| entry.fd == fd) else {
+        let Some(entry) = state.interests.iter_mut().find(|entry| {
+            entry.fd == fd
+                && entry
+                    .file
+                    .upgrade()
+                    .is_some_and(|watched| Arc::ptr_eq(&watched, file))
+        }) else {
             return Err(-2);
         };
         entry.event = event;
         entry.generation = generation;
         entry.last_ready = 0;
+        entry.last_readiness_generation = file.readiness_generation();
         entry.oneshot_disabled = false;
         Ok(())
     }
 
-    pub fn remove(&self, fd: usize) -> Result<(), isize> {
-        let removed = {
-            let mut state = self.state.exclusive_access();
-            let Some(index) = state.interests.iter().position(|entry| entry.fd == fd) else {
-                return Err(-2);
-            };
-            state.interests.remove(index)
+    pub fn remove(
+        &self,
+        fd: usize,
+        file: &Arc<dyn File + Send + Sync>,
+    ) -> Result<(), isize> {
+        let mut state = self.state.exclusive_access();
+        let Some(index) = state.interests.iter().position(|entry| {
+            entry.fd == fd
+                && entry
+                    .file
+                    .upgrade()
+                    .is_some_and(|watched| Arc::ptr_eq(&watched, file))
+        }) else {
+            return Err(-2);
         };
-        removed.file.close_ref();
+        state.interests.remove(index);
         Ok(())
     }
 
@@ -161,16 +182,24 @@ impl EpollFile {
         samples
             .try_reserve_exact(EPOLL_MAX_INTERESTS)
             .map_err(|_| -12isize)?;
-        let state = self.state.exclusive_access();
-        for entry in state.interests.iter() {
+        let mut state = self.state.exclusive_access();
+        let mut index = 0;
+        while index < state.interests.len() {
+            let entry = &state.interests[index];
+            let Some(file) = entry.file.upgrade() else {
+                state.interests.remove(index);
+                continue;
+            };
             samples.push(EpollSample {
                 fd: entry.fd,
-                file: entry.file.clone(),
+                file,
                 event: entry.event,
                 generation: entry.generation,
                 last_ready: entry.last_ready,
+                last_readiness_generation: entry.last_readiness_generation,
                 oneshot_disabled: entry.oneshot_disabled,
             });
+            index += 1;
         }
         Ok(samples)
     }
@@ -200,7 +229,8 @@ impl EpollFile {
         for sample in samples {
             let (readable, writable, hung_up) = sample.file.poll();
             let ready = Self::ready_mask(sample.event.events, readable, writable, hung_up);
-            sampled_ready.push((sample, ready));
+            let readiness_generation = sample.file.readiness_generation();
+            sampled_ready.push((sample, ready, readiness_generation));
         }
 
         let mut ready_events = Vec::new();
@@ -208,7 +238,7 @@ impl EpollFile {
             .try_reserve_exact(maxevents)
             .map_err(|_| -12isize)?;
         let mut state = self.state.exclusive_access();
-        for (sample, ready) in sampled_ready {
+        for (sample, ready, readiness_generation) in sampled_ready {
             let Some(entry) = state
                 .interests
                 .iter_mut()
@@ -219,6 +249,7 @@ impl EpollFile {
 
             if ready == 0 {
                 entry.last_ready = 0;
+                entry.last_readiness_generation = readiness_generation;
                 continue;
             }
             if entry.oneshot_disabled || ready_events.len() == maxevents {
@@ -227,9 +258,14 @@ impl EpollFile {
 
             let edge_triggered = entry.event.events & EPOLLET != 0;
             let newly_ready = ready & !entry.last_ready;
-            if !edge_triggered || newly_ready != 0 {
+            let readiness_changed = readiness_generation != entry.last_readiness_generation;
+            if !edge_triggered || newly_ready != 0 || readiness_changed {
                 ready_events.push(EpollEvent {
-                    events: if edge_triggered { newly_ready } else { ready },
+                    events: if edge_triggered && newly_ready != 0 {
+                        newly_ready
+                    } else {
+                        ready
+                    },
                     data: entry.event.data,
                 });
                 if entry.event.events & EPOLLONESHOT != 0 {
@@ -237,6 +273,7 @@ impl EpollFile {
                 }
             }
             entry.last_ready = ready;
+            entry.last_readiness_generation = readiness_generation;
         }
         Ok(ready_events)
     }
@@ -251,20 +288,11 @@ impl EpollFile {
             }
             let (readable, writable, hung_up) = sample.file.poll();
             let ready = Self::ready_mask(sample.event.events, readable, writable, hung_up);
-            ready != 0 && (sample.event.events & EPOLLET == 0 || ready & !sample.last_ready != 0)
+            ready != 0
+                && (sample.event.events & EPOLLET == 0
+                    || ready & !sample.last_ready != 0
+                    || sample.file.readiness_generation() != sample.last_readiness_generation)
         })
-    }
-}
-
-impl Drop for EpollFile {
-    fn drop(&mut self) {
-        let interests = {
-            let mut state = self.state.exclusive_access();
-            core::mem::take(&mut state.interests)
-        };
-        for interest in interests {
-            interest.file.close_ref();
-        }
     }
 }
 

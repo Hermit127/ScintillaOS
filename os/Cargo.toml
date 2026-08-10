@@ -5,11 +5,31 @@ authors = ["Yifan Wu <shinbokuow@163.com>"]
 edition = "2021"
 
 [features]
-default = []
+default = ["block-write-cache"]
 # Keep lock dependency checking and scheduler-stall snapshots available in an
 # optimized kernel. This feature adds diagnostics only and does not change the
 # userspace ABI or test programs.
 smp-diagnostics = []
+# Lock-order validation without per-event scheduler, VM, or syscall logging.
+# This is intended for long concurrent workloads where serial diagnostics
+# would otherwise dominate guest execution time.
+lockdep = []
+# Low-overhead aggregate lock counters. Unlike `smp-diagnostics`, this does
+# not enable per-event serial logging or lockdep checks in release builds.
+lock-stats = []
+# Fixed-size block write-back cache. Dirty data is flushed by fsync/sync,
+# unmount, shutdown, eviction, and the bounded dirty-page threshold.
+block-write-cache = []
+# Emit one scheduler/task snapshot only after all runnable work has vanished.
+# This stays separate from `smp-diagnostics` so long BuildStorm runs are not
+# perturbed by per-syscall and per-wakeup logging.
+scheduler-stall-diagnostics = []
+# Narrow filesystem tracing for BuildStorm diagnosis without enabling the
+# scheduler, signal and memory diagnostics above.
+buildstorm-diagnostics = []
+# Failure-only tracing for user-buffer validation during long BuildStorm runs.
+# Unlike buildstorm-diagnostics, this has no per-syscall success-path output.
+buildstorm-mm-diagnostics = []
 # Lightweight mount-path tracing for local SMP diagnosis. Unlike
 # `smp-diagnostics`, this does not enable lock-dependency instrumentation.
 mount-trace = []

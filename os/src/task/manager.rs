@@ -4,7 +4,7 @@ use crate::sync::{PidRegistryLock, SchedulerLock};
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use lazy_static::*;
 use log::*;
 
@@ -12,6 +12,36 @@ use log::*;
 /// boot; each secondary hart registers itself only after completing its local
 /// scheduler initialization.
 static ONLINE_CPU_MASK: AtomicUsize = AtomicUsize::new(1);
+static NEXT_ITIMER_DEADLINE_US: AtomicU64 = AtomicU64::new(u64::MAX);
+static NEXT_SLEEP_DEADLINE_NS: AtomicUsize = AtomicUsize::new(usize::MAX);
+#[cfg(feature = "lock-stats")]
+static SWITCHING_COMPLETIONS: [AtomicU64; 128] = [const { AtomicU64::new(0) }; 128];
+#[cfg(feature = "lock-stats")]
+static BLOCKING_COMPLETIONS: [AtomicU64; 128] = [const { AtomicU64::new(0) }; 128];
+#[cfg(feature = "lock-stats")]
+static WAKE_PENDING_COMPLETIONS: [AtomicU64; 128] = [const { AtomicU64::new(0) }; 128];
+
+#[cfg(feature = "lock-stats")]
+pub fn dump_context_switch_stats() {
+    for pid in 0..SWITCHING_COMPLETIONS.len() {
+        let switching = SWITCHING_COMPLETIONS[pid].load(Ordering::Relaxed);
+        let blocking = BLOCKING_COMPLETIONS[pid].load(Ordering::Relaxed);
+        let wake_pending = WAKE_PENDING_COMPLETIONS[pid].load(Ordering::Relaxed);
+        if switching != 0 || blocking != 0 || wake_pending != 0 {
+            crate::println!(
+                "[switch-stats] pid={} switching={} blocking={} wake_pending={}",
+                pid,
+                switching,
+                blocking,
+                wake_pending,
+            );
+        }
+    }
+}
+
+fn publish_sleep_deadline(deadline_ns: usize) {
+    NEXT_SLEEP_DEADLINE_NS.fetch_min(deadline_ns, Ordering::AcqRel);
+}
 
 pub fn online_cpu_mask() -> usize {
     ONLINE_CPU_MASK.load(Ordering::Acquire)
@@ -24,6 +54,41 @@ pub fn online_cpu_mask() -> usize {
 pub fn register_online_cpu(cpu: usize) -> usize {
     assert!(cpu < MAX_CPUS, "invalid scheduler CPU {}", cpu);
     ONLINE_CPU_MASK.fetch_or(1usize << cpu, Ordering::AcqRel) | (1usize << cpu)
+}
+
+pub fn itimer_scan_due(now_us: u64) -> bool {
+    NEXT_ITIMER_DEADLINE_US.load(Ordering::Acquire) <= now_us
+}
+
+/// Publish a possibly earlier process-timer deadline.
+///
+/// Replacing or disarming the current earliest timer may leave an old,
+/// conservative deadline in the hint.  That only triggers one harmless scan;
+/// the scan recomputes the exact minimum.  Publishing and recomputation both
+/// pass through SchedulerLock so a concurrent setter cannot be overwritten by
+/// a stale scan result.
+pub fn publish_itimer_deadline(deadline_us: u64) {
+    if deadline_us == 0 {
+        return;
+    }
+    let _scheduler = SCHEDULER.exclusive_access();
+    NEXT_ITIMER_DEADLINE_US.fetch_min(deadline_us, Ordering::AcqRel);
+}
+
+pub fn scan_itimers_if_due<R>(
+    now_us: u64,
+    scan: impl FnOnce() -> (R, u64),
+) -> Option<R> {
+    if !itimer_scan_due(now_us) {
+        return None;
+    }
+    let _scheduler = SCHEDULER.exclusive_access();
+    if !itimer_scan_due(now_us) {
+        return None;
+    }
+    let (result, next_deadline) = scan();
+    NEXT_ITIMER_DEADLINE_US.store(next_deadline, Ordering::Release);
+    Some(result)
 }
 /// A timer waiter owned by the scheduler.
 ///
@@ -58,6 +123,7 @@ pub struct SchedulerState {
     ready_queues: [VecDeque<Arc<TaskControlBlock>>; MAX_CPUS],
     running: [usize; MAX_CPUS],
     net_blocked: Vec<Arc<TaskControlBlock>>,
+    sleep_lock_waiters: BTreeMap<usize, Vec<Arc<TaskControlBlock>>>,
     waitpid_blocked: Vec<Arc<TaskControlBlock>>,
     sleeping: Vec<SleepTask>,
     exited: Vec<Arc<TaskControlBlock>>,
@@ -69,6 +135,7 @@ impl SchedulerState {
             ready_queues: core::array::from_fn(|_| VecDeque::new()),
             running: [0; MAX_CPUS],
             net_blocked: Vec::new(),
+            sleep_lock_waiters: BTreeMap::new(),
             waitpid_blocked: Vec::new(),
             sleeping: Vec::new(),
             exited: Vec::new(),
@@ -89,7 +156,9 @@ impl SchedulerState {
             if (allowed & (1 << cpu)) == 0 {
                 continue;
             }
-            let load = self.ready_queues[cpu].len().saturating_add(self.running[cpu]);
+            let load = self.ready_queues[cpu]
+                .len()
+                .saturating_add(usize::from(self.running[cpu] != 0));
             if load < selected_len {
                 selected = cpu;
                 selected_len = load;
@@ -99,32 +168,89 @@ impl SchedulerState {
     }
 
     pub fn add(&mut self, task: Arc<TaskControlBlock>) -> usize {
-        self.remove(task.getpid());
         let cpu = self.select_cpu(&task);
         task.mark_enqueued();
         self.ready_queues[cpu].push_back(task);
         cpu
     }
+
+    fn add_to_preferred_cpu(
+        &mut self,
+        task: Arc<TaskControlBlock>,
+        preferred_cpu: usize,
+    ) -> usize {
+        let allowed = task.allowed_cpus() & online_cpu_mask();
+        let cpu = if preferred_cpu < MAX_CPUS && allowed & (1usize << preferred_cpu) != 0 {
+            preferred_cpu
+        } else {
+            self.select_cpu(&task)
+        };
+        task.mark_enqueued();
+        self.ready_queues[cpu].push_back(task);
+        cpu
+    }
     pub fn add_priority(&mut self, task: Arc<TaskControlBlock>) -> usize {
-        self.remove(task.getpid());
         let cpu = self.select_cpu(&task);
         task.mark_enqueued();
         self.ready_queues[cpu].push_front(task);
         cpu
     }
+
+    fn promote_priority(&mut self, task: Arc<TaskControlBlock>) -> usize {
+        if task.is_enqueued() {
+            assert!(
+                self.remove(task.getpid()),
+                "ready pid {} has no scheduler queue entry during priority promotion",
+                task.getpid()
+            );
+        }
+        self.add_priority(task)
+    }
     pub fn fetch(&mut self, cpu: usize) -> Option<Arc<TaskControlBlock>> {
-        let task = self.ready_queues.get_mut(cpu)?.pop_front()?;
+        let task = if let Some(task) = self.ready_queues.get_mut(cpu)?.pop_front() {
+            task
+        } else {
+            let mut stolen = None;
+            for offset in 1..MAX_CPUS {
+                let victim = (cpu + offset) % MAX_CPUS;
+                // Leave one runnable task for an otherwise idle victim. It is
+                // normally the task that CPU just preempted and is about to
+                // resume; stealing it would cause migration on every quantum.
+                let reserved = usize::from(self.running[victim] == 0);
+                if self.ready_queues[victim].len() <= reserved {
+                    continue;
+                }
+                let Some(index) = self.ready_queues[victim]
+                    .iter()
+                    .position(|task| task.allowed_cpus() & (1usize << cpu) != 0)
+                else {
+                    continue;
+                };
+                stolen = self.ready_queues[victim].remove(index);
+                break;
+            }
+            stolen?
+        };
         task.mark_dequeued();
         Some(task)
     }
 
-    fn mark_running(&mut self, cpu: usize) {
-        self.running[cpu] = self.running[cpu].saturating_add(1);
+    fn mark_running(&mut self, cpu: usize, pid: usize) {
+        assert_eq!(
+            self.running[cpu], 0,
+            "hart {} dispatched pid {} while pid {} was still accounted",
+            cpu, pid, self.running[cpu]
+        );
+        self.running[cpu] = pid;
     }
 
-    fn complete_running(&mut self, cpu: usize) {
-        assert!(self.running[cpu] > 0, "hart {} completed an unaccounted task", cpu);
-        self.running[cpu] -= 1;
+    fn complete_running(&mut self, cpu: usize, pid: usize) {
+        assert_eq!(
+            self.running[cpu], pid,
+            "hart {} completed pid {} while pid {} was accounted",
+            cpu, pid, self.running[cpu]
+        );
+        self.running[cpu] = 0;
     }
     pub fn remove(&mut self, pid: usize) -> bool {
         let mut removed = false;
@@ -169,7 +295,7 @@ pub fn add_task(task: Arc<TaskControlBlock>) {
 }
 
 pub fn add_priority_task(task: Arc<TaskControlBlock>) {
-    let target = SCHEDULER.exclusive_access().add_priority(task);
+    let target = SCHEDULER.exclusive_access().promote_priority(task);
     super::processor::request_reschedule(target);
 }
 
@@ -226,7 +352,7 @@ pub fn fetch_task() -> Option<Arc<TaskControlBlock>> {
             if inner.task_status == TaskStatus::Ready {
                 inner.task_status = TaskStatus::Running;
                 drop(inner);
-                scheduler.mark_running(cpu);
+                scheduler.mark_running(cpu, task.getpid());
                 task.mark_running_on(cpu);
                 break task;
             }
@@ -244,10 +370,34 @@ pub fn fetch_task() -> Option<Arc<TaskControlBlock>> {
 /// context is safe for another hart to restore.
 pub fn complete_context_switch(task: Arc<TaskControlBlock>) {
     let mut scheduler = SCHEDULER.exclusive_access();
+    let previous_cpu = super::processor::current_hart_id();
     super::processor::set_scheduler_phase(31);
-    scheduler.complete_running(super::processor::current_hart_id());
+    scheduler.complete_running(previous_cpu, task.getpid());
     let mut inner = task.inner_exclusive_access();
     super::processor::set_scheduler_phase(32);
+    #[cfg(feature = "smp-diagnostics")]
+    inner.kernel_stack.validate_saved_sp(
+        inner.task_cx[polyhal::kcontext::KContextArgs::KSP],
+        task.getpid(),
+    );
+    #[cfg(feature = "lock-stats")]
+    {
+        let pid = task.getpid();
+        if pid < SWITCHING_COMPLETIONS.len() {
+            match inner.task_status {
+                TaskStatus::Switching => {
+                    SWITCHING_COMPLETIONS[pid].fetch_add(1, Ordering::Relaxed);
+                }
+                TaskStatus::Blocking => {
+                    BLOCKING_COMPLETIONS[pid].fetch_add(1, Ordering::Relaxed);
+                }
+                TaskStatus::WakePending => {
+                    WAKE_PENDING_COMPLETIONS[pid].fetch_add(1, Ordering::Relaxed);
+                }
+                _ => {}
+            }
+        }
+    }
     let priority = match inner.task_status {
         TaskStatus::Switching => {
             inner.task_status = TaskStatus::Ready;
@@ -273,7 +423,9 @@ pub fn complete_context_switch(task: Arc<TaskControlBlock>) {
     let target = if priority {
         scheduler.add_priority(task)
     } else {
-        scheduler.add(task)
+        // Keep a preempted or yielding task on its warm CPU. An idle CPU can
+        // still steal it below, and an affinity change overrides the hint.
+        scheduler.add_to_preferred_cpu(task, previous_cpu)
     };
     drop(scheduler);
     super::processor::request_reschedule(target);
@@ -296,9 +448,16 @@ pub fn begin_block(
     wakeup_time: Option<usize>,
 ) -> *mut polyhal::kcontext::KContext {
     let mut scheduler = SCHEDULER.exclusive_access();
-    // A running task should not already be queued, but clean up any stale
-    // entry defensively before changing its state.
-    scheduler.remove(task.getpid());
+    let sleep_lock_key = match reason {
+        Some(BlockReason::SleepLock(key)) => Some(key),
+        _ => None,
+    };
+    // Running tasks are absent from all ready queues. Avoid the old
+    // eight-queue scan on every blocking syscall while retaining a defensive
+    // repair path for an inconsistent scheduler state.
+    if task.is_enqueued() {
+        assert!(scheduler.remove(task.getpid()));
+    }
     let mut inner = task.inner_exclusive_access();
     debug_assert_eq!(inner.task_status, TaskStatus::Running);
     inner.task_status = TaskStatus::Blocking;
@@ -310,7 +469,18 @@ pub fn begin_block(
         BlockQueue::None => {}
         BlockQueue::Net => {
             let _ = remove_task(&mut scheduler.net_blocked, task.getpid());
+            let _ = remove_sleep_lock_waiter_by_pid(
+                &mut scheduler.sleep_lock_waiters,
+                task.getpid(),
+            );
             scheduler.net_blocked.push(task.clone());
+            if let Some(key) = sleep_lock_key {
+                scheduler
+                    .sleep_lock_waiters
+                    .entry(key)
+                    .or_default()
+                    .push(task.clone());
+            }
         }
         BlockQueue::WaitPid => {
             let _ = remove_task(&mut scheduler.waitpid_blocked, task.getpid());
@@ -329,6 +499,7 @@ pub fn begin_block(
             wakeup_time,
             task: task.clone(),
         });
+        publish_sleep_deadline(wakeup_time);
     }
     task_cx_ptr
 }
@@ -340,6 +511,7 @@ pub fn cancel_block_before_switch(task: &Arc<TaskControlBlock>) {
     let mut scheduler = SCHEDULER.exclusive_access();
     let pid = task.getpid();
     let _ = remove_task(&mut scheduler.net_blocked, pid);
+    let _ = remove_sleep_lock_waiter_by_pid(&mut scheduler.sleep_lock_waiters, pid);
     let _ = remove_task(&mut scheduler.waitpid_blocked, pid);
     if let Some(index) = scheduler
         .sleeping
@@ -355,12 +527,16 @@ pub fn cancel_block_before_switch(task: &Arc<TaskControlBlock>) {
     inner.block_reason = None;
 }
 
-/// Wake a task through the scheduler state machine.
-///
-/// If the task is already fully blocked, it is made Ready immediately.  If it
-/// is still switching out, only `WakePending` is recorded and the idle loop
-/// will perform the eventual Ready enqueue after the context has been saved.
-pub fn wake_task(task: Arc<TaskControlBlock>) -> bool {
+#[derive(Clone, Copy)]
+enum WakeFilter {
+    Any,
+    Vfork(usize),
+    WaitPid,
+}
+
+/// Wake a task through the scheduler state machine when its current wait
+/// still matches the event being published.
+fn wake_task_filtered(task: Arc<TaskControlBlock>, filter: WakeFilter) -> bool {
     loop {
         let mut scheduler = SCHEDULER.exclusive_access();
         let Some(mut inner) = task.try_inner_exclusive_access() else {
@@ -372,7 +548,28 @@ pub fn wake_task(task: Arc<TaskControlBlock>) -> bool {
             continue;
         };
         let pid = task.getpid();
+        let matches = match filter {
+            WakeFilter::Any => true,
+            WakeFilter::Vfork(child_pid) => {
+                matches!(inner.block_reason, Some(BlockReason::Vfork(waited)) if waited == child_pid)
+            }
+            WakeFilter::WaitPid => scheduler
+                .waitpid_blocked
+                .iter()
+                .any(|waiter| waiter.getpid() == pid),
+        };
+        if !matches {
+            return false;
+        }
+        let block_reason = inner.block_reason;
         let _ = remove_task(&mut scheduler.net_blocked, pid);
+        if let Some(BlockReason::SleepLock(key)) = block_reason {
+            let _ = remove_sleep_lock_waiter_by_key(
+                &mut scheduler.sleep_lock_waiters,
+                key,
+                pid,
+            );
+        }
         let _ = remove_task(&mut scheduler.waitpid_blocked, pid);
         if let Some(index) = scheduler
             .sleeping
@@ -419,6 +616,25 @@ pub fn wake_task(task: Arc<TaskControlBlock>) -> bool {
         }
         return enqueue_now;
     }
+}
+
+/// Unconditional wakeup used by events which are authoritative for every
+/// blocking state, such as process termination.
+pub fn wake_task(task: Arc<TaskControlBlock>) -> bool {
+    wake_task_filtered(task, WakeFilter::Any)
+}
+
+/// Complete only the vfork wait associated with `child_pid`.  An older child
+/// exiting must not release a parent currently sharing memory with a newer
+/// vfork child.
+pub fn wake_vfork_parent(task: Arc<TaskControlBlock>, child_pid: usize) -> bool {
+    wake_task_filtered(task, WakeFilter::Vfork(child_pid))
+}
+
+/// Publish a child-state change only to a parent currently registered in the
+/// waitpid queue. Other blocked syscalls recheck their own signal conditions.
+pub fn wake_waitpid_parent(task: Arc<TaskControlBlock>) -> bool {
+    wake_task_filtered(task, WakeFilter::WaitPid)
 }
 
 /// Wake every pipe waiter matching one endpoint direction in one scheduler
@@ -525,12 +741,63 @@ pub fn wake_poll_waiters() {
     wake_net_waiters_matching(|reason| matches!(reason, BlockReason::PollWait));
 }
 
-/// Remove scheduler membership and publish a terminal task state together.
+pub fn wake_file_page_load_waiters(load_id: usize) {
+    wake_net_waiters_matching(
+        |reason| matches!(reason, BlockReason::FilePageLoad(id) if id == load_id),
+    );
+}
+
+pub fn wake_exec_peer_waiters(tgid: usize) {
+    wake_net_waiters_matching(
+        |reason| matches!(reason, BlockReason::ExecPeer(waited_tgid) if waited_tgid == tgid),
+    );
+}
+
+fn wake_sleep_lock_waiters_inner(lock_id: Option<usize>, wake_all: bool) {
+    loop {
+        let task = {
+            let scheduler = SCHEDULER.exclusive_access();
+            match lock_id {
+                Some(key) => scheduler
+                    .sleep_lock_waiters
+                    .get(&key)
+                    .and_then(|waiters| waiters.first())
+                    .cloned(),
+                None => scheduler
+                    .sleep_lock_waiters
+                    .values()
+                    .find_map(|waiters| waiters.first())
+                    .cloned(),
+            }
+        };
+        let Some(task) = task else {
+            return;
+        };
+        let _ = wake_task(task);
+        if !wake_all {
+            return;
+        }
+    }
+}
+
+pub fn wake_sleep_lock_waiter(lock_id: usize) {
+    wake_sleep_lock_waiters_inner(Some(lock_id), false);
+}
+
+pub fn wake_all_sleep_lock_waiters(lock_id: usize) {
+    wake_sleep_lock_waiters_inner(Some(lock_id), true);
+}
+
+pub fn wake_all_sleep_lock_waiters_any() {
+    wake_sleep_lock_waiters_inner(None, true);
+}
+
+/// Publish the parent-visible exit event while preserving scheduler ownership.
 ///
 /// Callers must remove a futex-table entry before this function, because the
 /// futex table precedes SchedulerLock in the global order.  Resource teardown
-/// (files, page tables and parent notification) deliberately happens after
-/// this transaction has released both locks.
+/// may sleep on kernel locks, so the task remains Running/Blocking until the
+/// final CPU handoff in `finish_current_exit`.
 pub fn begin_exit(task: &Arc<TaskControlBlock>, exit_code: i32) -> bool {
     let mut scheduler = SCHEDULER.exclusive_access();
     let pid = task.getpid();
@@ -546,22 +813,36 @@ pub fn begin_exit(task: &Arc<TaskControlBlock>, exit_code: i32) -> bool {
     }
 
     let mut inner = task.inner_exclusive_access();
-    let was_running = inner.task_status == TaskStatus::Running;
-    let running_cpu = task.running_cpu();
-    if inner.task_status == TaskStatus::Zombie {
+    if inner.task_status == TaskStatus::Zombie || !task.try_publish_waitable_zombie() {
         return false;
     }
-    if was_running && running_cpu < MAX_CPUS {
-        scheduler.complete_running(running_cpu);
-    }
-    inner.task_status = TaskStatus::Zombie;
     inner.exit_code = exit_code;
     inner.block_reason = None;
-    // Parents wait on the terminal process state, not on the later idle-loop
-    // file/page cleanup.  Publishing after exit_code makes the status visible
-    // before SIGCHLD is sent from the caller.
-    task.publish_waitable_zombie();
     true
+}
+
+/// Retire the current task from its CPU after all potentially blocking exit
+/// cleanup has completed.
+pub fn finish_current_exit(task: &Arc<TaskControlBlock>) {
+    let cpu = super::processor::current_hart_id();
+    let pid = task.getpid();
+    let mut scheduler = SCHEDULER.exclusive_access();
+    let mut inner = task.inner_exclusive_access();
+    assert!(
+        task.is_waitable_zombie(),
+        "pid {} reached final exit without publishing its wait event",
+        pid
+    );
+    assert_eq!(
+        inner.task_status,
+        TaskStatus::Running,
+        "pid {} reached final exit in state {:?}",
+        pid,
+        inner.task_status
+    );
+    scheduler.complete_running(cpu, pid);
+    inner.task_status = TaskStatus::Zombie;
+    inner.block_reason = None;
 }
 
 pub fn ready_queue_len() -> usize {
@@ -594,7 +875,8 @@ pub fn ready_queue_counts() -> Option<(usize, usize)> {
 }
 
 pub fn running_counts() -> Option<[usize; MAX_CPUS]> {
-    Some(SCHEDULER.try_borrow()?.running)
+    let running = SCHEDULER.try_borrow()?.running;
+    Some(running.map(|pid| usize::from(pid != 0)))
 }
 
 pub fn remove_from_ready_queue(pid: usize) -> bool {
@@ -608,12 +890,42 @@ fn remove_task(queue: &mut Vec<Arc<TaskControlBlock>>, pid: usize) -> Option<Arc
         .map(|index| queue.remove(index))
 }
 
+fn remove_sleep_lock_waiter_by_key(
+    waiters: &mut BTreeMap<usize, Vec<Arc<TaskControlBlock>>>,
+    key: usize,
+    pid: usize,
+) -> Option<Arc<TaskControlBlock>> {
+    let (removed, empty) = {
+        let queue = waiters.get_mut(&key)?;
+        let removed = remove_task(queue, pid);
+        (removed, queue.is_empty())
+    };
+    if empty {
+        waiters.remove(&key);
+    }
+    removed
+}
+
+fn remove_sleep_lock_waiter_by_pid(
+    waiters: &mut BTreeMap<usize, Vec<Arc<TaskControlBlock>>>,
+    pid: usize,
+) -> Option<Arc<TaskControlBlock>> {
+    let key = waiters.iter().find_map(|(&key, queue)| {
+        queue
+            .iter()
+            .any(|task| task.getpid() == pid)
+            .then_some(key)
+    })?;
+    remove_sleep_lock_waiter_by_key(waiters, key, pid)
+}
+
 pub fn enqueue_net_blocked(task: Arc<TaskControlBlock>) {
     let pid = task.getpid();
     let old = {
         let mut scheduler = SCHEDULER.exclusive_access();
         // A task may have only one net/pipe/poll/signal wait entry.
         let old = remove_task(&mut scheduler.net_blocked, pid);
+        let _ = remove_sleep_lock_waiter_by_pid(&mut scheduler.sleep_lock_waiters, pid);
         scheduler.net_blocked.push(task);
         old
     };
@@ -621,7 +933,10 @@ pub fn enqueue_net_blocked(task: Arc<TaskControlBlock>) {
 }
 
 pub fn remove_net_blocked(pid: usize) -> Option<Arc<TaskControlBlock>> {
-    remove_task(&mut SCHEDULER.exclusive_access().net_blocked, pid)
+    let mut scheduler = SCHEDULER.exclusive_access();
+    let removed = remove_task(&mut scheduler.net_blocked, pid);
+    let _ = remove_sleep_lock_waiter_by_pid(&mut scheduler.sleep_lock_waiters, pid);
+    removed
 }
 
 /// Copy references for an operation which must inspect a network device.
@@ -646,7 +961,12 @@ pub fn take_net_blocked_by_pids(pids: &[usize]) -> Vec<Arc<TaskControlBlock>> {
             .iter()
             .any(|pid| *pid == scheduler.net_blocked[index].getpid())
         {
-            taken.push(scheduler.net_blocked.remove(index));
+            let task = scheduler.net_blocked.remove(index);
+            let _ = remove_sleep_lock_waiter_by_pid(
+                &mut scheduler.sleep_lock_waiters,
+                task.getpid(),
+            );
+            taken.push(task);
         } else {
             index += 1;
         }
@@ -679,6 +999,7 @@ pub fn enqueue_sleep(wakeup_time: usize, task: Arc<TaskControlBlock>) {
             .position(|entry| entry.task.getpid() == pid)
             .map(|index| scheduler.sleeping.remove(index));
         scheduler.sleeping.push(SleepTask { wakeup_time, task });
+        publish_sleep_deadline(wakeup_time);
         old
     };
     drop(old);
@@ -694,17 +1015,23 @@ pub fn remove_sleep(pid: usize) -> Option<SleepTask> {
 }
 
 pub fn take_due_sleep_tasks(now: usize) -> Vec<SleepTask> {
+    if NEXT_SLEEP_DEADLINE_NS.load(Ordering::Acquire) > now {
+        return Vec::new();
+    }
     let capacity = SCHEDULER.exclusive_access().sleeping.len();
     let mut due = Vec::with_capacity(capacity);
     let mut scheduler = SCHEDULER.exclusive_access();
+    let mut next_deadline = usize::MAX;
     let mut index = 0;
     while index < scheduler.sleeping.len() {
         if scheduler.sleeping[index].wakeup_time <= now {
             due.push(scheduler.sleeping.remove(index));
         } else {
+            next_deadline = next_deadline.min(scheduler.sleeping[index].wakeup_time);
             index += 1;
         }
     }
+    NEXT_SLEEP_DEADLINE_NS.store(next_deadline, Ordering::Release);
     due
 }
 
@@ -731,11 +1058,11 @@ pub fn defer_drop_task(task: Arc<TaskControlBlock>) {
     SCHEDULER.exclusive_access().exited.push(task);
 }
 
-pub fn take_exited_tasks() -> Vec<Arc<TaskControlBlock>> {
+pub fn take_exited_task() -> Option<Arc<TaskControlBlock>> {
     // Resource destruction must run only after the outgoing CPU has switched
-    // to the boot page table.  Move the list out with no destructors under the
-    // scheduler lock; the idle loop performs the actual inactive cleanup.
-    core::mem::take(&mut SCHEDULER.exclusive_access().exited)
+    // to the boot page table. Claim one task per scheduler pass so several
+    // idle CPUs can share a burst of expensive address-space teardown.
+    SCHEDULER.exclusive_access().exited.pop()
 }
 
 pub fn reap_exited_task(pid: usize) {

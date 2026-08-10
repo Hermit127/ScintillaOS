@@ -1,14 +1,18 @@
 // 这里负责操作系统的调度：保存每个 CPU 的运行任务，并实现从 idle 到用户任务的调度切换。
+use core::cell::{Cell, UnsafeCell};
 use core::mem::MaybeUninit;
+use core::ops::{Deref, DerefMut};
 
 use super::TaskControlBlock;
 use super::{fetch_task, reap_exited_tasks};
 use super::manager::complete_context_switch;
 use crate::config::MAX_CPUS;
 use crate::mm::AddressSpaceActivityHandle;
-use crate::sync::{assert_no_spin_locks_held, CpuLocalLock};
+use crate::sync::assert_no_spin_locks_held;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(feature = "lock-stats")]
+use core::sync::atomic::AtomicU64;
 #[cfg(target_arch = "loongarch64")]
 use core::sync::atomic::{fence, AtomicBool};
 use lazyinit::LazyInit;
@@ -19,13 +23,12 @@ use polyhal::pagetable::PageTable;
 /// State that belongs exclusively to the current hart.
 ///
 /// The backing storage uses polyhal's `percpu` section, so every hart receives
-/// a distinct `current`, idle context and timer counter.  The short
-/// `CpuLocalLock` protects against local interrupt re-entry; it is never used
-/// as a global scheduler lock.
+/// a distinct `current`, idle context and timer counter.
 pub struct CpuLocal {
     current: Option<Arc<TaskControlBlock>>,
     idle_task_cx: KContext,
     ticks: usize,
+    user_float_owner: usize,
 }
 
 impl CpuLocal {
@@ -36,6 +39,7 @@ impl CpuLocal {
             current: None,
             idle_task_cx: KContext::blank(),
             ticks: 0,
+            user_float_owner: 0,
         }
     }
     // 返回 idle 上下文指针，调度切换时作为内核落脚点。
@@ -55,16 +59,73 @@ impl CpuLocal {
     }
 }
 
+struct CpuLocalCell<T> {
+    borrowed: Cell<bool>,
+    value: UnsafeCell<T>,
+}
+
+unsafe impl<T: Send> Sync for CpuLocalCell<T> {}
+
+impl<T> CpuLocalCell<T> {
+    fn new(value: T) -> Self {
+        Self {
+            borrowed: Cell::new(false),
+            value: UnsafeCell::new(value),
+        }
+    }
+
+    fn exclusive_access(&self) -> CpuLocalGuard<'_, T> {
+        let restore_interrupts = IRQ::int_enabled();
+        IRQ::int_disable();
+        assert!(!self.borrowed.replace(true), "recursive CPU-local borrow");
+        CpuLocalGuard {
+            cell: self,
+            restore_interrupts,
+        }
+    }
+}
+
+struct CpuLocalGuard<'a, T> {
+    cell: &'a CpuLocalCell<T>,
+    restore_interrupts: bool,
+}
+
+impl<T> Deref for CpuLocalGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.cell.value.get() }
+    }
+}
+
+impl<T> DerefMut for CpuLocalGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut *self.cell.value.get() }
+    }
+}
+
+impl<T> Drop for CpuLocalGuard<'_, T> {
+    fn drop(&mut self) {
+        self.cell.borrowed.set(false);
+        if self.restore_interrupts {
+            IRQ::int_enable();
+        }
+    }
+}
+
 #[polyhal::percpu]
-static PROCESSOR: MaybeUninit<CpuLocalLock<CpuLocal>> = MaybeUninit::uninit();
+static PROCESSOR: MaybeUninit<CpuLocalCell<CpuLocal>> = MaybeUninit::uninit();
+
+#[polyhal::percpu]
+static LOCAL_HART_ID: usize = usize::MAX;
 
 /// Map the boot protocol's stable hart ID to the unique polyhal per-CPU base.
 ///
 /// The vendored RISC-V HAL currently reports CPU0 from `polyhal::hart_id()`
 /// on secondary harts after its `gp`-based per-CPU setup.  The boot entry's
 /// `hartid` argument is correct, and the per-CPU base remains unique across
-/// user/kernel transitions, so this small registration table is the scheduler
-/// authority for the fixed four-hart platform.
+/// user/kernel transitions. The table remains an initialization fallback and
+/// diagnostic map; normal scheduler paths read LOCAL_HART_ID directly.
 static HART_BY_PERCPU_BASE: [AtomicUsize; MAX_CPUS] =
     [const { AtomicUsize::new(usize::MAX) }; MAX_CPUS];
 
@@ -95,6 +156,12 @@ static TLB_REQUEST_SEQ: [AtomicUsize; MAX_CPUS] =
 #[cfg(target_arch = "loongarch64")]
 static TLB_ACK_SEQ: [AtomicUsize; MAX_CPUS] =
     [const { AtomicUsize::new(0) }; MAX_CPUS];
+#[cfg(target_arch = "loongarch64")]
+const TLB_WAIT_YIELD_INTERVAL: usize = 1 << 16;
+#[cfg(target_arch = "loongarch64")]
+const TLB_IPI_RETRY_INTERVAL: usize = 1 << 22;
+#[cfg(all(target_arch = "loongarch64", feature = "smp-diagnostics"))]
+const TLB_DIAGNOSTIC_INTERVAL: usize = 1 << 25;
 #[cfg(all(target_arch = "loongarch64", feature = "smp-diagnostics"))]
 static IPI_HANDLER_COUNT: [AtomicUsize; MAX_CPUS] =
     [const { AtomicUsize::new(0) }; MAX_CPUS];
@@ -109,6 +176,38 @@ static CURRENT_TGID: [AtomicUsize; MAX_CPUS] =
     [const { AtomicUsize::new(0) }; MAX_CPUS];
 static CURRENT_TCB: [AtomicUsize; MAX_CPUS] =
     [const { AtomicUsize::new(0) }; MAX_CPUS];
+#[cfg(feature = "lock-stats")]
+static SCHEDULER_LOOPS: [AtomicU64; MAX_CPUS] =
+    [const { AtomicU64::new(0) }; MAX_CPUS];
+#[cfg(feature = "lock-stats")]
+static SCHEDULER_DISPATCHES: [AtomicU64; MAX_CPUS] =
+    [const { AtomicU64::new(0) }; MAX_CPUS];
+#[cfg(feature = "lock-stats")]
+static SCHEDULER_IDLE_WAITS: [AtomicU64; MAX_CPUS] =
+    [const { AtomicU64::new(0) }; MAX_CPUS];
+#[cfg(feature = "lock-stats")]
+static SCHEDULER_RETURNS: [AtomicU64; MAX_CPUS] =
+    [const { AtomicU64::new(0) }; MAX_CPUS];
+#[cfg(feature = "lock-stats")]
+static TIMER_TICKS: [AtomicU64; MAX_CPUS] =
+    [const { AtomicU64::new(0) }; MAX_CPUS];
+
+#[cfg(feature = "lock-stats")]
+pub fn dump_scheduler_runtime_stats() {
+    for cpu in 0..MAX_CPUS {
+        crate::println!(
+            "[scheduler-stats] cpu={} loops={} dispatches={} returns={} idle_waits={} timer_ticks={}",
+            cpu,
+            SCHEDULER_LOOPS[cpu].load(Ordering::Relaxed),
+            SCHEDULER_DISPATCHES[cpu].load(Ordering::Relaxed),
+            SCHEDULER_RETURNS[cpu].load(Ordering::Relaxed),
+            SCHEDULER_IDLE_WAITS[cpu].load(Ordering::Relaxed),
+            TIMER_TICKS[cpu].load(Ordering::Relaxed),
+        );
+    }
+    super::manager::dump_context_switch_stats();
+    super::dump_suspend_reason_stats();
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct CpuSchedulerSnapshot {
@@ -148,10 +247,11 @@ pub fn init_current_cpu(hart_id: usize) {
         "unsupported hart {}",
         hart_id
     );
+    LOCAL_HART_ID.write(hart_id);
     HART_BY_PERCPU_BASE[hart_id].store(polyhal::percpu::get_percpu_ptr(), Ordering::Release);
     PROCESSOR
         .ref_mut()
-        .write(CpuLocalLock::new_named(CpuLocal::new(), "CpuLocal"));
+        .write(CpuLocalCell::new(CpuLocal::new()));
     #[cfg(target_arch = "loongarch64")]
     {
         let pending = loongArch64::ipi::ipi_status();
@@ -166,6 +266,13 @@ pub fn init_current_cpu(hart_id: usize) {
 #[inline]
 pub fn try_current_hart_id() -> Option<usize> {
     let base = polyhal::percpu::get_percpu_ptr();
+    if base == 0 {
+        return None;
+    }
+    let local = *LOCAL_HART_ID;
+    if local < MAX_CPUS {
+        return Some(local);
+    }
     HART_BY_PERCPU_BASE
         .iter()
         .position(|entry| entry.load(Ordering::Acquire) == base)
@@ -256,6 +363,18 @@ fn service_local_ipi_while_waiting() {
 }
 
 #[cfg(target_arch = "loongarch64")]
+fn relax_tlb_wait(spins: usize) {
+    if spins & (TLB_WAIT_YIELD_INTERVAL - 1) == 0 && IRQ::int_enabled() {
+        // A periodic timer will wake this hart. Sleeping here gives a remote
+        // vCPU which temporarily has interrupts masked a chance to leave its
+        // critical section and acknowledge the shootdown.
+        unsafe { loongArch64::asm::idle() };
+    } else {
+        core::hint::spin_loop();
+    }
+}
+
+#[cfg(target_arch = "loongarch64")]
 struct TlbShootdownGuard;
 
 #[cfg(target_arch = "loongarch64")]
@@ -268,14 +387,19 @@ impl TlbShootdownGuard {
         {
             service_local_ipi_while_waiting();
             spins = spins.wrapping_add(1);
-            if spins == 100_000_000 {
-                panic!(
-                    "LoongArch TLB shootdown gate timeout: cpu={}, online={:#x}",
-                    current_hart_id(),
-                    super::manager::online_cpu_mask()
+            #[cfg(feature = "smp-diagnostics")]
+            if spins & (TLB_DIAGNOSTIC_INTERVAL - 1) == 0 {
+                let cpu = current_hart_id();
+                crate::println!(
+                    "[tlb-guard-wait] cpu={} spins={} irq={} pending={:#x} ipi_status={:#x}",
+                    cpu,
+                    spins,
+                    IRQ::int_enabled(),
+                    PENDING_IPI[cpu].load(Ordering::Acquire),
+                    loongArch64::ipi::ipi_status(),
                 );
             }
-            core::hint::spin_loop();
+            relax_tlb_wait(spins);
         }
         Self
     }
@@ -371,38 +495,56 @@ pub fn flush_remote_tlb(
                 break;
             }
             spins = spins.wrapping_add(1);
-            if spins == 100_000_000 {
-                let snapshot = scheduler_cpu_snapshots()[waiting];
-                #[cfg(feature = "smp-diagnostics")]
-                {
-                    let caller = core::panic::Location::caller();
-                    println!(
-                        "[tlb-diag] target={} handled={} last_actions={:#x} request={} ack={} caller={}:{}",
-                        waiting,
-                        IPI_HANDLER_COUNT[waiting].load(Ordering::Acquire),
-                        LAST_IPI_ACTIONS[waiting].load(Ordering::Acquire),
-                        TLB_REQUEST_SEQ[waiting].load(Ordering::Acquire),
-                        TLB_ACK_SEQ[waiting].load(Ordering::Acquire),
-                        caller.file(),
-                        caller.line(),
-                    );
+            if spins & (TLB_IPI_RETRY_INTERVAL - 1) == 0 {
+                // IPI action bits are level-like and may be coalesced. Re-send
+                // outstanding requests after a long interrupt-masked section;
+                // the sequence acknowledgement remains the sole completion
+                // condition.
+                fence(Ordering::SeqCst);
+                for cpu in 0..MAX_CPUS {
+                    if remote & active_cpus & (1usize << cpu) != 0
+                        && TLB_ACK_SEQ[cpu].load(Ordering::Acquire) != sequence
+                    {
+                        loongArch64::ipi::send_ipi_single(cpu, LA_IPI_TLB_FLUSH);
+                    }
                 }
-                panic!(
-                    "LoongArch TLB shootdown timeout: requester={}, target={}, seq={}, start={:#x}, size={:#x}, online={:#x}, active={:#x}, phase={}, pid={}, tgid={}, pending={:#x}",
+            }
+            #[cfg(feature = "smp-diagnostics")]
+            if spins & (TLB_DIAGNOSTIC_INTERVAL - 1) == 0 {
+                let requests = core::array::from_fn::<_, MAX_CPUS, _>(|cpu| {
+                    TLB_REQUEST_SEQ[cpu].load(Ordering::Acquire)
+                });
+                let acknowledgements = core::array::from_fn::<_, MAX_CPUS, _>(|cpu| {
+                    TLB_ACK_SEQ[cpu].load(Ordering::Acquire)
+                });
+                let pending = core::array::from_fn::<_, MAX_CPUS, _>(|cpu| {
+                    PENDING_IPI[cpu].load(Ordering::Acquire)
+                });
+                let handlers = core::array::from_fn::<_, MAX_CPUS, _>(|cpu| {
+                    IPI_HANDLER_COUNT[cpu].load(Ordering::Acquire)
+                });
+                let actions = core::array::from_fn::<_, MAX_CPUS, _>(|cpu| {
+                    LAST_IPI_ACTIONS[cpu].load(Ordering::Acquire)
+                });
+                crate::println!(
+                    "[tlb-shootdown-wait] sender={} seq={} spins={} remote={:#x} active={:#x} waiting={} start={:#x} size={:#x} irq={} req={:?} ack={:?} pending={:?} handlers={:?} actions={:?}",
                     current,
-                    waiting,
                     sequence,
+                    spins,
+                    remote,
+                    active_cpus,
+                    waiting,
                     start_addr,
                     size,
-                    super::manager::online_cpu_mask(),
-                    active_cpus,
-                    snapshot.phase,
-                    snapshot.pid,
-                    snapshot.tgid,
-                    snapshot.pending_ipi,
+                    IRQ::int_enabled(),
+                    requests,
+                    acknowledgements,
+                    pending,
+                    handlers,
+                    actions,
                 );
             }
-            core::hint::spin_loop();
+            relax_tlb_wait(spins);
         }
     }
 
@@ -413,7 +555,7 @@ pub fn flush_remote_tlb(
 }
 
 #[inline]
-fn current_cpu() -> &'static CpuLocalLock<CpuLocal> {
+fn current_cpu() -> &'static CpuLocalCell<CpuLocal> {
     // `init_current_cpu` runs before any task or interrupt path uses this
     // accessor.  Each hart sees its own `percpu` copy of the MaybeUninit slot.
     unsafe { (&*PROCESSOR.get_mut_ptr()).assume_init_ref() }
@@ -426,6 +568,8 @@ pub fn run_tasks() {
     let mut first = true;
     loop {
         let cpu_id = current_hart_id();
+        #[cfg(feature = "lock-stats")]
+        SCHEDULER_LOOPS[cpu_id].fetch_add(1, Ordering::Relaxed);
         SCHEDULER_PHASE[cpu_id].store(1, Ordering::Release);
         // When a task yields or blocks, control returns here only after its
         // task context has been written by `context_switch_pt`.  Complete the
@@ -433,17 +577,32 @@ pub fn run_tasks() {
         // other hart can run stale register/context data.
         SCHEDULER_PHASE[cpu_id].store(2, Ordering::Release);
         if let Some(task) = take_current_task() {
+            #[cfg(feature = "lock-stats")]
+            SCHEDULER_RETURNS[cpu_id].fetch_add(1, Ordering::Relaxed);
             SCHEDULER_PHASE[cpu_id].store(3, Ordering::Release);
             complete_context_switch(task);
             SCHEDULER_PHASE[cpu_id].store(4, Ordering::Release);
         }
+        // The task-to-idle handoff is complete: no user context or address
+        // space remains owned by this hart. Resource teardown below may close
+        // files and sleep on the filesystem lock, so it must not inherit the
+        // interrupt-disabled handoff window from the preceding dispatch.
+        IRQ::int_enable();
         reap_exited_tasks();
+        crate::sync::drain_deferred_lock_wakes();
         SCHEDULER_PHASE[cpu_id].store(5, Ordering::Release);
         if let Some(task) = fetch_task() {
+            #[cfg(feature = "lock-stats")]
+            SCHEDULER_DISPATCHES[cpu_id].fetch_add(1, Ordering::Relaxed);
             SCHEDULER_PHASE[cpu_id].store(6, Ordering::Release);
             // The scheduler already performed Ready -> Running under its
             // lock.  Only snapshot the context and page table here.
             let mut task_inner = task.inner_exclusive_access();
+            #[cfg(feature = "smp-diagnostics")]
+            task_inner.kernel_stack.validate_saved_sp(
+                task_inner.task_cx[KContextArgs::KSP],
+                task.getpid(),
+            );
             // A task context includes the kernel thread pointer used by
             // `current_task()` and all `#[percpu]` data.  It may have been
             // created on a different hart, so refresh it immediately before
@@ -494,6 +653,8 @@ pub fn run_tasks() {
             // 从 idle 切到用户任务，同时切换到该任务的用户页表。
             unsafe { context_switch_pt(idle_task_cx_ptr, next_task_cx_ptr, token) }
         } else {
+            #[cfg(feature = "lock-stats")]
+            SCHEDULER_IDLE_WAITS[cpu_id].fetch_add(1, Ordering::Relaxed);
             SCHEDULER_PHASE[cpu_id].store(8, Ordering::Release);
             // The idle context saved by a context switch does not carry the
             // interrupted task's interrupt-enable state.  Explicitly enable
@@ -536,7 +697,34 @@ pub fn take_current_task() -> Option<Arc<TaskControlBlock>> {
 // 返回当前任务引用。
 // 执行时进入全局 Processor，克隆当前正在 CPU 上运行的任务引用。
 pub fn current_task() -> Option<Arc<TaskControlBlock>> {
-    current_cpu().exclusive_access().current()
+    let task = current_cpu().exclusive_access().current();
+    #[cfg(feature = "smp-diagnostics")]
+    if let Some(task) = &task {
+        assert_eq!(
+            task.running_cpu(),
+            current_hart_id(),
+            "hart {} observed pid {} owned by hart {}",
+            current_hart_id(),
+            task.getpid(),
+            task.running_cpu(),
+        );
+    }
+    task
+}
+
+#[inline]
+pub fn user_float_state_is_live(task: &TaskControlBlock) -> bool {
+    current_cpu().exclusive_access().user_float_owner == task as *const TaskControlBlock as usize
+}
+
+#[inline]
+pub fn mark_user_float_state_live(task: &TaskControlBlock) {
+    current_cpu().exclusive_access().user_float_owner = task as *const TaskControlBlock as usize;
+}
+
+#[inline]
+pub fn invalidate_user_float_state() {
+    current_cpu().exclusive_access().user_float_owner = 0;
 }
 
 /// Publish the current task's address space after its page table is installed.
@@ -562,6 +750,8 @@ const TIMER_TICKS_PER_USER_SLICE: usize = 1;
 /// has expired. LoongArch keeps its 1 ms timer resolution for deadlines but
 /// uses a 10 ms scheduling quantum, matching the RISC-V timer cadence.
 pub fn record_timer_tick() -> bool {
+    #[cfg(feature = "lock-stats")]
+    TIMER_TICKS[current_hart_id()].fetch_add(1, Ordering::Relaxed);
     let mut cpu = current_cpu().exclusive_access();
     cpu.ticks = cpu.ticks.wrapping_add(1);
     cpu.ticks % TIMER_TICKS_PER_USER_SLICE == 0
@@ -582,8 +772,17 @@ static BOOT_PAGE_TABLE: LazyInit<PageTable> = LazyInit::new();
 // 执行时取出 idle 上下文指针，并用启动时记录的内核页表切回调度主循环。
 pub fn schedule(switched_task_cx_ptr: *mut KContext) {
     assert_no_spin_locks_held("schedule");
-    // Keep the current-task ownership handoff atomic with local interrupt
-    // handlers while context_switch_pt saves or restores the task context.
+    // The kernel itself does not use floating-point/vector registers. Keep
+    // user state live across ordinary traps and materialize it only at a real
+    // scheduling boundary, before the task can migrate to another hart.
+    if let Some(task) = current_task() {
+        task.save_user_float_state();
+    }
+    invalidate_user_float_state();
+    // A task remains published as this CPU's current task until the switch
+    // reaches the idle context.  Keep that ownership handoff atomic with
+    // respect to local timer/IPI handlers; otherwise an interrupt can observe
+    // a task context while context_switch_pt is still saving it.
     let restore_interrupts = IRQ::int_enabled();
     IRQ::int_disable();
     let idle_task_cx_ptr = current_cpu().exclusive_access().get_idle_task_cx_ptr();

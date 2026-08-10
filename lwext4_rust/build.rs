@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::SystemTime;
 use std::{env, fs};
 
 fn copy_if_different(source: &Path, destination: &Path) {
@@ -7,6 +8,44 @@ fn copy_if_different(source: &Path, destination: &Path) {
     if fs::read(destination).ok().as_deref() != Some(source_data.as_slice()) {
         fs::write(destination, source_data).expect("cannot update lwext4 toolchain file");
     }
+}
+
+fn path_is_newer_than(path: &Path, reference: SystemTime) -> bool {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(_) => return true,
+    };
+    if metadata.is_dir() {
+        let entries = match fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(_) => return true,
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => return true,
+            };
+            if path_is_newer_than(&entry.path(), reference) {
+                return true;
+            }
+        }
+        false
+    } else {
+        metadata
+            .modified()
+            .map(|modified| modified > reference)
+            .unwrap_or(true)
+    }
+}
+
+fn needs_rebuild(library: &Path, inputs: &[&Path]) -> bool {
+    let modified = match fs::metadata(library).and_then(|metadata| metadata.modified()) {
+        Ok(modified) => modified,
+        Err(_) => return true,
+    };
+    inputs
+        .iter()
+        .any(|input| path_is_newer_than(input, modified))
 }
 
 fn main() {
@@ -23,8 +62,18 @@ fn main() {
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
     let lwext4_lib = &format!("lwext4-{}", arch);
     let lwext4_lib_path = PathBuf::from(format!("c/lwext4/lib{}.a", lwext4_lib));
+    let lwext4_inputs = [
+        Path::new("c/ulibc.c"),
+        Path::new("c/lwext4/CMakeLists.txt"),
+        Path::new("c/lwext4/Makefile"),
+        Path::new("c/lwext4/include"),
+        Path::new("c/lwext4/src"),
+        Path::new("c/lwext4/toolchain"),
+        Path::new("c/musl-generic.cmake"),
+        Path::new("c/wrapper.h"),
+    ];
     let force_rebuild = env::var_os("LWEXT4_FORCE_REBUILD").is_some();
-    if force_rebuild || !lwext4_lib_path.exists() {
+    if force_rebuild || needs_rebuild(&lwext4_lib_path, &lwext4_inputs) {
         let status = Command::new("make")
             .args(&[
                 "musl-generic",
@@ -71,6 +120,7 @@ fn main() {
         c_path.to_str().unwrap()
     );
     println!("cargo:rerun-if-changed=c/wrapper.h");
+    println!("cargo:rerun-if-changed=c/ulibc.c");
     println!("cargo:rerun-if-changed=c/musl-generic.cmake");
     println!("cargo:rerun-if-changed=c/lwext4/CMakeLists.txt");
     println!("cargo:rerun-if-changed=c/lwext4/Makefile");
