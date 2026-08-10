@@ -1,52 +1,30 @@
 // 这里负责操作系统的内存管理：初始化内核堆，并处理堆分配失败。
 use crate::config::KERNEL_HEAP_SIZE;
-use buddy_system_allocator::LockedHeap;
+use buddy_system_allocator::Heap;
 use core::alloc::{GlobalAlloc, Layout};
-use polyhal::irq::IRQ;
-
-struct IrqGuard {
-    restore: bool,
-}
-
-impl IrqGuard {
-    fn disable() -> Self {
-        let restore = IRQ::int_enabled();
-        IRQ::int_disable();
-        Self { restore }
-    }
-}
-
-impl Drop for IrqGuard {
-    fn drop(&mut self) {
-        if self.restore {
-            IRQ::int_enable();
-        }
-    }
-}
+use core::ptr::NonNull;
+use polyhal::utils::MutexNoIrq;
 
 struct IrqSafeHeap {
-    inner: LockedHeap<32>,
+    inner: MutexNoIrq<Heap<32>>,
 }
 
 impl IrqSafeHeap {
     const fn empty() -> Self {
         Self {
-            inner: LockedHeap::empty(),
+            inner: MutexNoIrq::new(Heap::empty()),
         }
     }
 
     unsafe fn init(&self, start: usize, size: usize) {
-        let _irq = IrqGuard::disable();
         self.inner.lock().init(start, size);
     }
 
     unsafe fn add_region(&self, start: usize, size: usize) {
-        let _irq = IrqGuard::disable();
         self.inner.lock().add_to_heap(start, start + size);
     }
 
     fn stats(&self) -> (usize, usize, usize) {
-        let _irq = IrqGuard::disable();
         let heap = self.inner.lock();
         (
             heap.stats_alloc_user(),
@@ -58,13 +36,17 @@ impl IrqSafeHeap {
 
 unsafe impl GlobalAlloc for IrqSafeHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let _irq = IrqGuard::disable();
-        GlobalAlloc::alloc(&self.inner, layout)
+        self.inner
+            .lock()
+            .alloc(layout)
+            .ok()
+            .map_or(core::ptr::null_mut(), |allocation| allocation.as_ptr())
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        let _irq = IrqGuard::disable();
-        GlobalAlloc::dealloc(&self.inner, ptr, layout);
+        self.inner
+            .lock()
+            .dealloc(NonNull::new_unchecked(ptr), layout);
     }
 }
 

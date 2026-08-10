@@ -551,6 +551,9 @@ pub fn wake_net_blocked_tasks() {
             | Some(BlockReason::PipeRead(_))
             | Some(BlockReason::PipeWrite(_))
             | Some(BlockReason::Futex(_, _))
+            | Some(BlockReason::FilePageLoad(_))
+            | Some(BlockReason::SleepLock(_))
+            | Some(BlockReason::ExecPeer(_))
             | Some(BlockReason::SignalWait(_))
             | Some(BlockReason::Vfork(_)) => false,
             None => true,

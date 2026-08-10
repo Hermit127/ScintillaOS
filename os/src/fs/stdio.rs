@@ -3,7 +3,7 @@ use polyhal::debug_console::DebugConsole;
 
 use super::{File, Kstat, S_IFBLK, S_IFCHR, S_IFREG, S_IFSOCK};
 use crate::sync::DeviceLock;
-use crate::task::{current_task, pid2task, suspend_current_and_run_next};
+use crate::task::{current_task, pid2task};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
@@ -36,7 +36,9 @@ fn stdout_acquire() {
             STDOUT_BUSY.store(false, Ordering::Release);
             return;
         }
-        suspend_current_and_run_next();
+        crate::task::suspend_current_and_run_next_reason(
+            crate::task::SuspendReason::StdoutAcquire,
+        );
     }
 }
 
@@ -94,7 +96,9 @@ impl File for Stdin {
                 return 1;
             }
             stdout_release_if_owner();
-            suspend_current_and_run_next();
+            let retry_at = (polyhal::time::Time::now().to_nsec() as usize)
+                .saturating_add(10_000_000);
+            crate::task::sleep_current_until(retry_at);
         }
     }
     // 往 stdin 写是内核逻辑错误，直接暴露出来。

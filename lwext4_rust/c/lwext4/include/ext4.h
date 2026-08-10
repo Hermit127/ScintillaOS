@@ -342,6 +342,18 @@ int ext4_fopen(ext4_file *file, const char *path, const char *flags);
  * @return  Standard error code.*/
 int ext4_fopen2(ext4_file *file, const char *path, int flags);
 
+/**@brief   Atomically create a regular file with its initial attributes.
+ *
+ * @param   file File handle returned for the new file.
+ * @param   path Absolute mounted path of the new file.
+ * @param   mode Initial permission bits.
+ * @param   uid  Initial owner user id.
+ * @param   gid  Initial owner group id.
+ *
+ * @return  EEXIST if the path already exists, otherwise a standard error code. */
+int ext4_fcreate_with_attrs(ext4_file *file, const char *path, uint32_t mode,
+			    uint32_t uid, uint32_t gid);
+
 /**@brief   File close function.
  *
  * @param   file File handle.

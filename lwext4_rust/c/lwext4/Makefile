@@ -66,7 +66,7 @@ mingw:
 
 ARCH ?= x86_64
 musl-generic:
-	$(call generate_common,$@)
+	$(call generate_common,$@,-DLIB_ONLY=TRUE)
 	cd build_$@ && make lwext4
 	cp build_$@/src/liblwext4.a ./liblwext4-$(ARCH).a
 

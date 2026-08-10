@@ -5,6 +5,7 @@ use crate::fs::vfs::{Dentry, ROOT_DENTRY};
 use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{translated_refmut, LoadedElf, MapArea, MapPermission, MapType, MemorySet};
 use crate::sync::{SignalActionsLock, TaskGuard, TaskLock};
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
@@ -28,6 +29,7 @@ pub struct TaskControlBlock {
     /// Ready -> Running handoff while holding `SchedulerLock` without exposing
     /// a partially moved task to another hart.
     scheduling: TaskSchedulingMeta,
+    runtime: TaskRuntime,
     // mutable
     /// Mutable per-task state.  Scheduler queue membership remains owned by
     /// `SchedulerLock`; callers must not retain this guard while scheduling,
@@ -63,6 +65,28 @@ struct TaskSchedulingMeta {
     vfork_parent: AtomicUsize,
 }
 
+struct TaskRuntime {
+    utime: AtomicUsize,
+    stime: AtomicUsize,
+    last_time: AtomicUsize,
+}
+
+impl TaskRuntime {
+    fn new() -> Self {
+        Self {
+            utime: AtomicUsize::new(0),
+            stime: AtomicUsize::new(0),
+            last_time: AtomicUsize::new(polyhal::time::Time::now().to_nsec() as usize),
+        }
+    }
+
+    fn charge(&self, counter: &AtomicUsize) {
+        let now = polyhal::time::Time::now().to_nsec() as usize;
+        let last = self.last_time.swap(now, Ordering::Relaxed);
+        counter.fetch_add(now.saturating_sub(last), Ordering::Relaxed);
+    }
+}
+
 impl TaskSchedulingMeta {
     const fn new(thread_group_id: usize) -> Self {
         Self {
@@ -86,19 +110,73 @@ impl Drop for TaskControlBlock {
 }
 
 pub struct KernelStack {
-    inner: Arc<[u128; KERNEL_STACK_SIZE / size_of::<u128>()]>,
+    inner: Box<[u128]>,
 }
+
+#[cfg(feature = "smp-diagnostics")]
+const KERNEL_STACK_SENTINEL: u128 = 0x6b737461636b6775_6172647363696e74;
+#[cfg(feature = "smp-diagnostics")]
+const KERNEL_STACK_GUARD_WORDS: usize = 32;
+#[cfg(feature = "smp-diagnostics")]
+static KERNEL_STACK_HIGH_WATER: AtomicUsize = AtomicUsize::new(0);
 
 impl KernelStack {
     pub fn new() -> Self {
+        #[cfg(feature = "smp-diagnostics")]
+        let initial_word = KERNEL_STACK_SENTINEL;
+        #[cfg(not(feature = "smp-diagnostics"))]
+        let initial_word = 0;
         Self {
-            inner: Arc::new([0u128; KERNEL_STACK_SIZE / size_of::<u128>()]),
+            // Building `[0; KERNEL_STACK_SIZE]` inside `Arc::new` materializes
+            // the full array in the caller's kernel stack before allocation.
+            // fork therefore needed more stack than the child stack it was
+            // creating. Vec initializes the storage directly on the heap.
+            inner: alloc::vec![initial_word; KERNEL_STACK_SIZE / size_of::<u128>()]
+                .into_boxed_slice(),
         }
     }
 
     pub fn get_position(&self) -> (usize, usize) {
         let bottom = self.inner.as_ptr() as usize;
         (bottom, bottom + KERNEL_STACK_SIZE)
+    }
+
+    #[cfg(feature = "smp-diagnostics")]
+    pub fn validate_saved_sp(&self, saved_sp: usize, pid: usize) {
+        let (bottom, top) = self.get_position();
+        let guard_end = bottom + KERNEL_STACK_GUARD_WORDS * size_of::<u128>();
+        assert!(
+            (guard_end..=top).contains(&saved_sp),
+            "pid {} saved kernel SP {:#x} outside stack {:#x}..{:#x}",
+            pid,
+            saved_sp,
+            guard_end,
+            top,
+        );
+        assert!(
+            self.inner[..KERNEL_STACK_GUARD_WORDS]
+                .iter()
+                .all(|word| *word == KERNEL_STACK_SENTINEL),
+            "pid {} overflowed its kernel stack guard at {:#x}",
+            pid,
+            bottom,
+        );
+
+        let first_used = self
+            .inner
+            .iter()
+            .position(|word| *word != KERNEL_STACK_SENTINEL)
+            .unwrap_or(self.inner.len());
+        let used = KERNEL_STACK_SIZE - first_used * size_of::<u128>();
+        let previous = KERNEL_STACK_HIGH_WATER.fetch_max(used, Ordering::Relaxed);
+        if used > previous && used / 1024 > previous / 1024 {
+            crate::println!(
+                "[kstack-diag] pid={} used={} bytes saved_sp={:#x}",
+                pid,
+                used,
+                saved_sp,
+            );
+        }
     }
 }
 
@@ -172,11 +250,8 @@ pub struct TaskControlBlockInner {
     pub heap_bottom: usize,
     pub program_brk: usize,
     pub sleeping: Option<u64>,
-    pub utime: usize,
-    pub stime: usize,
     pub cutime: usize,
     pub cstime: usize,
-    pub last_time: usize,
     pub block_reason: Option<BlockReason>,
     pub itimer_expire: u64,
     pub itimer_interval_us: u64,
@@ -262,13 +337,13 @@ fn task_entry() {
     mark_current_task_address_space_active();
     #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
     crate::SMP_FIRST_TASK_ENTERED.store(true, Ordering::Release);
+    // A kernel context is permanently paired with one TCB and kernel stack.
+    // exec replaces the TrapFrame value in place, so its address stays valid
+    // across traps, scheduling and migration for the lifetime of this task.
+    let task = current_task().unwrap();
+    let trap_cx = task.inner.exclusive_access().get_trap_cx() as *mut TrapFrame;
     loop {
-        let trap_cx = {
-            let task = current_task().unwrap();
-            task.restore_user_float_state();
-            let trap_cx = task.inner.exclusive_access().get_trap_cx() as *mut TrapFrame;
-            trap_cx
-        };
+        task.restore_user_float_state();
         let ctx_mut = unsafe { trap_cx.as_mut().unwrap() };
         // sscratch identifies a user trap frame while user_restore is loading
         // registers. Keep that handoff non-reentrant; sret restores the user
@@ -296,6 +371,7 @@ impl TaskControlBlock {
         Self {
             pid,
             scheduling: TaskSchedulingMeta::new(thread_group_id),
+            runtime: TaskRuntime::new(),
             inner: TaskLock::new_named(inner, "TaskInner"),
         }
     }
@@ -313,18 +389,22 @@ impl TaskControlBlock {
         }
     }
     pub fn save_user_float_state(&self) {
-        // A trap boundary is the only point at which this task's live LSX
-        // registers can be captured.  Skipping the save on transient TaskLock
-        // contention lets a later migration restore another thread's state.
+        if !super::user_float_state_is_live(self) {
+            return;
+        }
         let mut inner = self.inner_exclusive_access();
         inner.fp_state.save_current();
     }
     pub fn restore_user_float_state(&self) {
+        if super::user_float_state_is_live(self) {
+            return;
+        }
         let fp_state = {
             let inner = self.inner_exclusive_access();
             inner.fp_state
         };
         fp_state.restore_current();
+        super::mark_user_float_state_live(self);
     }
     pub fn new(elf_data: &[u8]) -> Self {
         trace!("os::task::TaskControlBlock::new");
@@ -346,6 +426,7 @@ impl TaskControlBlock {
         let task_control_block = Self {
             pid: pid_handle,
             scheduling: TaskSchedulingMeta::new(pid_value),
+            runtime: TaskRuntime::new(),
             inner: TaskLock::new_named(
                 TaskControlBlockInner {
                     trap_cx: TrapFrame::new(),
@@ -408,11 +489,8 @@ impl TaskControlBlock {
                     heap_bottom,
                     program_brk: heap_bottom,
                     sleeping: None,
-                    utime: 0,
-                    stime: 0,
                     cutime: 0,
                     cstime: 0,
-                    last_time: polyhal::time::Time::now().to_nsec() as usize,
                     block_reason: None,
                     itimer_expire: 0,
                     itimer_interval_us: 0,
@@ -572,6 +650,12 @@ impl TaskControlBlock {
             inner.memory_set.enter_cpu(cpu);
             inner.memory_set.token()
         };
+        // The TCB and hardware page table now agree. The rest of exec builds
+        // userspace data and may release file-backed mappings, so it must remain
+        // interruptible rather than extending this atomic handoff window.
+        if restore_interrupts {
+            IRQ::int_enable();
+        }
         // The processor no longer uses the old page table, so its frames may
         // be released before constructing the new initial stack.
         drop(retired_memory_set);
@@ -719,6 +803,7 @@ impl TaskControlBlock {
         *translated_refmut(token, sp as *mut u64) = argc as u64;
         let crt_sp = sp;
 
+        super::invalidate_user_float_state();
         let mut inner = self.inner_exclusive_access();
         #[cfg(feature = "smp-diagnostics")]
         for (fd, file) in inner.fd_table.iter().enumerate() {
@@ -798,15 +883,14 @@ impl TaskControlBlock {
             committed_tp,
         );
         drop(inner);
-        if restore_interrupts {
-            IRQ::int_enable();
-        }
         for file in cloexec_files {
             file.close_ref();
         }
     }
     pub fn fork(self: &Arc<TaskControlBlock>) -> Option<Arc<TaskControlBlock>> {
         trace!("os::task::TaskControlBlock::fork");
+        // fork inherits the register image as it existed at the syscall entry.
+        self.save_user_float_state();
         // Linux inherits the parent's CPU affinity across fork.  Snapshot the
         // atomic mask before publishing the child to any scheduler queue.
         let inherited_affinity = self.allowed_cpus();
@@ -815,12 +899,14 @@ impl TaskControlBlock {
         // mappings for COW. A parent which is already a CLONE_VM group can be
         // active on several harts, so retain its activity mask while the PTEs
         // are changed and shoot those harts down after releasing Task/Vm.
-        let parent_activity;
-        let memory_set = {
-            let mut parent_inner = self.inner_exclusive_access();
-            parent_activity = parent_inner.memory_set.activity_handle();
-            MemorySet::from_existed_user(&mut parent_inner.memory_set)?
+        let (parent_activity, parent_memory_set) = {
+            let parent_inner = self.inner_exclusive_access();
+            (
+                parent_inner.memory_set.activity_handle(),
+                parent_inner.memory_set.fault_view(),
+            )
         };
+        let memory_set = MemorySet::from_existed_user(&parent_memory_set)?;
         assert!(
             super::processor::flush_remote_tlb(&parent_activity, 0, 0),
             "fork COW remote TLB shootdown failed"
@@ -860,7 +946,7 @@ impl TaskControlBlock {
             let files_guard = super::FILE_TABLE_LOCK.lock();
             let Some(parent_inner) = self.try_inner_exclusive_access() else {
                 drop(files_guard);
-                super::suspend_current_and_run_next();
+                super::suspend_current_and_run_next_reason(super::SuspendReason::ForkSnapshotRetry);
                 continue;
             };
             let fork_signal_actions = Arc::new(SignalActionsLock::new_named(
@@ -904,7 +990,7 @@ impl TaskControlBlock {
                 parent_inner.signal_mask,
                 fork_signal_actions,
                 parent_inner.heap_bottom,
-                parent_inner.program_brk,
+                parent_inner.memory_set.program_brk(),
                 parent_inner.fp_state,
             );
             drop(parent_inner);
@@ -918,6 +1004,7 @@ impl TaskControlBlock {
         let task_control_block = Arc::new(TaskControlBlock {
             pid: pid_handle,
             scheduling: TaskSchedulingMeta::new(pid_value),
+            runtime: TaskRuntime::new(),
             inner: TaskLock::new_named(
                 TaskControlBlockInner {
                     trap_cx: trap_cx_clone,
@@ -969,11 +1056,8 @@ impl TaskControlBlock {
                     heap_bottom,
                     program_brk,
                     sleeping: None,
-                    utime: 0,
-                    stime: 0,
                     cutime: 0,
                     cstime: 0,
-                    last_time: polyhal::time::Time::now().to_nsec() as usize,
                     block_reason: None,
                     itimer_expire: 0,
                     itimer_interval_us: 0,
@@ -1004,6 +1088,7 @@ impl TaskControlBlock {
         materialize_writable_pages: bool,
     ) -> Option<Arc<TaskControlBlock>> {
         trace!("os::task::TaskControlBlock::clone_shared_vm");
+        self.save_user_float_state();
         let inherited_affinity = self.allowed_cpus();
         let mut parent_activity = None;
         let mut remapped_shared_pages = false;
@@ -1042,7 +1127,9 @@ impl TaskControlBlock {
             let files_guard = super::FILE_TABLE_LOCK.lock();
             let Some(mut parent_inner) = self.try_inner_exclusive_access() else {
                 drop(files_guard);
-                super::suspend_current_and_run_next();
+                super::suspend_current_and_run_next_reason(
+                    super::SuspendReason::CloneSnapshotRetry,
+                );
                 continue;
             };
             // COW mappings require normalization only when this is the first
@@ -1111,7 +1198,7 @@ impl TaskControlBlock {
                 parent_inner.signal_mask,
                 child_signal_actions,
                 parent_inner.heap_bottom,
-                parent_inner.program_brk,
+                parent_inner.memory_set.program_brk(),
                 parent_inner.fp_state,
             );
             drop(parent_inner);
@@ -1136,6 +1223,7 @@ impl TaskControlBlock {
         let task_control_block = Arc::new(TaskControlBlock {
             pid: pid_handle,
             scheduling: TaskSchedulingMeta::new(pid_value),
+            runtime: TaskRuntime::new(),
             inner: TaskLock::new_named(
                 TaskControlBlockInner {
                     trap_cx: trap_cx_clone,
@@ -1187,11 +1275,8 @@ impl TaskControlBlock {
                     heap_bottom,
                     program_brk,
                     sleeping: None,
-                    utime: 0,
-                    stime: 0,
                     cutime: 0,
                     cstime: 0,
-                    last_time: polyhal::time::Time::now().to_nsec() as usize,
                     block_reason: None,
                     itimer_expire: 0,
                     itimer_interval_us: 0,
@@ -1213,7 +1298,9 @@ impl TaskControlBlock {
                 let mut files = super::FILE_TABLE_LOCK.lock();
                 if !task_control_block.try_initialize_shared_files_from(self) {
                     drop(files);
-                    super::suspend_current_and_run_next();
+                    super::suspend_current_and_run_next_reason(
+                        super::SuspendReason::CloneFilesRetry,
+                    );
                     continue;
                 }
                 super::register_files_task_locked(
@@ -1322,8 +1409,11 @@ impl TaskControlBlock {
             .store(true, Ordering::Release);
     }
 
-    pub(crate) fn publish_waitable_zombie(&self) {
-        self.scheduling.waitable_zombie.store(true, Ordering::Release);
+    pub(crate) fn try_publish_waitable_zombie(&self) -> bool {
+        self.scheduling
+            .waitable_zombie
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 
     /// Return the task's requested CPU mask.  The mask is not user-modifiable
@@ -1390,34 +1480,25 @@ impl TaskControlBlock {
         );
     }
     pub fn record_time_user_to_kernel(&self) {
-        let Some(mut inner) = self.try_inner_exclusive_access() else {
-            return;
-        };
-        let now = polyhal::time::Time::now().to_nsec() as usize;
-        inner.utime += now - inner.last_time;
-        inner.last_time = now;
+        self.runtime.charge(&self.runtime.utime);
     }
     pub fn record_time_kernel_to_user(&self) {
-        let Some(mut inner) = self.try_inner_exclusive_access() else {
-            return;
-        };
-        let now = polyhal::time::Time::now().to_nsec() as usize;
-        inner.stime += now - inner.last_time;
-        inner.last_time = now;
+        self.runtime.charge(&self.runtime.stime);
     }
     pub fn record_time_suspend(&self) {
-        let Some(mut inner) = self.try_inner_exclusive_access() else {
-            return;
-        };
-        let now = polyhal::time::Time::now().to_nsec() as usize;
-        inner.stime += now - inner.last_time;
-        inner.last_time = now;
+        self.runtime.charge(&self.runtime.stime);
     }
     pub fn record_time_resume(&self) {
-        let Some(mut inner) = self.try_inner_exclusive_access() else {
-            return;
-        };
-        inner.last_time = polyhal::time::Time::now().to_nsec() as usize;
+        self.runtime.last_time.store(
+            polyhal::time::Time::now().to_nsec() as usize,
+            Ordering::Relaxed,
+        );
+    }
+    pub fn user_time_ns(&self) -> usize {
+        self.runtime.utime.load(Ordering::Relaxed)
+    }
+    pub fn system_time_ns(&self) -> usize {
+        self.runtime.stime.load(Ordering::Relaxed)
     }
 }
 
@@ -1435,6 +1516,9 @@ pub enum BlockReason {
     PipeRead(usize),
     PipeWrite(usize),
     Futex(usize, usize),
+    FilePageLoad(usize),
+    SleepLock(usize),
+    ExecPeer(usize),
     SignalWait(SignalFlags),
     Vfork(usize),
 }

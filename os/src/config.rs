@@ -5,7 +5,10 @@
 // 1 MiB fixed mapping is too small for rustc and caused its first stack-growth
 // access to collide with the signal restorer page below it.
 pub const USER_STACK_SIZE: usize = 8 * 1024 * 1024;
-pub const KERNEL_STACK_SIZE: usize = 4096 * 4;
+// Rust VFS paths can nest through the page cache, lwext4 and virtio layers.
+// A 16 KiB stack was not enough for those paths under SMP and let an overflow
+// silently corrupt adjacent kernel heap objects and saved task contexts.
+pub const KERNEL_STACK_SIZE: usize = 4096 * 8;
 // The heap is statically reserved from the physical RAM.  Keep enough user
 // frames available for real workloads on the 256 MiB RISC-V QEMU machine.
 pub const KERNEL_HEAP_SIZE: usize = 0x400_0000;

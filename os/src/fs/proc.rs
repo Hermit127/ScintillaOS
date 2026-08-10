@@ -168,7 +168,7 @@ impl ProcPidStatFile {
     fn build_content(&self) -> String {
         use alloc::format;
         if let Some(task) = crate::task::pid2task(self.pid) {
-            let (state, executable_path, parent, pgid, sid, utime, stime) = {
+            let (state, executable_path, parent, pgid, sid) = {
                 let inner = task.inner_exclusive_access();
                 (
                     match inner.task_status {
@@ -180,10 +180,10 @@ impl ProcPidStatFile {
                     inner.parent.clone(),
                     inner.pgid,
                     inner.sid,
-                    inner.utime.max(1),
-                    inner.stime,
                 )
             };
+            let utime = task.user_time_ns().max(1);
+            let stime = task.system_time_ns();
             let cmd = task_comm(&executable_path);
             let ppid = parent
                 .and_then(|parent| parent.upgrade())

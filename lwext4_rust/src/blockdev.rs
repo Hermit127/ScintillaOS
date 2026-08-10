@@ -31,12 +31,18 @@ pub struct Ext4BlockWrapper<K: KernelDevOp> {
     name: [u8; 16],
     mount_point: [u8; 32],
     has_journal: bool,
+    write_back_enabled: bool,
     pd: core::marker::PhantomData<K>,
 }
 
 impl<K: KernelDevOp> Ext4BlockWrapper<K> {
     pub fn get_fs_ptr(&self) -> *mut ext4_fs {
         self.value.fs
+    }
+
+    pub fn flush_device(&self) -> Result<usize, i32> {
+        let dev = unsafe { &mut *((*self.value.bdif).p_user as *mut K::DevType) };
+        K::flush(dev)
     }
 
     pub fn new(block_dev: K::DevType) -> Result<Self, i32> {
@@ -108,6 +114,7 @@ impl<K: KernelDevOp> Ext4BlockWrapper<K> {
             name,
             mount_point,
             has_journal: false,
+            write_back_enabled: false,
             pd: core::marker::PhantomData,
         };
 
@@ -264,10 +271,24 @@ impl<K: KernelDevOp> Ext4BlockWrapper<K> {
                     return Err(r);
                 }
             } else {
-                ext4_cache_write_back(c_mountpoint, true);
                 self.has_journal = true;
             }
         }
+        // Write-back is independent from journaling. Many contest rootfs
+        // images deliberately omit a journal; leaving lwext4 in its default
+        // write-through mode would synchronously flush every small compiler
+        // write. fsync/sync explicitly flush the cache, and unmount disables
+        // write-back before releasing the device.
+        let r = ext4_cache_write_back(c_mountpoint, true);
+        if r != EOK as i32 {
+            error!("ext4_cache_write_back: rc = {:?}\n", r);
+            if self.has_journal {
+                let _ = ext4_journal_stop(c_mountpoint);
+                self.has_journal = false;
+            }
+            return Err(r);
+        }
+        self.write_back_enabled = true;
         // ext4_bcache
 
         info!("lwext4 mount Okay");
@@ -280,8 +301,15 @@ impl<K: KernelDevOp> Ext4BlockWrapper<K> {
         let c_mountpoint = &self.mount_point as *const _ as *const c_char;
 
         unsafe {
+            if self.write_back_enabled {
+                let r = ext4_cache_write_back(c_mountpoint, false);
+                if r != EOK as i32 {
+                    error!("ext4_cache_write_back disable: fail {}", r);
+                    return Err(r);
+                }
+                self.write_back_enabled = false;
+            }
             if self.has_journal {
-                ext4_cache_write_back(c_mountpoint, false);
                 let r = ext4_journal_stop(c_mountpoint);
                 if r != EOK as i32 {
                     error!("ext4_journal_stop: fail {}", r);
@@ -294,6 +322,8 @@ impl<K: KernelDevOp> Ext4BlockWrapper<K> {
                 error!("ext4_umount: fail {}", r);
                 return Err(r);
             }
+
+            self.flush_device()?;
 
             let r = ext4_device_unregister(c_name);
             if r != EOK as i32 {

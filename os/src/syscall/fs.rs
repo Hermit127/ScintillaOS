@@ -8,7 +8,7 @@ use crate::fs::{
     symlink_at, DevBlock, DevNull, DevZero, EpollEvent, EpollFile, EventFdFile, File,
     Kstat, OpenFlags, UnixSocketKind, Urandom, EPOLL_MAX_INTERESTS, S_IFDIR, S_IFREG,
 };
-use crate::sync::TaskGuard;
+use crate::sync::{TaskGuard, VfsLock};
 use crate::task::{
     current_task, current_user_token, file_group_tasks_locked, has_interrupting_signal,
     pid2task, TaskControlBlock, TaskControlBlockInner, FILE_TABLE_LOCK,
@@ -28,7 +28,46 @@ const PATH_MAX: usize = 4096;
 const NAME_MAX: usize = 255;
 const EROFS: isize = -30;
 const INLINE_IO_STAGING_SIZE: usize = 1024;
-pub(crate) const MAX_IO_STAGING_SIZE: usize = 64 * 1024;
+pub(crate) const MAX_IO_STAGING_SIZE: usize = 1024 * 1024;
+const IO_STAGING_POOL_SIZE: usize = 16;
+
+struct IoStagingPool {
+    buffers: [Option<Vec<u8>>; IO_STAGING_POOL_SIZE],
+}
+
+impl IoStagingPool {
+    const fn new() -> Self {
+        Self {
+            buffers: [const { None }; IO_STAGING_POOL_SIZE],
+        }
+    }
+
+    fn take(&mut self, len: usize) -> Option<Vec<u8>> {
+        let index = self
+            .buffers
+            .iter()
+            .position(|buffer| buffer.as_ref().is_some_and(|buffer| buffer.capacity() >= len))
+            .or_else(|| self.buffers.iter().position(Option::is_some))?;
+        self.buffers[index].take()
+    }
+
+    fn put(&mut self, buffer: Vec<u8>) -> Result<(), Vec<u8>> {
+        let Some(slot) = self.buffers.iter_mut().find(|slot| slot.is_none()) else {
+            return Err(buffer);
+        };
+        *slot = Some(buffer);
+        Ok(())
+    }
+}
+
+static IO_STAGING_POOL: VfsLock<IoStagingPool> =
+    VfsLock::new_named(IoStagingPool::new(), "VfsIoStagingPool");
+
+fn recycle_io_staging(mut buffer: Vec<u8>) {
+    buffer.clear();
+    let retired = IO_STAGING_POOL.exclusive_access().put(buffer).err();
+    drop(retired);
+}
 
 pub(crate) enum IoStaging {
     Inline {
@@ -46,8 +85,12 @@ impl IoStaging {
                 len,
             });
         }
-        let mut bytes = Vec::new();
+        let mut bytes = IO_STAGING_POOL
+            .exclusive_access()
+            .take(len)
+            .unwrap_or_default();
         if bytes.try_reserve_exact(len).is_err() {
+            recycle_io_staging(bytes);
             return Err(-12);
         }
         bytes.resize(len, 0);
@@ -65,6 +108,14 @@ impl IoStaging {
         match self {
             Self::Inline { bytes, len } => &mut bytes[..*len],
             Self::Heap(bytes) => bytes,
+        }
+    }
+}
+
+impl Drop for IoStaging {
+    fn drop(&mut self) {
+        if let Self::Heap(bytes) = self {
+            recycle_io_staging(core::mem::take(bytes));
         }
     }
 }
@@ -298,17 +349,12 @@ impl Drop for LockedFileGroup<'_> {
     }
 }
 
-fn try_lock_file_group<'a>(
-    tasks: &'a [Arc<TaskControlBlock>],
-) -> Option<LockedFileGroup<'a>> {
+fn lock_file_group<'a>(tasks: &'a [Arc<TaskControlBlock>]) -> LockedFileGroup<'a> {
     let mut inners = LockedFileGroup::with_capacity(tasks.len());
     for task in tasks {
-        let Some(inner) = task.try_inner_exclusive_access() else {
-            return None;
-        };
-        inners.push(inner);
+        inners.push(task.inner_exclusive_access());
     }
-    Some(inners)
+    inners
 }
 
 fn prepare_file_group(
@@ -340,29 +386,23 @@ pub(crate) fn install_fd_shared(
     cloexec: bool,
 ) -> Result<usize, isize> {
     let files_id = task.inner_exclusive_access().files_id;
-    loop {
-        let mut files = FILE_TABLE_LOCK.lock();
-        let tasks = prepare_file_group(&mut files, task, files_id);
-        let Some(mut inners) = try_lock_file_group(&tasks) else {
-            drop(files);
-            crate::task::suspend_current_and_run_next();
-            continue;
-        };
-        let limit = shared_fd_limit(&inners);
-        let Some(fd) = first_free_shared_fd(&inners, 0, limit) else {
-            return Err(-24);
-        };
-        for _ in 1..inners.len() {
-            file.dup_ref();
-        }
-        for inner in inners.iter_mut() {
-            ensure_fd_slot(inner, fd);
-            debug_assert!(inner.fd_table[fd].is_none());
-            inner.fd_table[fd] = Some(file.clone());
-            inner.fd_cloexec[fd] = cloexec;
-        }
-        return Ok(fd);
+    let mut files = FILE_TABLE_LOCK.lock();
+    let tasks = prepare_file_group(&mut files, task, files_id);
+    let mut inners = lock_file_group(&tasks);
+    let limit = shared_fd_limit(&inners);
+    let Some(fd) = first_free_shared_fd(&inners, 0, limit) else {
+        return Err(-24);
+    };
+    for _ in 1..inners.len() {
+        file.dup_ref();
     }
+    for inner in inners.iter_mut() {
+        ensure_fd_slot(inner, fd);
+        debug_assert!(inner.fd_table[fd].is_none());
+        inner.fd_table[fd] = Some(file.clone());
+        inner.fd_cloexec[fd] = cloexec;
+    }
+    Ok(fd)
 }
 
 fn install_fd(
@@ -378,39 +418,33 @@ fn close_fd_shared(
     fd: usize,
 ) -> Result<bool, isize> {
     let files_id = task.inner_exclusive_access().files_id;
-    loop {
-        let mut file_state = FILE_TABLE_LOCK.lock();
-        let tasks = prepare_file_group(&mut file_state, task, files_id);
-        let Some(mut inners) = try_lock_file_group(&tasks) else {
-            drop(file_state);
-            crate::task::suspend_current_and_run_next();
-            continue;
-        };
-        let task_index = tasks
-            .iter()
-            .position(|candidate| Arc::ptr_eq(candidate, task))
-            .expect("current task missing from shared file group");
-        let Some(file) = inners[task_index]
-            .fd_table
-            .get(fd)
-            .and_then(|file| file.as_ref())
-        else {
-            return Err(-9);
-        };
-        let is_unix_socket = file.as_any().is::<crate::fs::UnixSocketFile>();
-        let mut closed_files = Vec::new();
-        for inner in inners.iter_mut() {
-            if let Some(file) = inner.take_fd_for_close(fd) {
-                closed_files.push(file);
-            }
+    let mut file_state = FILE_TABLE_LOCK.lock();
+    let tasks = prepare_file_group(&mut file_state, task, files_id);
+    let mut inners = lock_file_group(&tasks);
+    let task_index = tasks
+        .iter()
+        .position(|candidate| Arc::ptr_eq(candidate, task))
+        .expect("current task missing from shared file group");
+    let Some(file) = inners[task_index]
+        .fd_table
+        .get(fd)
+        .and_then(|file| file.as_ref())
+    else {
+        return Err(-9);
+    };
+    let is_unix_socket = file.as_any().is::<crate::fs::UnixSocketFile>();
+    let mut closed_files = Vec::new();
+    for inner in inners.iter_mut() {
+        if let Some(file) = inner.take_fd_for_close(fd) {
+            closed_files.push(file);
         }
-        drop(inners);
-        drop(file_state);
-        for file in closed_files {
-            file.close_ref();
-        }
-        return Ok(is_unix_socket);
     }
+    drop(inners);
+    drop(file_state);
+    for file in closed_files {
+        file.close_ref();
+    }
+    Ok(is_unix_socket)
 }
 
 fn duplicate_fd_shared(
@@ -420,42 +454,36 @@ fn duplicate_fd_shared(
     cloexec: bool,
 ) -> Result<usize, isize> {
     let files_id = task.inner_exclusive_access().files_id;
-    loop {
-        let mut files = FILE_TABLE_LOCK.lock();
-        let tasks = prepare_file_group(&mut files, task, files_id);
-        let Some(mut inners) = try_lock_file_group(&tasks) else {
-            drop(files);
-            crate::task::suspend_current_and_run_next();
-            continue;
-        };
-        let task_index = tasks
-            .iter()
-            .position(|candidate| Arc::ptr_eq(candidate, task))
-            .expect("current task missing from shared file group");
-        let source = inners[task_index]
-            .fd_table
-            .get(fd)
-            .and_then(|file| file.as_ref())
-            .cloned()
-            .ok_or(-9isize)?;
-        let limit = shared_fd_limit(&inners);
-        if minimum >= limit {
-            return Err(-22);
-        }
-        let Some(new_fd) = first_free_shared_fd(&inners, minimum, limit) else {
-            return Err(-24);
-        };
-        for _ in 0..inners.len() {
-            source.dup_ref();
-        }
-        for inner in inners.iter_mut() {
-            ensure_fd_slot(inner, new_fd);
-            debug_assert!(inner.fd_table[new_fd].is_none());
-            inner.fd_table[new_fd] = Some(source.clone());
-            inner.fd_cloexec[new_fd] = cloexec;
-        }
-        return Ok(new_fd);
+    let mut files = FILE_TABLE_LOCK.lock();
+    let tasks = prepare_file_group(&mut files, task, files_id);
+    let mut inners = lock_file_group(&tasks);
+    let task_index = tasks
+        .iter()
+        .position(|candidate| Arc::ptr_eq(candidate, task))
+        .expect("current task missing from shared file group");
+    let source = inners[task_index]
+        .fd_table
+        .get(fd)
+        .and_then(|file| file.as_ref())
+        .cloned()
+        .ok_or(-9isize)?;
+    let limit = shared_fd_limit(&inners);
+    if minimum >= limit {
+        return Err(-22);
     }
+    let Some(new_fd) = first_free_shared_fd(&inners, minimum, limit) else {
+        return Err(-24);
+    };
+    for _ in 0..inners.len() {
+        source.dup_ref();
+    }
+    for inner in inners.iter_mut() {
+        ensure_fd_slot(inner, new_fd);
+        debug_assert!(inner.fd_table[new_fd].is_none());
+        inner.fd_table[new_fd] = Some(source.clone());
+        inner.fd_cloexec[new_fd] = cloexec;
+    }
+    Ok(new_fd)
 }
 
 fn replace_fd_shared(
@@ -468,46 +496,40 @@ fn replace_fd_shared(
         return Ok(new_fd);
     }
     let files_id = task.inner_exclusive_access().files_id;
-    loop {
-        let mut files = FILE_TABLE_LOCK.lock();
-        let tasks = prepare_file_group(&mut files, task, files_id);
-        let Some(mut inners) = try_lock_file_group(&tasks) else {
-            drop(files);
-            crate::task::suspend_current_and_run_next();
-            continue;
-        };
-        let task_index = tasks
-            .iter()
-            .position(|candidate| Arc::ptr_eq(candidate, task))
-            .expect("current task missing from shared file group");
-        let source = inners[task_index]
-            .fd_table
-            .get(fd)
-            .and_then(|file| file.as_ref())
-            .cloned()
-            .ok_or(-9isize)?;
-        if new_fd >= shared_fd_limit(&inners) {
-            return Err(-9);
-        }
-        for _ in 0..inners.len() {
-            source.dup_ref();
-        }
-        let mut replaced = Vec::new();
-        for inner in inners.iter_mut() {
-            ensure_fd_slot(inner, new_fd);
-            if let Some(file) = inner.take_fd_for_close(new_fd) {
-                replaced.push(file);
-            }
-            inner.fd_table[new_fd] = Some(source.clone());
-            inner.fd_cloexec[new_fd] = cloexec;
-        }
-        drop(inners);
-        drop(files);
-        for file in replaced {
-            file.close_ref();
-        }
-        return Ok(new_fd);
+    let mut files = FILE_TABLE_LOCK.lock();
+    let tasks = prepare_file_group(&mut files, task, files_id);
+    let mut inners = lock_file_group(&tasks);
+    let task_index = tasks
+        .iter()
+        .position(|candidate| Arc::ptr_eq(candidate, task))
+        .expect("current task missing from shared file group");
+    let source = inners[task_index]
+        .fd_table
+        .get(fd)
+        .and_then(|file| file.as_ref())
+        .cloned()
+        .ok_or(-9isize)?;
+    if new_fd >= shared_fd_limit(&inners) {
+        return Err(-9);
     }
+    for _ in 0..inners.len() {
+        source.dup_ref();
+    }
+    let mut replaced = Vec::new();
+    for inner in inners.iter_mut() {
+        ensure_fd_slot(inner, new_fd);
+        if let Some(file) = inner.take_fd_for_close(new_fd) {
+            replaced.push(file);
+        }
+        inner.fd_table[new_fd] = Some(source.clone());
+        inner.fd_cloexec[new_fd] = cloexec;
+    }
+    drop(inners);
+    drop(files);
+    for file in replaced {
+        file.close_ref();
+    }
+    Ok(new_fd)
 }
 
 fn set_fd_cloexec_shared(
@@ -516,33 +538,27 @@ fn set_fd_cloexec_shared(
     cloexec: bool,
 ) -> Result<(), isize> {
     let files_id = task.inner_exclusive_access().files_id;
-    loop {
-        let mut files = FILE_TABLE_LOCK.lock();
-        let tasks = prepare_file_group(&mut files, task, files_id);
-        let Some(mut inners) = try_lock_file_group(&tasks) else {
-            drop(files);
-            crate::task::suspend_current_and_run_next();
-            continue;
-        };
-        let task_index = tasks
-            .iter()
-            .position(|candidate| Arc::ptr_eq(candidate, task))
-            .expect("current task missing from shared file group");
-        if inners[task_index]
-            .fd_table
-            .get(fd)
-            .and_then(|file| file.as_ref())
-            .is_none()
-        {
-            return Err(-9);
-        }
-        for inner in inners.iter_mut() {
-            if fd < inner.fd_table.len() && inner.fd_table[fd].is_some() {
-                inner.fd_cloexec[fd] = cloexec;
-            }
-        }
-        return Ok(());
+    let mut files = FILE_TABLE_LOCK.lock();
+    let tasks = prepare_file_group(&mut files, task, files_id);
+    let mut inners = lock_file_group(&tasks);
+    let task_index = tasks
+        .iter()
+        .position(|candidate| Arc::ptr_eq(candidate, task))
+        .expect("current task missing from shared file group");
+    if inners[task_index]
+        .fd_table
+        .get(fd)
+        .and_then(|file| file.as_ref())
+        .is_none()
+    {
+        return Err(-9);
     }
+    for inner in inners.iter_mut() {
+        if fd < inner.fd_table.len() && inner.fd_table[fd].is_some() {
+            inner.fd_cloexec[fd] = cloexec;
+        }
+    }
+    Ok(())
 }
 
 // RISC-V and LoongArch use the naturally aligned Linux UAPI layout:
@@ -873,26 +889,27 @@ fn resolve_base_dir_for_path(dirfd: isize, path: &str) -> Result<Arc<Dentry>, is
     if dirfd < 0 {
         return Err(-9);
     }
-    let inner = task.inner_exclusive_access();
-    let fd = dirfd as usize;
-    if fd >= inner.fd_table.len() {
-        return Err(-9);
-    }
-    let Some(file) = &inner.fd_table[fd] else {
-        return Err(-9);
-    };
-    if !file.is_dir() {
-        return Err(-20);
-    }
-    if let Some(inode) = file.as_any().downcast_ref::<crate::fs::inode::OSInode>() {
-        let dentry = inode.get_dentry().clone();
-        if dentry_still_exists(&dentry) {
-            Ok(dentry)
-        } else {
-            Err(-2)
+    let dentry = {
+        let inner = task.inner_exclusive_access();
+        let fd = dirfd as usize;
+        if fd >= inner.fd_table.len() {
+            return Err(-9);
         }
+        let Some(file) = &inner.fd_table[fd] else {
+            return Err(-9);
+        };
+        if !file.is_dir() {
+            return Err(-20);
+        }
+        let Some(inode) = file.as_any().downcast_ref::<crate::fs::inode::OSInode>() else {
+            return Err(-20);
+        };
+        inode.get_dentry().clone()
+    };
+    if dentry_still_exists(&dentry) {
+        Ok(dentry)
     } else {
-        Err(-20)
+        Err(-2)
     }
 }
 
@@ -1010,27 +1027,55 @@ pub fn sys_write(fd: usize, buf: *mut u8, len: usize) -> isize {
             }
         }
         drop(inner);
-        // File implementations may hold VFS, filesystem or device locks.
-        // Copy user data before entering them so a user page fault cannot
-        // re-enter TaskLock while an outer lock is held.
-        let mut staging = match copy_from_user_for_io(&task, token, buf, len) {
-            Ok(staging) => staging,
-            Err(errno) => {
-                #[cfg(any(
-                    feature = "buildstorm-diagnostics",
-                    feature = "buildstorm-mm-diagnostics"
-                ))]
-                super::process::diagnose_task_user_access(
-                    &task,
-                    buf as usize,
-                    len.min(MAX_IO_STAGING_SIZE),
-                    false,
-                    "write-copy-in",
-                );
-                return errno;
+        let complete_regular_io = file
+            .as_any()
+            .downcast_ref::<crate::fs::inode::OSInode>()
+            .is_some();
+        let mut total = 0usize;
+        loop {
+            let remaining = len - total;
+            let chunk_len = remaining.min(MAX_IO_STAGING_SIZE);
+            let Some(chunk_addr) = (buf as usize).checked_add(total) else {
+                return if total == 0 { -14 } else { total as isize };
+            };
+            // User memory is copied before entering the file layer so a page
+            // fault cannot re-enter TaskLock beneath a filesystem lock.
+            let mut staging = match copy_from_user_for_io(
+                &task,
+                token,
+                chunk_addr as *mut u8,
+                chunk_len,
+            ) {
+                Ok(staging) => staging,
+                Err(errno) => {
+                    #[cfg(any(
+                        feature = "buildstorm-diagnostics",
+                        feature = "buildstorm-mm-diagnostics"
+                    ))]
+                    super::process::diagnose_task_user_access(
+                        &task,
+                        chunk_addr,
+                        chunk_len,
+                        false,
+                        "write-copy-in",
+                    );
+                    return if total == 0 { errno } else { total as isize };
+                }
+            };
+            let staged_len = staging.as_slice().len();
+            let written = file.write(staging.as_mut_slice());
+            if written < 0 {
+                return if total == 0 { written } else { total as isize };
             }
-        };
-        file.write(staging.as_mut_slice())
+            let written = written as usize;
+            if written > staged_len {
+                return if total == 0 { -5 } else { total as isize };
+            }
+            total += written;
+            if written < staged_len || !complete_regular_io || total == len {
+                return total as isize;
+            }
+        }
     } else {
         -1
     }
@@ -1060,50 +1105,71 @@ pub fn sys_read(fd: usize, buf: *mut u8, len: usize) -> isize {
             return -9;
         }
         drop(inner);
-        // The file layer receives only a kernel buffer.  Copying back to user
-        // space happens after all file-system and device locks are released.
-        let mut staging = match copy_to_user_after_io(&task, token, buf, len) {
-            Ok(staging) => staging,
-            Err(errno) => {
+        let complete_regular_io = file
+            .as_any()
+            .downcast_ref::<crate::fs::inode::OSInode>()
+            .is_some();
+        let mut total = 0usize;
+        loop {
+            let remaining = len - total;
+            let chunk_len = remaining.min(MAX_IO_STAGING_SIZE);
+            let Some(chunk_addr) = (buf as usize).checked_add(total) else {
+                return if total == 0 { -14 } else { total as isize };
+            };
+            let mut staging = match copy_to_user_after_io(
+                &task,
+                token,
+                chunk_addr as *mut u8,
+                chunk_len,
+            ) {
+                Ok(staging) => staging,
+                Err(errno) => {
+                    #[cfg(any(
+                        feature = "buildstorm-diagnostics",
+                        feature = "buildstorm-mm-diagnostics"
+                    ))]
+                    super::process::diagnose_task_user_access(
+                        &task,
+                        chunk_addr,
+                        chunk_len,
+                        true,
+                        "read-prepare-out",
+                    );
+                    return if total == 0 { errno } else { total as isize };
+                }
+            };
+            let read = file.read(staging.as_mut_slice());
+            if read < 0 {
+                return if total == 0 { read } else { total as isize };
+            }
+            let read = read as usize;
+            if read > staging.as_slice().len() {
+                return if total == 0 { -5 } else { total as isize };
+            }
+            if let Err(errno) = copy_staged_output_to_user(
+                &task,
+                token,
+                chunk_addr as *mut u8,
+                &staging.as_slice()[..read],
+            ) {
                 #[cfg(any(
                     feature = "buildstorm-diagnostics",
                     feature = "buildstorm-mm-diagnostics"
                 ))]
                 super::process::diagnose_task_user_access(
                     &task,
-                    buf as usize,
-                    len.min(MAX_IO_STAGING_SIZE),
+                    chunk_addr,
+                    read,
                     true,
-                    "read-prepare-out",
+                    "read-copy-out",
                 );
-                return errno;
+                return if total == 0 { errno } else { total as isize };
             }
-        };
-        let read = file.read(staging.as_mut_slice());
-        if read <= 0 {
-            return read;
+            total += read;
+            if read < staging.as_slice().len() || !complete_regular_io || total == len {
+                return total as isize;
+            }
         }
-        let read = read as usize;
-        if read > len {
-            return -5;
-        }
-        if let Err(errno) =
-            copy_staged_output_to_user(&task, token, buf, &staging.as_slice()[..read])
-        {
-            #[cfg(any(
-                feature = "buildstorm-diagnostics",
-                feature = "buildstorm-mm-diagnostics"
-            ))]
-            super::process::diagnose_task_user_access(
-                &task,
-                buf as usize,
-                read,
-                true,
-                "read-copy-out",
-            );
-            return errno;
-        }
-        read as isize
     } else {
         #[cfg(feature = "smp-diagnostics")]
         crate::println!(
@@ -1285,6 +1351,14 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> isize
             }
         }
     } else if !open_flags.create_requested() {
+        #[cfg(feature = "buildstorm-diagnostics")]
+        crate::println!(
+            "[buildstorm-fs] open-lookup-missing dirfd={} flags={:#x} base={} path={}",
+            dirfd,
+            flags,
+            base.fs_path,
+            path,
+        );
         return -2;
     } else {
         let (parent, _) = match resolve_parent_and_name_checked(&base, path.as_str()) {
@@ -1329,14 +1403,13 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> isize
             return -17;
         }
         #[cfg(feature = "buildstorm-diagnostics")]
-        if diagnose_buildstorm {
-            crate::println!(
-                "[buildstorm-fs] open-file-at-failed dirfd={} flags={:#x} path={}",
-                dirfd,
-                flags,
-                path,
-            );
-        }
+        crate::println!(
+            "[buildstorm-fs] open-file-at-failed dirfd={} flags={:#x} base={} path={}",
+            dirfd,
+            flags,
+            base.fs_path,
+            path,
+        );
         -2
     }
 }
@@ -1669,7 +1742,13 @@ pub fn sys_mkdirat(dirfd: isize, path: *const u8, mode: u32) -> isize {
         if path.contains("/.fingerprint/") {
             crate::println!("[buildstorm-fs] mkdir-create-failed path={}", path);
         }
-        -2 // ENOENT
+        // A racing creator may have installed the same directory after the
+        // initial lookup. Linux reports EEXIST in that case, not ENOENT.
+        if vfs_resolve_path(&base_dir, path.as_str()).is_some() {
+            -17
+        } else {
+            -2
+        }
     }
 }
 
@@ -3065,7 +3144,9 @@ pub fn sys_lseek(fd: usize, offset: i64, whence: i32) -> isize {
     let file = file.clone();
     drop(inner);
     let mode_type = file.stat().st_mode & 0o170000;
-    if mode_type != 0o100000 {
+    let is_regular = mode_type == 0o100000;
+    let is_directory = mode_type == 0o040000;
+    if !is_regular && !is_directory {
         return -29; // ESPIPE
     }
 
@@ -3076,6 +3157,9 @@ pub fn sys_lseek(fd: usize, offset: i64, whence: i32) -> isize {
             cur + offset
         }
         SEEK_END => {
+            if is_directory {
+                return -22;
+            }
             let size = file.stat().st_size;
             size + offset
         }
@@ -4120,22 +4204,45 @@ pub fn sys_pread64(fd: usize, buf: *mut u8, len: usize, offset: usize) -> isize 
         return -9;
     }
     drop(inner);
-    let mut staging = match copy_to_user_after_io(&task, token, buf, len) {
-        Ok(staging) => staging,
-        Err(errno) => return errno,
-    };
-    let read = file.read_at(offset, staging.as_mut_slice());
-    if read <= 0 {
-        return read;
+    let mut total = 0usize;
+    loop {
+        let chunk_len = (len - total).min(MAX_IO_STAGING_SIZE);
+        let Some(chunk_addr) = (buf as usize).checked_add(total) else {
+            return if total == 0 { -14 } else { total as isize };
+        };
+        let Some(chunk_offset) = offset.checked_add(total) else {
+            return if total == 0 { -22 } else { total as isize };
+        };
+        let mut staging = match copy_to_user_after_io(
+            &task,
+            token,
+            chunk_addr as *mut u8,
+            chunk_len,
+        ) {
+            Ok(staging) => staging,
+            Err(errno) => return if total == 0 { errno } else { total as isize },
+        };
+        let read = file.read_at(chunk_offset, staging.as_mut_slice());
+        if read < 0 {
+            return if total == 0 { read } else { total as isize };
+        }
+        let read = read as usize;
+        if read > staging.as_slice().len() {
+            return if total == 0 { -5 } else { total as isize };
+        }
+        if let Err(errno) = copy_staged_output_to_user(
+            &task,
+            token,
+            chunk_addr as *mut u8,
+            &staging.as_slice()[..read],
+        ) {
+            return if total == 0 { errno } else { total as isize };
+        }
+        total += read;
+        if read < staging.as_slice().len() || total == len {
+            return total as isize;
+        }
     }
-    let read = read as usize;
-    if read > len {
-        return -5;
-    }
-    if let Err(errno) = copy_staged_output_to_user(&task, token, buf, &staging.as_slice()[..read]) {
-        return errno;
-    }
-    read as isize
 }
 
 pub fn sys_pwrite64(fd: usize, buf: *mut u8, len: usize, offset: usize) -> isize {
@@ -4160,11 +4267,38 @@ pub fn sys_pwrite64(fd: usize, buf: *mut u8, len: usize, offset: usize) -> isize
         return -9;
     }
     drop(inner);
-    let mut staging = match copy_from_user_for_io(&task, token, buf, len) {
-        Ok(staging) => staging,
-        Err(errno) => return errno,
-    };
-    file.write_at(offset, staging.as_mut_slice())
+    let mut total = 0usize;
+    loop {
+        let chunk_len = (len - total).min(MAX_IO_STAGING_SIZE);
+        let Some(chunk_addr) = (buf as usize).checked_add(total) else {
+            return if total == 0 { -14 } else { total as isize };
+        };
+        let Some(chunk_offset) = offset.checked_add(total) else {
+            return if total == 0 { -22 } else { total as isize };
+        };
+        let mut staging = match copy_from_user_for_io(
+            &task,
+            token,
+            chunk_addr as *mut u8,
+            chunk_len,
+        ) {
+            Ok(staging) => staging,
+            Err(errno) => return if total == 0 { errno } else { total as isize },
+        };
+        let staged_len = staging.as_slice().len();
+        let written = file.write_at(chunk_offset, staging.as_mut_slice());
+        if written < 0 {
+            return if total == 0 { written } else { total as isize };
+        }
+        let written = written as usize;
+        if written > staged_len {
+            return if total == 0 { -5 } else { total as isize };
+        }
+        total += written;
+        if written < staged_len || total == len {
+            return total as isize;
+        }
+    }
 }
 
 pub fn sys_preadv(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> isize {
@@ -4178,12 +4312,15 @@ pub fn sys_preadv(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> is
     if iovcnt == 0 {
         return 0;
     }
-    let token = current_user_token();
     let task = current_task().unwrap();
     let inner = task.inner_exclusive_access();
     if !inner
         .memory_set
-        .valid_user_buf(iov, iovcnt * core::mem::size_of::<IoVec>(), false)
+        .valid_user_buf(
+            iov,
+            iovcnt * core::mem::size_of::<super::process::UserIoVec>(),
+            false,
+        )
     {
         return -14;
     }
@@ -4202,62 +4339,64 @@ pub fn sys_preadv(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> is
         return -9;
     }
     drop(inner);
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct IoVec {
-        iov_base: usize,
-        iov_len: usize,
+    let (entries, requested) = match super::process::load_user_iovecs(&task, iov, iovcnt) {
+        Ok(entries) => entries,
+        Err(errno) => return errno,
+    };
+    if requested == 0 {
+        return 0;
     }
-    let mut off = offset;
-    let mut total = 0isize;
-    let mut requested = 0usize;
-    for i in 0..iovcnt {
-        let Some(iov_addr) = (iov as usize).checked_add(i * core::mem::size_of::<IoVec>()) else {
-            return if total == 0 { -14 } else { total };
-        };
-        let Some(iov) =
-            super::process::copy_user_value(&task, iov_addr as *const IoVec)
-        else {
-            return if total == 0 { -14 } else { total };
-        };
-        if iov.iov_len == 0 {
-            continue;
+    let mut total = 0usize;
+    let mut index = 0usize;
+    let mut iov_offset = 0usize;
+    while total < requested {
+        let staging_len = (requested - total).min(MAX_IO_STAGING_SIZE);
+        let prepared = super::process::prepare_iovec_output_prefix(
+            &task,
+            &entries,
+            index,
+            iov_offset,
+            staging_len,
+        );
+        if prepared == 0 {
+            return if total == 0 { -14 } else { total as isize };
         }
-        requested = match requested.checked_add(iov.iov_len) {
-            Some(sum) if sum <= isize::MAX as usize => sum,
-            _ => return -22,
+        let mut staging = match super::process::vectored_staging(prepared) {
+            Ok(staging) => staging,
+            Err(errno) => return if total == 0 { errno } else { total as isize },
         };
-        if iov.iov_len > isize::MAX as usize {
-            return -22;
-        }
-        let mut staging =
-            match copy_to_user_after_io(&task, token, iov.iov_base as *mut u8, iov.iov_len) {
-                Ok(staging) => staging,
-                Err(errno) => return if total == 0 { errno } else { total },
-            };
-        let n = file.read_at(off, staging.as_mut_slice());
+        let Some(file_offset) = offset.checked_add(total) else {
+            return if total == 0 { -22 } else { total as isize };
+        };
+        let n = file.read_at(file_offset, staging.as_mut_slice());
         if n < 0 {
-            return if total == 0 { n } else { total };
+            return if total == 0 { n } else { total as isize };
         }
         let n = n as usize;
-        if n > iov.iov_len {
-            return if total == 0 { -5 } else { total };
+        if n > prepared {
+            return if total == 0 { -5 } else { total as isize };
         }
-        if let Err(errno) = copy_staged_output_to_user(
+        if !super::process::copy_to_iovecs(
             &task,
-            token,
-            iov.iov_base as *mut u8,
+            &entries,
+            index,
+            iov_offset,
             &staging.as_slice()[..n],
         ) {
-            return if total == 0 { errno } else { total };
+            return if total == 0 { -14 } else { total as isize };
         }
-        total += n as isize;
-        off += n;
-        if n < iov.iov_len {
-            break;
+        super::process::advance_iovec_cursor(
+            &entries,
+            &mut index,
+            &mut iov_offset,
+            n,
+        );
+        total += n;
+        if n < prepared || prepared < staging_len {
+            return total as isize;
         }
     }
-    total
+    total as isize
 }
 
 pub fn sys_pwritev(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> isize {
@@ -4271,13 +4410,15 @@ pub fn sys_pwritev(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> i
     if iovcnt == 0 {
         return 0;
     }
-    let token = current_user_token();
     let task = current_task().unwrap();
     let inner = task.inner_exclusive_access();
-    // Validate iov array
     if !inner
         .memory_set
-        .valid_user_buf(iov, iovcnt * core::mem::size_of::<IoVec>(), false)
+        .valid_user_buf(
+            iov,
+            iovcnt * core::mem::size_of::<super::process::UserIoVec>(),
+            false,
+        )
     {
         return -14;
     }
@@ -4296,55 +4437,55 @@ pub fn sys_pwritev(fd: usize, iov: *const u8, iovcnt: usize, offset: usize) -> i
         return -9;
     }
     drop(inner);
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct IoVec {
-        iov_base: usize,
-        iov_len: usize,
+    let (entries, requested) = match super::process::load_user_iovecs(&task, iov, iovcnt) {
+        Ok(entries) => entries,
+        Err(errno) => return errno,
+    };
+    if requested == 0 {
+        return 0;
     }
-    let mut off = offset;
-    let mut total = 0isize;
-    let mut requested = 0usize;
-    for i in 0..iovcnt {
-        let Some(iov_addr) = (iov as usize).checked_add(i * core::mem::size_of::<IoVec>()) else {
-            return if total == 0 { -14 } else { total };
+    let mut total = 0usize;
+    let mut index = 0usize;
+    let mut iov_offset = 0usize;
+    while total < requested {
+        let staging_len = (requested - total).min(MAX_IO_STAGING_SIZE);
+        let mut staging = match super::process::vectored_staging(staging_len) {
+            Ok(staging) => staging,
+            Err(errno) => return if total == 0 { errno } else { total as isize },
         };
-        let Some(iov) =
-            super::process::copy_user_value(&task, iov_addr as *const IoVec)
-        else {
-            return if total == 0 { -14 } else { total };
-        };
-        if iov.iov_len == 0 {
-            continue;
+        let staged = super::process::copy_from_iovecs_prefix(
+            &task,
+            &entries,
+            index,
+            iov_offset,
+            staging.as_mut_slice(),
+        );
+        if staged == 0 {
+            return if total == 0 { -14 } else { total as isize };
         }
-        requested = match requested.checked_add(iov.iov_len) {
-            Some(sum) if sum <= isize::MAX as usize => sum,
-            _ => return -22,
+        let Some(file_offset) = offset.checked_add(total) else {
+            return if total == 0 { -22 } else { total as isize };
         };
-        let mut staging =
-            match copy_from_user_for_io(&task, token, iov.iov_base as *mut u8, iov.iov_len) {
-                Ok(staging) => staging,
-                Err(errno) => return if total == 0 { errno } else { total },
-            };
-        let len = staging.as_slice().len();
-        let n = file.write_at(off, staging.as_mut_slice());
+        let n = file.write_at(file_offset, &mut staging.as_mut_slice()[..staged]);
         if n < 0 {
-            return if total == 0 { n } else { total };
+            return if total == 0 { n } else { total as isize };
         }
         let n = n as usize;
-        if n > len {
-            return if total == 0 { -5 } else { total };
+        if n > staged {
+            return if total == 0 { -5 } else { total as isize };
         }
-        total += n as isize;
-        let Some(next_off) = off.checked_add(n) else {
-            return total;
-        };
-        off = next_off;
-        if n < iov.iov_len {
-            break;
+        super::process::advance_iovec_cursor(
+            &entries,
+            &mut index,
+            &mut iov_offset,
+            n,
+        );
+        total += n;
+        if n < staged || staged < staging_len {
+            return total as isize;
         }
     }
-    total
+    total as isize
 }
 
 pub fn sys_preadv2(fd: usize, iov: *const u8, iovcnt: usize, offset: usize, flags: usize) -> isize {
@@ -4380,17 +4521,21 @@ fn sync_fd(fd: usize) -> isize {
         return -9;
     }
     let file = inner.fd_table[fd].as_ref().unwrap().clone();
-    let dentry = match file.as_any().downcast_ref::<crate::fs::inode::OSInode>() {
+    let inode = match file.as_any().downcast_ref::<crate::fs::inode::OSInode>() {
         Some(inode) => {
             let mode_type = inode.stat().st_mode & 0o170000;
             if mode_type != S_IFREG && mode_type != S_IFDIR {
                 return -22;
             }
-            inode.dentry().clone()
+            inode
         }
         None => return -22,
     };
+    let dentry = inode.dentry().clone();
     drop(inner);
+    if !inode.flush_pending_data() {
+        return -5;
+    }
     let rc = dentry.super_block.fsync(&dentry.fs_path);
     if rc == 0 {
         0
@@ -4408,7 +4553,7 @@ pub fn sys_fdatasync(fd: usize) -> isize {
 }
 
 pub fn sys_sync() -> isize {
-    let rc = crate::fs::vfs::ROOT_SB.sync_all();
+    let rc = crate::fs::vfs::sync_filesystems();
     if rc == 0 {
         0
     } else {

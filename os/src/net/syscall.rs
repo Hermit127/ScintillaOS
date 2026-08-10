@@ -780,7 +780,7 @@ fn enqueue_local_udp(src: IpEndpoint, data: &[u8], dest: IpEndpoint) -> isize {
     crate::task::wake_poll_wait_tasks();
     if queue_was_full {
         stdout_release_if_owner();
-        suspend_current_and_run_next();
+        crate::task::suspend_current_and_run_next_reason(crate::task::SuspendReason::NetYield);
     }
     data.len() as isize
 }
@@ -1985,7 +1985,7 @@ pub(crate) fn tcp_send(handle: SocketHandle, nonblock: bool, data: &[u8]) -> isi
         })
         .unwrap_or(-1);
         crate::net::net_poll();
-        suspend_current_and_run_next();
+        crate::task::suspend_current_and_run_next_reason(crate::task::SuspendReason::NetYield);
         return result;
     }
 
@@ -2007,14 +2007,16 @@ pub(crate) fn tcp_send(handle: SocketHandle, nonblock: bool, data: &[u8]) -> isi
             offset += sent as usize;
         } else if sent == 0 {
             if !sock_can_send_tcp(handle) {
-                suspend_current_and_run_next();
+                crate::task::suspend_current_and_run_next_reason(
+                    crate::task::SuspendReason::NetYield,
+                );
             }
         } else {
             return sent;
         }
     }
     crate::net::net_poll();
-    suspend_current_and_run_next();
+    crate::task::suspend_current_and_run_next_reason(crate::task::SuspendReason::NetYield);
     offset as isize
 }
 
@@ -2056,7 +2058,9 @@ pub(crate) fn tcp_recv(handle: SocketHandle, nonblock: bool, buf: &mut [u8]) -> 
                 if !sock_is_active_tcp(handle) && sock_recv_queue_tcp(handle) == 0 {
                     return 0;
                 }
-                suspend_current_and_run_next();
+                crate::task::suspend_current_and_run_next_reason(
+                    crate::task::SuspendReason::NetYield,
+                );
             }
             None => return -1,
         }

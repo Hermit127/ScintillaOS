@@ -6,8 +6,8 @@
 use crate::{
     syscall::{syscall, SYSCALL_EXEC},
     task::{
-        check_and_wake_up_tasks, check_itimers, check_signals_error_of_current, current_add_signal,
-        current_task, exit_current_and_run_next, force_exit_task_group, handle_signals,
+        check_and_wake_up_tasks, check_itimers, current_add_signal, current_task,
+        exit_current_and_run_next, force_exit_task_group, handle_signals,
         suspend_current_and_run_next, SignalFlags,
     },
 };
@@ -101,36 +101,23 @@ fn sync_shared_vm_after_page_fault(
     vaddr: polyhal::VirtAddr,
     translation_changed: bool,
 ) {
-    let snapshot = {
-        let inner = task.inner_exclusive_access();
-        if !inner.memory_set.is_shared() {
-            return;
-        }
-        let vpn = vaddr.floor();
-        let Some(frame) = inner.memory_set.clone_frame_metadata(vpn) else {
-            return;
-        };
-        (
-            task.getpid(),
-            inner.tgid,
-            vpn,
-            frame,
-            inner.memory_set.activity_handle(),
-        )
-    };
-    crate::syscall::process::sync_thread_group_vm_frame(
-        snapshot.0,
-        snapshot.1,
-        snapshot.2,
-        &snapshot.3,
-    );
-    if translation_changed {
-        let _ = crate::task::flush_remote_tlb(
-            &snapshot.4,
-            snapshot.2.raw(),
-            crate::config::PAGE_SIZE,
-        );
+    if !translation_changed {
+        return;
     }
+    let memory_set = {
+        let inner = task.inner_exclusive_access();
+        inner.memory_set.fault_view()
+    };
+    if !memory_set.is_shared() {
+        return;
+    }
+    let vpn = vaddr.floor();
+    let activity = memory_set.activity_handle();
+    let _ = crate::task::flush_remote_tlb(
+        &activity,
+        vpn.raw(),
+        crate::config::PAGE_SIZE,
+    );
 }
 
 /// Resolve a user page fault and synchronize shared address-space metadata.
@@ -151,10 +138,11 @@ fn handle_current_user_page_fault(vaddr: polyhal::VirtAddr, access: crate::mm::P
         let ctx = inner.get_trap_cx();
         (ctx[TrapFrameArgs::SEPC], ctx[TrapFrameArgs::SP])
     };
-    let fault_result = {
-        let mut inner = task.inner_exclusive_access();
-        inner.memory_set.handle_page_fault(vaddr, access)
+    let fault_space = {
+        let inner = task.inner_exclusive_access();
+        inner.memory_set.fault_view()
     };
+    let fault_result = fault_space.handle_page_fault(vaddr, access);
 
     #[cfg(any(
         feature = "smp-diagnostics",
@@ -169,12 +157,19 @@ fn handle_current_user_page_fault(vaddr: polyhal::VirtAddr, access: crate::mm::P
             Some(crate::mm::PageFaultResult::SharedTranslationChanged) => "shared-translation",
             None => "failed",
         };
-        let inner = task.inner_exclusive_access();
+        let (tgid, executable_path, diag_space) = {
+            let inner = task.inner_exclusive_access();
+            (
+                inner.tgid,
+                inner.executable_path.clone(),
+                inner.memory_set.fault_view(),
+            )
+        };
         println!(
             "[fault-diag] stack-page tid={} tgid={} exe={} pc={:#x} sp={:#x} bad={:#x} access={} result={}",
             task.getpid(),
-            inner.tgid,
-            inner.executable_path,
+            tgid,
+            executable_path,
             fault_pc,
             fault_sp,
             vaddr.raw(),
@@ -185,7 +180,7 @@ fn handle_current_user_page_fault(vaddr: polyhal::VirtAddr, access: crate::mm::P
             },
             result,
         );
-        inner.memory_set.print_fault_mapping(vaddr);
+        diag_space.print_fault_mapping(vaddr);
     }
 
     let Some(fault_result) = fault_result else {
@@ -194,15 +189,21 @@ fn handle_current_user_page_fault(vaddr: polyhal::VirtAddr, access: crate::mm::P
             feature = "buildstorm-mm-diagnostics"
         ))]
         if USER_PAGE_FAULT_FAILURE_DIAG_COUNT.fetch_add(1, Ordering::Relaxed) < 64 {
-            let inner = task.inner_exclusive_access();
-            let ctx = inner.get_trap_cx();
+            let (tgid, executable_path, ctx) = {
+                let inner = task.inner_exclusive_access();
+                (
+                    inner.tgid,
+                    inner.executable_path.clone(),
+                    inner.get_trap_cx().clone(),
+                )
+            };
             let pc = ctx[TrapFrameArgs::SEPC];
-            let instruction = if inner.memory_set.valid_user_buf(
+            let instruction = if fault_space.valid_user_buf(
                 pc as *const u8,
                 core::mem::size_of::<u32>(),
                 false,
             ) {
-                let token = inner.get_user_token();
+                let token = fault_space.token();
                 Some(*crate::mm::translated_ref(token, pc as *const u32))
             } else {
                 None
@@ -211,8 +212,8 @@ fn handle_current_user_page_fault(vaddr: polyhal::VirtAddr, access: crate::mm::P
             println!(
                 "[fault-diag] user page fault tid={} tgid={} exe={} access={} sepc={:#x} raw={:#010x} bad={:#x} sp={:#x} tp={:#x} ra={:#x} a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x} reason={} frames={}/{} free={} alloc_failures={}",
                 task.getpid(),
-                inner.tgid,
-                inner.executable_path,
+                tgid,
+                executable_path,
                 match access {
                     crate::mm::PageFaultAccess::Read => "read",
                     crate::mm::PageFaultAccess::Write => "write",
@@ -251,10 +252,8 @@ fn handle_current_user_page_fault(vaddr: polyhal::VirtAddr, access: crate::mm::P
                 ctx.regs[31],
             );
             #[cfg(target_arch = "loongarch64")]
-            inner
-                .memory_set
-                .print_fault_mapping(polyhal::VirtAddr::from(ctx.regs[28]));
-            inner.memory_set.print_fault_mapping(vaddr);
+            fault_space.print_fault_mapping(polyhal::VirtAddr::from(ctx.regs[28]));
+            fault_space.print_fault_mapping(vaddr);
         }
         // A userspace access-permission fault is delivered through the normal
         // signal path.  The previous unconditional exit bypassed an installed
@@ -390,9 +389,6 @@ fn diagnose_watched_frame_corruption(ctx: &TrapFrame, trap_type: TrapType) {
 fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
     let from_user = trap_from_user(ctx);
     if from_user {
-        if let Some(task) = crate::task::current_task() {
-            task.save_user_float_state();
-        }
         // user time accounting
         if let Some(task) = crate::task::current_task() {
             task.record_time_user_to_kernel();
@@ -430,6 +426,12 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             }
         }
         StorePageFault(bad_addr) => {
+            if from_user {
+                // User faults may perform file-backed I/O. Keep that slow path
+                // interruptible so scheduler-aware VM and filesystem locks can
+                // block instead of spinning behind another hart.
+                IRQ::int_enable();
+            }
             dispatch_page_fault(
                 ctx,
                 bad_addr,
@@ -451,6 +453,9 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             }
         }
         LoadPageFault(bad_addr) => {
+            if from_user {
+                IRQ::int_enable();
+            }
             dispatch_page_fault(
                 ctx,
                 bad_addr,
@@ -459,6 +464,9 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             );
         }
         InstructionPageFault(bad_addr) => {
+            if from_user {
+                IRQ::int_enable();
+            }
             #[cfg(feature = "smp-diagnostics")]
             if bad_addr == 0 || ctx[TrapFrameArgs::SEPC] == 0 {
                 let args = ctx.args();
@@ -578,7 +586,9 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             // Kernel code is non-preemptible: switching only from a user trap
             // keeps lock ownership and kernel stacks local to the current hart.
             if user_slice_expired && from_user && current_task().is_some() {
-                suspend_current_and_run_next();
+                crate::task::suspend_current_and_run_next_reason(
+                    crate::task::SuspendReason::TimerPreempt,
+                );
             }
         }
         _ => {
@@ -588,18 +598,10 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
     if !from_user {
         return;
     }
+    crate::sync::drain_deferred_lock_wakes();
     // handle signals (handle the sent signal)
     // println!("[K] trap_handler:: handle_signals");
     handle_signals();
-
-    // check error signals (if error then exit)
-    if let Some((errno, msg)) = check_signals_error_of_current() {
-        println!("[kernel] {}", msg);
-        if let Some(task) = current_task() {
-            force_exit_task_group(&task, errno);
-        }
-        exit_current_and_run_next(errno);
-    }
 
     // kernel time accounting
     if let Some(task) = crate::task::current_task() {

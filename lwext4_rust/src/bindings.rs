@@ -91,7 +91,7 @@ pub const CONFIG_HAVE_OWN_OFLAGS: u32 = 1;
 pub const CONFIG_HAVE_OWN_ERRNO: u32 = 1;
 pub const CONFIG_HAVE_OWN_ASSERT: u32 = 1;
 pub const CONFIG_USE_USER_MALLOC: u32 = 0;
-pub const CONFIG_BLOCK_DEV_CACHE_SIZE: u32 = 256;
+pub const CONFIG_BLOCK_DEV_CACHE_SIZE: u32 = 4096;
 pub const F_SET_EXT2: u32 = 2;
 pub const F_SET_EXT3: u32 = 3;
 pub const F_SET_EXT4: u32 = 4;
@@ -1813,6 +1813,16 @@ unsafe extern "C" {
         file: *mut ext4_file,
         path: *const ::core::ffi::c_char,
         flags: ::core::ffi::c_int,
+    ) -> ::core::ffi::c_int;
+}
+unsafe extern "C" {
+    #[doc = "@brief   Atomically create a regular file with its initial attributes.\n\n @param   file File handle returned for the new file.\n @param   path Absolute mounted path of the new file.\n @param   mode Initial permission bits.\n @param   uid  Initial owner user id.\n @param   gid  Initial owner group id.\n\n @return  EEXIST if the path already exists, otherwise a standard error code."]
+    pub fn ext4_fcreate_with_attrs(
+        file: *mut ext4_file,
+        path: *const ::core::ffi::c_char,
+        mode: u32,
+        uid: u32,
+        gid: u32,
     ) -> ::core::ffi::c_int;
 }
 unsafe extern "C" {
