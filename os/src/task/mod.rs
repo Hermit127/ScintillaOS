@@ -93,7 +93,7 @@ pub use processor::{
     init_current_cpu, init_kernel_page, invalidate_user_float_state,
     mark_current_task_address_space_active, mark_user_float_state_live, record_timer_tick,
     request_reschedule, run_tasks, schedule, scheduler_cpu_snapshots, take_current_task,
-    try_current_hart_id, user_float_state_is_live,
+    timer_preemption_needed, try_current_hart_id, user_float_state_is_live,
 };
 #[cfg(feature = "lock-stats")]
 pub use processor::dump_scheduler_runtime_stats;

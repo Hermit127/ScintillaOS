@@ -1,7 +1,9 @@
 use super::vfs::{
-    begin_cached_child_mutation, dentry_parent, invalidate_cached_child,
-    invalidate_cached_child_during_mutation, mark_cached_child_absent, read_dentry_symlink,
-    vfs_create, vfs_create_open_file_during_mutation, vfs_lookup_during_mutation,
+    begin_cached_child_mutation, cache_readdir_entries, dentry_parent,
+    cache_renamed_leaf_during_mutation, flush_and_reset_inode_runtime, invalidate_cached_child,
+    invalidate_cached_child_during_mutation, mark_cached_child_absent, read_dentry_symlink, vfs_create,
+    vfs_cached_lookup_during_mutation, vfs_create_open_file_during_mutation,
+    vfs_lookup_during_mutation,
     vfs_resolve_parent_and_name, vfs_resolve_path, vfs_resolve_with_fallback,
     vfs_tmpfs_can_resize, vfs_tmpfs_commit_resize, Dentry,
 };
@@ -42,7 +44,13 @@ struct OpenInodeKey {
 struct OpenInodeState {
     count: usize,
     orphan_path: Option<String>,
+    orphan_needs_flush: bool,
     unlink_in_progress: bool,
+}
+
+struct OpenInodeCleanup {
+    orphan_path: String,
+    needs_flush: bool,
 }
 
 struct ReadAheadPool {
@@ -132,10 +140,9 @@ fn open_inode_key(dentry: &Arc<Dentry>) -> Option<OpenInodeKey> {
     if dentry.is_dir || dentry.is_link {
         return None;
     }
-    let inode = dentry.inode_info()?.inode_num;
     Some(OpenInodeKey {
         super_block: Arc::as_ptr(&dentry.super_block) as usize,
-        inode,
+        inode: dentry.inode_num,
     })
 }
 
@@ -171,12 +178,13 @@ fn register_open_inode(key: OpenInodeKey) {
     let state = open.entry(key).or_insert(OpenInodeState {
         count: 0,
         orphan_path: None,
+        orphan_needs_flush: false,
         unlink_in_progress: false,
     });
     state.count += 1;
 }
 
-fn unregister_open_inode(key: OpenInodeKey) -> Option<String> {
+fn unregister_open_inode(key: OpenInodeKey) -> Option<OpenInodeCleanup> {
     let mut open = OPEN_INODES.exclusive_access();
     let state = open.get_mut(&key)?;
     if state.count == 0 {
@@ -187,8 +195,12 @@ fn unregister_open_inode(key: OpenInodeKey) -> Option<String> {
         return None;
     }
     let orphan_path = state.orphan_path.take();
+    let needs_flush = state.orphan_needs_flush;
     open.remove(&key);
-    orphan_path
+    orphan_path.map(|orphan_path| OpenInodeCleanup {
+        orphan_path,
+        needs_flush,
+    })
 }
 
 fn unlinked_file_path(dentry: &Dentry, inode: u32) -> String {
@@ -220,6 +232,7 @@ fn retain_replaced_open_inode(
     super_block: usize,
     inode: u32,
     orphan_path: &str,
+    needs_flush: bool,
 ) -> bool {
     let key = OpenInodeKey { super_block, inode };
     let mut open = OPEN_INODES.exclusive_access();
@@ -231,6 +244,7 @@ fn retain_replaced_open_inode(
         return false;
     }
     state.orphan_path = Some(String::from(orphan_path));
+    state.orphan_needs_flush = needs_flush;
     state.unlink_in_progress = false;
     true
 }
@@ -280,6 +294,7 @@ fn defer_open_file_unlink(dentry: &Arc<Dentry>) -> Option<bool> {
             state.unlink_in_progress = false;
             if renamed {
                 state.orphan_path = Some(orphan_path.clone());
+                state.orphan_needs_flush = false;
             }
             if state.count == 0 {
                 cleanup = state.orphan_path.take();
@@ -296,6 +311,7 @@ fn defer_open_file_unlink(dentry: &Arc<Dentry>) -> Option<bool> {
         cleanup
     };
     if let Some(path) = cleanup_path {
+        dentry.discard_pending_writes_during_mutation();
         let _ = dentry.super_block.unlink_file(&path);
     }
     Some(renamed)
@@ -448,30 +464,38 @@ pub struct OSInodeInner {
 
 impl Drop for OSInode {
     fn drop(&mut self) {
-        let _ = self.dentry.flush_pending_writes();
+        self.dentry.record_pending_close();
         {
             let mut inner = self.inner.exclusive_access();
-            if inner.file_handle.is_some() || inner.dir_handle.is_some() {
-                let _fs_lock = self.dentry.super_block.lock_fs();
-                if let Some(ref mut file) = inner.file_handle {
-                    unsafe {
-                        ext4_fclose(file);
-                    }
+            if let Some(ref mut file) = inner.file_handle {
+                unsafe {
+                    ext4_fclose(file);
                 }
-                if let Some(ref mut dir) = inner.dir_handle {
-                    unsafe {
-                        ext4_dir_close(dir);
-                    }
+            }
+            if let Some(ref mut dir) = inner.dir_handle {
+                unsafe {
+                    ext4_dir_close(dir);
                 }
             }
         }
         if let Some(open_key) = self.open_key {
-            if let Some(orphan_path) = unregister_open_inode(open_key) {
+            if let Some(cleanup) = unregister_open_inode(open_key) {
+                let runtime_ready = if cleanup.needs_flush {
+                    flush_and_reset_inode_runtime(open_key.super_block, open_key.inode)
+                } else {
+                    // A final unlink has no remaining observer, so dirty data
+                    // can be discarded without writing blocks that are about
+                    // to be freed.
+                    self.dentry.discard_pending_writes();
+                    true
+                };
                 crate::mm::invalidate_file_page_cache(page_cache_key_from_open_key(open_key));
-                if self.dentry.super_block.unlink_file(&orphan_path) {
+                // Preserve the hidden link if writeback failed. This keeps the
+                // inode allocated until a later recovery path can flush it.
+                if runtime_ready && self.dentry.super_block.unlink_file(&cleanup.orphan_path) {
                     if let (Some(parent), Some(orphan_name)) = (
                         dentry_parent(&self.dentry),
-                        orphan_path.rsplit('/').next(),
+                        cleanup.orphan_path.rsplit('/').next(),
                     ) {
                         mark_cached_child_absent(&parent, orphan_name);
                     }
@@ -551,11 +575,12 @@ impl OSInode {
         dentry: Arc<Dentry>,
         file_handle: Option<ext4_file>,
     ) -> Self {
-        let offset = if append {
-            dentry.inode_info().map(|i| i.size as usize).unwrap_or(0)
-        } else {
-            0
-        };
+        if let Some(file) = file_handle {
+            dentry.cache_file_handle(file);
+        }
+        let offset = append
+            .then(|| dentry.runtime_file_size().unwrap_or(0) as usize)
+            .unwrap_or(0);
         let key = open_inode_key(&dentry);
         let mut inode = Self {
             readable,
@@ -580,7 +605,6 @@ impl OSInode {
             if inode.open_handle() {
                 register_open_inode(key);
                 inode.open_key = Some(key);
-                let _ = inode.stat_inner();
             }
         }
         inode
@@ -611,6 +635,20 @@ impl OSInode {
             return true;
         }
         let offset = inner.offset;
+        if let Some(mut file) = self.dentry.cached_file_handle() {
+            file.flags = if self.writable { O_RDWR } else { O_RDONLY };
+            if inner.append {
+                file.flags |= O_APPEND;
+            }
+            file.fsize = self.dentry.runtime_file_size().unwrap_or(file.fsize);
+            file.fpos = if file.flags & O_APPEND != 0 {
+                file.fsize
+            } else {
+                offset as u64
+            };
+            inner.file_handle = Some(file);
+            return true;
+        }
         let mut file: ext4_file = unsafe { core::mem::zeroed() };
         let rc = {
             let _fs_lock = self.dentry.super_block.lock_fs();
@@ -627,6 +665,7 @@ impl OSInode {
             }
         };
         if rc == EOK as i32 {
+            self.dentry.cache_file_handle(file);
             inner.file_handle = Some(file);
             true
         } else {
@@ -724,7 +763,6 @@ impl OSInode {
         let _cache_write = self.begin_cached_write();
         let mut inner = self.inner.exclusive_access();
         if let Some(mut file) = inner.file_handle.take() {
-            let _fs_lock = self.dentry.super_block.lock_fs();
             unsafe {
                 ext4_fclose(&mut file);
             }
@@ -896,6 +934,40 @@ impl OSInode {
         total
     }
 
+    fn read_with_pending_overlay(
+        &self,
+        file: &mut ext4_file,
+        offset: usize,
+        buf: &mut [u8],
+        read_len: usize,
+        backing_size: usize,
+    ) -> Option<usize> {
+        if read_len == 0 {
+            return Some(0);
+        }
+        let saved_pos = file.fpos;
+        let saved_size = file.fsize;
+        let backing_len = read_len.min(backing_size.saturating_sub(offset));
+        buf[..read_len].fill(0);
+        file.fsize = backing_size as u64;
+        let loaded = if backing_len == 0 {
+            0
+        } else {
+            let _fs_lock = self.dentry.super_block.lock_fs();
+            self.read_handle_at(file, offset, backing_size, &mut buf[..backing_len])
+        };
+        file.fpos = saved_pos;
+        file.fsize = saved_size;
+        if loaded != backing_len
+            || !self
+                .dentry
+                .overlay_pending_read(offset, &mut buf[..read_len])
+        {
+            return None;
+        }
+        Some(read_len)
+    }
+
     fn next_dir_entry(inner: &mut OSInodeInner) -> Option<ext4_direntry> {
         let entry = {
             let dir = inner.dir_handle.as_mut()?;
@@ -1003,7 +1075,7 @@ impl OpenFlags {
 // ==================== File Operations ====================
 
 pub fn open_file(path: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
-    open_file_new(None, path, flags, 0o666)
+    open_file_new(None, path, flags, 0o666, None)
 }
 
 pub fn open_file_at(
@@ -1012,7 +1084,18 @@ pub fn open_file_at(
     flags: OpenFlags,
     mode: u32,
 ) -> Option<Arc<OSInode>> {
-    open_file_new(base, path, flags, mode)
+    open_file_new(base, path, flags, mode, None)
+}
+
+pub(crate) fn open_file_at_with_status(
+    base: Option<Arc<Dentry>>,
+    path: &str,
+    flags: OpenFlags,
+    mode: u32,
+) -> Option<(Arc<OSInode>, bool)> {
+    let mut created = false;
+    let inode = open_file_new(base, path, flags, mode, Some(&mut created))?;
+    Some((inode, created))
 }
 
 fn open_file_new(
@@ -1020,7 +1103,11 @@ fn open_file_new(
     path: &str,
     flags: OpenFlags,
     mode: u32,
+    mut created_status: Option<&mut bool>,
 ) -> Option<Arc<OSInode>> {
+    if let Some(status) = created_status.as_deref_mut() {
+        *status = false;
+    }
     let start = base.unwrap_or_else(|| crate::fs::vfs::ROOT_DENTRY.clone());
     let want_dir = flags.directory_requested();
     #[cfg(feature = "buildstorm-diagnostics")]
@@ -1046,7 +1133,42 @@ fn open_file_new(
         // respect to rename/unlink in the parent directory. Keep the directory
         // mutation generation odd until the live lwext4 handle is registered.
         let _mutation = begin_cached_child_mutation(&parent);
-        let existing = vfs_lookup_during_mutation(&parent, &name);
+        let mut existing = vfs_cached_lookup_during_mutation(&parent, &name);
+        if existing.is_none() {
+            if let Some((dentry, file_handle)) =
+                vfs_create_open_file_during_mutation(&parent, &name, mode)
+            {
+                dentry.update_local_cached_size(0);
+                invalidate_dentry_file_pages(&dentry);
+                #[cfg(feature = "buildstorm-diagnostics")]
+                if name == "invoked.timestamp" || name.ends_with("build-script-build-script-build") {
+                    crate::println!(
+                        "[buildstorm-fs] traced-open-created name={} inode={} dir={} path={}",
+                        name,
+                        dentry.inode_num,
+                        dentry.is_dir,
+                        dentry.fs_path,
+                    );
+                }
+                let (readable, writable) = flags.read_write();
+                let inode = Arc::new(OSInode::new_created(
+                    readable,
+                    writable,
+                    flags.contains(OpenFlags::APPEND),
+                    dentry,
+                    file_handle,
+                ));
+                if let Some(status) = created_status.as_deref_mut() {
+                    *status = true;
+                }
+                return inode.has_backing_handle().then_some(inode);
+            }
+
+            // A failed atomic create commonly means EEXIST. Resolve only on
+            // this slow path so new build artifacts avoid a redundant inode
+            // lookup while existing files preserve normal O_CREAT semantics.
+            existing = vfs_lookup_during_mutation(&parent, &name);
+        }
         #[cfg(feature = "buildstorm-diagnostics")]
         if name == "invoked.timestamp" || name.ends_with("build-script-build-script-build") {
             crate::println!(
@@ -1107,38 +1229,11 @@ fn open_file_new(
             let inode = Arc::new(OSInode::new(readable, writable, append, dentry));
             return inode.has_backing_handle().then_some(inode);
         }
-
-        let (dentry, file_handle) = match vfs_create_open_file_during_mutation(&parent, &name, mode) {
-            Some(created) => created,
-            None => {
-                #[cfg(feature = "buildstorm-diagnostics")]
-                if diagnose_buildstorm {
-                    crate::println!("[buildstorm-fs] create-file-failed path={}", path);
-                }
-                return None;
-            }
-        };
-        dentry.update_local_cached_size(0);
-        invalidate_dentry_file_pages(&dentry);
         #[cfg(feature = "buildstorm-diagnostics")]
-        if name == "invoked.timestamp" || name.ends_with("build-script-build-script-build") {
-            crate::println!(
-                "[buildstorm-fs] traced-open-created name={} inode={} dir={} path={}",
-                name,
-                dentry.inode_num,
-                dentry.is_dir,
-                dentry.fs_path,
-            );
+        if diagnose_buildstorm {
+            crate::println!("[buildstorm-fs] create-file-failed path={}", path);
         }
-        let (readable, writable) = flags.read_write();
-        let inode = Arc::new(OSInode::new_created(
-            readable,
-            writable,
-            flags.contains(OpenFlags::APPEND),
-            dentry,
-            file_handle,
-        ));
-        return inode.has_backing_handle().then_some(inode);
+        return None;
     }
 
     let raw_dentry = vfs_resolve_with_fallback(&start, path)?;
@@ -1212,10 +1307,6 @@ pub fn follow_symlink(
 pub fn mkdir_at(base: Option<Arc<Dentry>>, path: &str, mode: u32) -> bool {
     let start = base.unwrap_or_else(|| crate::fs::vfs::ROOT_DENTRY.clone());
 
-    if vfs_resolve_path(&start, path).is_some() {
-        return false;
-    }
-
     let (parent, name) = match vfs_resolve_parent_and_name(&start, path) {
         Some(x) => x,
         None => return false,
@@ -1250,20 +1341,48 @@ pub fn unlink_at_result(
         return Err(-20);
     }
 
+    let final_file_unlink = !is_dir
+        && dentry
+            .inode_info()
+            .is_some_and(|info| info.links_count <= 1);
+    let _file_mutation = final_file_unlink
+        .then(|| dentry.lock_file_mutation())
+        .flatten();
     let _cache_write = (!is_dir).then(|| begin_dentry_cached_write(&dentry));
+    let mut discard_pending = false;
+    let mut unlink_error = -1;
     let ok = if is_dir {
-        dentry.super_block.unlink_dir(&dentry.fs_path)
+        let rc = dentry.super_block.unlink_child(
+            parent.inode_num,
+            dentry.inode_num,
+            &dentry.name,
+            true,
+        );
+        unlink_error = -(rc as isize);
+        rc == EOK as i32
     } else if let Some(deferred) = defer_open_file_unlink(&dentry) {
         deferred
     } else {
-        dentry.super_block.unlink_file(&dentry.fs_path)
+        let rc = dentry.super_block.unlink_child(
+            parent.inode_num,
+            dentry.inode_num,
+            &dentry.name,
+            false,
+        );
+        unlink_error = -(rc as isize);
+        let unlinked = rc == EOK as i32;
+        discard_pending = unlinked && final_file_unlink;
+        unlinked
     };
 
     if ok {
+        if discard_pending {
+            dentry.discard_pending_writes_during_mutation();
+        }
         invalidate_cached_child_during_mutation(&parent, &dentry.name);
         Ok(())
     } else {
-        Err(-1)
+        Err(unlink_error)
     }
 }
 
@@ -1286,9 +1405,51 @@ impl File for OSInode {
         if !self.readable {
             return -1;
         }
-        if !self.dentry.flush_pending_writes() {
+        let file_mutation = self.dentry.lock_file_mutation();
+        let pending_read = {
+            let mut inner = self.inner.exclusive_access();
+            let off = inner.offset;
+            self.dentry.read_pending_fully(off, buf).map(|read_len| {
+                inner.offset = off.saturating_add(read_len);
+                read_len
+            })
+        };
+        if let Some(read_len) = pending_read {
+            return read_len as isize;
+        }
+        if self.dentry.has_pending_writes() {
+            let need_open = self.inner.exclusive_access().file_handle.is_none();
+            if need_open {
+                self.open_handle();
+            }
+            let mut inner = self.inner.exclusive_access();
+            let off = inner.offset;
+            if let Some((read_len, backing_size)) =
+                self.dentry.pending_read_plan(off, buf.len())
+            {
+                if let Some(mut file) = inner.file_handle {
+                    if let Some(read_len) = self.read_with_pending_overlay(
+                        &mut file,
+                        off,
+                        buf,
+                        read_len,
+                        backing_size,
+                    ) {
+                        inner.offset = off.saturating_add(read_len);
+                        file.fpos = inner.offset as u64;
+                        file.fsize = self.dentry.runtime_file_size().unwrap_or(file.fsize);
+                        inner.file_handle = Some(file);
+                        return read_len as isize;
+                    }
+                }
+            }
+        }
+        if !self.dentry.flush_pending_writes_during_mutation() {
             return -5;
         }
+        // Page-cache waits must not hold the inode mutation lock: another
+        // task may own the in-flight load and need this lock to complete it.
+        drop(file_mutation);
         let need_open = {
             let inner = self.inner.exclusive_access();
             inner.file_handle.is_none()
@@ -1400,9 +1561,36 @@ impl File for OSInode {
         if !self.readable {
             return -1;
         }
-        if !self.dentry.flush_pending_writes() {
+        let file_mutation = self.dentry.lock_file_mutation();
+        if let Some(read_len) = self.dentry.read_pending_fully(offset, buf) {
+            return read_len as isize;
+        }
+        if self.dentry.has_pending_writes() {
+            let need_open = self.inner.exclusive_access().file_handle.is_none();
+            if need_open {
+                self.open_handle();
+            }
+            if let Some((read_len, backing_size)) =
+                self.dentry.pending_read_plan(offset, buf.len())
+            {
+                let mut file = self.inner.exclusive_access().file_handle;
+                if let Some(ref mut file) = file {
+                    if let Some(read_len) = self.read_with_pending_overlay(
+                        file,
+                        offset,
+                        buf,
+                        read_len,
+                        backing_size,
+                    ) {
+                        return read_len as isize;
+                    }
+                }
+            }
+        }
+        if !self.dentry.flush_pending_writes_during_mutation() {
             return -5;
         }
+        drop(file_mutation);
         let need_open = self.inner.exclusive_access().file_handle.is_none();
         if need_open {
             self.open_handle();
@@ -1509,7 +1697,7 @@ impl File for OSInode {
         if buf.is_empty() {
             return 0;
         }
-        let _file_mutation = self.dentry.lock_file_mutation();
+        let file_mutation = self.dentry.lock_file_mutation();
         let need_open = {
             let inner = self.inner.exclusive_access();
             inner.file_handle.is_none()
@@ -1536,7 +1724,7 @@ impl File for OSInode {
                 return -28;
             }
             if offset <= size {
-                if let Some(should_flush) = self.dentry.buffer_pending_write(
+                if let Some((flush_inode, apply_pressure)) = self.dentry.buffer_pending_write(
                     *file,
                     offset,
                     buf,
@@ -1563,8 +1751,12 @@ impl File for OSInode {
                         size as u64,
                         requested_new_size as u64,
                     );
-                    if should_flush {
+                    if flush_inode {
                         let _ = self.dentry.flush_pending_writes_during_mutation();
+                    }
+                    drop(file_mutation);
+                    if apply_pressure {
+                        let _ = self.dentry.balance_pending_writes();
                     }
                     return buf.len() as isize;
                 }
@@ -1726,7 +1918,7 @@ impl File for OSInode {
         if buf.is_empty() {
             return 0;
         }
-        let _file_mutation = self.dentry.lock_file_mutation();
+        let file_mutation = self.dentry.lock_file_mutation();
         let need_open = {
             let inner = self.inner.exclusive_access();
             inner.file_handle.is_none()
@@ -1755,7 +1947,7 @@ impl File for OSInode {
                 return -28;
             }
             if off <= size {
-                if let Some(should_flush) = self.dentry.buffer_pending_write(
+                if let Some((flush_inode, apply_pressure)) = self.dentry.buffer_pending_write(
                     *file,
                     off,
                     buf,
@@ -1784,8 +1976,12 @@ impl File for OSInode {
                         size as u64,
                         requested_new_size as u64,
                     );
-                    if should_flush {
+                    if flush_inode {
                         let _ = self.dentry.flush_pending_writes_during_mutation();
+                    }
+                    drop(file_mutation);
+                    if apply_pressure {
+                        let _ = self.dentry.balance_pending_writes();
                     }
                     return buf.len() as isize;
                 }
@@ -1993,8 +2189,9 @@ impl File for OSInode {
             Ok(path) => path,
             Err(_) => return -22,
         };
+        let cache_epoch = self.dentry.child_cache_snapshot_epoch();
         let mut inner = self.inner.exclusive_access();
-        let _fs_lock = self.dentry.super_block.lock_fs();
+        let fs_lock = self.dentry.super_block.lock_fs();
 
         if inner.dir_handle.is_none() {
             let mut dir: ext4_dir = unsafe { core::mem::zeroed() };
@@ -2068,6 +2265,11 @@ impl File for OSInode {
             written += record_size;
             inner.offset = inner.offset.saturating_add(1);
         }
+        drop(fs_lock);
+        drop(inner);
+        if let Some(epoch) = cache_epoch {
+            cache_readdir_entries(&self.dentry, &buf[..written], epoch);
+        }
         written as isize
     }
 
@@ -2121,8 +2323,7 @@ pub fn rename_at(
     new_path: &str,
     flags: u32,
 ) -> Result<(), isize> {
-    use alloc::ffi::CString;
-    use lwext4_rust::bindings::{ext4_frename2, EOK, EXT4_RENAME_NOREPLACE};
+    use lwext4_rust::bindings::{EOK, EXT4_RENAME_NOREPLACE};
 
     const RENAME_NOREPLACE: u32 = 1;
 
@@ -2157,11 +2358,6 @@ pub fn rename_at(
         }
     };
 
-    let old_cpath = match CString::new(old_dentry.fs_path.as_bytes()) {
-        Ok(s) => s,
-        Err(_) => return Err(-22),
-    };
-
     let new_start = new_base.unwrap_or_else(|| crate::fs::vfs::ROOT_DENTRY.clone());
     let (new_parent, new_name) = match vfs_resolve_parent_and_name(&new_start, new_path) {
         Some(x) => x,
@@ -2182,6 +2378,7 @@ pub fn rename_at(
         return Err(-18);
     }
 
+    #[cfg(feature = "buildstorm-diagnostics")]
     let new_fs_path = if new_parent.fs_path == "/" {
         alloc::format!("/{}", new_name)
     } else if new_parent.fs_path.ends_with('/') {
@@ -2190,28 +2387,17 @@ pub fn rename_at(
         alloc::format!("{}/{}", new_parent.fs_path, new_name)
     };
 
-    let new_cpath = match CString::new(new_fs_path.as_bytes()) {
-        Ok(s) => s,
-        Err(_) => return Err(-22),
-    };
-
     let orphan_fs_path = replacement_orphan_path(&new_parent);
-    let orphan_cpath = match CString::new(orphan_fs_path.as_bytes()) {
-        Ok(s) => s,
-        Err(_) => return Err(-22),
+    let orphan_name = match orphan_fs_path.rsplit('/').next() {
+        Some(name) if !name.is_empty() => name,
+        _ => return Err(-22),
     };
 
+    let source_inode = old_dentry.inode_num;
     if old_dentry.is_dir {
-        let source_inode = old_dentry
-            .inode_info()
-            .map(|info| info.inode_num)
-            .unwrap_or(old_dentry.inode_num);
         let mut ancestor = Some(new_parent.clone());
         while let Some(candidate) = ancestor {
-            let candidate_inode = candidate
-                .inode_info()
-                .map(|info| info.inode_num)
-                .unwrap_or(candidate.inode_num);
+            let candidate_inode = candidate.inode_num;
             if Arc::ptr_eq(&candidate.super_block, &old_dentry.super_block)
                 && candidate_inode == source_inode
             {
@@ -2242,29 +2428,27 @@ pub fn rename_at(
     let _second_mutation = second_parent
         .as_ref()
         .map(begin_cached_child_mutation);
-    let _replacement_cache_write = vfs_lookup_during_mutation(&new_parent, &new_name)
-        .map(|dentry| begin_dentry_cached_write(&dentry));
+    // ext4_rename_at2 revalidates both leaf entries and atomically reports a
+    // replaced inode without repeating the VFS path walk.
+    let replacement_dentry = vfs_cached_lookup_during_mutation(&new_parent, &new_name);
+    let _replacement_cache_write = replacement_dentry
+        .as_ref()
+        .map(|dentry| begin_dentry_cached_write(dentry));
 
-    let mut replaced_inode = 0u32;
-    let mut replaced_is_dir = false;
     let lwext4_flags = if flags & RENAME_NOREPLACE != 0 {
         EXT4_RENAME_NOREPLACE
     } else {
         0
     };
-    let rc = {
-        let _fs_lock = old_dentry.super_block.lock_fs();
-        unsafe {
-            ext4_frename2(
-                old_cpath.as_ptr() as *const core::ffi::c_char,
-                new_cpath.as_ptr() as *const core::ffi::c_char,
-                orphan_cpath.as_ptr() as *const core::ffi::c_char,
-                lwext4_flags,
-                &mut replaced_inode,
-                &mut replaced_is_dir,
-            )
-        }
-    };
+    let (rc, replaced_inode, replaced_is_dir) = old_dentry.super_block.rename_child(
+        old_parent.inode_num,
+        source_inode,
+        &old_name,
+        new_parent.inode_num,
+        &new_name,
+        orphan_name,
+        lwext4_flags,
+    );
 
     #[cfg(feature = "buildstorm-diagnostics")]
     if old_dentry.fs_path.contains("build-script-build")
@@ -2283,6 +2467,13 @@ pub fn rename_at(
     if rc == EOK as i32 {
         invalidate_cached_child_during_mutation(&old_parent, &old_name);
         invalidate_cached_child_during_mutation(&new_parent, &new_name);
+        if !old_dentry.is_dir {
+            let _ = cache_renamed_leaf_during_mutation(
+                &new_parent,
+                &new_name,
+                &old_dentry,
+            );
+        }
         if replaced_inode != 0 {
             let super_block_key = Arc::as_ptr(&old_dentry.super_block) as usize;
             crate::mm::invalidate_file_page_cache(FilePageCacheKey {
@@ -2294,15 +2485,23 @@ pub fn rename_at(
                     super_block_key,
                     replaced_inode,
                     &orphan_fs_path,
+                    true,
                 );
             if !retained {
-                let cleaned = if replaced_is_dir {
-                    old_dentry.super_block.unlink_dir(&orphan_fs_path)
-                } else {
-                    old_dentry.super_block.unlink_file(&orphan_fs_path)
-                };
+                // A closed target may still have delayed writes, including
+                // through another hard link. Persist them before removing the
+                // orphan name, then drop stale handle/size state so inode reuse
+                // cannot inherit the replaced file's cached identity.
+                let runtime_ready = replaced_is_dir
+                    || flush_and_reset_inode_runtime(super_block_key, replaced_inode);
+                let _cleaned = runtime_ready
+                    && if replaced_is_dir {
+                        old_dentry.super_block.unlink_dir(&orphan_fs_path)
+                    } else {
+                        old_dentry.super_block.unlink_file(&orphan_fs_path)
+                    };
                 #[cfg(feature = "buildstorm-diagnostics")]
-                if !cleaned {
+                if !_cleaned {
                     crate::println!(
                         "[buildstorm-fs] rename-orphan-cleanup-failed inode={} path={}",
                         replaced_inode,

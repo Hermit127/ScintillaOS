@@ -15,7 +15,9 @@ pub use frame_allocator::{
 pub use frame_allocator::{
     take_watched_frame_corruption, watch_frame, watched_frame_is_intact, watched_frame_paddr,
 };
-pub use heap_allocator::{add_heap_region, init_heap};
+pub use heap_allocator::{add_heap_region, heap_total_bytes, init_heap};
+#[cfg(feature = "lock-stats")]
+pub use heap_allocator::dump_heap_allocator_stats;
 pub use file_page_cache::invalidate_file_page_cache;
 #[cfg(feature = "lock-stats")]
 pub use file_page_cache::dump_file_page_cache_stats;

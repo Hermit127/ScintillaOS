@@ -585,7 +585,7 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
             }
             // Kernel code is non-preemptible: switching only from a user trap
             // keeps lock ownership and kernel stacks local to the current hart.
-            if user_slice_expired && from_user && current_task().is_some() {
+            if user_slice_expired && from_user && task::timer_preemption_needed() {
                 crate::task::suspend_current_and_run_next_reason(
                     crate::task::SuspendReason::TimerPreempt,
                 );
@@ -677,7 +677,13 @@ fn main(hartid: usize) {
     let available_bytes = mem_areas
         .iter()
         .fold(0usize, |total, (_, size)| total.saturating_add(*size));
-    let mut heap_growth = (available_bytes / crate::config::KERNEL_HEAP_GROWTH_DIVISOR)
+    let heap_growth_divisor =
+        if available_bytes >= crate::config::KERNEL_HEAP_LARGE_MEMORY_THRESHOLD {
+            crate::config::KERNEL_HEAP_LARGE_GROWTH_DIVISOR
+        } else {
+            crate::config::KERNEL_HEAP_GROWTH_DIVISOR
+        };
+    let mut heap_growth = (available_bytes / heap_growth_divisor)
         .min(crate::config::KERNEL_HEAP_MAX_GROWTH)
         & !(crate::config::PAGE_SIZE - 1);
     let requested_heap_growth = heap_growth;

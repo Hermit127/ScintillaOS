@@ -9,13 +9,12 @@ use lwext4_rust::KernelDevOp;
 const SECTOR_SIZE: usize = 512;
 const CACHE_BLOCK_SIZE: usize = 4096;
 const CACHE_SECTOR_COUNT: usize = CACHE_BLOCK_SIZE / SECTOR_SIZE;
-const CACHE_WAYS: usize = 4;
 const CACHE_PREFERRED_SLOT_COUNT: usize = 4096;
 const CACHE_MIN_SLOT_COUNT: usize = 1024;
 const MAX_BULK_IO_SIZE: usize = 128 * 1024;
-// Keep writeback latency bounded while still sorting enough blocks to merge
-// adjacent device writes. Explicit sync paths continue to drain the cache.
-const CACHE_THRESHOLD_FLUSH_BATCH: usize = 8;
+const SEQUENTIAL_READAHEAD_BLOCKS: usize = 64 * 1024 / CACHE_BLOCK_SIZE;
+const SEQUENTIAL_READAHEAD_TRIGGER: usize = 2;
+const INVALID_CACHE_SLOT: usize = usize::MAX;
 #[cfg(feature = "mount-trace")]
 static MOUNT_TRACE_TEST_DISK_READS: AtomicUsize = AtomicUsize::new(0);
 
@@ -28,10 +27,14 @@ pub struct BlockDeviceStream {
     /// enter the heap/frame allocator.
     pub scratch: alloc::vec::Vec<u8>,
     cache: alloc::vec::Vec<BlockCacheSlot>,
+    cache_hash_heads: alloc::vec::Vec<usize>,
     flush_order: alloc::vec::Vec<usize>,
-    flush_cursor: usize,
+    replacement_cursor: usize,
+    valid_count: usize,
     cache_clock: u64,
     dirty_count: usize,
+    sequential_next_block: usize,
+    sequential_read_streak: usize,
     #[cfg(feature = "lock-stats")]
     cache_hits: u64,
     #[cfg(feature = "lock-stats")]
@@ -44,13 +47,42 @@ pub struct BlockDeviceStream {
     explicit_flush_blocks: u64,
     #[cfg(feature = "lock-stats")]
     dirty_peak: usize,
+    #[cfg(feature = "lock-stats")]
+    replacement_scans: u64,
+    #[cfg(feature = "lock-stats")]
+    clean_replacements: u64,
+    #[cfg(feature = "lock-stats")]
+    writeback_runs: u64,
+    #[cfg(feature = "lock-stats")]
+    read_cache_hit_ops: u64,
+    #[cfg(feature = "lock-stats")]
+    read_cache_hit_bytes: u64,
+    #[cfg(feature = "lock-stats")]
+    read_partial_fills: u64,
+    #[cfg(feature = "lock-stats")]
+    read_partial_bytes: u64,
+    #[cfg(feature = "lock-stats")]
+    read_direct_runs: u64,
+    #[cfg(feature = "lock-stats")]
+    read_direct_bytes: u64,
+    #[cfg(feature = "lock-stats")]
+    write_rmw_fills: u64,
+    #[cfg(feature = "lock-stats")]
+    readahead_runs: u64,
+    #[cfg(feature = "lock-stats")]
+    readahead_blocks: u64,
+    #[cfg(feature = "lock-stats")]
+    readahead_hits: u64,
 }
 
 struct BlockCacheSlot {
     block: usize,
     stamp: u64,
+    hash_next: usize,
     valid: bool,
     dirty: bool,
+    referenced: bool,
+    prefetched: bool,
     data: [u8; CACHE_BLOCK_SIZE],
 }
 
@@ -59,8 +91,11 @@ impl BlockCacheSlot {
         Self {
             block: 0,
             stamp: 0,
+            hash_next: INVALID_CACHE_SLOT,
             valid: false,
             dirty: false,
+            referenced: false,
+            prefetched: false,
             data: [0; CACHE_BLOCK_SIZE],
         }
     }
@@ -79,9 +114,21 @@ impl BlockDeviceStream {
                 }
             }
         }
+        let mut cache_hash_heads = alloc::vec::Vec::new();
+        if !cache.is_empty() {
+            let bucket_count = (cache.len() * 2).next_power_of_two();
+            if cache_hash_heads.try_reserve_exact(bucket_count).is_ok() {
+                for _ in 0..bucket_count {
+                    cache_hash_heads.push(INVALID_CACHE_SLOT);
+                }
+            } else {
+                cache.clear();
+            }
+        }
         let mut flush_order = alloc::vec::Vec::new();
         if flush_order.try_reserve_exact(cache.len()).is_err() {
             cache.clear();
+            cache_hash_heads.clear();
         }
         Self {
             inner,
@@ -89,10 +136,14 @@ impl BlockDeviceStream {
             total_size,
             scratch: alloc::vec![0u8; MAX_BULK_IO_SIZE],
             cache,
+            cache_hash_heads,
             flush_order,
-            flush_cursor: 0,
+            replacement_cursor: 0,
+            valid_count: 0,
             cache_clock: 0,
             dirty_count: 0,
+            sequential_next_block: INVALID_CACHE_SLOT,
+            sequential_read_streak: 0,
             #[cfg(feature = "lock-stats")]
             cache_hits: 0,
             #[cfg(feature = "lock-stats")]
@@ -105,6 +156,32 @@ impl BlockDeviceStream {
             explicit_flush_blocks: 0,
             #[cfg(feature = "lock-stats")]
             dirty_peak: 0,
+            #[cfg(feature = "lock-stats")]
+            replacement_scans: 0,
+            #[cfg(feature = "lock-stats")]
+            clean_replacements: 0,
+            #[cfg(feature = "lock-stats")]
+            writeback_runs: 0,
+            #[cfg(feature = "lock-stats")]
+            read_cache_hit_ops: 0,
+            #[cfg(feature = "lock-stats")]
+            read_cache_hit_bytes: 0,
+            #[cfg(feature = "lock-stats")]
+            read_partial_fills: 0,
+            #[cfg(feature = "lock-stats")]
+            read_partial_bytes: 0,
+            #[cfg(feature = "lock-stats")]
+            read_direct_runs: 0,
+            #[cfg(feature = "lock-stats")]
+            read_direct_bytes: 0,
+            #[cfg(feature = "lock-stats")]
+            write_rmw_fills: 0,
+            #[cfg(feature = "lock-stats")]
+            readahead_runs: 0,
+            #[cfg(feature = "lock-stats")]
+            readahead_blocks: 0,
+            #[cfg(feature = "lock-stats")]
+            readahead_hits: 0,
         }
     }
 
@@ -113,25 +190,111 @@ impl BlockDeviceStream {
         self.cache_clock
     }
 
-    fn cache_slot(&self, block: usize) -> Option<usize> {
-        if self.cache.is_empty() || self.cache.len() % CACHE_WAYS != 0 {
-            return None;
-        }
-        let first = (block % (self.cache.len() / CACHE_WAYS)) * CACHE_WAYS;
-        (first..first + CACHE_WAYS)
-            .find(|&index| self.cache[index].valid && self.cache[index].block == block)
+    fn cache_hash(&self, block: usize) -> usize {
+        let mut value = block;
+        value ^= value >> 16;
+        value = value.wrapping_mul(0x7feb_352d);
+        value ^= value >> 15;
+        value = value.wrapping_mul(0x846c_a68b);
+        value ^= value >> 16;
+        value & (self.cache_hash_heads.len() - 1)
     }
 
-    fn replacement_slot(&self, block: usize) -> Option<usize> {
-        if self.cache.is_empty() || self.cache.len() % CACHE_WAYS != 0 {
+    fn cache_slot(&self, block: usize) -> Option<usize> {
+        if self.cache_hash_heads.is_empty() {
             return None;
         }
-        let first = (block % (self.cache.len() / CACHE_WAYS)) * CACHE_WAYS;
-        (first..first + CACHE_WAYS)
-            .find(|&index| !self.cache[index].valid)
-            .or_else(|| {
-                (first..first + CACHE_WAYS).min_by_key(|&index| self.cache[index].stamp)
-            })
+        let mut index = self.cache_hash_heads[self.cache_hash(block)];
+        while index != INVALID_CACHE_SLOT {
+            let slot = &self.cache[index];
+            if slot.valid && slot.block == block {
+                return Some(index);
+            }
+            index = slot.hash_next;
+        }
+        None
+    }
+
+    fn insert_cache_index(&mut self, index: usize) {
+        let bucket = self.cache_hash(self.cache[index].block);
+        self.cache[index].hash_next = self.cache_hash_heads[bucket];
+        self.cache_hash_heads[bucket] = index;
+    }
+
+    fn remove_cache_index(&mut self, index: usize) {
+        let bucket = self.cache_hash(self.cache[index].block);
+        let mut current = self.cache_hash_heads[bucket];
+        let mut previous = INVALID_CACHE_SLOT;
+        while current != INVALID_CACHE_SLOT {
+            if current == index {
+                let next = self.cache[current].hash_next;
+                if previous == INVALID_CACHE_SLOT {
+                    self.cache_hash_heads[bucket] = next;
+                } else {
+                    self.cache[previous].hash_next = next;
+                }
+                self.cache[index].hash_next = INVALID_CACHE_SLOT;
+                return;
+            }
+            previous = current;
+            current = self.cache[current].hash_next;
+        }
+        debug_assert!(false, "cache index is missing from its hash bucket");
+    }
+
+    fn replacement_slot(&mut self) -> Option<usize> {
+        if self.cache.is_empty() {
+            return None;
+        }
+        if self.valid_count < self.cache.len() {
+            let index = self.valid_count;
+            self.valid_count += 1;
+            return Some(index);
+        }
+
+        let cache_len = self.cache.len();
+        let mut scanned = 0usize;
+        while scanned < cache_len * 2 {
+            let index = self.replacement_cursor;
+            self.replacement_cursor = (self.replacement_cursor + 1) % cache_len;
+            scanned += 1;
+            if self.cache[index].referenced {
+                self.cache[index].referenced = false;
+                continue;
+            }
+            if self.cache[index].dirty {
+                continue;
+            }
+            #[cfg(feature = "lock-stats")]
+            {
+                self.replacement_scans += scanned as u64;
+                self.clean_replacements += 1;
+            }
+            return Some(index);
+        }
+
+        // A high-watermark writeback normally leaves many clean slots. This
+        // fallback only handles a cache where every clean page was touched
+        // during both CLOCK passes.
+        for _ in 0..cache_len {
+            let index = self.replacement_cursor;
+            self.replacement_cursor = (self.replacement_cursor + 1) % cache_len;
+            scanned += 1;
+            if !self.cache[index].dirty {
+                #[cfg(feature = "lock-stats")]
+                {
+                    self.replacement_scans += scanned as u64;
+                    self.clean_replacements += 1;
+                }
+                return Some(index);
+            }
+        }
+
+        #[cfg(feature = "lock-stats")]
+        {
+            self.replacement_scans += scanned as u64;
+        }
+        Some(self.replacement_cursor)
     }
 
     fn flush_slot(&mut self, index: usize) {
@@ -178,46 +341,6 @@ impl BlockDeviceStream {
         debug_assert!(self.dirty_count <= target_dirty);
     }
 
-    /// Perform a bounded amount of background-style writeback. A cyclic scan
-    /// avoids repeatedly sorting every dirty cache entry in the foreground.
-    fn flush_dirty_cache_batch(&mut self, max_blocks: usize) {
-        if self.dirty_count == 0 || self.cache.is_empty() || max_blocks == 0 {
-            return;
-        }
-        self.flush_order.clear();
-        let cache_len = self.cache.len();
-        let mut scanned = 0usize;
-        while scanned < cache_len && self.flush_order.len() < max_blocks {
-            let index = self.flush_cursor;
-            self.flush_cursor = (self.flush_cursor + 1) % cache_len;
-            scanned += 1;
-            if !self.cache[index].dirty || self.flush_order.contains(&index) {
-                continue;
-            }
-            self.flush_order.push(index);
-
-            // Cache-set order does not match disk order.  Follow the seed's
-            // physical successors explicitly so the existing writeback batch
-            // can become one larger VirtIO request instead of isolated blocks.
-            let mut next_block = self.cache[index].block.saturating_add(1);
-            while self.flush_order.len() < max_blocks {
-                let Some(next_index) = self.cache_slot(next_block) else {
-                    break;
-                };
-                if !self.cache[next_index].dirty || self.flush_order.contains(&next_index) {
-                    break;
-                }
-                self.flush_order.push(next_index);
-                next_block = next_block.saturating_add(1);
-            }
-        }
-        #[cfg(feature = "lock-stats")]
-        {
-            self.threshold_flush_blocks += self.flush_order.len() as u64;
-        }
-        self.flush_selected_slots();
-    }
-
     fn flush_selected_slots(&mut self) {
         if self.flush_order.is_empty() {
             return;
@@ -250,6 +373,10 @@ impl BlockDeviceStream {
                 first_block * CACHE_SECTOR_COUNT,
                 &self.scratch[..block_count * CACHE_BLOCK_SIZE],
             );
+            #[cfg(feature = "lock-stats")]
+            {
+                self.writeback_runs += 1;
+            }
             for order_index in first_cursor..cursor {
                 let index = self.flush_order[order_index];
                 self.cache[index].dirty = false;
@@ -262,6 +389,59 @@ impl BlockDeviceStream {
         self.flush_dirty_cache_to(0);
     }
 
+    fn observe_aligned_read(&mut self, block: usize, block_count: usize) -> bool {
+        if block == self.sequential_next_block {
+            self.sequential_read_streak = self.sequential_read_streak.saturating_add(1);
+        } else {
+            self.sequential_read_streak = 1;
+        }
+        self.sequential_next_block = block.saturating_add(block_count);
+        self.sequential_read_streak >= SEQUENTIAL_READAHEAD_TRIGGER
+    }
+
+    fn prefetch_read_run(&mut self, first_block: usize) -> Option<usize> {
+        let total_blocks = (self.total_size as usize) / CACHE_BLOCK_SIZE;
+        let mut block_count = total_blocks
+            .saturating_sub(first_block)
+            .min(SEQUENTIAL_READAHEAD_BLOCKS);
+        for offset in 1..block_count {
+            if self.cache_slot(first_block + offset).is_some() {
+                block_count = offset;
+                break;
+            }
+        }
+        if block_count < 2 {
+            return None;
+        }
+
+        let mut slots = [INVALID_CACHE_SLOT; SEQUENTIAL_READAHEAD_BLOCKS];
+        for (offset, slot) in slots[..block_count].iter_mut().enumerate() {
+            *slot = self.prepare_slot(first_block + offset, false)?;
+        }
+        let read_len = block_count * CACHE_BLOCK_SIZE;
+        self.inner.read_block(
+            first_block * CACHE_SECTOR_COUNT,
+            &mut self.scratch[..read_len],
+        );
+        let (cache, scratch) = (&mut self.cache, &self.scratch);
+        for (offset, &index) in slots[..block_count].iter().enumerate() {
+            let begin = offset * CACHE_BLOCK_SIZE;
+            cache[index]
+                .data
+                .copy_from_slice(&scratch[begin..begin + CACHE_BLOCK_SIZE]);
+            cache[index].referenced = offset == 0;
+            cache[index].prefetched = offset != 0;
+        }
+        #[cfg(feature = "lock-stats")]
+        {
+            self.readahead_runs += 1;
+            self.readahead_blocks += block_count as u64;
+            self.read_direct_runs += 1;
+            self.read_direct_bytes += read_len as u64;
+        }
+        Some(slots[0])
+    }
+
     fn prepare_slot(&mut self, block: usize, load: bool) -> Option<usize> {
         if let Some(index) = self.cache_slot(block) {
             #[cfg(feature = "lock-stats")]
@@ -270,27 +450,32 @@ impl BlockDeviceStream {
             }
             let stamp = self.next_stamp();
             self.cache[index].stamp = stamp;
+            self.cache[index].referenced = true;
             return Some(index);
         }
         #[cfg(feature = "lock-stats")]
         {
             self.cache_misses += 1;
         }
-        let flush_threshold = self.cache.len() * 3 / 4;
-        if self.dirty_count >= flush_threshold {
-            self.flush_dirty_cache_batch(CACHE_THRESHOLD_FLUSH_BATCH);
+        let dirty_high = self.cache.len() * 3 / 4;
+        if dirty_high != 0 && self.dirty_count >= dirty_high {
+            self.flush_dirty_cache_to(self.cache.len() / 2);
         }
-        let index = self.replacement_slot(block)?;
-        self.flush_slot(index);
+        let index = self.replacement_slot()?;
+        if self.cache[index].valid {
+            self.flush_slot(index);
+            self.remove_cache_index(index);
+        }
         self.cache[index].block = block;
         self.cache[index].valid = true;
         self.cache[index].dirty = false;
+        self.cache[index].referenced = true;
+        self.cache[index].prefetched = false;
         self.cache[index].stamp = self.next_stamp();
+        self.insert_cache_index(index);
         if load {
-            self.inner.read_block(
-                block * CACHE_SECTOR_COUNT,
-                &mut self.cache[index].data,
-            );
+            self.inner
+                .read_block(block * CACHE_SECTOR_COUNT, &mut self.cache[index].data);
         }
         Some(index)
     }
@@ -377,9 +562,14 @@ impl KernelDevOp for BlockDeviceStreamOp {
             let in_block = absolute % CACHE_BLOCK_SIZE;
             let chunk = (buf.len() - copied).min(CACHE_BLOCK_SIZE - in_block);
             let full_overwrite = in_block == 0 && chunk == CACHE_BLOCK_SIZE;
+            #[cfg(feature = "lock-stats")]
+            if !full_overwrite && dev.cache_slot(block).is_none() {
+                dev.write_rmw_fills += 1;
+            }
             let index = dev.prepare_slot(block, !full_overwrite).ok_or(-1)?;
             dev.cache[index].data[in_block..in_block + chunk]
                 .copy_from_slice(&buf[copied..copied + chunk]);
+            dev.cache[index].prefetched = false;
             if !dev.cache[index].dirty {
                 dev.cache[index].dirty = true;
                 dev.dirty_count += 1;
@@ -435,29 +625,61 @@ impl KernelDevOp for BlockDeviceStreamOp {
                     dev.cache_hits += 1;
                 }
                 let chunk = remaining.min(CACHE_BLOCK_SIZE - in_block);
+                #[cfg(feature = "lock-stats")]
+                {
+                    dev.read_cache_hit_ops += 1;
+                    dev.read_cache_hit_bytes += chunk as u64;
+                    if dev.cache[index].prefetched {
+                        dev.readahead_hits += 1;
+                    }
+                }
+                dev.cache[index].prefetched = false;
                 buf[copied..copied + chunk]
                     .copy_from_slice(&dev.cache[index].data[in_block..in_block + chunk]);
+                if in_block == 0 && chunk == CACHE_BLOCK_SIZE {
+                    dev.observe_aligned_read(block, 1);
+                }
                 let stamp = dev.next_stamp();
                 dev.cache[index].stamp = stamp;
+                dev.cache[index].referenced = true;
                 copied += chunk;
                 continue;
             }
             if in_block == 0 && remaining >= CACHE_BLOCK_SIZE {
-                let mut run_blocks = (remaining / CACHE_BLOCK_SIZE)
-                    .min(MAX_BULK_IO_SIZE / CACHE_BLOCK_SIZE);
+                let mut run_blocks =
+                    (remaining / CACHE_BLOCK_SIZE).min(MAX_BULK_IO_SIZE / CACHE_BLOCK_SIZE);
                 for offset in 1..run_blocks {
                     if dev.cache_slot(block + offset).is_some() {
                         run_blocks = offset;
                         break;
                     }
                 }
+                let sequential = dev.observe_aligned_read(block, run_blocks);
+                if run_blocks == 1 && sequential {
+                    if let Some(index) = dev.prefetch_read_run(block) {
+                        buf[copied..copied + CACHE_BLOCK_SIZE]
+                            .copy_from_slice(&dev.cache[index].data);
+                        copied += CACHE_BLOCK_SIZE;
+                        continue;
+                    }
+                }
                 let run_len = run_blocks * CACHE_BLOCK_SIZE;
+                #[cfg(feature = "lock-stats")]
+                {
+                    dev.read_direct_runs += 1;
+                    dev.read_direct_bytes += run_len as u64;
+                }
                 dev.inner.read_block(
                     block * CACHE_SECTOR_COUNT,
                     &mut buf[copied..copied + run_len],
                 );
                 copied += run_len;
                 continue;
+            }
+            #[cfg(feature = "lock-stats")]
+            {
+                dev.read_partial_fills += 1;
+                dev.read_partial_bytes += remaining.min(CACHE_BLOCK_SIZE - in_block) as u64;
             }
             let index = dev.prepare_slot(block, true).ok_or(-1)?;
             let chunk = remaining.min(CACHE_BLOCK_SIZE - in_block);
@@ -498,14 +720,32 @@ impl KernelDevOp for BlockDeviceStreamOp {
         dev.inner.flush();
         #[cfg(feature = "lock-stats")]
         crate::println!(
-            "[block-cache-stats] slots={} hits={} misses={} dirty_evictions={} threshold_flush_blocks={} explicit_flush_blocks={} dirty_peak={}",
+            "[block-cache-stats] slots={} buckets={} hits={} misses={} dirty_evictions={} threshold_flush_blocks={} explicit_flush_blocks={} dirty_peak={} replacement_scans={} clean_replacements={} writeback_runs={}",
             dev.cache.len(),
+            dev.cache_hash_heads.len(),
             dev.cache_hits,
             dev.cache_misses,
             dev.dirty_evictions,
             dev.threshold_flush_blocks,
             dev.explicit_flush_blocks,
             dev.dirty_peak,
+            dev.replacement_scans,
+            dev.clean_replacements,
+            dev.writeback_runs,
+        );
+        #[cfg(feature = "lock-stats")]
+        crate::println!(
+            "[block-cache-read-stats] hit_ops={} hit_bytes={} partial_fills={} partial_bytes={} direct_runs={} direct_bytes={} write_rmw_fills={} readahead_runs={} readahead_blocks={} readahead_hits={}",
+            dev.read_cache_hit_ops,
+            dev.read_cache_hit_bytes,
+            dev.read_partial_fills,
+            dev.read_partial_bytes,
+            dev.read_direct_runs,
+            dev.read_direct_bytes,
+            dev.write_rmw_fills,
+            dev.readahead_runs,
+            dev.readahead_blocks,
+            dev.readahead_hits,
         );
         Ok(0)
     }
