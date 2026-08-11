@@ -1834,3 +1834,76 @@ Docker 宿主强制结束。原策略在 8 GiB guest 中仍只使用 64 MiB 静�
 `cargo xtask arceos build -p arceos-helloworld --arch riscv64`，正在从源码构建
 `core`、`std`、`compiler_builtins` 和 ArceOS 组件。正式构建尚未输出最终返回码和产物大小，
 LA 也尚未运行本轮全量，因此截至本次发布仍不能宣称双架构题 2.2 完整通过。
+
+## 30. 2026-08-11：LoongArch `rustc` 静默停滞与 TLB refill 修复
+
+### 30.1 故障边界与寄存器证据
+
+LoongArch 使用官方数据盘、双 VirtIO 块设备、VirtIO 网卡以及 `-smp 8 -m 8G` 启动后，
+可以完成 CAgent，但真实 `rustc --version` 在载入 `librustc_driver.so` 后长期没有版本输出。
+逐系统调用和逐缺页诊断确认，动态链接器已经执行成功，`rustc` 已创建多个线程，文件页读取、
+物理帧分配和已进入软件处理器的缺页均正常返回；因此问题不在 ELF 装载入口、lwext4 读失败
+或单个内核锁等待。
+
+使用仅监听本机 `127.0.0.1` 的 QEMU monitor 冻结并检查 8 个虚拟 CPU，发现执行线程反复
+停在用户地址 `0x100624d800` 的 TLB refill 上。该地址的页表索引为
+`L2=0x40, L1=0x31, L0=0x4d`，当时 `PGDL=0x5b68000`。直接读取 guest 物理内存得到：
+
+```text
+root[0x40] @ 0x5b68200 = 0x5bbe000
+next[0x31] @ 0x5bbe188 = 0x0
+TLBRBADV  = 0x100624d800
+TLBRERA   = 0x100624d800
+TLBRELO0  = 0x0
+TLBRELO1  = 0x3
+```
+
+这说明第一级目录存在，但覆盖目标 2 MiB 区间的叶页表尚未创建。原 refill 汇编仍以零为
+页表基址执行 `ldpte`，从物理零页相同偏移读到 `0x3`，随后不断为同一虚拟地址安装错误
+条目并重试。软件缺页处理器因此根本没有获得为该 VMA 分配真实文件页的机会。此前能够处理
+数千个 `librustc_driver.so` 缺页，是因为那些地址所在的 2 MiB 区间已经由相邻驻留页创建了
+中间页表；首次跨入完全空的页表区间才触发该问题。
+
+### 30.2 LoongArch PTE 位布局与缓存属性
+
+检查 PolyHAL 的 LoongArch PTE 定义时还发现三个架构语义缺口。原实现把 `NR`、`NX`
+定义在 bit 11、bit 12，其中 bit 12 已属于物理页号；同时普通内存映射没有设置一致可缓存
+的 MAT 值。按照 Linux `arch/loongarch/include/asm/pgtable-bits.h` 和 LoongArch Volume 1
+对 LA64 `TLBELO` 的定义，修正为：
+
+- 普通 RAM 映射使用 `MAT=01` 的一致可缓存属性，设备映射继续使用非缓存属性；
+- `NR` 使用 bit 61，`NX` 使用 bit 62；
+- 由 `MappingFlags` 生成 PTE 时真实写入读、写、执行限制，反向转换时恢复 Cache/Device 属性。
+
+修复后的普通用户代码页 PTE 低位为 `0x217`，不再让物理地址 bit 12 偶然参与权限解释；
+匿名可写且不可执行页则通过 bit 62 表达 NX，而不会篡改 PPN。该修改是体系结构通用语义修复，
+不根据 `rustc` 路径、进程名或测试输出选择行为。
+
+### 30.3 空目录的安全 refill
+
+Linux 64 位 LoongArch 的快速 refill 同样使用 `PGD -> lddir(3) -> lddir(1) -> ldpte`，
+其正常前提是缺失目录最终只能得到无效零叶项。ScintillaOS 的物理零页并非全零，因此不能
+依赖该隐含条件。新的 refill 在两次 `lddir` 后分别检查结果；任一级目录为空时，不再访问
+物理零页，而是显式把 `TLBRELO0`、`TLBRELO1` 写零，再执行标准 `tlbfill`。返回用户态后，
+无效叶项产生普通页无效异常，现有 VMA 需求分页路径据此读取真实文件页并安装映射。
+
+该方案保留需求分页：它没有预读整个 200 MiB 以上的 `librustc_driver.so`，没有把不存在的
+页面标为成功，也没有对 BuildStorm 做特殊判断。相比为每个 VMA 预分配所有中间页表，它
+还避免了大范围稀疏映射的额外内存占用，并覆盖匿名映射、文件映射和未来任意空目录访问。
+
+### 30.4 独立验证结果
+
+| 小改动 | 验证负载 | 修改前 | 修改后 | 变化 | 当前结论 |
+| --- | --- | --- | --- | --- | --- |
+| PTE `MAT/NR/NX` 对齐 LA64 定义 | 8 核真实 `rustc --version` | 普通页无一致缓存属性，NR/NX 位错误 | 映射项按 LA64 位布局生成 | 消除权限位与 PPN 重叠 | 保留；release 构建通过 |
+| refill 空目录检查 | LA，官方盘，`-smp 8 -m 8G` | 静默超过 2 分钟，PC 固定在 `0x100624d800` | 输出 `rustc`、`cargo` 版本并返回 | 确定性卡死消失 | 保留 |
+| 两项组合 | 官方 BuildStorm 2.1 | 无工具链或 minibuild 结算标记 | `BUILDSTORM_TOOLCHAIN ok`、`BUILDSTORM_MINIBUILD ok` | 2.1 从阻塞变为完整通过 | 已通过本地 LA 长测 |
+| 两项组合 | 同轮 CAgent | 作为前置回归 | 10/10 testcase 均输出 pass | 无功能回退 | 已通过本地 LA 长测 |
+
+本轮内核 SHA-256 为
+`7fae3dd87a31663130a76d4ae8d861dd83a86283d47ed11c8a824ce3b5ded08d` 的前一版只包含
+PTE 修复，仍在两分钟后静默；加入空目录 refill 后重新生成的 release 内核 SHA-256 为
+`bed59c694008dd67c5717e56473cafe7a4c2fe7e0699bebecad7954ffd4b99d6`。该版本已经越过
+故障地址，完成题 2.1，并自动进入 446 个构建单元的 `tg-xtask` 预构建。记录本节时预构建
+仍在继续，因此这里只确认 LoongArch 题 2.1 和 CAgent，不提前宣称 LoongArch 题 2.2
+完整通过。

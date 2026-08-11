@@ -38,13 +38,19 @@ impl PTE {
 impl From<MappingFlags> for PTEFlags {
     fn from(value: MappingFlags) -> Self {
         let mut flags = PTEFlags::V;
+        if !value.contains(MappingFlags::Device) {
+            flags |= PTEFlags::MAT_CACHE;
+        }
         if value.contains(MappingFlags::W) {
             flags |= PTEFlags::W | PTEFlags::D;
         }
 
-        // if !value.contains(MappingFlags::X) {
-        //     flags |= PTEFlags::NX;
-        // }
+        if !value.contains(MappingFlags::R) {
+            flags |= PTEFlags::NR;
+        }
+        if !value.contains(MappingFlags::X) {
+            flags |= PTEFlags::NX;
+        }
 
         if value.contains(MappingFlags::U) {
             flags |= PTEFlags::PLV_USER;
@@ -78,6 +84,11 @@ impl From<PTEFlags> for MappingFlags {
         if val.contains(PTEFlags::PLV_USER) {
             flags |= MappingFlags::U;
         }
+        if val.contains(PTEFlags::MAT_CACHE) {
+            flags |= MappingFlags::Cache;
+        } else {
+            flags |= MappingFlags::Device;
+        }
         flags
     }
 }
@@ -92,7 +103,7 @@ bitflags::bitflags! {
 
         const PLV_USER = 0b11 << 2;
 
-        const MAT_NOCACHE = 0b01 << 4;
+        const MAT_CACHE = 0b01 << 4;
 
         /// Designates a global mapping OR Whether the page is huge page.
         const GH = bit!(6);
@@ -104,11 +115,11 @@ bitflags::bitflags! {
         /// Is a Global Page if using huge page(GH bit).
         const G = bit!(10);
         /// Page is not readable.
-        const NR = bit!(11);
+        const NR = bit!(61);
         /// Page is not executable.
         /// FIXME: Is it just for a huge page?
         /// Linux related url: https://github.com/torvalds/linux/blob/master/arch/loongarch/include/asm/pgtable-bits.h
-        const NX = bit!(12);
+        const NX = bit!(62);
         /// Whether the privilege Level is restricted. When RPLV is 0, the PTE
         /// can be accessed by any program with privilege Level highter than PLV.
         const RPLV = bit!(63);

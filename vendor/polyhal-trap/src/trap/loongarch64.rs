@@ -133,9 +133,16 @@ pub unsafe extern "C" fn tlb_fill() {
             csrwr   $t0, LA_CSR_TLBRSAVE
             csrrd   $t0, LA_CSR_PGD
             lddir   $t0, $t0, 3
+            beqz    $t0, 1f
             lddir   $t0, $t0, 1
+            beqz    $t0, 1f
             ldpte   $t0, 0
             ldpte   $t0, 1
+            b       2f
+        1:
+            csrwr   $zero, 0x8c
+            csrwr   $zero, 0x8d
+        2:
             tlbfill
             csrrd   $t0, LA_CSR_TLBRSAVE
             ertn
