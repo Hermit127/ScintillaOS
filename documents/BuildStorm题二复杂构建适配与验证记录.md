@@ -2066,3 +2066,17 @@ socket 锁前经当前任务页表复制输入，`recvfrom` 先准备用户可�
 `74e580679b57fa61db8640f615240af322162000444f00c31c34bf2ee50409e7`，在保留 VirtIO 块设备、
 VirtIO 网卡和 `mon:stdio` 的原配置下输出 `Hello, world!` 并以状态 0 退出。该闭环把“产物
 不可运行”和“本机双层模拟过慢”区分开，同时验证 socket 修复覆盖了官网新增的嵌套启动路径。
+
+## 33. 2026-08-12：官网隐藏产物启动检查的双架构修复
+
+最新官网运行中，RV 和 LA 的正式 Cargo 构建分别以 `2347.69s` 和 `1681.77s` 成功结束，
+但隐藏启动检查分别因重定向描述符的 `F_SETFL(O_NONBLOCK)` 返回 `EINVAL`、LoongArch
+`AT_HWCAP` 未报告 UAL 而失败。前者把无状态、始终就绪描述符的 `F_SETFL` 默认语义改为
+接受并忽略不影响 I/O 的状态位，有状态的终端、管道、socket、eventfd 和 inode 仍使用原覆盖
+实现；后者仅在 LoongArch 辅助向量中报告 Linux 定义的 `HWCAP_LOONGARCH_UAL` 位。
+
+修改后双目标 `cargo check` 与官方 Docker release 构建通过。最小验证在 8 核 RV 和 12 核
+LA 外层系统中进入官方 glibc 镜像，使用镜像自带 QEMU、`/dev/null` 输入和文件输出启动当前
+内核产物。两种架构均越过动态链接、`mon:stdio`、TCG 与 ELF 加载并打印内层
+`[kernel] Hello, world!`；旧错误和新的 QEMU 运行时错误均未出现。诊断未挂内层块设备，后续
+块设备 panic 属于预期终点。临时 shell 入口已移除，正式评测入口和脚本没有变化。

@@ -832,7 +832,11 @@ impl TaskControlBlock {
         auxv_write!(AT_EGID, 0u64);
         auxv_write!(AT_CLKTCK, 100u64);
         auxv_write!(AT_SECURE, 0u64);
-        auxv_write!(AT_HWCAP, 0u64);
+        #[cfg(target_arch = "loongarch64")]
+        const PLATFORM_HWCAP: u64 = 1 << 2; // HWCAP_LOONGARCH_UAL
+        #[cfg(not(target_arch = "loongarch64"))]
+        const PLATFORM_HWCAP: u64 = 0;
+        auxv_write!(AT_HWCAP, PLATFORM_HWCAP);
         auxv_write!(AT_PLATFORM, platform_addr as u64);
         auxv_write!(AT_RANDOM, random_addr as u64);
         // AT_EXECFN normally points at argv[0]. Some internal runners are

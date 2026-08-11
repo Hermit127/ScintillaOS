@@ -113,3 +113,43 @@ sha256=74e580679b57fa61db8640f615240af322162000444f00c31c34bf2ee50409e7
 单层启动。产物完整输出 ArceOS 架构信息与 `Hello, world!`，QEMU 返回 0。该对照证明正式
 构建产物可运行；本地双层未在时限内到达应用输出是嵌套 TCG 性能限制，而不是 ELF、根文件
 系统或虚拟网卡被删除。修复仍是通用用户内存语义，不检查 QEMU、Cargo 或测试名称。
+
+## 8. 2026-08-12 最新官网双架构启动失败与修复
+
+最新官网日志显示两种架构都已完成正式构建并生成产物。RISC-V 的构建返回 `rc=0`，耗时
+`2347.69s`；LoongArch 的构建返回 `rc=0`，耗时 `1681.77s`。两者最终仍为零分，是因为官网
+新增的隐藏产物启动检查分别在 QEMU 入口失败：
+
+```text
+qemu-system-riscv64: Failed to set FD nonblocking: Invalid argument
+qemu-system-riscv64: could not connect serial device to character backend 'mon:stdio'
+qemu-system-loongarch64: TCG: unaligned access support required; exiting
+```
+
+RISC-V 的进一步根因是 shell 重定向会用 `/dev/null` 或普通文件替换标准描述符。此前只为
+`Stdin` 和 `Stdout` 保存了 `O_NONBLOCK`，简单设备仍落入 `File::set_flags` 的失败默认值。
+现在默认文件描述符按 Linux 的通用 `F_SETFL` 语义接受可设置状态位；对 `/dev/null`、
+`/dev/zero` 和 proc 文件等始终就绪对象，`O_NONBLOCK` 不改变实际 I/O 行为。管道、socket、
+eventfd、Unix socket、标准终端和普通 inode 继续使用各自的覆盖实现，因此没有削弱这些对象
+原有的阻塞、追加和状态共享语义。
+
+LoongArch 用户进程辅助向量此前把 `AT_HWCAP` 固定为 0。LoongArch 宿主上的 QEMU TCG 会
+通过 `getauxval(AT_HWCAP)` 检查宿主是否支持非对齐访问；Linux UAPI 将该能力定义为
+`HWCAP_LOONGARCH_UAL = 1 << 2`。内核现在只在 LoongArch 用户进程中报告这个确实由硬件和
+异常处理路径支持的位，RISC-V 仍保持原值，也没有虚报 LSX、LASX 等可选向量能力。
+
+两种目标的 `cargo check` 和官方 Docker release 构建均成功。随后临时把 shell 嵌入诊断
+内核，在外层分别以 8 核 RISC-V、12 核 LoongArch 启动官方 glibc 镜像，在 chroot 内调用
+镜像自带的真实 `qemu-system-*`。测试刻意使用 `stdin=/dev/null` 和普通文件重定向输出，
+并补齐镜像脚本使用的 QEMU 私有库、固件和 ROM 搜索路径。两个 QEMU 都完成动态装载、字符
+后端初始化、TCG 翻译和内层内核加载，最终均打印：
+
+```text
+[kernel] Hello, world!
+```
+
+诊断命令没有给内层 ScintillaOS 挂块设备，因此它在该标志之后报告“未找到块设备”，这是
+刻意设置的最小测试终点，不属于产物入口失败。输出中不再出现上述两个官网错误，也没有新的
+syscall、动态链接、信号、内存映射或 QEMU 主循环错误。临时 shell 已恢复为正式评测入口，
+正式 `initproc`、测试顺序、计时、构建并发度和评分标记均未修改。本轮没有重新执行数小时的
+完整 Cargo 构建，结论限定为双架构产物启动基础设施已经真实走通。
