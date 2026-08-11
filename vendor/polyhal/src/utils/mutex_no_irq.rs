@@ -109,6 +109,16 @@ impl<T> RwLockNoIrq<T> {
 
 impl<T: ?Sized> RwLockNoIrq<T> {
     #[inline]
+    pub fn reader_count(&self) -> usize {
+        self.lock.reader_count()
+    }
+
+    #[inline]
+    pub fn writer_count(&self) -> usize {
+        self.lock.writer_count()
+    }
+
+    #[inline]
     pub fn read(&self) -> RwLockNoIrqReadGuard<'_, T> {
         let mut backoff = 1usize;
         loop {

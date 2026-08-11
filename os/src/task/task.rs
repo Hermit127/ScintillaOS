@@ -1588,6 +1588,8 @@ pub enum BlockReason {
     Futex(usize, usize),
     FilePageLoad(usize),
     SleepLock(usize),
+    VmReadLock(usize),
+    VmWriteLock(usize),
     ExecPeer(usize),
     SignalWait(SignalFlags),
     Vfork(usize),

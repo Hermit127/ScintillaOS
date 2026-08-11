@@ -482,7 +482,11 @@ pub fn begin_block(
 ) -> *mut polyhal::kcontext::KContext {
     let mut scheduler = SCHEDULER.exclusive_access();
     let sleep_lock_key = match reason {
-        Some(BlockReason::SleepLock(key)) => Some(key),
+        Some(
+            BlockReason::SleepLock(key)
+            | BlockReason::VmReadLock(key)
+            | BlockReason::VmWriteLock(key),
+        ) => Some(key),
         _ => None,
     };
     // Running tasks are absent from all ready queues. Avoid the old
@@ -596,7 +600,12 @@ fn wake_task_filtered(task: Arc<TaskControlBlock>, filter: WakeFilter) -> bool {
         }
         let block_reason = inner.block_reason;
         let _ = remove_task(&mut scheduler.net_blocked, pid);
-        if let Some(BlockReason::SleepLock(key)) = block_reason {
+        if let Some(
+            BlockReason::SleepLock(key)
+            | BlockReason::VmReadLock(key)
+            | BlockReason::VmWriteLock(key),
+        ) = block_reason
+        {
             let _ = remove_sleep_lock_waiter_by_key(
                 &mut scheduler.sleep_lock_waiters,
                 key,

@@ -1184,6 +1184,9 @@ pub struct VmRwLock<T> {
     inner: RwLockNoIrq<T>,
     name: &'static str,
     writer_owner: AtomicUsize,
+    // Pairs unlock with the waiter's post-registration check, even when the
+    // protected state itself is observed stale on a weakly ordered hart.
+    wake_sequence: AtomicUsize,
     waiters: AtomicUsize,
     waiting_writers: AtomicUsize,
 }
@@ -1201,6 +1204,7 @@ impl<T> VmRwLock<T> {
             inner: RwLockNoIrq::new(value),
             name,
             writer_owner: AtomicUsize::new(NO_OWNER),
+            wake_sequence: AtomicUsize::new(0),
             waiters: AtomicUsize::new(0),
             waiting_writers: AtomicUsize::new(0),
         }
@@ -1286,15 +1290,17 @@ impl<T> VmRwLock<T> {
                     misses += 1;
                 }
                 if can_sleep && attempts >= 4 {
-                    self.waiters.fetch_add(1, Ordering::AcqRel);
+                    let wake_sequence = self.wake_sequence.load(Ordering::SeqCst);
+                    self.waiters.fetch_add(1, Ordering::SeqCst);
                     crate::task::block_current_and_run_next_if(
-                        crate::task::BlockReason::SleepLock(self.key()),
+                        crate::task::BlockReason::VmReadLock(self.key()),
                         || {
-                            self.waiting_writers.load(Ordering::Acquire) != 0
-                                || self.inner.try_read().is_none()
+                            self.wake_sequence.load(Ordering::SeqCst) == wake_sequence
+                                && (self.waiting_writers.load(Ordering::Acquire) != 0
+                                    || self.inner.writer_count() != 0)
                         },
                     );
-                    self.waiters.fetch_sub(1, Ordering::AcqRel);
+                    self.waiters.fetch_sub(1, Ordering::SeqCst);
                     attempts = 0;
                     backoff = 1;
                     continue;
@@ -1356,12 +1362,17 @@ impl<T> VmRwLock<T> {
                     misses += 1;
                 }
                 if attempts >= 4 {
-                    self.waiters.fetch_add(1, Ordering::AcqRel);
+                    let wake_sequence = self.wake_sequence.load(Ordering::SeqCst);
+                    self.waiters.fetch_add(1, Ordering::SeqCst);
                     crate::task::block_current_and_run_next_if(
-                        crate::task::BlockReason::SleepLock(self.key()),
-                        || self.inner.try_write().is_none(),
+                        crate::task::BlockReason::VmWriteLock(self.key()),
+                        || {
+                            self.wake_sequence.load(Ordering::SeqCst) == wake_sequence
+                                && (self.inner.reader_count() != 0
+                                    || self.inner.writer_count() != 0)
+                        },
                     );
-                    self.waiters.fetch_sub(1, Ordering::AcqRel);
+                    self.waiters.fetch_sub(1, Ordering::SeqCst);
                     attempts = 0;
                     backoff = 1;
                     continue;
@@ -1511,7 +1522,8 @@ impl<T> Drop for VmRwReadGuard<'_, T> {
     fn drop(&mut self) {
         lockdep_released(LockClass::Vm, self.lock.name, self.lock.key());
         self.guard.take();
-        if self.lock.waiters.load(Ordering::Acquire) != 0 {
+        self.lock.wake_sequence.fetch_add(1, Ordering::SeqCst);
+        if self.lock.waiters.load(Ordering::SeqCst) != 0 {
             defer_lock_waiter_wake(self.lock.key(), true);
         }
     }
@@ -1552,7 +1564,8 @@ impl<T> Drop for VmRwWriteGuard<'_, T> {
             self.lock.writer_owner.store(NO_OWNER, Ordering::Release);
         }
         self.guard.take();
-        if self.lock.waiters.load(Ordering::Acquire) != 0 {
+        self.lock.wake_sequence.fetch_add(1, Ordering::SeqCst);
+        if self.lock.waiters.load(Ordering::SeqCst) != 0 {
             defer_lock_waiter_wake(self.lock.key(), true);
         }
     }
@@ -1777,6 +1790,8 @@ pub struct SleepLock<T> {
     locked: AtomicUsize,
     waiters: AtomicUsize,
     owner: AtomicUsize,
+    // See VmRwLock::wake_sequence; the same lost-wakeup window exists here.
+    wake_sequence: AtomicUsize,
     name: &'static str,
     stats_class: usize,
 }
@@ -1799,6 +1814,7 @@ impl<T> SleepLock<T> {
             locked: AtomicUsize::new(0),
             waiters: AtomicUsize::new(0),
             owner: AtomicUsize::new(NO_OWNER),
+            wake_sequence: AtomicUsize::new(0),
             name,
             stats_class,
         }
@@ -1854,12 +1870,16 @@ impl<T> SleepLock<T> {
                 {
                     sleep_waits += 1;
                 }
-                self.waiters.fetch_add(1, Ordering::AcqRel);
+                let wake_sequence = self.wake_sequence.load(Ordering::SeqCst);
+                self.waiters.fetch_add(1, Ordering::SeqCst);
                 crate::task::block_current_and_run_next_if(
                     crate::task::BlockReason::SleepLock(self.key()),
-                    || self.locked.load(Ordering::Acquire) != 0,
+                    || {
+                        self.wake_sequence.load(Ordering::SeqCst) == wake_sequence
+                            && self.locked.load(Ordering::Acquire) != 0
+                    },
                 );
-                self.waiters.fetch_sub(1, Ordering::AcqRel);
+                self.waiters.fetch_sub(1, Ordering::SeqCst);
                 backoff = 1;
                 continue;
             }
@@ -2017,7 +2037,8 @@ impl<T> Drop for SleepGuard<'_, T> {
         }
         self.lock.owner.store(NO_OWNER, Ordering::Release);
         self.lock.locked.store(0, Ordering::Release);
-        if self.lock.waiters.load(Ordering::Acquire) != 0 {
+        self.lock.wake_sequence.fetch_add(1, Ordering::SeqCst);
+        if self.lock.waiters.load(Ordering::SeqCst) != 0 {
             defer_lock_waiter_wake(self.lock.key(), false);
         }
     }
