@@ -7,6 +7,8 @@ use crate::task::{current_task, pid2task};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
+const O_NONBLOCK: usize = 0x800;
+
 static STDOUT_BUSY: AtomicBool = AtomicBool::new(false);
 static STDOUT_OWNER: AtomicI32 = AtomicI32::new(0);
 
@@ -69,9 +71,29 @@ pub fn stdout_release_pid(pid: usize) {
     }
 }
 
-pub struct Stdin;
+pub struct Stdin {
+    nonblock: AtomicBool,
+}
 
-pub struct Stdout;
+impl Stdin {
+    pub fn new() -> Self {
+        Self {
+            nonblock: AtomicBool::new(false),
+        }
+    }
+}
+
+pub struct Stdout {
+    nonblock: AtomicBool,
+}
+
+impl Stdout {
+    pub fn new() -> Self {
+        Self {
+            nonblock: AtomicBool::new(false),
+        }
+    }
+}
 
 impl File for Stdin {
     // 标准输入可以读。
@@ -95,6 +117,9 @@ impl File for Stdin {
                 user_buf[0] = c;
                 return 1;
             }
+            if self.nonblock.load(Ordering::Relaxed) {
+                return -11;
+            }
             stdout_release_if_owner();
             let retry_at = (polyhal::time::Time::now().to_nsec() as usize)
                 .saturating_add(10_000_000);
@@ -110,6 +135,19 @@ impl File for Stdin {
     // 执行时构造字符设备类型的 Kstat，不需要访问真实设备元数据。
     fn stat(&self) -> Kstat {
         Kstat::new(S_IFCHR)
+    }
+    fn get_flags(&self) -> usize {
+        0x8000
+            | if self.nonblock.load(Ordering::Relaxed) {
+                O_NONBLOCK
+            } else {
+                0
+            }
+    }
+    fn set_flags(&self, flags: usize) -> bool {
+        self.nonblock
+            .store((flags & O_NONBLOCK) != 0, Ordering::Relaxed);
+        true
     }
     // 给 fd 层做具体类型判断。
     // 执行时直接把当前对象转成 Any trait 引用，方便文件描述符层做具体类型判断。
@@ -150,6 +188,20 @@ impl File for Stdout {
     // 执行时构造字符设备类型的 Kstat，不需要访问真实设备元数据。
     fn stat(&self) -> Kstat {
         Kstat::new(S_IFCHR)
+    }
+    fn get_flags(&self) -> usize {
+        0x8000
+            | 1
+            | if self.nonblock.load(Ordering::Relaxed) {
+                O_NONBLOCK
+            } else {
+                0
+            }
+    }
+    fn set_flags(&self, flags: usize) -> bool {
+        self.nonblock
+            .store((flags & O_NONBLOCK) != 0, Ordering::Relaxed);
+        true
     }
     // 给 fd 层做具体类型判断。
     // 执行时直接把当前对象转成 Any trait 引用，方便文件描述符层做具体类型判断。

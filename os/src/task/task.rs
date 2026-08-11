@@ -444,11 +444,11 @@ impl TaskControlBlock {
                     exit_code: 0,
                     fd_table: vec![
                         // 0 -> stdin
-                        Some(Arc::new(Stdin)),
+                        Some(Arc::new(Stdin::new())),
                         // 1 -> stdout
-                        Some(Arc::new(Stdout)),
+                        Some(Arc::new(Stdout::new())),
                         // 2 -> stderr
-                        Some(Arc::new(Stdout)),
+                        Some(Arc::new(Stdout::new())),
                     ],
                     fd_cloexec: vec![false, false, false],
                     files_id: pid_value,
