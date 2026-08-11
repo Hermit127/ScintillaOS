@@ -771,6 +771,101 @@ impl MemorySet {
         self.areas.exclusive_access().push(map_area);
         true
     }
+
+    fn push_lazy_file_segment(
+        &mut self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        permission: MapPermission,
+        file: Arc<dyn File>,
+        file_offset: usize,
+        file_size: usize,
+    ) -> bool {
+        let start = start_va.raw();
+        let end = end_va.raw();
+        if end < start || file_size > end - start {
+            return false;
+        }
+        if end == start {
+            return true;
+        }
+        let aligned_start = start / PAGE_SIZE * PAGE_SIZE;
+        let Some(aligned_end) = end
+            .checked_add(PAGE_SIZE - 1)
+            .map(|value| value / PAGE_SIZE * PAGE_SIZE)
+        else {
+            return false;
+        };
+        if aligned_start == aligned_end {
+            return true;
+        }
+
+        let page_offset = start - aligned_start;
+        let mut copied = 0usize;
+        let mut cursor = aligned_start;
+        if page_offset != 0 && file_size != 0 {
+            let head_len = (PAGE_SIZE - page_offset).min(file_size);
+            if !self.push_file_segment(
+                MapArea::new(
+                    aligned_start.into(),
+                    (aligned_start + PAGE_SIZE).into(),
+                    MapType::Framed,
+                    permission,
+                ),
+                file.as_ref(),
+                file_offset,
+                head_len,
+                page_offset,
+            ) {
+                return false;
+            }
+            copied = head_len;
+            cursor += PAGE_SIZE;
+        }
+
+        let full_len = (file_size - copied) / PAGE_SIZE * PAGE_SIZE;
+        if full_len != 0 {
+            let Some(full_offset) = file_offset.checked_add(copied) else {
+                return false;
+            };
+            if !self.insert_file_area(
+                cursor.into(),
+                (cursor + full_len).into(),
+                permission,
+                file.clone(),
+                full_offset,
+            ) {
+                return false;
+            }
+            copied += full_len;
+            cursor += full_len;
+        }
+
+        let tail_len = file_size - copied;
+        if tail_len != 0 {
+            let Some(tail_offset) = file_offset.checked_add(copied) else {
+                return false;
+            };
+            if !self.push_file_segment(
+                MapArea::new(
+                    cursor.into(),
+                    (cursor + PAGE_SIZE).into(),
+                    MapType::Framed,
+                    permission,
+                ),
+                file.as_ref(),
+                tail_offset,
+                tail_len,
+                0,
+            ) {
+                return false;
+            }
+            cursor += PAGE_SIZE;
+        }
+
+        cursor >= aligned_end
+            || self.insert_lazy_area(cursor.into(), aligned_end.into(), permission)
+    }
     pub fn from_elf(elf_data: &[u8]) -> LoadedElf {
         trace!("os::mm::MemorySet::from_elf");
         let mut memory_set = Self::new_bare();
@@ -881,9 +976,9 @@ impl MemorySet {
         }
     }
 
-    pub fn from_elf_file(file: &dyn File) -> Option<LoadedElf> {
+    pub fn from_elf_file(file: Arc<dyn File>) -> Option<LoadedElf> {
         trace!("os::mm::MemorySet::from_elf_file");
-        let header_data = match read_elf_header_table(file) {
+        let header_data = match read_elf_header_table(file.as_ref()) {
             Some(data) => data,
             None => {
                 #[cfg(feature = "smp-diagnostics")]
@@ -956,17 +1051,14 @@ impl MemorySet {
                 if ph_flags.is_execute() {
                     map_perm |= MapPermission::X;
                 }
-                let page_off = start_va.raw() % PAGE_SIZE;
-                let aligned_start = start_va.raw() - page_off;
-                let map_area =
-                    MapArea::new(aligned_start.into(), end_va, MapType::Framed, map_perm);
-                max_end_va = max_end_va.max(map_area.vaddr_range.get_end());
-                if !memory_set.push_file_segment(
-                    map_area,
-                    file,
+                max_end_va = max_end_va.max(end_va.ceil());
+                if !memory_set.push_lazy_file_segment(
+                    start_va,
+                    end_va,
+                    map_perm,
+                    file.clone(),
                     ph.offset() as usize,
                     ph.file_size() as usize,
-                    page_off,
                 ) {
                     #[cfg(feature = "smp-diagnostics")]
                     crate::println!(
@@ -983,7 +1075,7 @@ impl MemorySet {
             } else if ph_type == xmas_elf::program::Type::Interp {
                 let offset = ph.offset() as usize;
                 let size = ph.file_size() as usize;
-                let raw = match read_small_file_region(file, offset, size) {
+                let raw = match read_small_file_region(file.as_ref(), offset, size) {
                     Some(data) => data,
                     None => {
                         #[cfg(feature = "smp-diagnostics")]
@@ -1000,15 +1092,10 @@ impl MemorySet {
         let user_stack_top: usize = 0x8_0000_0000;
         let user_stack_bottom = user_stack_top - USER_STACK_SIZE;
         let user_stack_top = user_stack_bottom + USER_STACK_SIZE;
-        if !memory_set.push(
-            MapArea::new(
-                user_stack_bottom.into(),
-                user_stack_top.into(),
-                MapType::Framed,
-                MapPermission::R | MapPermission::W | MapPermission::U,
-            ),
-            None,
-            0,
+        if !memory_set.insert_lazy_area(
+            user_stack_bottom.into(),
+            user_stack_top.into(),
+            MapPermission::R | MapPermission::W | MapPermission::U,
         ) {
             #[cfg(feature = "smp-diagnostics")]
             crate::println!("[exec-diag] ELF file load failed: user stack");
@@ -1089,10 +1176,10 @@ impl MemorySet {
 
     pub fn load_interp_file(
         memory_set: &mut MemorySet,
-        file: &dyn File,
+        file: Arc<dyn File>,
         base: usize,
     ) -> Option<(usize, usize)> {
-        let header_data = read_elf_header_table(file)?;
+        let header_data = read_elf_header_table(file.as_ref())?;
         let elf = xmas_elf::ElfFile::new(&header_data).ok()?;
         let entry = elf.header.pt2.entry_point() as usize + base;
         let ph_count = elf.header.pt2.ph_count();
@@ -1112,16 +1199,13 @@ impl MemorySet {
                 if ph_flags.is_execute() {
                     map_perm |= MapPermission::X;
                 }
-                let page_off = start_va.raw() % PAGE_SIZE;
-                let aligned_start = start_va.raw() - page_off;
-                let map_area =
-                    MapArea::new(aligned_start.into(), end_va, MapType::Framed, map_perm);
-                if !memory_set.push_file_segment(
-                    map_area,
-                    file,
+                if !memory_set.push_lazy_file_segment(
+                    start_va,
+                    end_va,
+                    map_perm,
+                    file.clone(),
                     ph.offset() as usize,
                     ph.file_size() as usize,
-                    page_off,
                 ) {
                     return None;
                 }
@@ -2139,6 +2223,23 @@ impl MemorySet {
             &mut areas,
             MapArea::new(start_addr, end_addr, MapType::Framed, permission),
         );
+        true
+    }
+
+    pub fn populate_lazy_range(
+        &self,
+        start_addr: polyhal::VirtAddr,
+        end_addr: polyhal::VirtAddr,
+        access: PageFaultAccess,
+    ) -> bool {
+        let mut page = start_addr.floor();
+        let end = end_addr.ceil();
+        while page < end {
+            if self.handle_page_fault(page, access).is_none() {
+                return false;
+            }
+            page = page + PAGE_SIZE;
+        }
         true
     }
 

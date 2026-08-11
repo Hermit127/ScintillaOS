@@ -191,18 +191,22 @@ static SCHEDULER_RETURNS: [AtomicU64; MAX_CPUS] =
 #[cfg(feature = "lock-stats")]
 static TIMER_TICKS: [AtomicU64; MAX_CPUS] =
     [const { AtomicU64::new(0) }; MAX_CPUS];
+#[cfg(feature = "lock-stats")]
+static SOLO_PREEMPT_SKIPS: [AtomicU64; MAX_CPUS] =
+    [const { AtomicU64::new(0) }; MAX_CPUS];
 
 #[cfg(feature = "lock-stats")]
 pub fn dump_scheduler_runtime_stats() {
     for cpu in 0..MAX_CPUS {
         crate::println!(
-            "[scheduler-stats] cpu={} loops={} dispatches={} returns={} idle_waits={} timer_ticks={}",
+            "[scheduler-stats] cpu={} loops={} dispatches={} returns={} idle_waits={} timer_ticks={} solo_preempt_skips={}",
             cpu,
             SCHEDULER_LOOPS[cpu].load(Ordering::Relaxed),
             SCHEDULER_DISPATCHES[cpu].load(Ordering::Relaxed),
             SCHEDULER_RETURNS[cpu].load(Ordering::Relaxed),
             SCHEDULER_IDLE_WAITS[cpu].load(Ordering::Relaxed),
             TIMER_TICKS[cpu].load(Ordering::Relaxed),
+            SOLO_PREEMPT_SKIPS[cpu].load(Ordering::Relaxed),
         );
     }
     super::manager::dump_context_switch_stats();
@@ -755,6 +759,22 @@ pub fn record_timer_tick() -> bool {
     let mut cpu = current_cpu().exclusive_access();
     cpu.ticks = cpu.ticks.wrapping_add(1);
     cpu.ticks % TIMER_TICKS_PER_USER_SLICE == 0
+}
+
+pub fn timer_preemption_needed() -> bool {
+    let cpu = current_hart_id();
+    let Some(task) = current_task() else {
+        return false;
+    };
+    if task.allowed_cpus() & (1usize << cpu) == 0 {
+        return true;
+    }
+    let needed = super::manager::has_local_ready_task(cpu).unwrap_or(true);
+    #[cfg(feature = "lock-stats")]
+    if !needed {
+        SOLO_PREEMPT_SKIPS[cpu].fetch_add(1, Ordering::Relaxed);
+    }
+    needed
 }
 
 // 返回当前任务的用户页表 token。

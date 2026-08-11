@@ -13,11 +13,14 @@ pub const KERNEL_STACK_SIZE: usize = 4096 * 8;
 // frames available for real workloads on the 256 MiB RISC-V QEMU machine.
 pub const KERNEL_HEAP_SIZE: usize = 0x400_0000;
 // Large process trees need substantially more kernel metadata than the
-// preliminary-suite workload.  Bootstrap with the fixed heap above, then
-// reserve a small fraction of discovered RAM before the rest enters the frame
-// allocator.  The cap keeps the kernel footprint bounded on 8 GiB machines.
+// preliminary-suite workload. Keep the conservative split on small machines,
+// but let BuildStorm-class machines reserve a larger fraction for reclaimable
+// VFS, task and allocator metadata. The cap leaves at least seven GiB of an
+// eight GiB guest available to user pages and the file page cache.
 pub const KERNEL_HEAP_GROWTH_DIVISOR: usize = 32;
-pub const KERNEL_HEAP_MAX_GROWTH: usize = 0xc000_000;
+pub const KERNEL_HEAP_LARGE_MEMORY_THRESHOLD: usize = 2 * 1024 * 1024 * 1024;
+pub const KERNEL_HEAP_LARGE_GROWTH_DIVISOR: usize = 8;
+pub const KERNEL_HEAP_MAX_GROWTH: usize = 0x3c00_0000;
 
 pub const PAGE_SIZE: usize = 0x1000;
 /// One readable/executable page kept outside the reserved initial stack VMA.

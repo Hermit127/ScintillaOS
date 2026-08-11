@@ -914,14 +914,21 @@ fn resolve_base_dir_for_path(dirfd: isize, path: &str) -> Result<Arc<Dentry>, is
 }
 
 fn dentry_still_exists(dentry: &Arc<Dentry>) -> bool {
-    if dentry.fs_path == "/" {
+    if dentry.parent_epoch_is_current() {
         return true;
     }
-    dentry
+    let validation_epoch = dentry.parent_epoch_for_revalidation();
+    let exists = dentry
         .super_block
         .get_inode_info(&dentry.fs_path)
         .map(|info| info.inode_num == dentry.inode_num)
-        .unwrap_or(false)
+        .unwrap_or(false);
+    if exists {
+        if let Some(epoch) = validation_epoch {
+            dentry.mark_parent_epoch_validated(epoch);
+        }
+    }
+    exists
 }
 
 fn resolve_search_dir(current: Arc<Dentry>) -> Result<Arc<Dentry>, isize> {
@@ -1296,6 +1303,87 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> isize
         path.contains("/target/debug/") || base.fs_path.contains("/target/debug/");
     if path.is_empty() {
         return -2;
+    }
+    if open_flags.create_requested() && open_flags.excl_requested() {
+        let (parent, _) = match resolve_parent_and_name_checked(&base, path.as_str()) {
+            Ok(parts) => parts,
+            Err(errno) => return errno,
+        };
+        // O_CREAT|O_EXCL is already an atomic create operation. If creating
+        // in this directory is permitted, avoid resolving the absent target
+        // first; a racing/existing target is resolved only after create fails.
+        // Read-only or denied parents retain the slower path below so an
+        // already-existing target still reports EEXIST with Linux ordering.
+        if !vfs_dentry_is_readonly(&parent) && can_modify_directory(&parent) {
+            if let Some(inode) =
+                open_file_at(Some(base.clone()), path.as_str(), open_flags, mode as u32)
+            {
+                let file: Arc<dyn File + Send + Sync> =
+                    if is_libc_tmpfile_fallback(path.as_str(), open_flags) {
+                        Arc::new(crate::fs::TmpFile::new())
+                    } else {
+                        inode
+                    };
+                return install_fd_shared(&task, file, cloexec)
+                    .map(|fd| fd as isize)
+                    .unwrap_or_else(|errno| errno);
+            }
+            return if vfs_resolve_with_fallback(&base, path.as_str()).is_some() {
+                -17
+            } else {
+                -2
+            };
+        }
+    }
+    if open_flags.create_requested()
+        && !open_flags.directory_requested()
+        && !open_flags.nofollow_requested()
+        && !open_flags.path_requested()
+        && (!open_flags.trunc_requested() || open_flags.read_write().1)
+    {
+        let (parent, _) = match resolve_parent_and_name_checked(&base, path.as_str()) {
+            Ok(parts) => parts,
+            Err(errno) => return errno,
+        };
+        if !vfs_dentry_is_readonly(&parent) && can_modify_directory(&parent) {
+            let mut deferred_flags = open_flags;
+            deferred_flags.remove(OpenFlags::TRUNC);
+            if let Some((inode, created)) = crate::fs::inode::open_file_at_with_status(
+                Some(base.clone()),
+                path.as_str(),
+                deferred_flags,
+                mode as u32,
+            ) {
+                if !created {
+                    let existing = inode.get_dentry();
+                    if (open_flags.read_write().1 || open_flags.trunc_requested())
+                        && vfs_dentry_is_readonly(existing)
+                    {
+                        return EROFS;
+                    }
+                    let access = open_existing_access(existing, open_flags);
+                    if access != 0 {
+                        return access;
+                    }
+                    if flags & O_NOATIME != 0 {
+                        let euid = {
+                            let inner = task.inner_exclusive_access();
+                            inner.euid
+                        };
+                        let owner = existing.inode_info().map(|info| info.uid).unwrap_or(0);
+                        if euid != 0 && euid != owner {
+                            return -1;
+                        }
+                    }
+                    if open_flags.trunc_requested() && !inode.truncate(0) {
+                        return -5;
+                    }
+                }
+                return install_fd_shared(&task, inode, cloexec)
+                    .map(|fd| fd as isize)
+                    .unwrap_or_else(|errno| errno);
+            }
+        }
     }
     let existing = vfs_resolve_with_fallback(&base, path.as_str());
     #[cfg(feature = "buildstorm-diagnostics")]
@@ -1686,9 +1774,6 @@ pub fn sys_mkdirat(dirfd: isize, path: *const u8, mode: u32) -> isize {
     #[cfg(feature = "smp-diagnostics")]
     if path.starts_with("/mnt") {
         crate::println!("[mkdir-diag] resolving-existing path={}", path);
-    }
-    if vfs_resolve_path(&base_dir, path.as_str()).is_some() {
-        return -17;
     }
     #[cfg(feature = "smp-diagnostics")]
     if path.starts_with("/mnt") {

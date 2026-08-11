@@ -1861,11 +1861,11 @@ pub fn sys_exec(path: *const u8, args: *const usize, envp: *const usize) -> isiz
             if interp_path.is_some() && interp_inode.is_none() {
                 return ENOENT;
             }
-            let interp_file = interp_inode
-                .as_ref()
-                .map(|inode| inode.as_ref() as &dyn File);
+            let interp_file: Option<Arc<dyn File>> =
+                interp_inode.map(|inode| -> Arc<dyn File> { inode });
+            let executable_file: Arc<dyn File> = i2;
             if current_task().unwrap().exec_file_with_interp(
-                i2.as_ref(),
+                executable_file,
                 interp_file,
                 new_args,
                 env_vec,
@@ -1904,11 +1904,11 @@ pub fn sys_exec(path: *const u8, args: *const usize, envp: *const usize) -> isiz
                         if interp_path.is_some() && interp_inode.is_none() {
                             return ENOENT;
                         }
-                        let interp_file = interp_inode
-                            .as_ref()
-                            .map(|inode| inode.as_ref() as &dyn File);
+                        let interp_file: Option<Arc<dyn File>> =
+                            interp_inode.map(|inode| -> Arc<dyn File> { inode });
+                        let executable_file: Arc<dyn File> = sh_inode;
                         if current_task().unwrap().exec_file_with_interp(
-                            sh_inode.as_ref(),
+                            executable_file,
                             interp_file,
                             sh_args,
                             env_vec,
@@ -1931,9 +1931,11 @@ pub fn sys_exec(path: *const u8, args: *const usize, envp: *const usize) -> isiz
                 open_exec(&usr_interp)
             });
             if let Some(interp_inode) = interp_inode {
+                let executable_file: Arc<dyn File> = app_inode;
+                let interp_file: Arc<dyn File> = interp_inode;
                 if task.exec_file_with_interp(
-                    app_inode.as_ref(),
-                    Some(interp_inode.as_ref() as &dyn File),
+                    executable_file,
+                    Some(interp_file),
                     args_vec,
                     env_vec,
                 ) {
@@ -1945,7 +1947,8 @@ pub fn sys_exec(path: *const u8, args: *const usize, envp: *const usize) -> isiz
             }
             return ENOENT;
         }
-        if task.exec_file_with_interp(app_inode.as_ref(), None, args_vec, env_vec) {
+        let executable_file: Arc<dyn File> = app_inode;
+        if task.exec_file_with_interp(executable_file, None, args_vec, env_vec) {
             exec_task.set_executable_path(executable_path);
             crate::task::complete_vfork(&exec_task);
             0
@@ -2842,7 +2845,10 @@ pub fn sys_shutdown() -> isize {
     }
     #[cfg(feature = "lock-stats")]
     {
+        crate::mm::dump_heap_allocator_stats();
         crate::mm::dump_file_page_cache_stats();
+        crate::fs::vfs::dump_pending_write_stats();
+        crate::fs::vfs::dump_vfs_cache_stats();
         crate::task::dump_scheduler_runtime_stats();
         dump_yield_stats();
     }

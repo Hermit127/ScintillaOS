@@ -1,9 +1,11 @@
 use super::{current_task, mark_current_task_address_space_active, SignalActions, UserFloatState};
 use super::{pid_alloc, PendingSignalInfo, PidHandle, SignalFlags};
-use crate::config::KERNEL_STACK_SIZE;
+use crate::config::{KERNEL_STACK_SIZE, PAGE_SIZE, USER_STACK_SIZE};
 use crate::fs::vfs::{Dentry, ROOT_DENTRY};
 use crate::fs::{File, Stdin, Stdout};
-use crate::mm::{translated_refmut, LoadedElf, MapArea, MapPermission, MapType, MemorySet};
+use crate::mm::{
+    translated_refmut, LoadedElf, MapArea, MapPermission, MapType, MemorySet, PageFaultAccess,
+};
 use crate::sync::{SignalActionsLock, TaskGuard, TaskLock};
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -49,6 +51,7 @@ pub const NO_RUNNING_CPU: usize = usize::MAX;
 /// recycled frames become available again.
 struct TaskSchedulingMeta {
     running_cpu: AtomicUsize,
+    last_cpu: AtomicUsize,
     allowed_cpus: AtomicUsize,
     enqueued: AtomicBool,
     /// Stable task-list identity used by exec/exit group walks without taking
@@ -91,6 +94,7 @@ impl TaskSchedulingMeta {
     const fn new(thread_group_id: usize) -> Self {
         Self {
             running_cpu: AtomicUsize::new(NO_RUNNING_CPU),
+            last_cpu: AtomicUsize::new(NO_RUNNING_CPU),
             allowed_cpus: AtomicUsize::new(DEFAULT_TASK_CPU_MASK),
             enqueued: AtomicBool::new(false),
             thread_group_id: AtomicUsize::new(thread_group_id),
@@ -564,8 +568,8 @@ impl TaskControlBlock {
 
     pub fn exec_file_with_interp(
         &self,
-        elf_file: &dyn File,
-        interp_file: Option<&dyn File>,
+        elf_file: Arc<dyn File>,
+        interp_file: Option<Arc<dyn File>>,
         args: Vec<String>,
         envs: Vec<String>,
     ) -> bool {
@@ -594,8 +598,69 @@ impl TaskControlBlock {
             loaded.entry_point = interp_entry;
             loaded.interp_base = interp_base;
         }
+        if !Self::prepare_initial_stack(&loaded.memory_set, loaded.user_sp, &args, &envs) {
+            #[cfg(feature = "smp-diagnostics")]
+            crate::println!(
+                "[exec-diag] tid={} initial stack allocation failed",
+                self.getpid()
+            );
+            return false;
+        }
         self.exec_loaded(loaded, args, envs);
         true
+    }
+
+    fn prepare_initial_stack(
+        memory_set: &MemorySet,
+        stack_top: usize,
+        args: &[String],
+        envs: &[String],
+    ) -> bool {
+        const AUXV_COUNT: usize = 18;
+        let platform_len = if cfg!(target_arch = "riscv64") {
+            "riscv64\0".len()
+        } else if cfg!(target_arch = "loongarch64") {
+            "loongarch64\0".len()
+        } else {
+            "unknown\0".len()
+        };
+        let Some(string_bytes) = args
+            .iter()
+            .chain(envs.iter())
+            .try_fold(platform_len, |total, value| {
+                total.checked_add(value.len() + 1)
+            })
+        else {
+            return false;
+        };
+        let Some(pointer_bytes) = args
+            .len()
+            .checked_add(envs.len())
+            .and_then(|count| count.checked_add(3))
+            .and_then(|count| count.checked_mul(core::mem::size_of::<u64>()))
+        else {
+            return false;
+        };
+        let Some(required_bytes) = string_bytes
+            .checked_add(15)
+            .and_then(|size| size.checked_add(16))
+            .and_then(|size| size.checked_add(AUXV_COUNT * 2 * core::mem::size_of::<u64>()))
+            .and_then(|size| size.checked_add(pointer_bytes))
+        else {
+            return false;
+        };
+        if required_bytes > USER_STACK_SIZE {
+            return false;
+        }
+        let Some(required_bottom) = stack_top.checked_sub(required_bytes) else {
+            return false;
+        };
+        let mapped_bottom = required_bottom / PAGE_SIZE * PAGE_SIZE;
+        memory_set.populate_lazy_range(
+            mapped_bottom.into(),
+            stack_top.into(),
+            PageFaultAccess::Write,
+        )
     }
 
     fn exec_loaded(&self, loaded: LoadedElf, args: Vec<String>, envs: Vec<String>) {
@@ -1358,6 +1423,10 @@ impl TaskControlBlock {
         self.scheduling.running_cpu.load(Ordering::Acquire)
     }
 
+    pub(crate) fn last_cpu(&self) -> usize {
+        self.scheduling.last_cpu.load(Ordering::Relaxed)
+    }
+
     pub fn thread_group_id(&self) -> usize {
         self.scheduling.thread_group_id.load(Ordering::Acquire)
     }
@@ -1463,6 +1532,7 @@ impl TaskControlBlock {
             self.getpid(),
             self.running_cpu(),
         );
+        self.scheduling.last_cpu.store(cpu, Ordering::Relaxed);
     }
 
     /// Scheduler-only: clear execution ownership after this CPU has removed

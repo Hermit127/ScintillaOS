@@ -277,6 +277,15 @@ int ext4_cache_flush(const char *path);
  * @return  Standard error code. */
 int ext4_fremove(const char *path);
 
+/**@brief Remove a child below an already resolved parent inode.
+ *
+ * The directory entry is looked up again and must still reference child_inode.
+ * Directories must be empty, matching unlinkat/rmdir semantics.
+ *
+ * @return A standard error code. */
+int ext4_remove_at(const char *mount_point, uint32_t parent_inode,
+		   uint32_t child_inode, const char *name, bool is_dir);
+
 /**@brief   Create a hardlink for a file.
  *
  * @param   path Path to file.
@@ -310,6 +319,29 @@ int ext4_frename(const char *path, const char *new_path);
 int ext4_frename2(const char *path, const char *new_path,
 		 const char *replaced_path, uint32_t flags,
 		 uint32_t *replaced_inode, bool *replaced_is_dir);
+
+/**@brief Rename below already resolved source and destination directories.
+ *
+ * Both directory entries are revalidated while holding the mount lock. If
+ * the destination exists, it is moved to replaced_name in the destination
+ * directory in the same journal transaction.
+ *
+ * @param mount_point Mounted filesystem path.
+ * @param source_parent_inode Resolved source parent directory inode.
+ * @param source_inode Expected source inode.
+ * @param source_name Source leaf name.
+ * @param target_parent_inode Resolved destination parent directory inode.
+ * @param target_name Destination leaf name.
+ * @param replaced_name Hidden leaf name used for a replaced destination.
+ * @param flags EXT4_RENAME_NOREPLACE or zero.
+ * @param replaced_inode Replaced inode number, or zero if none.
+ * @param replaced_is_dir Whether the replaced inode is a directory.
+ * @return Standard error code. */
+int ext4_rename_at2(const char *mount_point, uint32_t source_parent_inode,
+		    uint32_t source_inode, const char *source_name,
+		    uint32_t target_parent_inode, const char *target_name,
+		    const char *replaced_name, uint32_t flags,
+		    uint32_t *replaced_inode, bool *replaced_is_dir);
 
 /**@brief   File open function.
  *
@@ -353,6 +385,27 @@ int ext4_fopen2(ext4_file *file, const char *path, int flags);
  * @return  EEXIST if the path already exists, otherwise a standard error code. */
 int ext4_fcreate_with_attrs(ext4_file *file, const char *path, uint32_t mode,
 			    uint32_t uid, uint32_t gid);
+
+/**@brief Create a file or directory below an already resolved parent inode.
+ *
+ * The parent and leaf name are revalidated while holding the mount lock. This
+ * is the inode-oriented equivalent of ext4_fcreate_with_attrs and avoids
+ * repeating a full path walk already completed by the VFS.
+ *
+ * @param file File handle returned for the new inode.
+ * @param mount_point Mounted filesystem path.
+ * @param parent_inode Resolved parent directory inode.
+ * @param name Single path component to create.
+ * @param is_dir Create a directory when true, otherwise a regular file.
+ * @param mode Initial permission bits.
+ * @param uid Initial owner user id.
+ * @param gid Initial owner group id.
+ *
+ * @return EEXIST if the name already exists, otherwise a standard error code. */
+int ext4_create_at_with_attrs(ext4_file *file, const char *mount_point,
+			      uint32_t parent_inode, const char *name,
+			      bool is_dir, uint32_t mode, uint32_t uid,
+			      uint32_t gid);
 
 /**@brief   File close function.
  *

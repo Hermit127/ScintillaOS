@@ -1775,6 +1775,16 @@ unsafe extern "C" {
     pub fn ext4_fremove(path: *const ::core::ffi::c_char) -> ::core::ffi::c_int;
 }
 unsafe extern "C" {
+    #[doc = "@brief Remove a child below an already resolved parent inode."]
+    pub fn ext4_remove_at(
+        mount_point: *const ::core::ffi::c_char,
+        parent_inode: u32,
+        child_inode: u32,
+        name: *const ::core::ffi::c_char,
+        is_dir: bool,
+    ) -> ::core::ffi::c_int;
+}
+unsafe extern "C" {
     #[doc = "@brief   Create a hardlink for a file.\n\n @param   path Path to file.\n @param   hardlink_path Path of hardlink.\n\n @return  Standard error code."]
     pub fn ext4_flink(
         path: *const ::core::ffi::c_char,
@@ -1794,6 +1804,21 @@ unsafe extern "C" {
         path: *const ::core::ffi::c_char,
         new_path: *const ::core::ffi::c_char,
         replaced_path: *const ::core::ffi::c_char,
+        flags: u32,
+        replaced_inode: *mut u32,
+        replaced_is_dir: *mut bool,
+    ) -> ::core::ffi::c_int;
+}
+unsafe extern "C" {
+    #[doc = "@brief Rename below already resolved source and destination directories."]
+    pub fn ext4_rename_at2(
+        mount_point: *const ::core::ffi::c_char,
+        source_parent_inode: u32,
+        source_inode: u32,
+        source_name: *const ::core::ffi::c_char,
+        target_parent_inode: u32,
+        target_name: *const ::core::ffi::c_char,
+        replaced_name: *const ::core::ffi::c_char,
         flags: u32,
         replaced_inode: *mut u32,
         replaced_is_dir: *mut bool,
@@ -1820,6 +1845,19 @@ unsafe extern "C" {
     pub fn ext4_fcreate_with_attrs(
         file: *mut ext4_file,
         path: *const ::core::ffi::c_char,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> ::core::ffi::c_int;
+}
+unsafe extern "C" {
+    #[doc = "@brief Create a file or directory below an already resolved parent inode."]
+    pub fn ext4_create_at_with_attrs(
+        file: *mut ext4_file,
+        mount_point: *const ::core::ffi::c_char,
+        parent_inode: u32,
+        name: *const ::core::ffi::c_char,
+        is_dir: bool,
         mode: u32,
         uid: u32,
         gid: u32,

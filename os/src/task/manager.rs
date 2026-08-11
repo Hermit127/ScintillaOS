@@ -164,6 +164,15 @@ impl SchedulerState {
                 selected_len = load;
             }
         }
+        let last_cpu = task.last_cpu();
+        if last_cpu < MAX_CPUS && allowed & (1usize << last_cpu) != 0 {
+            let last_load = self.ready_queues[last_cpu]
+                .len()
+                .saturating_add(usize::from(self.running[last_cpu] != 0));
+            if last_load == selected_len {
+                return last_cpu;
+            }
+        }
         selected
     }
 
@@ -295,8 +304,32 @@ pub fn add_task(task: Arc<TaskControlBlock>) {
 }
 
 pub fn add_priority_task(task: Arc<TaskControlBlock>) {
-    let target = SCHEDULER.exclusive_access().promote_priority(task);
-    super::processor::request_reschedule(target);
+    let (target, running_cpu) = {
+        let mut scheduler = SCHEDULER.exclusive_access();
+        let inner = task.inner_exclusive_access();
+        let status = inner.task_status;
+        drop(inner);
+
+        if status == TaskStatus::Ready {
+            assert!(
+                task.is_enqueued(),
+                "ready pid {} has no scheduler queue entry during priority promotion",
+                task.getpid()
+            );
+            (Some(scheduler.promote_priority(task)), None)
+        } else {
+            let cpu = task.running_cpu();
+            (None, (cpu < MAX_CPUS).then_some(cpu))
+        }
+    };
+    if let Some(target) = target {
+        super::processor::request_reschedule(target);
+    } else if let Some(cpu) = running_cpu {
+        // A signal may race with Ready -> Running after its sender released
+        // TaskLock.  Ask the owning CPU to observe the pending signal instead
+        // of publishing a second ready-queue entry for a running context.
+        super::processor::request_reschedule(cpu);
+    }
 }
 
 /// Apply a validated affinity mask and, if the task is already Ready, move its
@@ -852,6 +885,16 @@ pub fn ready_queue_len() -> usize {
         .iter()
         .map(VecDeque::len)
         .sum()
+}
+
+pub(super) fn has_local_ready_task(cpu: usize) -> Option<bool> {
+    let scheduler = SCHEDULER.try_borrow()?;
+    Some(
+        scheduler
+            .ready_queues
+            .get(cpu)
+            .is_some_and(|queue| !queue.is_empty()),
+    )
 }
 
 pub fn ready_queue_counts() -> Option<(usize, usize)> {
