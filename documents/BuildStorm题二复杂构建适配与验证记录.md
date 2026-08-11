@@ -1983,8 +1983,8 @@ crate 名称和构建进度无关，在任意并发读写地址空间的负载�
 | Acquire/Release `wake_sequence` | LA 完整预构建 | `438--441/446` 停滞 | 越过旧点后在 `443/446` 停滞 | 只移动故障窗口 | 回退；不能作为正确修复 |
 | SeqCst 等待握手 | 官方 Docker 内核构建 | 未验证 | LA 诊断版、LA release、RV release 均成功生成 | 双架构编译通过 | 保留候选 |
 | SeqCst 等待握手 | LA 全新覆盖层完整链路 | 空闲锁遗留 2/4 个等待者 | 越过 `443/446` 后在 `444/446` 再现空锁和 4 个等待者 | 排除简单内存序是唯一根因 | 失败；不能单独采用 |
-| 无副作用条件复查 | LA 官方原始盘全新覆盖层 | `try_read/try_write` 产生无通知临时解锁 | 仅观察底层读写计数 | 自然越过 `438--445/446`，446 单元预构建在 54 分 51 秒完成 | 原丢唤醒点验证通过；正式 2.2 构建继续运行 |
-| `ext4_dir_entry_next` EOF 防护 | LA 旧失败快照续跑 | 目录收缩后解引用空 `it.curr`，内核态读地址 `0x6` panic | 空迭代项按目录结束返回 | 同一快照复测不再 panic，CAgent 10/10、2.1 通过 | 保留候选；全新覆盖层长测中 |
+| 无副作用条件复查 | LA 官方原始盘全新覆盖层 | `try_read/try_write` 产生无通知临时解锁 | 仅观察底层读写计数 | 自然越过 `438--445/446`；预构建 54 分 51 秒，正式构建 1642.49 秒 | 完整通过 |
+| `ext4_dir_entry_next` EOF 防护 | LA 官方原始盘全新覆盖层 | 目录收缩后解引用空 `it.curr`，内核态读地址 `0x6` panic | 空迭代项按目录结束返回 | CAgent 10/10、2.1、预构建和正式 2.2 均通过，无 panic | 完整通过 |
 
 两轮运行均保持 `-smp 8 -m 8G`、官方数据盘、真实 Cargo 工作量和 VirtIO 网卡，没有修改
 构建并发数、crate 清单、guest 时间或判分标记。失败样本均保留为反例，最终结论必须以
@@ -2010,6 +2010,59 @@ panic，地址空间锁也未再次停滞。该快照随后暴露多个继承的
 旧内核多轮强制终止后的父快照，不能作为新候选的干净验证。为避免用删除个别缓存掩盖问题，
 验证已切换到官方原始 LA 数据盘的全新 qcow2 覆盖层，保持 `-smp 8 -m 8G`、双 VirtIO
 块设备、VirtIO 网卡和真实 446 单元 Cargo 工作量。全新运行通过 CAgent 10/10 和题 2.1，
-自然越过旧故障区并以 54 分 51 秒完成全部 446 单元预构建，随后进入正式 2.2 release 构建。
-这已验证原丢唤醒点和目录 EOF 修复；最终 2.2 结论仍以正式 `BUILDSTORM_COMPILE` 与测试组
-结束标记为准。
+自然越过旧故障区并以 54 分 51 秒完成全部 446 单元预构建。正式 2.2 release 构建随后以
+26 分 11 秒完成，最终输出
+`BUILDSTORM_COMPILE mode=multi ok=true elapsed_s=1642.49 cores=8 bytes=1714568 arch=loongarch64`，
+并输出测试组结束标记后正常关机。该全新盘结果同时验证了原丢唤醒点、并发目录 EOF 修复以及
+CAgent、题 2.1、题 2.2 的完整链路。
+
+## 32. 2026-08-12：双架构完整回归与构建产物启动闭环
+
+### 32.1 RISC-V 全新覆盖层完整结果
+
+使用正式 `finalsubmission` 源码、官方 RISC-V 数据盘的全新 qcow2 覆盖层、双 VirtIO 块设备、
+VirtIO 网卡以及 `-smp 8 -m 8G` 完整执行 CAgent、题 2.1 和题 2.2。设备顺序显式固定为测试盘
+`virtio-mmio-bus.0`、根盘 `.1`、网卡 `.2`；此前一次自动分配 MMIO 顺序导致根盘被识别为
+`vda`，属于本地启动命令错误，不计为内核失败。
+
+修正设备顺序后的同一轮结果如下：CAgent 10/10；工具链和 minibuild 均通过；446 个单元的
+dev 预构建用时 120 分 24 秒；正式 release 构建用时 55 分 44 秒。最终输出：
+
+```text
+BUILDSTORM_COMPILE mode=multi ok=true elapsed_s=3459.62 cores=8 bytes=1681000 arch=riscv64
+#### OS COMP TEST GROUP END buildstorm-glibc ####
+[kernel] shutdown requested by tid=1
+```
+
+与同一机器上旧候选的 137 分 47 秒预构建相比，本轮预构建减少 17 分 23 秒，约 12.6%；
+本节只记录实测差异，不把宿主机并发负载变化归因成单一内核优化。
+
+### 32.2 LoongArch 全新覆盖层完整结果
+
+第 31 节的无副作用 VM 锁条件复查和 lwext4 目录 EOF 防护使用官方 LA 原始盘重新派生全新
+覆盖层。该轮 CAgent 10/10，题 2.1 通过，446 单元预构建用时 54 分 51 秒，正式 release
+构建用时 26 分 11 秒，最终输出：
+
+```text
+BUILDSTORM_COMPILE mode=multi ok=true elapsed_s=1642.49 cores=8 bytes=1714568 arch=loongarch64
+#### OS COMP TEST GROUP END buildstorm-glibc ####
+[kernel] shutdown requested by tid=1
+```
+
+这两轮都自然执行真实 Cargo 工作量并到达测试组结束标记，没有删减 crate、修改并行度、伪造
+时间或跳过产物生成。它们分别验证 RISC-V 和 LoongArch 的 CAgent、2.1、2.2 公共链路。
+
+### 32.3 内层 QEMU 的用户缓冲区安全拷贝
+
+官网私有结果还会在正式编译后启动 `arceos-helloworld`。标准终端支持 `O_NONBLOCK` 后，
+本地复现继续暴露 `sys_sendto` 把用户指针直接交给 `UnixSocketFile::send_with_flags` 的问题：
+内核在 `memcpy` 读取未驻留用户地址 `0x98c1df` 时发生内核态缺页。修复后，`sendto` 在获取
+socket 锁前经当前任务页表复制输入，`recvfrom` 先准备用户可写页、接收到内核暂存区后再
+回写。TCP/Unix stream 保留短读写，UDP 和 Unix seqpacket 保留 `EMSGSIZE` 消息边界。
+
+8 核外层复测已完成 `cargo metadata` 和增量构建，并真正创建内层 QEMU；原内核 panic 未再
+出现。Mac 双层 TCG 在诊断上限内只到 ArceOS 启动横幅，因此又从相同磁盘提取正式产物做
+单层对照。提取产物 SHA-256 为
+`74e580679b57fa61db8640f615240af322162000444f00c31c34bf2ee50409e7`，在保留 VirtIO 块设备、
+VirtIO 网卡和 `mon:stdio` 的原配置下输出 `Hello, world!` 并以状态 0 退出。该闭环把“产物
+不可运行”和“本机双层模拟过慢”区分开，同时验证 socket 修复覆盖了官网新增的嵌套启动路径。

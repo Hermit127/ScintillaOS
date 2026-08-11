@@ -11,6 +11,9 @@ use crate::fs::File;
 use crate::mm::{translated_ref, translated_refmut};
 use crate::net::socket::{SocketFile, SocketType};
 use crate::syscall::install_fd_shared;
+use crate::syscall::process::{
+    copy_from_task_user, copy_to_task_user, prepare_task_user_access, write_user_value,
+};
 use crate::sync::DeviceLock;
 use crate::task::{
     block_current_and_run_next, block_current_and_run_next_if, current_task, current_user_token,
@@ -224,6 +227,43 @@ fn copy_to_iov(buf: &[u8], iov: *mut Iovec, iovcnt: usize) -> usize {
         read += len;
     }
     read
+}
+
+fn copy_socket_input(
+    task: &Arc<crate::task::TaskControlBlock>,
+    ptr: *const u8,
+    len: usize,
+) -> Result<Vec<u8>, isize> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    if ptr.is_null() {
+        return Err(-14);
+    }
+    let mut data = Vec::new();
+    data.try_reserve_exact(len).map_err(|_| -12isize)?;
+    data.resize(len, 0);
+    if !copy_from_task_user(task, ptr as usize, &mut data) {
+        return Err(-14);
+    }
+    Ok(data)
+}
+
+fn prepare_socket_output(
+    task: &Arc<crate::task::TaskControlBlock>,
+    ptr: *mut u8,
+    len: usize,
+) -> Result<Vec<u8>, isize> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    if ptr.is_null() || !prepare_task_user_access(task, ptr as usize, len, true) {
+        return Err(-14);
+    }
+    let mut data = Vec::new();
+    data.try_reserve_exact(len).map_err(|_| -12isize)?;
+    data.resize(len, 0);
+    Ok(data)
 }
 
 fn add_to_socket_set(st: SocketType) -> Option<(SocketHandle, SocketType)> {
@@ -1402,8 +1442,16 @@ pub fn sys_sendto(
         if !dest_addr.is_null() && addrlen != 0 {
             return -106;
         }
-        let data = unsafe { core::slice::from_raw_parts(buf, len) };
-        socket.send_with_flags(data, flags)
+        let task = current_task().unwrap();
+        let copy_len = match socket.send_staging_len(len) {
+            Ok(len) => len,
+            Err(errno) => return errno,
+        };
+        let data = match copy_socket_input(&task, buf, copy_len) {
+            Ok(data) => data,
+            Err(errno) => return errno,
+        };
+        socket.send_with_flags(&data, flags)
     }) {
         return result;
     }
@@ -1421,14 +1469,22 @@ pub fn sys_sendto(
     }
     // For TCP, dest_addr is ignored (use connected peer)
 
-    let data = unsafe { core::slice::from_raw_parts(buf, len) };
+    if st == SocketType::Udp && len > SOCKET_BUFFER_SIZE {
+        return -90;
+    }
+    let task = current_task().unwrap();
+    let copy_len = len.min(SOCKET_BUFFER_SIZE);
+    let data = match copy_socket_input(&task, buf, copy_len) {
+        Ok(data) => data,
+        Err(errno) => return errno,
+    };
 
     match st {
         SocketType::Tcp => {
             if let Some((conn_id, server_side, _)) = socket_local_tcp(sockfd) {
-                local_tcp_send(conn_id, server_side, dontwait, data)
+                local_tcp_send(conn_id, server_side, dontwait, &data)
             } else if let Some(handle) = handle {
-                tcp_send(handle, dontwait, data)
+                tcp_send(handle, dontwait, &data)
             } else {
                 -107
             }
@@ -1445,10 +1501,10 @@ pub fn sys_sendto(
                 IpAddress::from(Ipv4Address::from_bytes(&ip.to_be_bytes())),
                 port,
             );
-            if let Some(ret) = try_send_local_udp(sockfd, handle, data, dest) {
+            if let Some(ret) = try_send_local_udp(sockfd, handle, &data, dest) {
                 return ret;
             }
-            udp_send(handle, data, dest)
+            udp_send(handle, &data, dest)
         }
         SocketType::Unix => -107,
     }
@@ -1463,12 +1519,24 @@ pub fn sys_recvfrom(
     addrlen: *mut usize,
 ) -> isize {
     if let Some(result) = with_unix_socket(sockfd, |socket| {
+        let task = current_task().unwrap();
         if !addrlen.is_null() {
-            let token = current_user_token();
-            *translated_refmut(token, addrlen as *mut u32) = 0;
+            if !write_user_value(&task, addrlen as *mut u32, &0u32) {
+                return -14;
+            }
         }
-        let recv_buf = unsafe { core::slice::from_raw_parts_mut(buf, len) };
-        socket.recv_with_flags(recv_buf, flags)
+        let copy_len = len.min(SOCKET_BUFFER_SIZE);
+        let mut recv_buf = match prepare_socket_output(&task, buf, copy_len) {
+            Ok(data) => data,
+            Err(errno) => return errno,
+        };
+        let result = socket.recv_with_flags(&mut recv_buf, flags);
+        if result > 0
+            && !copy_to_task_user(&task, buf as usize, &recv_buf[..result as usize])
+        {
+            return -14;
+        }
+        result
     }) {
         return result;
     }
@@ -1481,14 +1549,19 @@ pub fn sys_recvfrom(
     let dontwait = nonblock || (flags & MSG_DONTWAIT) != 0;
     let peek = (flags & MSG_PEEK) != 0;
 
-    let recv_buf = unsafe { core::slice::from_raw_parts_mut(buf, len) };
+    let task = current_task().unwrap();
+    let copy_len = len.min(SOCKET_BUFFER_SIZE);
+    let mut recv_buf = match prepare_socket_output(&task, buf, copy_len) {
+        Ok(data) => data,
+        Err(errno) => return errno,
+    };
 
     let result = match st {
         SocketType::Tcp => {
             if let Some((conn_id, server_side, _)) = socket_local_tcp(sockfd) {
-                local_tcp_recv(conn_id, server_side, dontwait, peek, recv_buf)
+                local_tcp_recv(conn_id, server_side, dontwait, peek, &mut recv_buf)
             } else if let Some(handle) = handle {
-                tcp_recv(handle, dontwait, recv_buf)
+                tcp_recv(handle, dontwait, &mut recv_buf)
             } else {
                 -107
             }
@@ -1499,12 +1572,21 @@ pub fn sys_recvfrom(
             };
             loop {
                 if let Some(ret) =
-                    try_recv_local_udp(sockfd, handle, recv_buf, src_addr, addrlen, peek)
+                    try_recv_local_udp(sockfd, handle, &mut recv_buf, src_addr, addrlen, peek)
                 {
+                    if ret > 0
+                        && !copy_to_task_user(
+                            &task,
+                            buf as usize,
+                            &recv_buf[..ret as usize],
+                        )
+                    {
+                        return -14;
+                    }
                     return ret;
                 }
                 let ret = if net_ready() {
-                    udp_recv(handle, true, recv_buf)
+                    udp_recv(handle, true, &mut recv_buf)
                 } else {
                     -11
                 };
@@ -1519,6 +1601,12 @@ pub fn sys_recvfrom(
         }
         SocketType::Unix => -107,
     };
+
+    if result > 0
+        && !copy_to_task_user(&task, buf as usize, &recv_buf[..result as usize])
+    {
+        return -14;
+    }
 
     // Fill source address for UDP if requested
     if result > 0
