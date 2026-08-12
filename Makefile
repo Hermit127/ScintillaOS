@@ -346,7 +346,7 @@ endif
 	else \
 		echo "  LTP directory not found: $(LTP_BIN_DIR)/ltp/testcases/bin (build LTP first in Docker)"; \
 	fi
-	@echo "  main branch keeps shell initproc; ltp_runner remains available as /bin/ltp_runner"
+	@echo "  runtime-dispatch initproc enabled for preliminary/final test disks"
 	@dd if=/dev/zero of=$(FS_IMG) bs=1M count=512
 	@mke2fs -t ext4 -b 4096 -F -O ^metadata_csum,^64bit,^orphan_file -d $(ROOTFS_DIR) $(FS_IMG)
 	@e2fsck -fy $(FS_IMG) 2>/dev/null || true
