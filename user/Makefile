@@ -8,8 +8,8 @@ BINS := $(patsubst $(APP_DIR)/%.rs, $(TARGET_DIR)/%.bin, $(APPS))
 
 RUST_SYSROOT := $(shell rustc --print sysroot)
 LLVM_TOOLS_DIR := $(RUST_SYSROOT)/lib/rustlib/$(shell rustc -vV | sed -n 's/^host: //p')/bin
-OBJDUMP ?= $(if $(shell command -v rust-objdump 2>/dev/null),rust-objdump,$(LLVM_TOOLS_DIR)/llvm-objdump) --arch-name=riscv64
-OBJCOPY ?= $(if $(shell command -v rust-objcopy 2>/dev/null),rust-objcopy,$(LLVM_TOOLS_DIR)/llvm-objcopy) --binary-architecture=riscv64
+OBJDUMP ?= $(if $(wildcard $(LLVM_TOOLS_DIR)/llvm-objdump),$(LLVM_TOOLS_DIR)/llvm-objdump,rust-objdump)
+OBJCOPY ?= $(if $(wildcard $(LLVM_TOOLS_DIR)/llvm-objcopy),$(LLVM_TOOLS_DIR)/llvm-objcopy,rust-objcopy)
 CP := cp 
 
 TEST ?= 
@@ -21,7 +21,10 @@ ifeq ($(TEST), 1)
 endif
 
 binary: elf
-	@$(foreach elf, $(ELFS), $(OBJCOPY) $(elf) --strip-all -O binary $(patsubst $(TARGET_DIR)/%, $(TARGET_DIR)/%.bin, $(elf));)
+	@set -e; \
+	for elf in $(ELFS); do \
+		$(OBJCOPY) "$$elf" --strip-all -O binary "$$elf.bin"; \
+	done
 
 build: binary
 

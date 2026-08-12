@@ -153,3 +153,35 @@ LoongArch 用户进程辅助向量此前把 `AT_HWCAP` 固定为 0。LoongArch �
 syscall、动态链接、信号、内存映射或 QEMU 主循环错误。临时 shell 已恢复为正式评测入口，
 正式 `initproc`、测试顺序、计时、构建并发度和评分标记均未修改。本轮没有重新执行数小时的
 完整 Cargo 构建，结论限定为双架构产物启动基础设施已经真实走通。
+
+## 9. 直接故障与发布构建风险的区分
+
+官网零分的直接原因不是内核或用户程序没有编译出来。两份原始日志中，RISC-V 和
+LoongArch 的 `rustc`、`cargo`、minibuild 均成功，正式 release 构建也分别在
+`2347.69s` 和 `1681.77s` 后返回 `rc=0`。唯一使最终 `BUILDSTORM_RESULT`
+变成 `status=FAIL` 的阶段，是评分脚本启动刚编译出的内层产物时，分别遇到
+`F_SETFL(O_NONBLOCK)` 和 `HWCAP_LOONGARCH_UAL` 语义缺口。第 8 节的两处修复和
+真实嵌套 QEMU 结果直接覆盖这一最终启动门。
+
+在直接故障已通过后，另外审计了发布构建的确定性。这一工作是必要的提交保护，但不是
+对官网日志的替代解释。仓库中跟踪了预编译的 `liblwext4-*.a`，旧构建脚本又使用文件
+mtime 判断是否重建；新 checkout 可能让旧归档的时间戳晚于已修复的 C 源码，从而错误链接旧
+lwext4。现在 Cargo 一旦运行该 build script，就从当前 checkout 的源码重建归档；RISC-V
+和 LoongArch 使用独立的 CMake 目录，根 `make all` 对四个最终目标串行发布，用户 ELF
+转换中任意一个 `objcopy` 失败也会立即使整体构建失败。这些改动只保证正确源码进入产物，
+不修改 guest 中的评测顺序、编译并发度、时钟或评分输出。
+
+在官方 `zhouzhouyi/os-contest:20260510` Docker 环境中从当前工作树执行标准
+`make all`，命令返回 0，并生成四个正确架构的产物：
+
+```text
+disk.img     512 MiB
+disk-la.img  512 MiB
+kernel-rv    RISC-V ELF, 3.7 MiB
+kernel-la    LoongArch ELF, 3.0 MiB
+```
+
+再从两个磁盘镜像中直接提取 `/bin/initproc`，其 SHA-256 分别与本轮 RISC-V 和
+LoongArch release 目标完全一致。两者的 ELF 架构也分别正确。`initproc.rs` 与正式提交
+`266bd1aa` 相比无差异，仍然依次挂载官方数据盘、`chroot` 到 `/glibc`、运行 CAgent
+和完整 BuildStorm 2.1 + 2.2，最后关机。

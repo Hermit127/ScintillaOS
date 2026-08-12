@@ -102,6 +102,7 @@ prepare-vendor:
 	@find vendor -name cargo-checksum.json -exec sh -c \
 		'cp "$$1" "$$(dirname "$$1")/.cargo-checksum.json"' _ {} \;
 
+.NOTPARALLEL: all
 all: kernel-rv disk.img kernel-la disk-la.img
 	@echo "===== Build complete ====="
 	@ls -lh kernel-rv kernel-la disk.img disk-la.img 2>/dev/null || true
@@ -127,7 +128,7 @@ disk.img: fs-img
 
 disk-rv.img:
 	@echo "===== Building disk-rv.img (riscv64) ====="
-	@make fs-img ARCH=riscv64
+	@$(MAKE) fs-img ARCH=riscv64
 	@cp target/riscv64gc-unknown-none-elf/release/fs.img disk-rv.img
 	@echo "disk-rv.img ready"
 
@@ -155,7 +156,7 @@ $(KERNEL_BIN): kernel
 fs-img: prepare-vendor $(APPS)
 	@mkdir -p .cargo 2>/dev/null || true
 	@cp -f cargo_config/config.toml .cargo/config.toml 2>/dev/null || true
-	@cd user && make build TARGET=$(TARGET) TEST=$(TEST)
+	@$(MAKE) -C user build TARGET=$(TARGET) TEST=$(TEST)
 	@if [ -d "$(OSCOMP_DIR)" ]; then \
 		if [ ! -d "$(OSCOMP_BIN_DIR)" ] || [ -z "$$(ls -A $(OSCOMP_BIN_DIR) 2>/dev/null)" ]; then \
 			$(MAKE) -C "$(OSCOMP_DIR)" ARCH=$(ARCH) clean binary; \
@@ -359,7 +360,7 @@ kernel: prepare-vendor
 	@echo Platform: $(BOARD)
 	@mkdir -p .cargo 2>/dev/null || true
 	@cp -f cargo_config/config.toml .cargo/config.toml 2>/dev/null || true
-	@cd user && make build TARGET=$(TARGET)
+	@$(MAKE) -C user build TARGET=$(TARGET)
 	@cargo build --release --target $(TARGET) $(OS_FEATURES)
 
 clean:

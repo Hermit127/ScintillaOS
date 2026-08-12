@@ -2080,3 +2080,22 @@ LA 外层系统中进入官方 glibc 镜像，使用镜像自带 QEMU、`/dev/nu
 内核产物。两种架构均越过动态链接、`mon:stdio`、TCG 与 ELF 加载并打印内层
 `[kernel] Hello, world!`；旧错误和新的 QEMU 运行时错误均未出现。诊断未挂内层块设备，后续
 块设备 panic 属于预期终点。临时 shell 入口已移除，正式评测入口和脚本没有变化。
+
+## 34. 2026-08-12：最终提交构建一致性审计
+
+本轮先依据官网原始日志区分“已成功构建”和“产物启动失败”：RV 和 LA 都已通过工具链、
+minibuild 和正式 release 构建，最后只因内层 QEMU 的非阻塞描述符和 UAL 能力查询失败。
+因此第 33 节的语义修复是官网零分的直接修复；本节的构建调整是防止该修复在最终发布中被
+旧静态库或双架构竞争覆盖，不是对直接根因的替代。
+
+具体防护包括：`lwext4_rust` 在 Cargo 运行 build script 时始终从当前 C 源码重建归档，
+不再依赖 checkout 后不可靠的 mtime；两种架构的 lwext4 使用独立构建目录；根 `make all`
+串行生成四个发布目标；用户程序统一使用 LLVM `objcopy`，不再强行传入 RISC-V 架构参数，
+且任意一个 ELF 转换失败都会终止构建。这些改动不影响 guest 内 Cargo 的并发度、计时和任务内容。
+
+在 `zhouzhouyi/os-contest:20260510` 官方 Docker 环境执行标准 `make all`，返回状态为 0，
+`kernel-rv`、`kernel-la`、`disk.img` 和 `disk-la.img` 全部生成。两个磁盘中的
+`/bin/initproc` 与各自 release 目标的 SHA-256 完全一致，架构分别为 RISC-V 和
+LoongArch。正式 `initproc.rs` 与修复提交相比无任何差异，仍然运行 CAgent 后继续运行
+完整 BuildStorm 2.1 + 2.2。本轮不重复数小时的 Cargo 全量构建：官网日志已证明该阶段成功，
+最小嵌套测试则直接覆盖唯一失败的后续产物启动阶段。
