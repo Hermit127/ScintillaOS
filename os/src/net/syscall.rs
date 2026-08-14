@@ -12,7 +12,8 @@ use crate::mm::{translated_ref, translated_refmut};
 use crate::net::socket::{SocketFile, SocketType};
 use crate::syscall::install_fd_shared;
 use crate::syscall::process::{
-    copy_from_task_user, copy_to_task_user, prepare_task_user_access, write_user_value,
+    copy_from_task_user, copy_to_task_user, copy_user_value, prepare_task_user_access,
+    write_user_value,
 };
 use crate::sync::DeviceLock;
 use crate::task::{
@@ -132,6 +133,7 @@ fn next_ephemeral_port() -> u16 {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct SockAddrIn {
     sin_family: u16,
     sin_port: u16,
@@ -157,11 +159,8 @@ struct Msghdr {
 }
 
 fn parse_sockaddr_in(ptr: *const u8) -> Option<(u32, u16)> {
-    if ptr.is_null() {
-        return None;
-    }
-    let token = current_user_token();
-    let sa: &SockAddrIn = translated_ref(token, ptr as *const SockAddrIn);
+    let task = current_task()?;
+    let sa = copy_user_value(&task, ptr as *const SockAddrIn)?;
     if sa.sin_family as usize != AF_INET {
         return None;
     }
@@ -171,22 +170,35 @@ fn parse_sockaddr_in(ptr: *const u8) -> Option<(u32, u16)> {
 }
 
 fn sockaddr_family(ptr: *const u8) -> Option<u16> {
-    if ptr.is_null() {
-        return None;
-    }
-    let token = current_user_token();
-    Some(*translated_ref(token, ptr as *const u16))
+    let task = current_task()?;
+    copy_user_value(&task, ptr as *const u16)
 }
 
-fn write_sockaddr_in(ptr: *mut u8, sin_addr: u32, sin_port: u16) {
-    let token = current_user_token();
+fn write_sockaddr_in(ptr: *mut u8, sin_addr: u32, sin_port: u16) -> bool {
+    let Some(task) = current_task() else {
+        return false;
+    };
     let sa = SockAddrIn {
         sin_family: AF_INET as u16,
         sin_port: sin_port.to_be(),
         sin_addr: sin_addr.to_be(),
         sin_zero: [0; 8],
     };
-    *translated_refmut(token, ptr as *mut SockAddrIn) = sa;
+    write_user_value(&task, ptr as *mut SockAddrIn, &sa)
+}
+
+fn write_sockaddr_with_len(
+    ptr: *mut u8,
+    addrlen: *mut usize,
+    sin_addr: u32,
+    sin_port: u16,
+) -> bool {
+    let Some(task) = current_task() else {
+        return false;
+    };
+    let len = core::mem::size_of::<SockAddrIn>() as u32;
+    write_user_value(&task, addrlen as *mut u32, &len)
+        && write_sockaddr_in(ptr, sin_addr, sin_port)
 }
 
 fn iov_total_len(iov: *const Iovec, iovcnt: usize) -> usize {
@@ -922,9 +934,14 @@ fn try_recv_local_udp(
 
     if !src_addr.is_null() && !addrlen.is_null() {
         let IpAddress::Ipv4(ipv4) = packet.src.addr;
-        let token = current_user_token();
-        *translated_refmut(token, addrlen as *mut u32) = core::mem::size_of::<SockAddrIn>() as u32;
-        write_sockaddr_in(src_addr, u32::from_be_bytes(ipv4.0), packet.src.port);
+        if !write_sockaddr_with_len(
+            src_addr,
+            addrlen,
+            u32::from_be_bytes(ipv4.0),
+            packet.src.port,
+        ) {
+            return Some(-14);
+        }
     }
 
     Some(n as isize)
@@ -1463,7 +1480,6 @@ pub fn sys_accept(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
     crate::net::net_poll();
 
     if !addr.is_null() && !addrlen.is_null() {
-        let token = current_user_token();
         let peer = crate::net::with_net_iface(|iface| {
             let sock: &TcpSocket = iface.sockets.get(handle);
             sock.remote_endpoint()
@@ -1471,9 +1487,14 @@ pub fn sys_accept(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
         .flatten();
         if let Some(peer) = peer {
             if let IpAddress::Ipv4(ipv4) = peer.addr {
-                *translated_refmut(token, addrlen as *mut usize) =
-                    core::mem::size_of::<SockAddrIn>();
-                write_sockaddr_in(addr, u32::from_be_bytes(ipv4.0), peer.port);
+                if !write_sockaddr_with_len(
+                    addr,
+                    addrlen,
+                    u32::from_be_bytes(ipv4.0),
+                    peer.port,
+                ) {
+                    return -14;
+                }
             }
         }
     }
@@ -2122,11 +2143,16 @@ pub fn sys_getpeername(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isi
     match peer {
         Some(ep) => {
             if let IpAddress::Ipv4(ipv4) = ep.addr {
-                let token = current_user_token();
-                *translated_refmut(token, addrlen as *mut u32) =
-                    core::mem::size_of::<SockAddrIn>() as u32;
-                write_sockaddr_in(addr, u32::from_be_bytes(ipv4.0), ep.port);
-                0
+                if write_sockaddr_with_len(
+                    addr,
+                    addrlen,
+                    u32::from_be_bytes(ipv4.0),
+                    ep.port,
+                ) {
+                    0
+                } else {
+                    -14
+                }
             } else {
                 -97
             }
@@ -2180,11 +2206,16 @@ pub fn sys_getsockname(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isi
         0,
     ));
     if let IpAddress::Ipv4(ipv4) = ep.addr {
-        let token = current_user_token();
-        *translated_refmut(token, addrlen as *mut u32) =
-            core::mem::size_of::<SockAddrIn>() as u32;
-        write_sockaddr_in(addr, u32::from_be_bytes(ipv4.0), ep.port);
-        0
+        if write_sockaddr_with_len(
+            addr,
+            addrlen,
+            u32::from_be_bytes(ipv4.0),
+            ep.port,
+        ) {
+            0
+        } else {
+            -14
+        }
     } else {
         -97
     }

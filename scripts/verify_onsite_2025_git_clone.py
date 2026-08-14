@@ -117,6 +117,11 @@ def main() -> int:
                 b"export http_proxy=" + proxy + b"\n"
                 b"export https_proxy=$http_proxy\n"
                 b"export GIT_PAGER=cat\n"
+                b"getent ahostsv4 github.com >/tmp/getent-github.out 2>&1\n"
+                b"dns_rc=$?\n"
+                b"cat /tmp/getent-github.out\n"
+                b"if test $dns_rc -eq 0 && test -s /tmp/getent-github.out; then "
+                b"printf 'GETENT_DNS_%s\\n' OK; else printf 'GETENT_DNS_%s\\n' FAILED; fi\n"
                 b"rm -rf /tmp/xv6-riscv\n"
                 b"git clone https://github.com/oscomp/xv6-riscv.git /tmp/xv6-riscv\n"
                 b"clone_rc=$?\n"
@@ -146,13 +151,15 @@ def main() -> int:
                 args.log.write_bytes(transcript)
         subprocess.run(["qemu-img", "check", str(overlay)], check=True)
 
-    required = (b"GIT_CLONE_RC=0", b"GIT_CLONE_TREE_OK")
+    required = (b"GETENT_DNS_OK", b"GIT_CLONE_RC=0", b"GIT_CLONE_TREE_OK")
     missing = [marker for marker in required if marker not in transcript]
     if missing:
         print(f"missing Git clone markers: {missing!r}", file=sys.stderr)
         return 1
-    if b"GIT_CLONE_TREE_FAILED" in transcript:
-        print("Git clone tree validation failed", file=sys.stderr)
+    failures = (b"GETENT_DNS_FAILED", b"GIT_CLONE_TREE_FAILED")
+    present = [marker for marker in failures if marker in transcript]
+    if present:
+        print(f"Git/DNS validation failed: {present!r}", file=sys.stderr)
         return 1
     print("onsite 2025 full Git clone passed")
     return 0
