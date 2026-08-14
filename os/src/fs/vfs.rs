@@ -1,5 +1,8 @@
-use crate::sync::{DentryLock, FsAuxLock, FsGlobalGuard, FsGlobalLock, FsGuard, FsLock, VfsLock};
-use alloc::collections::{BTreeMap, VecDeque};
+use crate::sync::{
+    DentryLock, FsAuxLock, FsGlobalLock, FsGlobalReadGuard, FsGuard, FsLock, SleepGuard,
+    SleepLock, VfsLock,
+};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::ffi::CString;
 use alloc::format;
 use alloc::string::String;
@@ -7,9 +10,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::ffi::c_char;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicU64, Ordering};
-#[cfg(feature = "mount-watchdog")]
-use core::sync::atomic::{AtomicBool, AtomicUsize};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use lazy_static::*;
 
 use super::block_device_stream::{BlockDeviceStream, BlockDeviceStreamOp, Ext4Wrapper};
@@ -17,6 +18,12 @@ use lwext4_rust::bindings::*;
 use lwext4_rust::Ext4BlockWrapper;
 
 const PATH_OWNER_CACHE_MAX_ENTRIES: usize = 1024;
+const INODE_RUNTIME_SIZE_MAX_ENTRIES: usize = 262_144;
+const INODE_RUNTIME_SIZE_UNKNOWN: u64 = u64::MAX;
+const DENTRY_PARENT_EPOCH_UNKNOWN: u64 = u64::MAX;
+const PENDING_WRITEBACK_CHUNK_SIZE: usize = 1024 * 1024;
+const PENDING_WRITEBACK_PER_INODE_LIMIT: usize = 8 * 1024 * 1024;
+const PENDING_WRITEBACK_GLOBAL_MAX: usize = 64 * 1024 * 1024;
 const ROOT_LWEXT4_MOUNT: &str = "/__rootfs/";
 const ROOT_LWEXT4_BIN: &str = "/__rootfs/bin";
 // The first SMP release has no mount hotplug requirement.  Reserving the
@@ -32,6 +39,425 @@ lazy_static! {
         FsGlobalLock::new_named((), "LwExt4Global");
     static ref PATH_OWNER_CACHE: VfsLock<BTreeMap<String, (u32, u32)>> =
         VfsLock::new_named(BTreeMap::new(), "VfsPathOwnerCache");
+    static ref INODE_RUNTIME_SIZES: FsAuxLock<BTreeMap<(usize, u32), Arc<InodeRuntimeSize>>> =
+        FsAuxLock::new_named(BTreeMap::new(), "VfsInodeRuntimeSizes");
+}
+
+static PENDING_WRITE_BYTES: AtomicUsize = AtomicUsize::new(0);
+static NEXT_PENDING_DIRTY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+#[cfg(feature = "lock-stats")]
+static PENDING_CACHE_READS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "lock-stats")]
+static PENDING_CACHE_READ_BYTES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "lock-stats")]
+static PENDING_CACHE_OVERLAY_READS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "lock-stats")]
+static PENDING_CACHE_OVERLAY_BYTES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "lock-stats")]
+static PENDING_CACHE_FLUSHES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "lock-stats")]
+static PENDING_CACHE_FLUSHED_BYTES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "lock-stats")]
+static PENDING_CACHE_PRESSURE_FLUSHES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "lock-stats")]
+static PENDING_CACHE_DEFERRED_CLOSES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "lock-stats")]
+static VFS_INODE_INFO_QUERIES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "lock-stats")]
+static VFS_INODE_INFO_FOUND: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "lock-stats")]
+static VFS_INODE_INFO_ABSENT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "lock-stats")]
+static VFS_INODE_INFO_ERRORS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "lock-stats")]
+static VFS_POSITIVE_DENTRY_HITS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "lock-stats")]
+static VFS_READDIR_DENTRIES_PUBLISHED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "lock-stats")]
+static VFS_DIRFD_EPOCH_HITS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "lock-stats")]
+static VFS_DIRFD_REVALIDATIONS: AtomicUsize = AtomicUsize::new(0);
+
+struct InodeRuntimeSize {
+    value: AtomicU64,
+    mutation: SleepLock<()>,
+    cached_file_handle: SleepLock<Option<CachedExt4File>>,
+    pending_writes: SleepLock<PendingFileWrites>,
+    pending_dirty: AtomicBool,
+    dirty_sequence: AtomicU64,
+}
+
+struct CachedExt4File(ext4_file);
+
+// The cached descriptor is an immutable mount/inode template. All operations
+// on copies still enter VfsSuperBlock::lock_fs before touching lwext4 state.
+unsafe impl Send for CachedExt4File {}
+
+struct PendingWriteRange {
+    offset: usize,
+    data: Vec<u8>,
+}
+
+struct PendingFileWrites {
+    super_block: Option<Arc<VfsSuperBlock>>,
+    file: Option<ext4_file>,
+    ranges: Vec<PendingWriteRange>,
+    buffered_bytes: usize,
+    timestamp: u32,
+}
+
+unsafe impl Send for PendingFileWrites {}
+
+impl PendingFileWrites {
+    const fn new() -> Self {
+        Self {
+            super_block: None,
+            file: None,
+            ranges: Vec::new(),
+            buffered_bytes: 0,
+            timestamp: 0,
+        }
+    }
+
+    fn push(
+        &mut self,
+        super_block: Arc<VfsSuperBlock>,
+        file: ext4_file,
+        offset: usize,
+        data: &[u8],
+        timestamp: u32,
+    ) -> Option<bool> {
+        if data.is_empty() {
+            return Some(false);
+        }
+        if let Some(last) = self.ranges.last_mut() {
+            if last.offset.checked_add(last.data.len()) == Some(offset) {
+                last.data.try_reserve(data.len()).ok()?;
+                last.data.extend_from_slice(data);
+                self.buffered_bytes = self.buffered_bytes.saturating_add(data.len());
+                self.timestamp = timestamp;
+                return Some(self.buffered_bytes >= PENDING_WRITEBACK_PER_INODE_LIMIT);
+            }
+        }
+
+        let mut stored = Vec::new();
+        stored.try_reserve_exact(data.len()).ok()?;
+        stored.extend_from_slice(data);
+        self.ranges.try_reserve(1).ok()?;
+        self.ranges.push(PendingWriteRange {
+            offset,
+            data: stored,
+        });
+        self.buffered_bytes = self.buffered_bytes.saturating_add(data.len());
+        self.timestamp = timestamp;
+        if self.super_block.is_none() {
+            self.super_block = Some(super_block);
+            self.file = Some(file);
+        }
+        Some(self.buffered_bytes >= PENDING_WRITEBACK_PER_INODE_LIMIT)
+    }
+
+    fn read_fully(&self, offset: usize, buf: &mut [u8], file_size: u64) -> Option<usize> {
+        let file_size = usize::try_from(file_size).unwrap_or(usize::MAX);
+        if offset >= file_size || buf.is_empty() {
+            return Some(0);
+        }
+        let read_len = buf.len().min(file_size - offset);
+        let end = offset.checked_add(read_len)?;
+
+        let mut covered_until = offset;
+        while covered_until < end {
+            let mut next = covered_until;
+            for range in &self.ranges {
+                let range_end = range.offset.saturating_add(range.data.len());
+                if range.offset <= covered_until && range_end > next {
+                    next = range_end.min(end);
+                }
+            }
+            if next == covered_until {
+                return None;
+            }
+            covered_until = next;
+        }
+
+        // Ranges retain write order, so later overlapping writes win.
+        for range in &self.ranges {
+            let range_end = range.offset.saturating_add(range.data.len());
+            let copy_start = range.offset.max(offset);
+            let copy_end = range_end.min(end);
+            if copy_start >= copy_end {
+                continue;
+            }
+            let source_start = copy_start - range.offset;
+            let destination_start = copy_start - offset;
+            let len = copy_end - copy_start;
+            buf[destination_start..destination_start + len]
+                .copy_from_slice(&range.data[source_start..source_start + len]);
+        }
+        Some(read_len)
+    }
+
+    fn read_plan(&self, offset: usize, request_len: usize, file_size: u64) -> (usize, usize) {
+        let file_size = usize::try_from(file_size).unwrap_or(usize::MAX);
+        let read_len = request_len.min(file_size.saturating_sub(offset));
+        let backing_size = self
+            .file
+            .as_ref()
+            .map(|file| usize::try_from(file.fsize).unwrap_or(usize::MAX))
+            .unwrap_or(0);
+        (read_len, backing_size)
+    }
+
+    fn overlay_read(&self, offset: usize, buf: &mut [u8]) {
+        let end = offset.saturating_add(buf.len());
+        // Ranges retain write order, so later overlapping writes win.
+        for range in &self.ranges {
+            let range_end = range.offset.saturating_add(range.data.len());
+            let copy_start = range.offset.max(offset);
+            let copy_end = range_end.min(end);
+            if copy_start >= copy_end {
+                continue;
+            }
+            let source_start = copy_start - range.offset;
+            let destination_start = copy_start - offset;
+            let len = copy_end - copy_start;
+            buf[destination_start..destination_start + len]
+                .copy_from_slice(&range.data[source_start..source_start + len]);
+        }
+    }
+}
+
+impl InodeRuntimeSize {
+    fn new() -> Self {
+        Self {
+            value: AtomicU64::new(INODE_RUNTIME_SIZE_UNKNOWN),
+            mutation: SleepLock::new_named((), "VfsInodeMutation"),
+            cached_file_handle: SleepLock::new_named(None, "VfsCachedFileHandle"),
+            pending_writes: SleepLock::new_named(
+                PendingFileWrites::new(),
+                "VfsPendingWrites",
+            ),
+            pending_dirty: AtomicBool::new(false),
+            dirty_sequence: AtomicU64::new(0),
+        }
+    }
+
+    fn load(&self) -> Option<u64> {
+        match self.value.load(Ordering::Acquire) {
+            INODE_RUNTIME_SIZE_UNKNOWN => None,
+            size => Some(size),
+        }
+    }
+
+    fn initialize(&self, size: u64) -> u64 {
+        match self.value.compare_exchange(
+            INODE_RUNTIME_SIZE_UNKNOWN,
+            size,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => size,
+            Err(current) => current,
+        }
+    }
+
+    fn store(&self, size: u64) {
+        self.value.store(size, Ordering::Release);
+    }
+}
+
+fn pending_writeback_limit() -> usize {
+    // Pending ranges live in the kernel heap rather than in reclaimable user
+    // frames. Keep their aggregate below one quarter of small heaps and cap it
+    // on large machines so extra metadata capacity cannot turn into an
+    // equally large write buffer.
+    (crate::mm::heap_total_bytes() / 4)
+        .max(PENDING_WRITEBACK_PER_INODE_LIMIT.saturating_mul(2))
+        .min(PENDING_WRITEBACK_GLOBAL_MAX)
+}
+
+fn subtract_pending_write_bytes(bytes: usize) {
+    if bytes == 0 {
+        return;
+    }
+    let _ = PENDING_WRITE_BYTES.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        Some(current.saturating_sub(bytes))
+    });
+}
+
+fn add_pending_write_bytes(bytes: usize) -> usize {
+    let mut result = 0usize;
+    let _ = PENDING_WRITE_BYTES.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        result = current.saturating_add(bytes);
+        Some(result)
+    });
+    result
+}
+
+fn discard_pending_write_state(state: &InodeRuntimeSize) {
+    let discarded = {
+        let mut slot = state.pending_writes.lock();
+        core::mem::replace(&mut *slot, PendingFileWrites::new())
+    };
+    state.pending_dirty.store(false, Ordering::Release);
+    state.dirty_sequence.store(0, Ordering::Release);
+    state.value.store(INODE_RUNTIME_SIZE_UNKNOWN, Ordering::Release);
+    *state.cached_file_handle.lock() = None;
+    subtract_pending_write_bytes(discarded.buffered_bytes);
+}
+
+fn flush_pending_write_state(state: &InodeRuntimeSize) -> bool {
+    if !state.pending_dirty.load(Ordering::Acquire) {
+        return true;
+    }
+    let pending = {
+        let mut slot = state.pending_writes.lock();
+        if slot.ranges.is_empty() {
+            state.pending_dirty.store(false, Ordering::Release);
+            state.dirty_sequence.store(0, Ordering::Release);
+            return true;
+        }
+        core::mem::replace(&mut *slot, PendingFileWrites::new())
+    };
+
+    let Some(super_block) = pending.super_block.as_ref() else {
+        let mut slot = state.pending_writes.lock();
+        *slot = pending;
+        return false;
+    };
+    let Some(mut file) = pending.file else {
+        let mut slot = state.pending_writes.lock();
+        *slot = pending;
+        return false;
+    };
+
+    let mut ok = true;
+    'ranges: for range in &pending.ranges {
+        let mut written = 0usize;
+        while written < range.data.len() {
+            let chunk_len = (range.data.len() - written).min(PENDING_WRITEBACK_CHUNK_SIZE);
+            let mut rw_count = 0usize;
+            let rc = {
+                let _fs_lock = super_block.lock_fs();
+                unsafe {
+                    ext4_fseek(
+                        &mut file,
+                        range.offset.saturating_add(written) as i64,
+                        SEEK_SET as u32,
+                    );
+                    ext4_fwrite_with_times(
+                        &mut file,
+                        range.data[written..written + chunk_len].as_ptr()
+                            as *const core::ffi::c_void,
+                        chunk_len,
+                        &mut rw_count,
+                        pending.timestamp,
+                        pending.timestamp,
+                    )
+                }
+            };
+            if rc != EOK as i32 || rw_count == 0 || rw_count > chunk_len {
+                ok = false;
+                break 'ranges;
+            }
+            written += rw_count;
+        }
+    }
+
+    if ok {
+        state.pending_dirty.store(false, Ordering::Release);
+        state.dirty_sequence.store(0, Ordering::Release);
+        subtract_pending_write_bytes(pending.buffered_bytes);
+        #[cfg(feature = "lock-stats")]
+        {
+            PENDING_CACHE_FLUSHES.fetch_add(1, Ordering::Relaxed);
+            PENDING_CACHE_FLUSHED_BYTES.fetch_add(pending.buffered_bytes, Ordering::Relaxed);
+        }
+        true
+    } else {
+        let mut slot = state.pending_writes.lock();
+        debug_assert!(slot.ranges.is_empty());
+        *slot = pending;
+        state.pending_dirty.store(true, Ordering::Release);
+        false
+    }
+}
+
+fn inode_runtime_key_from_parts(super_block: &VfsSuperBlock, inode: u32) -> (usize, u32) {
+    (super_block as *const VfsSuperBlock as usize, inode)
+}
+
+fn inode_runtime_state_by_key(key: (usize, u32)) -> Arc<InodeRuntimeSize> {
+    let mut sizes = INODE_RUNTIME_SIZES.exclusive_access();
+    if let Some(state) = sizes.get(&key) {
+        return state.clone();
+    }
+    if sizes.len() >= INODE_RUNTIME_SIZE_MAX_ENTRIES {
+        let unused = sizes
+            .iter()
+            .find(|(_, state)| {
+                Arc::strong_count(state) == 1
+                    && !state.pending_dirty.load(Ordering::Acquire)
+            })
+            .map(|(&key, _)| key);
+        if let Some(unused) = unused {
+            sizes.remove(&unused);
+        }
+    }
+    let state = Arc::new(InodeRuntimeSize::new());
+    sizes.insert(key, state.clone());
+    state
+}
+
+fn inode_runtime_state(super_block: &Arc<VfsSuperBlock>, inode: u32) -> Arc<InodeRuntimeSize> {
+    inode_runtime_state_by_key((Arc::as_ptr(super_block) as usize, inode))
+}
+
+fn balance_pending_writeback() -> bool {
+    if PENDING_WRITE_BYTES.load(Ordering::Acquire) <= pending_writeback_limit() {
+        return true;
+    }
+    let mut candidates = {
+        let sizes = INODE_RUNTIME_SIZES.exclusive_access();
+        sizes
+            .values()
+            .filter(|state| state.pending_dirty.load(Ordering::Acquire))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    candidates.sort_by_key(|state| state.dirty_sequence.load(Ordering::Acquire));
+
+    for state in candidates {
+        if PENDING_WRITE_BYTES.load(Ordering::Acquire) <= pending_writeback_limit() {
+            break;
+        }
+        let _mutation = state.mutation.lock();
+        if !state.pending_dirty.load(Ordering::Acquire) {
+            continue;
+        }
+        if !flush_pending_write_state(&state) {
+            return false;
+        }
+        #[cfg(feature = "lock-stats")]
+        PENDING_CACHE_PRESSURE_FLUSHES.fetch_add(1, Ordering::Relaxed);
+    }
+    true
+}
+
+pub(crate) fn flush_and_reset_inode_runtime(super_block: usize, inode: u32) -> bool {
+    let state = {
+        let sizes = INODE_RUNTIME_SIZES.exclusive_access();
+        sizes.get(&(super_block, inode)).cloned()
+    };
+    let Some(state) = state else {
+        return true;
+    };
+    let _mutation = state.mutation.lock();
+    if !flush_pending_write_state(&state) {
+        return false;
+    }
+    discard_pending_write_state(&state);
+    true
 }
 
 #[cfg(feature = "mount-watchdog")]
@@ -84,11 +510,10 @@ pub(crate) fn mount_watchdog_poll() {
 }
 
 pub(crate) struct VfsFsGuard<'a> {
-    // Struct fields are dropped in declaration order. The local Ext4 lock was
-    // acquired after the global lwext4 lock and therefore must be declared
-    // first so it is released first.
+    // Fields drop in declaration order, reversing the acquisition sequence.
+    // Release the global registry reference before waking per-volume waiters.
+    _global: FsGlobalReadGuard<'a, ()>,
     local: FsGuard<'a, FsInner>,
-    _global: FsGlobalGuard<'a, ()>,
 }
 
 impl Deref for VfsFsGuard<'_> {
@@ -163,6 +588,44 @@ pub struct InodeInfo {
     pub gid: u32,
 }
 
+fn inode_info_from_raw(
+    raw_ino: u32,
+    raw_inode: &ext4_inode,
+    cached_owner: Option<(u32, u32)>,
+) -> InodeInfo {
+    let mode = u16::from_le(raw_inode.mode) as u32;
+    let file_type = mode & 0o170000;
+    let is_dir = file_type == 0o040000;
+    let is_link = file_type == 0o120000;
+    let size_lo = u32::from_le(raw_inode.size_lo) as u64;
+    let size = if file_type == 0o100000 {
+        size_lo | ((u32::from_le(raw_inode.size_hi) as u64) << 32)
+    } else {
+        size_lo
+    };
+    let (uid, gid) = cached_owner.unwrap_or_else(|| {
+        (
+            u16::from_le(raw_inode.uid) as u32,
+            u16::from_le(raw_inode.gid) as u32,
+        )
+    });
+
+    InodeInfo {
+        inode_num: raw_ino,
+        is_dir,
+        is_link,
+        mode,
+        size,
+        atime: u32::from_le(raw_inode.access_time),
+        mtime: u32::from_le(raw_inode.modification_time),
+        ctime: u32::from_le(raw_inode.change_inode_time),
+        blocks_count: u32::from_le(raw_inode.blocks_count_lo) as u64,
+        links_count: u16::from_le(raw_inode.links_count) as u32,
+        uid,
+        gid,
+    }
+}
+
 // ==================== VfsSuperBlock ====================
 
 pub enum FsInner {
@@ -171,6 +634,7 @@ pub enum FsInner {
 
 pub struct VfsSuperBlock {
     pub fs_type: &'static str,
+    lwext4_mount_path: String,
     /// Ext4/lwext4 is not reentrant.  The first SMP revision serializes each
     /// mounted superblock explicitly, rather than relying on a global
     /// single-core cell.
@@ -178,16 +642,25 @@ pub struct VfsSuperBlock {
 }
 
 impl VfsSuperBlock {
-    /// Serialize direct lwext4 handle operations.  Callers that also protect
-    /// dentry or open-file metadata must acquire that VFS lock first, then
-    /// this guard, following `VfsLock -> FsLock`.
+    fn commit_inode_runtime_size(&self, inode: u32, size: u64) {
+        inode_runtime_state_by_key(inode_runtime_key_from_parts(self, inode)).store(size);
+    }
+
+    /// Serialize direct lwext4 operations. lwext4 keeps a process-global
+    /// mount registry and lazily initialized checksum tables in addition to
+    /// each volume's journal and block cache.
+    #[track_caller]
     pub(crate) fn lock_fs(&self) -> VfsFsGuard<'_> {
-        let global = LWEXT4_GLOBAL.exclusive_access();
         let local = self.fs_data.exclusive_access();
+        let global = LWEXT4_GLOBAL.read();
         VfsFsGuard {
-            local,
             _global: global,
+            local,
         }
+    }
+
+    pub(crate) fn fs_has_waiters(&self) -> bool {
+        self.fs_data.has_waiters()
     }
 
     pub fn new_ext4(
@@ -216,12 +689,7 @@ impl VfsSuperBlock {
             mount_point,
             total_size
         );
-        let stream = BlockDeviceStream {
-            inner: blk_device,
-            pos: 0,
-            total_size,
-            scratch: alloc::vec![0u8; 128 * 1024],
-        };
+        let stream = BlockDeviceStream::new(blk_device, total_size);
         #[cfg(feature = "mount-watchdog")]
         mount_watchdog_stage(8);
         #[cfg(feature = "mount-trace")]
@@ -261,10 +729,12 @@ impl VfsSuperBlock {
         crate::println!("[mount-diag] create-done point={}", mount_point);
         Some(Arc::new(VfsSuperBlock {
             fs_type,
+            lwext4_mount_path: String::from(mount_point),
             fs_data: FsLock::new_named(FsInner::Ext4(Ext4Wrapper(ext4)), "VfsFsData"),
         }))
     }
 
+    #[track_caller]
     fn with_fs<R>(&self, f: impl FnOnce(&Ext4Wrapper) -> R) -> R {
         let data = self.lock_fs();
         match &*data {
@@ -273,7 +743,8 @@ impl VfsSuperBlock {
     }
 
     pub fn force_umount(&self) {
-        let mut data = self.lock_fs();
+        let mut data = self.fs_data.exclusive_access();
+        let _global = LWEXT4_GLOBAL.exclusive_access();
         if let FsInner::Ext4(ref mut wrapper) = *data {
             unsafe {
                 wrapper.0.lwext4_umount().ok();
@@ -322,11 +793,13 @@ impl VfsSuperBlock {
     }
 
     fn get_inode_info_result(&self, fs_path: &str) -> Result<InodeInfo, i32> {
+        #[cfg(feature = "lock-stats")]
+        VFS_INODE_INFO_QUERIES.fetch_add(1, Ordering::Relaxed);
         // The owner cache is VFS metadata. Take this snapshot before
         // `with_fs` acquires the superblock FsLock, preserving the documented
         // `VfsLock -> FsLock` order.
         let cached_owner = cached_path_owner(fs_path);
-        self.with_fs(|_fs| {
+        let result = self.with_fs(|_fs| {
             let c_path = CString::new(fs_path).map_err(|_| EINVAL as i32)?;
             let mut raw_ino: u32 = 0;
             let mut raw_inode: ext4_inode = unsafe { core::mem::zeroed() };
@@ -338,9 +811,7 @@ impl VfsSuperBlock {
                 )
             };
             #[cfg(feature = "buildstorm-diagnostics")]
-            if fs_path.contains("/target/debug/")
-                && raw_rc != EOK as i32
-                && raw_rc != ENOENT as i32
+            if fs_path.contains("/target/debug/") && raw_rc != EOK as i32 && raw_rc != ENOENT as i32
             {
                 crate::println!(
                     "[buildstorm-fs] inode-query-failed raw_rc={} path={}",
@@ -355,38 +826,21 @@ impl VfsSuperBlock {
             // ext4_raw_inode_fill resolves the path once and copies a coherent
             // on-disk inode snapshot. Decoding that snapshot avoids repeating
             // the same path walk for mode, owner, three timestamps and size.
-            let mode = u16::from_le(raw_inode.mode) as u32;
-            let file_type = mode & 0o170000;
-            let is_dir = file_type == 0o040000;
-            let is_link = file_type == 0o120000;
-            let size_lo = u32::from_le(raw_inode.size_lo) as u64;
-            let size = if file_type == 0o100000 {
-                size_lo | ((u32::from_le(raw_inode.size_hi) as u64) << 32)
-            } else {
-                size_lo
-            };
-            let mut uid = u16::from_le(raw_inode.uid) as u32;
-            let mut gid = u16::from_le(raw_inode.gid) as u32;
-            if let Some((cached_uid, cached_gid)) = cached_owner {
-                uid = cached_uid;
-                gid = cached_gid;
+            Ok(inode_info_from_raw(raw_ino, &raw_inode, cached_owner))
+        });
+        #[cfg(feature = "lock-stats")]
+        match &result {
+            Ok(_) => {
+                VFS_INODE_INFO_FOUND.fetch_add(1, Ordering::Relaxed);
             }
-
-            Ok(InodeInfo {
-                inode_num: raw_ino,
-                is_dir,
-                is_link,
-                mode,
-                size,
-                atime: u32::from_le(raw_inode.access_time),
-                mtime: u32::from_le(raw_inode.modification_time),
-                ctime: u32::from_le(raw_inode.change_inode_time),
-                blocks_count: u32::from_le(raw_inode.blocks_count_lo) as u64,
-                links_count: u16::from_le(raw_inode.links_count) as u32,
-                uid,
-                gid,
-            })
-        })
+            Err(rc) if *rc == ENOENT as i32 => {
+                VFS_INODE_INFO_ABSENT.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(_) => {
+                VFS_INODE_INFO_ERRORS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        result
     }
 
     pub fn get_inode_info(&self, fs_path: &str) -> Option<InodeInfo> {
@@ -508,6 +962,15 @@ impl VfsSuperBlock {
                 return 0;
             }
 
+            let old_size = unsafe { ext4_fsize(&mut file) };
+            if offset as u64 > old_size
+                && unsafe { ext4_ftruncate(&mut file, offset as u64) } != EOK as i32
+            {
+                unsafe {
+                    ext4_fclose(&mut file);
+                }
+                return 0;
+            }
             unsafe {
                 ext4_fseek(&mut file, offset as i64, SEEK_SET as u32);
             }
@@ -523,6 +986,10 @@ impl VfsSuperBlock {
                     timestamp,
                 )
             };
+            let new_size = unsafe { ext4_fsize(&mut file) };
+            if write_rc == EOK as i32 {
+                self.commit_inode_runtime_size(file.inode, new_size);
+            }
             unsafe {
                 ext4_fclose(&mut file);
             }
@@ -545,7 +1012,17 @@ impl VfsSuperBlock {
         })
     }
 
-    pub fn create_file(&self, parent_path: &str, name: &str, is_dir: bool) -> Option<u32> {
+    fn create_file(
+        &self,
+        parent_path: &str,
+        parent_inode: u32,
+        name: &str,
+        is_dir: bool,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        keep_file_open: bool,
+    ) -> Option<(InodeInfo, Option<ext4_file>)> {
         let full_path = if parent_path == "/" {
             format!("/{}", name)
         } else if parent_path.ends_with('/') {
@@ -554,66 +1031,75 @@ impl VfsSuperBlock {
             format!("{}/{}", parent_path, name)
         };
 
-        let (created, raw_rc) = self.with_fs(|_fs| {
-            if is_dir {
-                let c_path = match CString::new(full_path.as_bytes()) {
-                    Ok(path) => path,
-                    Err(_) => return (None, -(EINVAL as i32)),
-                };
-                let rc = unsafe { ext4_dir_mk(c_path.as_ptr() as *const c_char) };
-                if rc == EOK as i32 {
-                    let mut inode = 0u32;
-                    let mut raw_inode: ext4_inode = unsafe { core::mem::zeroed() };
-                    let query_rc = unsafe {
-                        ext4_raw_inode_fill(
-                            c_path.as_ptr() as *const c_char,
-                            &mut inode,
-                            &mut raw_inode,
-                        )
-                    };
-                    if query_rc == EOK as i32 {
-                        return (Some(inode), query_rc);
-                    }
-                    return (None, query_rc);
-                }
-                (None, rc)
-            } else {
-                let c_path = match CString::new(full_path.as_bytes()) {
-                    Ok(path) => path,
-                    Err(_) => return (None, -(EINVAL as i32)),
-                };
-                let c_path = c_path.into_raw();
-                // Creation must not truncate a file installed by a racing
-                // O_CREAT caller. The returned handle is closed immediately.
-                let flags = match CString::new("ab") {
-                    Ok(flags) => flags,
-                    Err(_) => return (None, -(EINVAL as i32)),
-                };
-                let flags_ptr = flags.into_raw();
-
-                let mut file: ext4_file = unsafe { core::mem::zeroed() };
-                let rc = unsafe { ext4_fopen(&mut file, c_path, flags_ptr) };
-                unsafe {
-                    drop(CString::from_raw(c_path));
-                    drop(CString::from_raw(flags_ptr));
-                }
-                if rc == EOK as i32 {
-                    let inode = file.inode;
-                    unsafe {
-                        ext4_fclose(&mut file);
-                    }
-                    (Some(inode), rc)
-                } else {
-                    (None, rc)
-                }
+        let (created, _raw_rc) = self.with_fs(|_fs| {
+            let c_mount = match CString::new(self.lwext4_mount_path.as_bytes()) {
+                Ok(path) => path,
+                Err(_) => return (None, -(EINVAL as i32)),
+            };
+            let c_name = match CString::new(name.as_bytes()) {
+                Ok(name) => name,
+                Err(_) => return (None, -(EINVAL as i32)),
+            };
+            let mut file: ext4_file = unsafe { core::mem::zeroed() };
+            let create_rc = unsafe {
+                ext4_create_at_with_attrs(
+                    &mut file,
+                    c_mount.as_ptr() as *const c_char,
+                    parent_inode,
+                    c_name.as_ptr() as *const c_char,
+                    is_dir,
+                    mode,
+                    uid,
+                    gid,
+                )
+            };
+            if create_rc != EOK as i32 {
+                return (None, create_rc);
             }
+
+            let size = unsafe { ext4_fsize(&mut file) };
+            let inode_num = file.inode;
+            if !is_dir {
+                self.commit_inode_runtime_size(inode_num, size);
+            }
+            let file_handle = if !is_dir && keep_file_open {
+                Some(file)
+            } else {
+                unsafe {
+                    ext4_fclose(&mut file);
+                }
+                None
+            };
+            (
+                Some((
+                    InodeInfo {
+                        inode_num,
+                        is_dir,
+                        is_link: false,
+                        mode,
+                        size,
+                        atime: 0,
+                        mtime: 0,
+                        ctime: 0,
+                        blocks_count: 0,
+                        links_count: if is_dir { 2 } else { 1 },
+                        uid,
+                        gid,
+                    },
+                    file_handle,
+                )),
+                EOK as i32,
+            )
         });
+        if created.is_some() {
+            record_path_owner(&full_path, uid, gid);
+        }
         #[cfg(feature = "buildstorm-diagnostics")]
         if created.is_none() && full_path.contains("/target/debug/") {
             crate::println!(
                 "[buildstorm-fs] create-failed dir={} rc={} path={}",
                 is_dir,
-                raw_rc,
+                _raw_rc,
                 full_path,
             );
         }
@@ -651,40 +1137,14 @@ impl VfsSuperBlock {
                 return false;
             }
 
+            #[cfg(feature = "buildstorm-diagnostics")]
             let old_size = unsafe { ext4_fsize(&mut file) };
             let inode = file.inode;
-            let (ok, operation_rc) = if size <= old_size {
-                let rc = unsafe { ext4_ftruncate(&mut file, size) };
-                (rc == EOK as i32, rc)
-            } else {
-                let zeros = [0u8; 4096];
-                let mut pos = old_size as usize;
-                let target = size as usize;
-                let mut operation_rc = EOK as i32;
-                unsafe {
-                    ext4_fseek(&mut file, old_size as i64, SEEK_SET as u32);
-                }
-                let mut ok = true;
-                while pos < target {
-                    let chunk = (target - pos).min(zeros.len());
-                    let mut written: usize = 0;
-                    let rc = unsafe {
-                        ext4_fwrite(
-                            &mut file,
-                            zeros[..chunk].as_ptr() as *const core::ffi::c_void,
-                            chunk,
-                            &mut written,
-                        )
-                    };
-                    if rc != EOK as i32 || written == 0 {
-                        operation_rc = if rc == EOK as i32 { EIO as i32 } else { rc };
-                        ok = false;
-                        break;
-                    }
-                    pos += written;
-                }
-                (ok, operation_rc)
-            };
+            let operation_rc = unsafe { ext4_ftruncate(&mut file, size) };
+            let ok = operation_rc == EOK as i32;
+            if ok {
+                self.commit_inode_runtime_size(inode, size);
+            }
             unsafe {
                 ext4_fclose(&mut file);
             }
@@ -720,6 +1180,81 @@ impl VfsSuperBlock {
                 Err(_) => return false,
             };
             unsafe { ext4_dir_rm(c_path.as_ptr() as *const c_char) == EOK as i32 }
+        })
+    }
+
+    pub fn unlink_child(
+        &self,
+        parent_inode: u32,
+        child_inode: u32,
+        name: &str,
+        is_dir: bool,
+    ) -> i32 {
+        self.with_fs(|_fs| {
+            let c_mount = match CString::new(self.lwext4_mount_path.as_bytes()) {
+                Ok(path) => path,
+                Err(_) => return EINVAL as i32,
+            };
+            let c_name = match CString::new(name.as_bytes()) {
+                Ok(name) => name,
+                Err(_) => return EINVAL as i32,
+            };
+            unsafe {
+                ext4_remove_at(
+                    c_mount.as_ptr() as *const c_char,
+                    parent_inode,
+                    child_inode,
+                    c_name.as_ptr() as *const c_char,
+                    is_dir,
+                )
+            }
+        })
+    }
+
+    pub fn rename_child(
+        &self,
+        source_parent_inode: u32,
+        source_inode: u32,
+        source_name: &str,
+        target_parent_inode: u32,
+        target_name: &str,
+        replaced_name: &str,
+        flags: u32,
+    ) -> (i32, u32, bool) {
+        self.with_fs(|_fs| {
+            let c_mount = match CString::new(self.lwext4_mount_path.as_bytes()) {
+                Ok(path) => path,
+                Err(_) => return (EINVAL as i32, 0, false),
+            };
+            let c_source_name = match CString::new(source_name.as_bytes()) {
+                Ok(name) => name,
+                Err(_) => return (EINVAL as i32, 0, false),
+            };
+            let c_target_name = match CString::new(target_name.as_bytes()) {
+                Ok(name) => name,
+                Err(_) => return (EINVAL as i32, 0, false),
+            };
+            let c_replaced_name = match CString::new(replaced_name.as_bytes()) {
+                Ok(name) => name,
+                Err(_) => return (EINVAL as i32, 0, false),
+            };
+            let mut replaced_inode = 0u32;
+            let mut replaced_is_dir = false;
+            let rc = unsafe {
+                ext4_rename_at2(
+                    c_mount.as_ptr() as *const c_char,
+                    source_parent_inode,
+                    source_inode,
+                    c_source_name.as_ptr() as *const c_char,
+                    target_parent_inode,
+                    c_target_name.as_ptr() as *const c_char,
+                    c_replaced_name.as_ptr() as *const c_char,
+                    flags,
+                    &mut replaced_inode,
+                    &mut replaced_is_dir,
+                )
+            };
+            (rc, replaced_inode, replaced_is_dir)
         })
     }
 
@@ -781,9 +1316,14 @@ impl VfsSuperBlock {
     }
 
     pub fn fsync(&self, fs_path: &str) -> i32 {
-        self.with_fs(|_fs| {
+        self.with_fs(|wrapper| {
             if let Ok(c_path) = CString::new(fs_path) {
-                unsafe { ext4_cache_flush(c_path.as_ptr() as *const c_char) }
+                let rc = unsafe { ext4_cache_flush(c_path.as_ptr() as *const c_char) };
+                if rc == EOK as i32 {
+                    wrapper.0.flush_device().map(|_| 0).unwrap_or(-1)
+                } else {
+                    rc
+                }
             } else {
                 -1
             }
@@ -791,9 +1331,14 @@ impl VfsSuperBlock {
     }
 
     pub fn sync_all(&self) -> i32 {
-        self.with_fs(|_fs| {
-            let root = CString::new("/").unwrap();
-            unsafe { ext4_cache_flush(root.as_ptr() as *const c_char) }
+        self.with_fs(|wrapper| {
+            let mount_path = CString::new(self.lwext4_mount_path.as_str()).unwrap();
+            let rc = unsafe { ext4_cache_flush(mount_path.as_ptr() as *const c_char) };
+            if rc == EOK as i32 {
+                wrapper.0.flush_device().map(|_| 0).unwrap_or(-1)
+            } else {
+                rc
+            }
         })
     }
 
@@ -813,12 +1358,23 @@ pub struct Dentry {
     pub is_link: bool,
     pub parent: Option<Weak<Dentry>>,
     pub super_block: Arc<VfsSuperBlock>,
-    /// Cache updates use a two-phase protocol: create/reserve a replacement
-    /// list before acquiring this lock, and never call Ext4 while it is held.
-    pub children: DentryLock<Option<Vec<Arc<Dentry>>>>,
+    runtime_size: Option<Arc<InodeRuntimeSize>>,
+    /// Large build directories need logarithmic lookup and insertion. This
+    /// sleeping lock may allocate B-tree nodes, but is never held across Ext4.
+    pub children: SleepLock<Option<BTreeMap<String, Arc<Dentry>>>>,
+    /// Serializes namespace mutations in this directory. The epoch below is
+    /// only a lockless cache sequence; slow ext4 operations must not make
+    /// competing creators spin for their full duration.
+    child_mutation: SleepLock<()>,
     /// Even values describe a stable cache generation. Odd values mean a
     /// directory mutation is updating the child cache.
     child_cache_epoch: AtomicU64,
+    /// Parent namespace generation at the last successful path validation.
+    /// A stable generation lets openat(dirfd, ...) reuse the directory inode
+    /// without re-walking the same path for every child operation.
+    parent_validation_epoch: AtomicU64,
+    /// ENOENT results remain valid until the next mutation in this directory.
+    negative_children: SleepLock<Option<BTreeSet<String>>>,
     /// This is only an in-memory metadata cache.  Ext4 lookup happens after
     /// dropping the lock, then the result is stored in a second short phase.
     inode_info: DentryLock<Option<InodeInfo>>,
@@ -835,8 +1391,12 @@ impl Dentry {
             is_link: false,
             parent: None,
             super_block: sb,
-            children: DentryLock::new_named(None, "DentryChildren"),
+            runtime_size: None,
+            children: SleepLock::new_named(None, "DentryChildren"),
+            child_mutation: SleepLock::new_named((), "DentryChildMutation"),
             child_cache_epoch: AtomicU64::new(0),
+            parent_validation_epoch: AtomicU64::new(DENTRY_PARENT_EPOCH_UNKNOWN),
+            negative_children: SleepLock::new_named(None, "DentryNegativeChildren"),
             inode_info: DentryLock::new_named(None, "DentryInodeInfo"),
         })
     }
@@ -851,8 +1411,12 @@ impl Dentry {
             is_link: false,
             parent: None,
             super_block: sb,
-            children: DentryLock::new_named(None, "DentryChildren"),
+            runtime_size: None,
+            children: SleepLock::new_named(None, "DentryChildren"),
+            child_mutation: SleepLock::new_named((), "DentryChildMutation"),
             child_cache_epoch: AtomicU64::new(0),
+            parent_validation_epoch: AtomicU64::new(DENTRY_PARENT_EPOCH_UNKNOWN),
+            negative_children: SleepLock::new_named(None, "DentryNegativeChildren"),
             inode_info: DentryLock::new_named(None, "DentryInodeInfo"),
         })
     }
@@ -876,6 +1440,11 @@ impl Dentry {
         } else {
             format!("{}/{}", parent.fs_path, name)
         };
+        let runtime_size =
+            (!is_dir && !is_link).then(|| inode_runtime_state(&parent.super_block, inode_num));
+        let parent_validation_epoch = parent
+            .child_cache_snapshot_epoch()
+            .unwrap_or(DENTRY_PARENT_EPOCH_UNKNOWN);
         Arc::new(Dentry {
             name: String::from(name),
             path,
@@ -885,19 +1454,34 @@ impl Dentry {
             is_link,
             parent: Some(Arc::downgrade(parent)),
             super_block: parent.super_block.clone(),
-            children: DentryLock::new_named(None, "DentryChildren"),
+            runtime_size,
+            children: SleepLock::new_named(None, "DentryChildren"),
+            child_mutation: SleepLock::new_named((), "DentryChildMutation"),
             child_cache_epoch: AtomicU64::new(0),
+            parent_validation_epoch: AtomicU64::new(parent_validation_epoch),
+            negative_children: SleepLock::new_named(None, "DentryNegativeChildren"),
             inode_info: DentryLock::new_named(None, "DentryInodeInfo"),
         })
     }
 
     pub fn inode_info(&self) -> Option<InodeInfo> {
         let cached = { *self.inode_info.exclusive_access() };
-        if let Some(info) = cached {
-            return Some(info);
+        let mut info = if let Some(info) = cached {
+            info
+        } else {
+            let info = self.super_block.get_inode_info(&self.fs_path)?;
+            *self.inode_info.exclusive_access() = Some(info);
+            info
+        };
+        if !info.is_dir && !info.is_link {
+            if let Some(runtime_size) = self.runtime_size.as_ref() {
+                let size = runtime_size
+                    .load()
+                    .unwrap_or_else(|| runtime_size.initialize(info.size));
+                info.size = size;
+                info.blocks_count = (size + 511) / 512;
+            }
         }
-        let info = self.super_block.get_inode_info(&self.fs_path)?;
-        *self.inode_info.exclusive_access() = Some(info);
         Some(info)
     }
 
@@ -911,14 +1495,234 @@ impl Dentry {
         *self.inode_info.exclusive_access() = Some(info);
     }
 
+    pub(crate) fn cached_inode_info_snapshot(&self) -> Option<InodeInfo> {
+        *self.inode_info.exclusive_access()
+    }
+
     pub fn invalidate_inode_info(&self) {
         *self.inode_info.exclusive_access() = None;
     }
 
-    pub fn update_cached_size(&self, size: u64) {
+    pub fn update_local_cached_size(&self, size: u64) {
         if let Some(ref mut info) = *self.inode_info.exclusive_access() {
             info.size = size;
             info.blocks_count = (size + 511) / 512;
+        }
+    }
+
+    pub(crate) fn commit_cached_size(&self, size: u64) {
+        self.update_local_cached_size(size);
+        if let Some(runtime_size) = self.runtime_size.as_ref() {
+            runtime_size.store(size);
+        }
+    }
+
+    pub(crate) fn runtime_file_size(&self) -> Option<u64> {
+        self.runtime_size
+            .as_ref()
+            .and_then(|runtime_size| runtime_size.load())
+    }
+
+    pub(crate) fn cached_file_handle(&self) -> Option<ext4_file> {
+        self.runtime_size
+            .as_ref()
+            .and_then(|runtime_size| {
+                runtime_size
+                    .cached_file_handle
+                    .lock()
+                    .as_ref()
+                    .map(|cached| cached.0)
+            })
+    }
+
+    pub(crate) fn cache_file_handle(&self, mut file: ext4_file) {
+        let Some(runtime_size) = self.runtime_size.as_ref() else {
+            return;
+        };
+        file.fpos = 0;
+        file.fsize = runtime_size
+            .load()
+            .unwrap_or_else(|| runtime_size.initialize(file.fsize));
+        *runtime_size.cached_file_handle.lock() = Some(CachedExt4File(file));
+    }
+
+    pub(crate) fn lock_file_mutation(&self) -> Option<SleepGuard<'_, ()>> {
+        self.runtime_size
+            .as_ref()
+            .map(|runtime_size| runtime_size.mutation.lock())
+    }
+
+    pub(crate) fn child_cache_snapshot_epoch(&self) -> Option<u64> {
+        let epoch = self.child_cache_epoch.load(Ordering::Acquire);
+        (epoch & 1 == 0).then_some(epoch)
+    }
+
+    pub(crate) fn parent_epoch_is_current(&self) -> bool {
+        let Some(parent) = self.parent.as_ref() else {
+            return true;
+        };
+        let Some(parent) = parent.upgrade() else {
+            return false;
+        };
+        let expected = self.parent_validation_epoch.load(Ordering::Acquire);
+        let current = parent.child_cache_epoch.load(Ordering::Acquire);
+        let current = expected != DENTRY_PARENT_EPOCH_UNKNOWN
+            && current & 1 == 0
+            && current == expected;
+        #[cfg(feature = "lock-stats")]
+        if current {
+            VFS_DIRFD_EPOCH_HITS.fetch_add(1, Ordering::Relaxed);
+        }
+        current
+    }
+
+    pub(crate) fn parent_epoch_for_revalidation(&self) -> Option<u64> {
+        #[cfg(feature = "lock-stats")]
+        VFS_DIRFD_REVALIDATIONS.fetch_add(1, Ordering::Relaxed);
+        self.parent
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .and_then(|parent| parent.child_cache_snapshot_epoch())
+    }
+
+    pub(crate) fn mark_parent_epoch_validated(&self, epoch: u64) {
+        let Some(parent) = self.parent.as_ref().and_then(Weak::upgrade) else {
+            return;
+        };
+        if parent.child_cache_epoch.load(Ordering::Acquire) == epoch && epoch & 1 == 0 {
+            self.parent_validation_epoch.store(epoch, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn buffer_pending_write(
+        &self,
+        file: ext4_file,
+        offset: usize,
+        data: &[u8],
+        timestamp: u32,
+    ) -> Option<(bool, bool)> {
+        let runtime_size = self.runtime_size.as_ref()?;
+        let flush_inode = runtime_size.pending_writes.lock().push(
+            self.super_block.clone(),
+            file,
+            offset,
+            data,
+            timestamp,
+        )?;
+        if !runtime_size.pending_dirty.swap(true, Ordering::AcqRel) {
+            let sequence = NEXT_PENDING_DIRTY_SEQUENCE.fetch_add(1, Ordering::AcqRel);
+            runtime_size
+                .dirty_sequence
+                .store(sequence.max(1), Ordering::Release);
+        }
+        let pending_bytes = add_pending_write_bytes(data.len());
+        Some((flush_inode, pending_bytes > pending_writeback_limit()))
+    }
+
+    pub(crate) fn read_pending_fully(&self, offset: usize, buf: &mut [u8]) -> Option<usize> {
+        let runtime_size = self.runtime_size.as_ref()?;
+        if !runtime_size.pending_dirty.load(Ordering::Acquire) {
+            return None;
+        }
+        let file_size = runtime_size.load()?;
+        let read = runtime_size
+            .pending_writes
+            .lock()
+            .read_fully(offset, buf, file_size)?;
+        #[cfg(feature = "lock-stats")]
+        {
+            PENDING_CACHE_READS.fetch_add(1, Ordering::Relaxed);
+            PENDING_CACHE_READ_BYTES.fetch_add(read, Ordering::Relaxed);
+        }
+        Some(read)
+    }
+
+    /// Return the logical read length and the size currently present on disk.
+    /// Callers hold the inode mutation lock until `overlay_pending_read` returns,
+    /// so writeback and newer writes cannot change the two-layer snapshot.
+    pub(crate) fn pending_read_plan(
+        &self,
+        offset: usize,
+        request_len: usize,
+    ) -> Option<(usize, usize)> {
+        let runtime_size = self.runtime_size.as_ref()?;
+        if !runtime_size.pending_dirty.load(Ordering::Acquire) {
+            return None;
+        }
+        let file_size = runtime_size.load()?;
+        let pending = runtime_size.pending_writes.lock();
+        if pending.ranges.is_empty() {
+            return None;
+        }
+        Some(pending.read_plan(offset, request_len, file_size))
+    }
+
+    pub(crate) fn overlay_pending_read(&self, offset: usize, buf: &mut [u8]) -> bool {
+        let Some(runtime_size) = self.runtime_size.as_ref() else {
+            return false;
+        };
+        if !runtime_size.pending_dirty.load(Ordering::Acquire) {
+            return false;
+        }
+        let pending = runtime_size.pending_writes.lock();
+        if pending.ranges.is_empty() {
+            return false;
+        }
+        pending.overlay_read(offset, buf);
+        #[cfg(feature = "lock-stats")]
+        {
+            PENDING_CACHE_OVERLAY_READS.fetch_add(1, Ordering::Relaxed);
+            PENDING_CACHE_OVERLAY_BYTES.fetch_add(buf.len(), Ordering::Relaxed);
+        }
+        true
+    }
+
+    pub(crate) fn has_pending_writes(&self) -> bool {
+        self.runtime_size
+            .as_ref()
+            .is_some_and(|state| state.pending_dirty.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn record_pending_close(&self) {
+        #[cfg(feature = "lock-stats")]
+        if self.has_pending_writes() {
+            PENDING_CACHE_DEFERRED_CLOSES.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn flush_pending_writes(&self) -> bool {
+        let Some(runtime_size) = self.runtime_size.as_ref() else {
+            return true;
+        };
+        if !runtime_size.pending_dirty.load(Ordering::Acquire) {
+            return true;
+        }
+        let _mutation = runtime_size.mutation.lock();
+        flush_pending_write_state(runtime_size)
+    }
+
+    pub(crate) fn flush_pending_writes_during_mutation(&self) -> bool {
+        self.runtime_size
+            .as_ref()
+            .map(|runtime_size| flush_pending_write_state(runtime_size))
+            .unwrap_or(true)
+    }
+
+    pub(crate) fn balance_pending_writes(&self) -> bool {
+        balance_pending_writeback()
+    }
+
+    pub(crate) fn discard_pending_writes(&self) {
+        let Some(runtime_size) = self.runtime_size.as_ref() else {
+            return;
+        };
+        let _mutation = runtime_size.mutation.lock();
+        discard_pending_write_state(runtime_size);
+    }
+
+    pub(crate) fn discard_pending_writes_during_mutation(&self) {
+        if let Some(runtime_size) = self.runtime_size.as_ref() {
+            discard_pending_write_state(runtime_size);
         }
     }
 
@@ -1118,10 +1922,20 @@ fn is_mount_root(dentry: &Arc<Dentry>) -> Option<Arc<Dentry>> {
 
 // ==================== Path Resolution ====================
 
-// Large build trees routinely contain hundreds of siblings. Grow hot directory
-// caches outside DentryLock while keeping small directories inexpensive.
-const DENTRY_CHILD_CACHE_INITIAL_CAPACITY: usize = 16;
-const DENTRY_CHILD_CACHE_LIMIT: usize = 1024;
+// Cap one exceptionally large directory to roughly 1/32 of the kernel heap.
+// The estimate includes the Dentry, path/name strings, Arc and B-tree node.
+const DENTRY_CACHE_ESTIMATED_ENTRY_BYTES: usize = 512;
+const DENTRY_CHILD_CACHE_MIN_LIMIT: usize = 1024;
+const DENTRY_CHILD_CACHE_MAX_LIMIT: usize = 32 * 1024;
+
+fn dentry_child_cache_limit() -> usize {
+    (crate::mm::heap_total_bytes() / (DENTRY_CACHE_ESTIMATED_ENTRY_BYTES * 32))
+        .clamp(DENTRY_CHILD_CACHE_MIN_LIMIT, DENTRY_CHILD_CACHE_MAX_LIMIT)
+}
+
+fn dentry_negative_cache_limit() -> usize {
+    (dentry_child_cache_limit() / 4).max(256)
+}
 
 pub fn dentry_parent(dentry: &Arc<Dentry>) -> Option<Arc<Dentry>> {
     dentry.parent.as_ref().and_then(Weak::upgrade)
@@ -1181,21 +1995,13 @@ pub(crate) fn read_dentry_symlink(dentry: &Arc<Dentry>) -> Option<String> {
 }
 
 fn begin_child_cache_mutation(parent: &Dentry) -> u64 {
-    loop {
-        let epoch = parent.child_cache_epoch.load(Ordering::Acquire);
-        if epoch & 1 != 0 {
-            core::hint::spin_loop();
-            continue;
-        }
-        let updating = epoch.wrapping_add(1);
-        if parent
-            .child_cache_epoch
-            .compare_exchange_weak(epoch, updating, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            return updating;
-        }
-    }
+    let epoch = parent.child_cache_epoch.load(Ordering::Acquire);
+    debug_assert_eq!(epoch & 1, 0);
+    let updating = epoch.wrapping_add(1);
+    parent
+        .child_cache_epoch
+        .store(updating, Ordering::Release);
+    updating
 }
 
 fn finish_child_cache_mutation(parent: &Dentry, updating: u64) {
@@ -1205,31 +2011,78 @@ fn finish_child_cache_mutation(parent: &Dentry, updating: u64) {
         .store(updating.wrapping_add(1), Ordering::Release);
 }
 
-pub(crate) struct ChildCacheMutation {
-    parent: Arc<Dentry>,
+pub(crate) struct ChildCacheMutation<'a> {
+    parent: &'a Dentry,
+    _guard: SleepGuard<'a, ()>,
     updating: u64,
 }
 
-impl Drop for ChildCacheMutation {
+impl Drop for ChildCacheMutation<'_> {
     fn drop(&mut self) {
         finish_child_cache_mutation(&self.parent, self.updating);
     }
 }
 
-pub(crate) fn begin_cached_child_mutation(parent: &Arc<Dentry>) -> ChildCacheMutation {
-    ChildCacheMutation {
-        parent: parent.clone(),
+pub(crate) fn begin_cached_child_mutation(
+    parent: &Arc<Dentry>,
+) -> ChildCacheMutation<'_> {
+    let guard = parent.child_mutation.lock();
+    let mutation = ChildCacheMutation {
+        parent,
+        _guard: guard,
         updating: begin_child_cache_mutation(parent),
-    }
+    };
+    // The odd epoch prevents concurrent lookups from publishing an ENOENT
+    // observed before or during the namespace operation.
+    let retired = parent.negative_children.exclusive_access().take();
+    drop(retired);
+    mutation
 }
 
 fn child_cache_epoch_matches(parent: &Dentry, expected_epoch: Option<u64>) -> bool {
     match expected_epoch {
-        Some(epoch) => {
-            epoch & 1 == 0 && parent.child_cache_epoch.load(Ordering::Acquire) == epoch
-        }
+        Some(epoch) => epoch & 1 == 0 && parent.child_cache_epoch.load(Ordering::Acquire) == epoch,
         None => true,
     }
+}
+
+fn negative_child_cached(parent: &Dentry, name: &str, expected_epoch: u64) -> bool {
+    if !child_cache_epoch_matches(parent, Some(expected_epoch)) {
+        return false;
+    }
+    let cached = {
+        let negative = parent.negative_children.exclusive_access();
+        negative.as_ref().is_some_and(|set| set.contains(name))
+    };
+    cached && child_cache_epoch_matches(parent, Some(expected_epoch))
+}
+
+fn cache_negative_child(parent: &Dentry, name: &str, expected_epoch: Option<u64>) {
+    if !child_cache_epoch_matches(parent, expected_epoch) || expected_epoch.is_none() {
+        return;
+    }
+
+    let mut candidate = Some(String::from(name));
+    let mut retired = None;
+    {
+        let mut negative = parent.negative_children.exclusive_access();
+        if !child_cache_epoch_matches(parent, expected_epoch) {
+            return;
+        }
+        let set = negative.get_or_insert_with(BTreeSet::new);
+        if !set.contains(name) {
+            if set.len() >= dentry_negative_cache_limit() {
+                retired = set.pop_first();
+            }
+            set.insert(
+                candidate
+                    .take()
+                    .expect("negative dentry candidate remains owned"),
+            );
+        }
+    }
+    drop(retired);
+    drop(candidate);
 }
 
 fn insert_positive_child(
@@ -1240,146 +2093,75 @@ fn insert_positive_child(
     if !child_cache_epoch_matches(parent, expected_epoch) {
         return None;
     }
-
-    // Reserve outside DentryLock. A second lookup handles a racing initializer.
-    if parent.children.exclusive_access().is_none() {
-        let mut initial = Vec::with_capacity(DENTRY_CHILD_CACHE_INITIAL_CAPACITY);
-        initial.push(child.clone());
-        let mut initial = Some(initial);
-        let mut stale = false;
-        let installed = {
-            let mut children = parent.children.exclusive_access();
-            if !child_cache_epoch_matches(parent, expected_epoch) {
-                stale = true;
-                false
-            } else if children.is_none() {
-                *children = initial.take();
-                true
+    let key = child.name.clone();
+    let mut retired_child = None;
+    let result = {
+        let mut children = parent.children.exclusive_access();
+        if !child_cache_epoch_matches(parent, expected_epoch) {
+            None
+        } else {
+            let map = children.get_or_insert_with(BTreeMap::new);
+            if let Some(cached) = map.get(key.as_str()) {
+                if cached.inode_num == child.inode_num {
+                    Some(cached.clone())
+                } else {
+                    retired_child = map.insert(key, child.clone());
+                    Some(child)
+                }
             } else {
-                false
-            }
-        };
-        drop(initial);
-        if stale {
-            return None;
-        }
-        if installed {
-            return Some(child);
-        }
-    }
-
-    enum InsertAction {
-        Done(Arc<Dentry>),
-        Grow(usize),
-        Stale,
-        Uncached,
-    }
-
-    loop {
-        let mut retired_child = None;
-        let action = {
-            let mut children = parent.children.exclusive_access();
-            if !child_cache_epoch_matches(parent, expected_epoch) {
-                InsertAction::Stale
-            } else {
-                let list = children
-                    .as_mut()
-                    .expect("Dentry child cache initialized before use");
-                match list
-                    .binary_search_by(|cached| cached.name.as_str().cmp(child.name.as_str()))
-                {
-                    Ok(idx) => {
-                        if list[idx].inode_num == child.inode_num {
-                            InsertAction::Done(list[idx].clone())
+                if map.len() >= dentry_child_cache_limit() {
+                    let mut removed = false;
+                    map.retain(|_, cached| {
+                        if !removed && Arc::strong_count(cached) == 1 {
+                            retired_child = Some(cached.clone());
+                            removed = true;
+                            false
                         } else {
-                            retired_child =
-                                Some(core::mem::replace(&mut list[idx], child.clone()));
-                            InsertAction::Done(child.clone())
+                            true
                         }
-                    }
-                    Err(idx) if list.len() < list.capacity() => {
-                        list.insert(idx, child.clone());
-                        InsertAction::Done(child.clone())
-                    }
-                    Err(_) if list.capacity() < DENTRY_CHILD_CACHE_LIMIT => {
-                        let next = list
-                            .capacity()
-                            .max(DENTRY_CHILD_CACHE_INITIAL_CAPACITY)
-                            .saturating_mul(2)
-                            .min(DENTRY_CHILD_CACHE_LIMIT);
-                        InsertAction::Grow(next)
-                    }
-                    Err(_) => {
-                        if let Some(idx) = list
-                            .iter()
-                            .position(|cached| Arc::strong_count(cached) == 1)
-                        {
-                            retired_child = Some(list.remove(idx));
-                            let idx = list
-                                .binary_search_by(|cached| {
-                                    cached.name.as_str().cmp(child.name.as_str())
-                                })
-                                .unwrap_or_else(|idx| idx);
-                            list.insert(idx, child.clone());
-                            InsertAction::Done(child.clone())
-                        } else {
-                            InsertAction::Uncached
-                        }
+                    });
+                    if !removed {
+                        return None;
                     }
                 }
-            }
-        };
-        drop(retired_child);
-
-        let target_capacity = match action {
-            InsertAction::Done(canonical) => return Some(canonical),
-            InsertAction::Stale | InsertAction::Uncached => return None,
-            InsertAction::Grow(target_capacity) => target_capacity,
-        };
-
-        let mut replacement = Some(Vec::with_capacity(target_capacity));
-        let mut retired_cache = None;
-        let mut stale = false;
-        {
-            let mut children = parent.children.exclusive_access();
-            if !child_cache_epoch_matches(parent, expected_epoch) {
-                stale = true;
-            } else if let Some(list) = children.as_mut() {
-                if list.len() == list.capacity() && list.capacity() < target_capacity {
-                    let mut old = core::mem::replace(
-                        list,
-                        replacement
-                            .take()
-                            .expect("replacement child cache allocated before lock"),
-                    );
-                    list.append(&mut old);
-                    retired_cache = Some(old);
-                }
+                map.insert(key, child.clone());
+                Some(child)
             }
         }
-        drop(retired_cache);
-        drop(replacement);
-        if stale {
-            return None;
-        }
-    }
+    };
+    drop(retired_child);
+    result
 }
 
-pub(crate) fn cache_child_during_mutation(
-    parent: &Arc<Dentry>,
-    child: Arc<Dentry>,
-) -> Arc<Dentry> {
+pub(crate) fn cache_child_during_mutation(parent: &Arc<Dentry>, child: Arc<Dentry>) -> Arc<Dentry> {
     insert_positive_child(parent, child.clone(), None).unwrap_or(child)
+}
+
+pub(crate) fn cache_renamed_leaf_during_mutation(
+    parent: &Arc<Dentry>,
+    name: &str,
+    source: &Arc<Dentry>,
+) -> Arc<Dentry> {
+    debug_assert!(!source.is_dir);
+    let moved = Dentry::new_child(
+        parent,
+        name,
+        source.inode_num,
+        false,
+        source.is_link,
+    );
+    if let Some(info) = source.cached_inode_info_snapshot() {
+        moved.set_cached_inode_info(info);
+    }
+    cache_child_during_mutation(parent, moved)
 }
 
 pub(crate) fn invalidate_cached_child_during_mutation(parent: &Arc<Dentry>, name: &str) {
     let mut retired_positive = None;
     {
         let mut children = parent.children.exclusive_access();
-        if let Some(list) = children.as_mut() {
-            if let Ok(idx) = list.binary_search_by(|cached| cached.name.as_str().cmp(name)) {
-                retired_positive = Some(list.remove(idx));
-            }
+        if let Some(map) = children.as_mut() {
+            retired_positive = map.remove(name);
         }
     }
     drop(retired_positive);
@@ -1391,7 +2173,148 @@ pub(crate) fn invalidate_cached_child(parent: &Arc<Dentry>, name: &str) {
 }
 
 pub(crate) fn mark_cached_child_absent(parent: &Arc<Dentry>, name: &str) {
-    invalidate_cached_child(parent, name);
+    {
+        let _mutation = begin_cached_child_mutation(parent);
+        invalidate_cached_child_during_mutation(parent, name);
+    }
+    let epoch = parent.child_cache_epoch.load(Ordering::Acquire);
+    cache_negative_child(parent, name, Some(epoch));
+}
+
+fn cached_positive_child(parent: &Dentry, name: &str) -> Option<Arc<Dentry>> {
+    let children = parent.children.exclusive_access();
+    let cached = children.as_ref().and_then(|map| map.get(name).cloned());
+    #[cfg(feature = "lock-stats")]
+    if cached.is_some() {
+        VFS_POSITIVE_DENTRY_HITS.fetch_add(1, Ordering::Relaxed);
+    }
+    cached
+}
+
+pub(crate) fn cache_readdir_entries(parent: &Arc<Dentry>, dirents: &[u8], epoch: u64) {
+    const DIRENT64_FIXED_SIZE: usize = 19;
+    if !child_cache_epoch_matches(parent, Some(epoch)) {
+        return;
+    }
+
+    let mut pending = Vec::new();
+    let mut offset = 0usize;
+    while offset.saturating_add(DIRENT64_FIXED_SIZE) <= dirents.len() {
+        let record = &dirents[offset..];
+        let record_len = u16::from_le_bytes([record[16], record[17]]) as usize;
+        if record_len < DIRENT64_FIXED_SIZE || offset.saturating_add(record_len) > dirents.len() {
+            break;
+        }
+        let inode = u64::from_le_bytes([
+            record[0], record[1], record[2], record[3], record[4], record[5], record[6], record[7],
+        ]);
+        let d_type = record[18];
+        let name_field = &record[DIRENT64_FIXED_SIZE..record_len];
+        let name_len = name_field
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(name_field.len());
+        let name = core::str::from_utf8(&name_field[..name_len]).ok();
+        if let (Ok(inode), Some(name)) = (u32::try_from(inode), name) {
+            if inode != 0 && name != "." && name != ".." && d_type != 0 {
+                let child = Dentry::new_child(
+                    parent,
+                    name,
+                    inode,
+                    d_type == 4,
+                    d_type == 10,
+                );
+                pending.push((String::from(name), child));
+            }
+        }
+        offset += record_len;
+    }
+    if pending.is_empty() || !child_cache_epoch_matches(parent, Some(epoch)) {
+        return;
+    }
+
+    let limit = dentry_child_cache_limit();
+    let mut retired = Vec::with_capacity(pending.len());
+    #[cfg(feature = "lock-stats")]
+    let mut published = 0usize;
+    {
+        let mut children = parent.children.exclusive_access();
+        if !child_cache_epoch_matches(parent, Some(epoch)) {
+            return;
+        }
+        let map = children.get_or_insert_with(BTreeMap::new);
+        for (name, child) in pending {
+            if map
+                .get(name.as_str())
+                .is_some_and(|cached| cached.inode_num == child.inode_num)
+            {
+                continue;
+            }
+            if map.len() >= limit && !map.contains_key(name.as_str()) {
+                continue;
+            }
+            if let Some(old) = map.insert(name, child) {
+                retired.push(old);
+            }
+            #[cfg(feature = "lock-stats")]
+            {
+                published += 1;
+            }
+        }
+    }
+    drop(retired);
+    #[cfg(feature = "lock-stats")]
+    VFS_READDIR_DENTRIES_PUBLISHED.fetch_add(published, Ordering::Relaxed);
+}
+
+fn child_fs_path(parent: &Dentry, name: &str) -> String {
+    if parent.fs_path == "/" {
+        format!("/{}", name)
+    } else if parent.fs_path.ends_with('/') {
+        format!("{}{}", parent.fs_path, name)
+    } else {
+        format!("{}/{}", parent.fs_path, name)
+    }
+}
+
+fn mounted_child(child: Arc<Dentry>) -> Arc<Dentry> {
+    lookup_mount(&child).unwrap_or(child)
+}
+
+pub(crate) fn vfs_lookup_during_mutation(
+    parent: &Arc<Dentry>,
+    name: &str,
+) -> Option<Arc<Dentry>> {
+    if let Some(cached) = vfs_cached_lookup_during_mutation(parent, name) {
+        return Some(cached);
+    }
+
+    let info = parent
+        .super_block
+        .get_inode_info_result(&child_fs_path(parent, name))
+        .ok()?;
+    let child = Dentry::new_child(
+        parent,
+        name,
+        info.inode_num,
+        info.is_dir,
+        info.is_link,
+    );
+    child.set_cached_inode_info(info);
+    Some(mounted_child(cache_child_during_mutation(parent, child)))
+}
+
+pub(crate) fn vfs_cached_lookup_during_mutation(
+    parent: &Arc<Dentry>,
+    name: &str,
+) -> Option<Arc<Dentry>> {
+    match name {
+        "." => return Some(parent.clone()),
+        ".." => return vfs_parent(parent).or_else(|| Some(parent.clone())),
+        _ => {}
+    }
+
+    cached_positive_child(parent, name).map(mounted_child)
 }
 
 pub fn vfs_lookup(parent: &Arc<Dentry>, name: &str) -> Option<Arc<Dentry>> {
@@ -1409,56 +2332,74 @@ pub fn vfs_lookup(parent: &Arc<Dentry>, name: &str) -> Option<Arc<Dentry>> {
         _ => {}
     }
 
-    let cache_epoch = parent.child_cache_epoch.load(Ordering::Acquire);
-    if cache_epoch & 1 == 0 {
-        let cached = {
-            let children = parent.children.exclusive_access();
-            children.as_ref().and_then(|list| {
-                list.binary_search_by(|cached| cached.name.as_str().cmp(name))
-                    .ok()
-                    .map(|idx| list[idx].clone())
-            })
-        };
-        if parent.child_cache_epoch.load(Ordering::Acquire) == cache_epoch {
-            if let Some(cached) = cached {
-                if let Some(mnt_root) = lookup_mount(&cached) {
-                    return Some(mnt_root);
-                }
-                return Some(cached);
-            }
+    loop {
+        let lookup_epoch = parent.child_cache_epoch.load(Ordering::Acquire);
+        if lookup_epoch & 1 != 0 {
+            // Namespace mutations publish an odd epoch before touching ext4.
+            // Waiting on the per-directory lock prevents an uncached duplicate
+            // Dentry from escaping and serializes same-directory operations.
+            let guard = parent.child_mutation.lock();
+            drop(guard);
+            continue;
+        }
 
+        let cached = cached_positive_child(parent, name);
+        if !child_cache_epoch_matches(parent, Some(lookup_epoch)) {
+            continue;
+        }
+        if let Some(cached) = cached {
+            return Some(mounted_child(cached));
+        }
+        if negative_child_cached(parent, name, lookup_epoch) {
+            return None;
+        }
+
+        // lwext4 serializes physical lookups anyway.  Queue cache misses on
+        // the directory namespace lock, then recheck after acquiring it so
+        // concurrent readers share the first reader's positive/negative result.
+        let _lookup = parent.child_mutation.lock();
+        let lookup_epoch = parent.child_cache_epoch.load(Ordering::Acquire);
+        if lookup_epoch & 1 != 0 {
+            continue;
+        }
+        if let Some(cached) = cached_positive_child(parent, name) {
+            return Some(mounted_child(cached));
+        }
+        if negative_child_cached(parent, name, lookup_epoch) {
+            return None;
+        }
+
+        let info = match parent
+            .super_block
+            .get_inode_info_result(&child_fs_path(parent, name))
+        {
+            Ok(info) => info,
+            Err(rc) => {
+                if !child_cache_epoch_matches(parent, Some(lookup_epoch)) {
+                    continue;
+                }
+                if rc == ENOENT as i32 {
+                    cache_negative_child(parent, name, Some(lookup_epoch));
+                    if !child_cache_epoch_matches(parent, Some(lookup_epoch)) {
+                        continue;
+                    }
+                }
+                return None;
+            }
+        };
+        let (child_inode, is_dir, is_link) = (info.inode_num, info.is_dir, info.is_link);
+
+        let child = Dentry::new_child(parent, name, child_inode, is_dir, is_link);
+        child.set_cached_inode_info(info);
+
+        if let Some(canonical) = insert_positive_child(parent, child.clone(), Some(lookup_epoch)) {
+            return Some(mounted_child(canonical));
+        }
+        if child_cache_epoch_matches(parent, Some(lookup_epoch)) {
+            // A full cache may deliberately leave a stable lookup uncached.
+            return Some(mounted_child(child));
         }
     }
-
-    let lookup_epoch = parent.child_cache_epoch.load(Ordering::Acquire);
-    let lookup_epoch = (lookup_epoch & 1 == 0).then_some(lookup_epoch);
-
-    let child_fs_path = if parent.fs_path == "/" {
-        format!("/{}", name)
-    } else if parent.fs_path.ends_with('/') {
-        format!("{}{}", parent.fs_path, name)
-    } else {
-        format!("{}/{}", parent.fs_path, name)
-    };
-
-    let info = match parent.super_block.get_inode_info_result(&child_fs_path) {
-        Ok(info) => info,
-        Err(_) => return None,
-    };
-    let (child_inode, is_dir, is_link) = (info.inode_num, info.is_dir, info.is_link);
-
-    let child = Dentry::new_child(parent, name, child_inode, is_dir, is_link);
-    child.set_cached_inode_info(info);
-
-    let child = lookup_epoch
-        .and_then(|epoch| insert_positive_child(parent, child.clone(), Some(epoch)))
-        .unwrap_or(child);
-
-    if let Some(mnt_root) = lookup_mount(&child) {
-        return Some(mnt_root);
-    }
-
-    Some(child)
 }
 
 fn vfs_resolve_path_inner(
@@ -1486,7 +2427,37 @@ fn vfs_resolve_path_inner(
         .peekable();
     let mut needs_symlink_resolution = false;
     while let Some(component) = borrowed_components.next() {
-        let next = vfs_lookup(&current, component)?;
+        let next = match vfs_lookup(&current, component) {
+            Some(next) => next,
+            None => {
+                #[cfg(feature = "buildstorm-diagnostics")]
+                if path.contains("scintillaos-fs-stress") {
+                    let cached = cached_positive_child(&current, component).map(|child| {
+                        (
+                            Arc::as_ptr(&child) as usize,
+                            child.inode_num,
+                            child.is_dir,
+                        )
+                    });
+                    let physical = current
+                        .super_block
+                        .get_inode_info_result(&child_fs_path(&current, component))
+                        .map(|info| (info.inode_num, info.is_dir, info.is_link));
+                    crate::println!(
+                        "[buildstorm-fs] resolve-component-missing path={} current={} current_ptr={:#x} current_inode={} component={} epoch={} cached={:?} physical={:?}",
+                        path,
+                        current.fs_path,
+                        Arc::as_ptr(&current) as usize,
+                        current.inode_num,
+                        component,
+                        current.child_cache_epoch.load(Ordering::Acquire),
+                        cached,
+                        physical,
+                    );
+                }
+                return None;
+            }
+        };
         if next.is_link && (follow_final_symlink || borrowed_components.peek().is_some()) {
             needs_symlink_resolution = true;
             break;
@@ -1567,7 +2538,11 @@ pub fn vfs_resolve_parent_and_name(
     let filename_offset = filename.as_ptr() as usize - path.as_ptr() as usize;
     let parent_path = &path[..filename_offset];
     let parent_path = if parent_path.is_empty() {
-        if path.starts_with('/') { "/" } else { "." }
+        if path.starts_with('/') {
+            "/"
+        } else {
+            "."
+        }
     } else {
         parent_path
     };
@@ -1599,22 +2574,39 @@ pub(crate) fn vfs_create_during_mutation(
     is_dir: bool,
     mode: u32,
 ) -> Option<Arc<Dentry>> {
+    vfs_create_during_mutation_inner(parent, name, is_dir, mode, false).map(|(dentry, _)| dentry)
+}
+
+pub(crate) fn vfs_create_open_file_during_mutation(
+    parent: &Arc<Dentry>,
+    name: &str,
+    mode: u32,
+) -> Option<(Arc<Dentry>, ext4_file)> {
+    let (dentry, file_handle) =
+        vfs_create_during_mutation_inner(parent, name, false, mode, true)?;
+    Some((dentry, file_handle?))
+}
+
+fn vfs_create_during_mutation_inner(
+    parent: &Arc<Dentry>,
+    name: &str,
+    is_dir: bool,
+    mode: u32,
+    keep_file_open: bool,
+) -> Option<(Arc<Dentry>, Option<ext4_file>)> {
     #[cfg(feature = "buildstorm-diagnostics")]
     if name == "invoked.timestamp" || name == "build-script-build-script-build" {
         crate::println!(
-            "[buildstorm-fs] traced-vfs-create name={} dir={} mode={:#o} parent={}",
+            "[buildstorm-fs] traced-vfs-create name={} dir={} mode={:#o} parent={} parent_ptr={:#x} parent_inode={} epoch={}",
             name,
             is_dir,
             mode,
             parent.fs_path,
+            Arc::as_ptr(parent) as usize,
+            parent.inode_num,
+            parent.child_cache_epoch.load(Ordering::Acquire),
         );
     }
-    let inode_num = parent
-        .super_block
-        .create_file(&parent.fs_path, name, is_dir)?;
-
-    let child = Dentry::new_child(parent, name, inode_num, is_dir, false);
-
     let (uid, egid, umask) = crate::task::current_task()
         .map(|t| {
             let inner = t.inner_exclusive_access();
@@ -1644,14 +2636,21 @@ pub(crate) fn vfs_create_during_mutation(
         effective_perm |= 0o2000;
     }
     let effective_mode = file_type | effective_perm;
-    let fs_path = child.fs_path.clone();
-    child.super_block.set_owner(&fs_path, uid, gid);
-    child.super_block.set_mode(&fs_path, effective_mode);
-    if let Some(info) = child.super_block.get_inode_info(&fs_path) {
-        child.set_cached_inode_info(info);
-    }
+    let (info, file_handle) = parent.super_block.create_file(
+        &parent.fs_path,
+        parent.inode_num,
+        name,
+        is_dir,
+        effective_mode,
+        uid,
+        gid,
+        keep_file_open,
+    )?;
 
-    Some(cache_child_during_mutation(parent, child))
+    let child = Dentry::new_child(parent, name, info.inode_num, info.is_dir, info.is_link);
+    child.set_cached_inode_info(info);
+
+    Some((cache_child_during_mutation(parent, child), file_handle))
 }
 
 // ==================== Mount Operations ====================
@@ -1723,13 +2722,8 @@ pub fn mount_root() {
     });
 }
 
-/// Flush and unmount every ext4 volume immediately before powering off.
-///
-/// The mount table can contain multiple dentries backed by the same superblock,
-/// so deduplicate the snapshot before invoking lwext4.  Locks are released
-/// before flushing/unmounting to preserve the VFS lock order.
-pub fn shutdown_filesystems() {
-    let mut super_blocks: Vec<Arc<VfsSuperBlock>> = Vec::new();
+fn mounted_super_blocks() -> Vec<Arc<VfsSuperBlock>> {
+    let mut super_blocks = Vec::new();
     {
         let table = MOUNT_TABLE.exclusive_access();
         for mount in table.iter() {
@@ -1739,14 +2733,85 @@ pub fn shutdown_filesystems() {
             }
         }
     }
-
     if !super_blocks
         .iter()
         .any(|known| Arc::ptr_eq(known, &ROOT_SB))
     {
         super_blocks.push(ROOT_SB.clone());
     }
+    super_blocks
+}
 
+fn flush_all_pending_file_writes() -> bool {
+    let states = {
+        let sizes = INODE_RUNTIME_SIZES.exclusive_access();
+        sizes.values().cloned().collect::<Vec<_>>()
+    };
+    let mut ok = true;
+    for state in states {
+        if !state.pending_dirty.load(Ordering::Acquire) {
+            continue;
+        }
+        let _mutation = state.mutation.lock();
+        ok &= flush_pending_write_state(&state);
+    }
+    ok
+}
+
+#[cfg(feature = "lock-stats")]
+pub fn dump_pending_write_stats() {
+    crate::println!(
+        "[pending-write-stats] dirty_bytes={} limit={} cache_reads={} cache_read_bytes={} overlay_reads={} overlay_bytes={} flushes={} flushed_bytes={} pressure_flushes={} deferred_closes={}",
+        PENDING_WRITE_BYTES.load(Ordering::Relaxed),
+        pending_writeback_limit(),
+        PENDING_CACHE_READS.load(Ordering::Relaxed),
+        PENDING_CACHE_READ_BYTES.load(Ordering::Relaxed),
+        PENDING_CACHE_OVERLAY_READS.load(Ordering::Relaxed),
+        PENDING_CACHE_OVERLAY_BYTES.load(Ordering::Relaxed),
+        PENDING_CACHE_FLUSHES.load(Ordering::Relaxed),
+        PENDING_CACHE_FLUSHED_BYTES.load(Ordering::Relaxed),
+        PENDING_CACHE_PRESSURE_FLUSHES.load(Ordering::Relaxed),
+        PENDING_CACHE_DEFERRED_CLOSES.load(Ordering::Relaxed),
+    );
+}
+
+#[cfg(feature = "lock-stats")]
+pub fn dump_vfs_cache_stats() {
+    crate::println!(
+        "[vfs-cache-stats] inode_queries={} found={} absent={} errors={} positive_hits={} readdir_published={} dirfd_epoch_hits={} dirfd_revalidations={} child_limit={} negative_limit={}",
+        VFS_INODE_INFO_QUERIES.load(Ordering::Relaxed),
+        VFS_INODE_INFO_FOUND.load(Ordering::Relaxed),
+        VFS_INODE_INFO_ABSENT.load(Ordering::Relaxed),
+        VFS_INODE_INFO_ERRORS.load(Ordering::Relaxed),
+        VFS_POSITIVE_DENTRY_HITS.load(Ordering::Relaxed),
+        VFS_READDIR_DENTRIES_PUBLISHED.load(Ordering::Relaxed),
+        VFS_DIRFD_EPOCH_HITS.load(Ordering::Relaxed),
+        VFS_DIRFD_REVALIDATIONS.load(Ordering::Relaxed),
+        dentry_child_cache_limit(),
+        dentry_negative_cache_limit(),
+    );
+}
+
+pub fn sync_filesystems() -> i32 {
+    let mut result = if flush_all_pending_file_writes() { 0 } else { -1 };
+    for sb in mounted_super_blocks() {
+        let rc = sb.sync_all();
+        if result == 0 && rc != 0 {
+            result = rc;
+        }
+    }
+    result
+}
+
+/// Flush and unmount every ext4 volume immediately before powering off.
+///
+/// The mount table can contain multiple dentries backed by the same superblock,
+/// so deduplicate the snapshot before invoking lwext4.  Locks are released
+/// before flushing/unmounting to preserve the VFS lock order.
+pub fn shutdown_filesystems() {
+    let super_blocks = mounted_super_blocks();
+
+    let _ = flush_all_pending_file_writes();
     for sb in &super_blocks {
         let _ = sb.sync_all();
     }

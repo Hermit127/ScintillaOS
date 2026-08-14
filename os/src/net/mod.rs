@@ -534,7 +534,10 @@ pub fn wake_net_blocked_tasks() {
                     if sock.socket_type != crate::net::socket::SocketType::Tcp {
                         return false;
                     }
-                    let socket_handle: usize = unsafe { core::mem::transmute(sock.get_handle()) };
+                    let Some(socket_set_handle) = sock.get_handle() else {
+                        return false;
+                    };
+                    let socket_handle: usize = unsafe { core::mem::transmute(socket_set_handle) };
                     socket_handle == handle
                         && sock
                             .get_local_endpoint()
@@ -598,6 +601,11 @@ pub fn wake_net_blocked_tasks() {
             | Some(BlockReason::PipeRead(_))
             | Some(BlockReason::PipeWrite(_))
             | Some(BlockReason::Futex(_, _))
+            | Some(BlockReason::FilePageLoad(_))
+            | Some(BlockReason::SleepLock(_))
+            | Some(BlockReason::VmReadLock(_))
+            | Some(BlockReason::VmWriteLock(_))
+            | Some(BlockReason::ExecPeer(_))
             | Some(BlockReason::SignalWait(_))
             | Some(BlockReason::Vfork(_)) => false,
             None => true,

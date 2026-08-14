@@ -31,6 +31,15 @@ define generate_common
 	-DCMAKE_TOOLCHAIN_FILE=../toolchain/$(1).cmake ..
 endef
 
+define generate_arch
+	rm -R -f build_$(1)-$(ARCH)
+	mkdir build_$(1)-$(ARCH)
+	cd build_$(1)-$(ARCH) && cmake -G"Unix Makefiles" \
+	$(COMMON_DEFINITIONS)                               \
+	$(2)                                                \
+	-DCMAKE_TOOLCHAIN_FILE=../toolchain/$(1).cmake ..
+endef
+
 generic:
 	$(call generate_common,$@)
 
@@ -66,9 +75,9 @@ mingw:
 
 ARCH ?= x86_64
 musl-generic:
-	$(call generate_common,$@)
-	cd build_$@ && make lwext4
-	cp build_$@/src/liblwext4.a ./liblwext4-$(ARCH).a
+	$(call generate_arch,$@,-DLIB_ONLY=TRUE)
+	$(MAKE) -C build_$@-$(ARCH) lwext4
+	cp build_$@-$(ARCH)/src/liblwext4.a ./liblwext4-$(ARCH).a
 
 lib_only:
 	rm -R -f build_lib_only

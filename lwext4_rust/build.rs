@@ -1,6 +1,5 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::SystemTime;
 use std::{env, fs};
 
 fn copy_if_different(source: &Path, destination: &Path) {
@@ -8,44 +7,6 @@ fn copy_if_different(source: &Path, destination: &Path) {
     if fs::read(destination).ok().as_deref() != Some(source_data.as_slice()) {
         fs::write(destination, source_data).expect("cannot update lwext4 toolchain file");
     }
-}
-
-fn path_is_newer_than(path: &Path, reference: SystemTime) -> bool {
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) => metadata,
-        Err(_) => return true,
-    };
-    if metadata.is_dir() {
-        let entries = match fs::read_dir(path) {
-            Ok(entries) => entries,
-            Err(_) => return true,
-        };
-        for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(_) => return true,
-            };
-            if path_is_newer_than(&entry.path(), reference) {
-                return true;
-            }
-        }
-        false
-    } else {
-        metadata
-            .modified()
-            .map(|modified| modified > reference)
-            .unwrap_or(true)
-    }
-}
-
-fn needs_rebuild(library: &Path, inputs: &[&Path]) -> bool {
-    let modified = match fs::metadata(library).and_then(|metadata| metadata.modified()) {
-        Ok(modified) => modified,
-        Err(_) => return true,
-    };
-    inputs
-        .iter()
-        .any(|input| path_is_newer_than(input, modified))
 }
 
 fn main() {
@@ -61,30 +22,19 @@ fn main() {
 
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
     let lwext4_lib = &format!("lwext4-{}", arch);
-    let lwext4_lib_path = PathBuf::from(format!("c/lwext4/lib{}.a", lwext4_lib));
-    let lwext4_inputs = [
-        Path::new("c/ulibc.c"),
-        Path::new("c/lwext4/CMakeLists.txt"),
-        Path::new("c/lwext4/Makefile"),
-        Path::new("c/lwext4/include"),
-        Path::new("c/lwext4/src"),
-        Path::new("c/lwext4/toolchain"),
-        Path::new("c/musl-generic.cmake"),
-        Path::new("c/wrapper.h"),
-    ];
-    let force_rebuild = env::var_os("LWEXT4_FORCE_REBUILD").is_some();
-    if force_rebuild || needs_rebuild(&lwext4_lib_path, &lwext4_inputs) {
-        let status = Command::new("make")
-            .args(&[
-                "musl-generic",
-                "-C",
-                c_path.to_str().expect("invalid path of lwext4"),
-            ])
-            .arg(&format!("ARCH={}", arch))
-            .status()
-            .expect("failed to execute process: make lwext4");
-        assert!(status.success());
-    }
+    // A tracked prebuilt archive may have a newer mtime after checkout even
+    // when its C sources changed. Rebuild whenever Cargo runs this script so
+    // the linked archive is always derived from the checked-out sources.
+    let status = Command::new("make")
+        .args(&[
+            "musl-generic",
+            "-C",
+            c_path.to_str().expect("invalid path of lwext4"),
+        ])
+        .arg(&format!("ARCH={}", arch))
+        .status()
+        .expect("failed to execute process: make lwext4");
+    assert!(status.success());
 
     if !Path::new("src/bindings.rs").exists() {
         let cc = &format!("{}-linux-musl-gcc", arch);
@@ -97,7 +47,7 @@ fn main() {
         let sysroot = sysroot.trim_end();
         let sysroot_inc = &format!("-I{}/include/", sysroot);
 
-        generates_bindings_to_rust(sysroot_inc);
+        generates_bindings_to_rust(sysroot_inc, &arch);
     }
 
     /* No longer need to implement the libc.a
@@ -127,10 +77,9 @@ fn main() {
     println!("cargo:rerun-if-changed=c/lwext4/include");
     println!("cargo:rerun-if-changed=c/lwext4/src");
     println!("cargo:rerun-if-changed=c/lwext4/toolchain");
-    println!("cargo:rerun-if-env-changed=LWEXT4_FORCE_REBUILD");
 }
 
-fn generates_bindings_to_rust(mpath: &str) {
+fn generates_bindings_to_rust(mpath: &str, arch: &str) {
     let bindings = bindgen::Builder::default()
         .use_core()
         // The input header we would like to generate bindings for.
@@ -139,7 +88,7 @@ fn generates_bindings_to_rust(mpath: &str) {
         .clang_arg(mpath)
         //.clang_arg("-I../../ulib/axlibc/include")
         .clang_arg("-I./c/lwext4/include")
-        .clang_arg("-I./c/lwext4/build_musl-generic/include/")
+        .clang_arg(format!("-I./c/lwext4/build_musl-generic-{arch}/include/"))
         .layout_tests(false)
         // Tell cargo to invalidate the built crate whenever any of the included header files changed.
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))

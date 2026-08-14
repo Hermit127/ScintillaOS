@@ -3,11 +3,13 @@ use polyhal::debug_console::DebugConsole;
 
 use super::{File, Kstat, S_IFBLK, S_IFCHR, S_IFREG, S_IFSOCK};
 use crate::sync::DeviceLock;
-use crate::task::{current_task, pid2task, suspend_current_and_run_next};
+use crate::task::{current_task, pid2task};
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering};
 use lazy_static::*;
+
+const O_NONBLOCK: usize = 0x800;
 
 static STDOUT_BUSY: AtomicBool = AtomicBool::new(false);
 static STDOUT_OWNER: AtomicI32 = AtomicI32::new(0);
@@ -147,7 +149,7 @@ pub fn console_input_available(echo_enabled: bool) -> usize {
     input.ready.len()
 }
 
-fn console_read(user_buf: &mut [u8], echo_enabled: bool) -> isize {
+fn console_read(user_buf: &mut [u8], echo_enabled: bool, nonblock: bool) -> isize {
     if user_buf.is_empty() {
         return 0;
     }
@@ -172,8 +174,13 @@ fn console_read(user_buf: &mut [u8], echo_enabled: bool) -> isize {
             }
             return read as isize;
         }
+        if nonblock {
+            return -11;
+        }
         stdout_release_if_owner();
-        suspend_current_and_run_next();
+        let retry_at = (polyhal::time::Time::now().to_nsec() as usize)
+            .saturating_add(10_000_000);
+        crate::task::sleep_current_until(retry_at);
     }
 }
 
@@ -213,7 +220,9 @@ fn stdout_acquire() {
             STDOUT_BUSY.store(false, Ordering::Release);
             return;
         }
-        suspend_current_and_run_next();
+        crate::task::suspend_current_and_run_next_reason(
+            crate::task::SuspendReason::StdoutAcquire,
+        );
     }
 }
 
@@ -244,9 +253,29 @@ pub fn stdout_release_pid(pid: usize) {
     }
 }
 
-pub struct Stdin;
+pub struct Stdin {
+    nonblock: AtomicBool,
+}
 
-pub struct Stdout;
+impl Stdin {
+    pub fn new() -> Self {
+        Self {
+            nonblock: AtomicBool::new(false),
+        }
+    }
+}
+
+pub struct Stdout {
+    nonblock: AtomicBool,
+}
+
+impl Stdout {
+    pub fn new() -> Self {
+        Self {
+            nonblock: AtomicBool::new(false),
+        }
+    }
+}
 
 impl File for Stdin {
     // 标准输入可以读。
@@ -262,7 +291,11 @@ impl File for Stdin {
     // 从调试串口读一个字节；暂时没输入就主动切出去等。
     // 执行时先处理空缓冲区，再循环查询 DebugConsole；没字符时释放 stdout 并让出 CPU。
     fn read(&self, user_buf: &mut [u8]) -> isize {
-        console_read(user_buf, false)
+        console_read(
+            user_buf,
+            false,
+            self.nonblock.load(Ordering::Relaxed),
+        )
     }
     // 往 stdin 写是内核逻辑错误，直接暴露出来。
     // 执行时直接 panic，因为内核不应该把标准输入当成可写文件使用。
@@ -276,6 +309,19 @@ impl File for Stdin {
     // 执行时构造字符设备类型的 Kstat，不需要访问真实设备元数据。
     fn stat(&self) -> Kstat {
         Kstat::new(S_IFCHR)
+    }
+    fn get_flags(&self) -> usize {
+        0x8000
+            | if self.nonblock.load(Ordering::Relaxed) {
+                O_NONBLOCK
+            } else {
+                0
+            }
+    }
+    fn set_flags(&self, flags: usize) -> bool {
+        self.nonblock
+            .store((flags & O_NONBLOCK) != 0, Ordering::Relaxed);
+        true
     }
     // 给 fd 层做具体类型判断。
     // 执行时直接把当前对象转成 Any trait 引用，方便文件描述符层做具体类型判断。
@@ -313,6 +359,20 @@ impl File for Stdout {
     fn stat(&self) -> Kstat {
         Kstat::new(S_IFCHR)
     }
+    fn get_flags(&self) -> usize {
+        0x8000
+            | 1
+            | if self.nonblock.load(Ordering::Relaxed) {
+                O_NONBLOCK
+            } else {
+                0
+            }
+    }
+    fn set_flags(&self, flags: usize) -> bool {
+        self.nonblock
+            .store((flags & O_NONBLOCK) != 0, Ordering::Relaxed);
+        true
+    }
     // 给 fd 层做具体类型判断。
     // 执行时直接把当前对象转成 Any trait 引用，方便文件描述符层做具体类型判断。
     fn as_any(&self) -> &dyn core::any::Any {
@@ -332,7 +392,7 @@ impl File for DevTty {
     }
 
     fn read(&self, user_buf: &mut [u8]) -> isize {
-        console_read(user_buf, true)
+        console_read(user_buf, true, false)
     }
 
     fn write(&self, user_buf: &mut [u8]) -> isize {

@@ -11,6 +11,9 @@ use crate::fs::File;
 use crate::mm::{translated_ref, translated_refmut};
 use crate::net::socket::{SocketFile, SocketType};
 use crate::syscall::install_fd_shared;
+use crate::syscall::process::{
+    copy_from_task_user, copy_to_task_user, prepare_task_user_access, write_user_value,
+};
 use crate::sync::DeviceLock;
 use crate::task::{
     block_current_and_run_next, block_current_and_run_next_if, current_task, current_user_token,
@@ -227,6 +230,43 @@ fn copy_to_iov(buf: &[u8], iov: *mut Iovec, iovcnt: usize) -> usize {
     read
 }
 
+fn copy_socket_input(
+    task: &Arc<crate::task::TaskControlBlock>,
+    ptr: *const u8,
+    len: usize,
+) -> Result<Vec<u8>, isize> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    if ptr.is_null() {
+        return Err(-14);
+    }
+    let mut data = Vec::new();
+    data.try_reserve_exact(len).map_err(|_| -12isize)?;
+    data.resize(len, 0);
+    if !copy_from_task_user(task, ptr as usize, &mut data) {
+        return Err(-14);
+    }
+    Ok(data)
+}
+
+fn prepare_socket_output(
+    task: &Arc<crate::task::TaskControlBlock>,
+    ptr: *mut u8,
+    len: usize,
+) -> Result<Vec<u8>, isize> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    if ptr.is_null() || !prepare_task_user_access(task, ptr as usize, len, true) {
+        return Err(-14);
+    }
+    let mut data = Vec::new();
+    data.try_reserve_exact(len).map_err(|_| -12isize)?;
+    data.resize(len, 0);
+    Ok(data)
+}
+
 fn add_to_socket_set(st: SocketType) -> Option<(SocketHandle, SocketType)> {
     if st == SocketType::Unix {
         return None;
@@ -255,7 +295,7 @@ fn add_to_socket_set(st: SocketType) -> Option<(SocketHandle, SocketType)> {
     })
 }
 
-fn sock_lookup(sockfd: usize) -> Option<(SocketHandle, SocketType, bool)> {
+fn sock_lookup(sockfd: usize) -> Option<(Option<SocketHandle>, SocketType, bool)> {
     let task = current_task()?;
     let inner = task.inner_exclusive_access();
     if sockfd >= inner.fd_table.len() {
@@ -781,7 +821,7 @@ fn enqueue_local_udp(src: IpEndpoint, data: &[u8], dest: IpEndpoint) -> isize {
     crate::task::wake_poll_wait_tasks();
     if queue_was_full {
         stdout_release_if_owner();
-        suspend_current_and_run_next();
+        crate::task::suspend_current_and_run_next_reason(crate::task::SuspendReason::NetYield);
     }
     data.len() as isize
 }
@@ -1000,11 +1040,12 @@ pub fn sys_bind(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
             endpoint.addr
         };
         set_socket_local_endpoint(sockfd, IpEndpoint::new(local_addr, port));
-        if st == SocketType::Tcp {
-            local_tcp_listen(port);
-        }
         return 0;
     }
+
+    let Some(handle) = handle else {
+        return -22;
+    };
 
     let ret = crate::net::with_net_iface(|iface| match st {
         SocketType::Tcp => {
@@ -1043,9 +1084,6 @@ pub fn sys_bind(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
             endpoint.addr
         };
         set_socket_local_endpoint(sockfd, IpEndpoint::new(local_addr, port));
-        if st == SocketType::Tcp {
-            local_tcp_listen(port);
-        }
     }
     ret
 }
@@ -1148,6 +1186,9 @@ pub fn sys_connect(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
         return -97;
     }
 
+    let Some(handle) = handle else {
+        return -107;
+    };
     let selected_local = get_socket_local_endpoint(sockfd);
     let local = IpListenEndpoint {
         addr: selected_local.and_then(|endpoint| match endpoint.addr {
@@ -1257,6 +1298,10 @@ pub fn sys_listen(sockfd: usize, _backlog: usize) -> isize {
         return -22;
     }
 
+    let Some(handle) = handle else {
+        return -22;
+    };
+
     let listening = crate::net::with_net_iface(|iface| {
         let sock: &TcpSocket = iface.sockets.get(handle);
         sock.is_listening()
@@ -1297,17 +1342,8 @@ pub fn sys_accept(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
     if let Some(port) = local_port {
         loop {
             if let Some(conn_id) = local_tcp_accept(port) {
-                let new_handle = if net_ready() {
-                    match add_to_socket_set(SocketType::Tcp) {
-                        Some((handle, _)) => handle,
-                        None => return -105,
-                    }
-                } else {
-                    dummy_socket_handle()
-                };
                 let task = current_task().unwrap();
-                let new_sock = Arc::new(SocketFile::new(new_handle, SocketType::Tcp, nonblock));
-                new_sock.set_local_tcp(conn_id, true);
+                let new_sock = Arc::new(SocketFile::new_local_tcp(conn_id, true, nonblock));
                 if let Some(local) = local_tcp_server_endpoint(conn_id) {
                     new_sock.set_local_endpoint(local);
                 }
@@ -1334,6 +1370,10 @@ pub fn sys_accept(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
     if !net_ready() {
         return -22;
     }
+
+    let Some(handle) = handle else {
+        return -22;
+    };
 
     crate::net::net_poll();
 
@@ -1453,8 +1493,16 @@ pub fn sys_sendto(
         if !dest_addr.is_null() && addrlen != 0 {
             return -106;
         }
-        let data = unsafe { core::slice::from_raw_parts(buf, len) };
-        socket.send_with_flags(data, flags)
+        let task = current_task().unwrap();
+        let copy_len = match socket.send_staging_len(len) {
+            Ok(len) => len,
+            Err(errno) => return errno,
+        };
+        let data = match copy_socket_input(&task, buf, copy_len) {
+            Ok(data) => data,
+            Err(errno) => return errno,
+        };
+        socket.send_with_flags(&data, flags)
     }) {
         return result;
     }
@@ -1472,17 +1520,30 @@ pub fn sys_sendto(
     }
     // For TCP, dest_addr is ignored (use connected peer)
 
-    let data = unsafe { core::slice::from_raw_parts(buf, len) };
+    if st == SocketType::Udp && len > SOCKET_BUFFER_SIZE {
+        return -90;
+    }
+    let task = current_task().unwrap();
+    let copy_len = len.min(SOCKET_BUFFER_SIZE);
+    let data = match copy_socket_input(&task, buf, copy_len) {
+        Ok(data) => data,
+        Err(errno) => return errno,
+    };
 
     match st {
         SocketType::Tcp => {
             if let Some((conn_id, server_side, _)) = socket_local_tcp(sockfd) {
-                local_tcp_send(conn_id, server_side, dontwait, data)
+                local_tcp_send(conn_id, server_side, dontwait, &data)
+            } else if let Some(handle) = handle {
+                tcp_send(handle, dontwait, &data)
             } else {
-                tcp_send(handle, dontwait, data)
+                -107
             }
         }
         SocketType::Udp => {
+            let Some(handle) = handle else {
+                return -107;
+            };
             let (ip, port) = match parse_sockaddr_in(dest_addr) {
                 Some(v) => v,
                 None => return -22,
@@ -1491,10 +1552,10 @@ pub fn sys_sendto(
                 IpAddress::from(Ipv4Address::from_bytes(&ip.to_be_bytes())),
                 port,
             );
-            if let Some(ret) = try_send_local_udp(sockfd, handle, data, dest) {
+            if let Some(ret) = try_send_local_udp(sockfd, handle, &data, dest) {
                 return ret;
             }
-            udp_send(handle, data, dest)
+            udp_send(handle, &data, dest)
         }
         SocketType::Unix => -107,
     }
@@ -1511,30 +1572,26 @@ pub fn sys_recvfrom(
     if len != 0 && buf.is_null() {
         return -14;
     }
-    let task = current_task().unwrap();
-    // Never let smoltcp write directly through a userspace pointer while its
-    // device lock is held.  The destination may be a demand-mapped or COW
-    // page; touching it in memcpy would turn a recoverable user fault into a
-    // kernel-mode page fault (Git's HTTP worker reaches this path).
-    let mut recv_storage = alloc::vec![0u8; len.min(SOCKET_BUFFER_SIZE)];
-    let recv_buf = recv_storage.as_mut_slice();
-
     if let Some(result) = with_unix_socket(sockfd, |socket| {
+        let task = current_task().unwrap();
         if !addrlen.is_null() {
-            let token = current_user_token();
-            *translated_refmut(token, addrlen as *mut u32) = 0;
+            if !write_user_value(&task, addrlen as *mut u32, &0u32) {
+                return -14;
+            }
         }
-        socket.recv_with_flags(recv_buf, flags)
-    }) {
+        let copy_len = len.min(SOCKET_BUFFER_SIZE);
+        let mut recv_buf = match prepare_socket_output(&task, buf, copy_len) {
+            Ok(data) => data,
+            Err(errno) => return errno,
+        };
+        let result = socket.recv_with_flags(&mut recv_buf, flags);
         if result > 0
-            && !crate::syscall::process::copy_to_task_user(
-                &task,
-                buf as usize,
-                &recv_storage[..result as usize],
-            )
+            && !copy_to_task_user(&task, buf as usize, &recv_buf[..result as usize])
         {
             return -14;
         }
+        result
+    }) {
         return result;
     }
 
@@ -1546,45 +1603,65 @@ pub fn sys_recvfrom(
     let dontwait = nonblock || (flags & MSG_DONTWAIT) != 0;
     let peek = (flags & MSG_PEEK) != 0;
 
+    let task = current_task().unwrap();
+    let copy_len = len.min(SOCKET_BUFFER_SIZE);
+    let mut recv_buf = match prepare_socket_output(&task, buf, copy_len) {
+        Ok(data) => data,
+        Err(errno) => return errno,
+    };
     let mut udp_peer = None;
     let result = match st {
         SocketType::Tcp => {
             if let Some((conn_id, server_side, _)) = socket_local_tcp(sockfd) {
-                local_tcp_recv(conn_id, server_side, dontwait, peek, recv_buf)
+                local_tcp_recv(conn_id, server_side, dontwait, peek, &mut recv_buf)
+            } else if let Some(handle) = handle {
+                tcp_recv(handle, dontwait, &mut recv_buf)
             } else {
-                tcp_recv(handle, dontwait, recv_buf)
+                -107
             }
         }
-        SocketType::Udp => loop {
-            if let Some(ret) = try_recv_local_udp(sockfd, handle, recv_buf, src_addr, addrlen, peek)
-            {
-                if ret > 0
-                    && !crate::syscall::process::copy_to_task_user(
-                        &task,
-                        buf as usize,
-                        &recv_storage[..ret as usize],
-                    )
-                {
-                    return -14;
-                }
-                return ret;
-            }
-            let (ret, peer) = if net_ready() {
-                udp_recv_from(handle, true, peek, recv_buf)
-            } else {
-                (-11, None)
+        SocketType::Udp => {
+            let Some(handle) = handle else {
+                return -107;
             };
-            if ret != -11 || dontwait {
-                udp_peer = peer;
-                break ret;
+            loop {
+                if let Some(ret) =
+                    try_recv_local_udp(sockfd, handle, &mut recv_buf, src_addr, addrlen, peek)
+                {
+                    if ret > 0
+                        && !copy_to_task_user(
+                            &task,
+                            buf as usize,
+                            &recv_buf[..ret as usize],
+                        )
+                    {
+                        return -14;
+                    }
+                    return ret;
+                }
+                let (ret, peer) = if net_ready() {
+                    udp_recv_from(handle, true, peek, &mut recv_buf)
+                } else {
+                    (-11, None)
+                };
+                if ret != -11 || dontwait {
+                    udp_peer = peer;
+                    break ret;
+                }
+                let reason = BlockReason::UdpRecv(unsafe { core::mem::transmute(handle) });
+                block_current_and_run_next_if(reason, || {
+                    !local_udp_ready(sockfd, handle) && !udp_handle_can_recv(handle)
+                });
             }
-            let reason = BlockReason::UdpRecv(unsafe { core::mem::transmute(handle) });
-            block_current_and_run_next_if(reason, || {
-                !local_udp_ready(sockfd, handle) && !udp_handle_can_recv(handle)
-            });
-        },
+        }
         SocketType::Unix => -107,
     };
+
+    if result > 0
+        && !copy_to_task_user(&task, buf as usize, &recv_buf[..result as usize])
+    {
+        return -14;
+    }
 
     // Fill source address for UDP if requested
     if result > 0 && !src_addr.is_null() && !addrlen.is_null() && st == SocketType::Udp {
@@ -1593,21 +1670,19 @@ pub fn sys_recvfrom(
             port,
         }) = udp_peer
         {
-            let token = current_user_token();
-            *translated_refmut(token, addrlen as *mut u32) =
-                core::mem::size_of::<SockAddrIn>() as u32;
-            write_sockaddr_in(src_addr, u32::from_be_bytes(ipv4.0), port);
+            let length = core::mem::size_of::<SockAddrIn>() as u32;
+            let address = SockAddrIn {
+                sin_family: AF_INET as u16,
+                sin_port: port.to_be(),
+                sin_addr: u32::from_be_bytes(ipv4.0).to_be(),
+                sin_zero: [0; 8],
+            };
+            if !write_user_value(&task, addrlen as *mut u32, &length)
+                || !write_user_value(&task, src_addr as *mut SockAddrIn, &address)
+            {
+                return -14;
+            }
         }
-    }
-
-    if result > 0
-        && !crate::syscall::process::copy_to_task_user(
-            &task,
-            buf as usize,
-            &recv_storage[..result as usize],
-        )
-    {
-        return -14;
     }
 
     result
@@ -1651,11 +1726,16 @@ pub fn sys_sendmsg(sockfd: usize, msg: *const u8, flags: usize) -> isize {
         SocketType::Tcp => {
             if let Some((conn_id, server_side, _)) = socket_local_tcp(sockfd) {
                 local_tcp_send(conn_id, server_side, dontwait, &buf[..copied])
-            } else {
+            } else if let Some(handle) = handle {
                 tcp_send(handle, dontwait, &buf[..copied])
+            } else {
+                -107
             }
         }
         SocketType::Udp => {
+            let Some(handle) = handle else {
+                return -107;
+            };
             let dest = if !msghdr.msg_name.is_null() && msghdr.msg_namelen as usize >= 8 {
                 match parse_sockaddr_in(msghdr.msg_name) {
                     Some((ip, port)) => Some(IpEndpoint::new(
@@ -1727,35 +1807,42 @@ pub fn sys_recvmsg(sockfd: usize, msg: *mut u8, flags: usize) -> isize {
         SocketType::Tcp => {
             if let Some((conn_id, server_side, _)) = socket_local_tcp(sockfd) {
                 local_tcp_recv(conn_id, server_side, dontwait, peek, &mut buf)
-            } else {
+            } else if let Some(handle) = handle {
                 tcp_recv(handle, dontwait, &mut buf)
+            } else {
+                -107
             }
         }
-        SocketType::Udp => loop {
-            if let Some(ret) = try_recv_local_udp(
-                sockfd,
-                handle,
-                &mut buf,
-                core::ptr::null_mut(),
-                core::ptr::null_mut(),
-                peek,
-            ) {
-                break ret;
-            }
-            let (ret, peer) = if net_ready() {
-                udp_recv_from(handle, true, peek, &mut buf)
-            } else {
-                (-11, None)
+        SocketType::Udp => {
+            let Some(handle) = handle else {
+                return -107;
             };
-            if ret != -11 || dontwait {
-                udp_peer = peer;
-                break ret;
+            loop {
+                if let Some(ret) = try_recv_local_udp(
+                    sockfd,
+                    handle,
+                    &mut buf,
+                    core::ptr::null_mut(),
+                    core::ptr::null_mut(),
+                    peek,
+                ) {
+                    break ret;
+                }
+                let (ret, peer) = if net_ready() {
+                    udp_recv_from(handle, true, peek, &mut buf)
+                } else {
+                    (-11, None)
+                };
+                if ret != -11 || dontwait {
+                    udp_peer = peer;
+                    break ret;
+                }
+                let reason = BlockReason::UdpRecv(unsafe { core::mem::transmute(handle) });
+                block_current_and_run_next_if(reason, || {
+                    !local_udp_ready(sockfd, handle) && !udp_handle_can_recv(handle)
+                });
             }
-            let reason = BlockReason::UdpRecv(unsafe { core::mem::transmute(handle) });
-            block_current_and_run_next_if(reason, || {
-                !local_udp_ready(sockfd, handle) && !udp_handle_can_recv(handle)
-            });
-        },
+        }
         SocketType::Unix => -107,
     };
 
@@ -1821,6 +1908,9 @@ pub fn sys_setsockopt(
                             false
                         };
                         if net_ready() {
+                            let Some(handle) = handle else {
+                                return 0;
+                            };
                             crate::net::with_net_iface(|iface| {
                                 let sock: &mut TcpSocket = iface.sockets.get_mut(handle);
                                 if val {
@@ -1851,6 +1941,9 @@ pub fn sys_setsockopt(
                     false
                 };
                 if net_ready() {
+                    let Some(handle) = handle else {
+                        return 0;
+                    };
                     crate::net::with_net_iface(|iface| {
                         let sock: &mut TcpSocket = iface.sockets.get_mut(handle);
                         sock.set_nagle_enabled(!val);
@@ -1886,7 +1979,7 @@ pub fn sys_getsockopt(
         (SOL_SOCKET, SO_ERROR) => {
             let error = if st != SocketType::Tcp {
                 0
-            } else {
+            } else if let Some(handle) = handle {
                 crate::net::with_net_iface(|iface| {
                     let sock: &TcpSocket = iface.sockets.get(handle);
                     match sock.state() {
@@ -1896,6 +1989,10 @@ pub fn sys_getsockopt(
                     }
                 })
                 .unwrap_or(111)
+            } else if socket_local_tcp(sockfd).is_some() {
+                0
+            } else {
+                111
             };
             *translated_refmut(token, optlen as *mut u32) = 4;
             *translated_refmut(token, optval as *mut i32) = error;
@@ -1915,11 +2012,14 @@ pub fn sys_getsockopt(
             if st != SocketType::Tcp {
                 return -95;
             }
-            let nagle = crate::net::with_net_iface(|iface| {
-                let sock: &TcpSocket = iface.sockets.get(handle);
-                !sock.nagle_enabled()
-            })
-            .unwrap_or(false);
+            let nagle = handle
+                .and_then(|handle| {
+                    crate::net::with_net_iface(|iface| {
+                        let sock: &TcpSocket = iface.sockets.get(handle);
+                        !sock.nagle_enabled()
+                    })
+                })
+                .unwrap_or(false);
             *translated_refmut(token, optlen as *mut u32) = 4;
             *translated_refmut(token, optval as *mut i32) = if nagle { 1 } else { 0 };
             0
@@ -1965,6 +2065,10 @@ pub fn sys_sock_shutdown(sockfd: usize, how: usize) -> isize {
         return -97;
     }
 
+    let Some(handle) = handle else {
+        return -107;
+    };
+
     crate::net::with_net_iface(|iface| {
         let sock: &mut TcpSocket = iface.sockets.get_mut(handle);
         match how {
@@ -1989,22 +2093,27 @@ pub fn sys_getpeername(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isi
     };
 
     let peer: Option<IpEndpoint> = match st {
-        SocketType::Tcp => crate::net::with_net_iface(|iface| {
-            let sock: &TcpSocket = iface.sockets.get(handle);
-            sock.remote_endpoint()
-        })
-        .flatten()
-        .or_else(|| get_socket_peer_endpoint(sockfd)),
-        SocketType::Udp => get_socket_peer_endpoint(sockfd).or_else(|| {
-            crate::net::with_net_iface(|iface| {
-                let sock: &UdpSocket = iface.sockets.get(handle);
-                sock.endpoint()
+        SocketType::Tcp => get_socket_peer_endpoint(sockfd).or_else(|| {
+            handle.and_then(|handle| {
+                crate::net::with_net_iface(|iface| {
+                    let sock: &TcpSocket = iface.sockets.get(handle);
+                    sock.remote_endpoint()
+                })
+                .flatten()
             })
-            .map(|ep| {
-                IpEndpoint::new(
-                    ep.addr.unwrap_or(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED)),
-                    ep.port,
-                )
+        }),
+        SocketType::Udp => get_socket_peer_endpoint(sockfd).or_else(|| {
+            handle.and_then(|handle| {
+                crate::net::with_net_iface(|iface| {
+                    let sock: &UdpSocket = iface.sockets.get(handle);
+                    sock.endpoint()
+                })
+                .map(|ep| {
+                    IpEndpoint::new(
+                        ep.addr.unwrap_or(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED)),
+                        ep.port,
+                    )
+                })
             })
         }),
         SocketType::Unix => None,
@@ -2037,23 +2146,29 @@ pub fn sys_getsockname(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isi
     };
 
     let local: Option<IpEndpoint> = match st {
-        SocketType::Tcp => crate::net::with_net_iface(|iface| {
-            let sock: &TcpSocket = iface.sockets.get(handle);
-            sock.local_endpoint()
-        })
-        .flatten()
-        .or_else(|| get_socket_local_endpoint(sockfd)),
-        SocketType::Udp => crate::net::with_net_iface(|iface| {
-            let sock: &UdpSocket = iface.sockets.get(handle);
-            sock.endpoint()
-        })
-        .map(|ep| {
-            IpEndpoint::new(
-                ep.addr.unwrap_or(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED)),
-                ep.port,
-            )
-        })
-        .or_else(|| get_socket_local_endpoint(sockfd)),
+        SocketType::Tcp => get_socket_local_endpoint(sockfd).or_else(|| {
+            handle.and_then(|handle| {
+                crate::net::with_net_iface(|iface| {
+                    let sock: &TcpSocket = iface.sockets.get(handle);
+                    sock.local_endpoint()
+                })
+                .flatten()
+            })
+        }),
+        SocketType::Udp => get_socket_local_endpoint(sockfd).or_else(|| {
+            handle.and_then(|handle| {
+                crate::net::with_net_iface(|iface| {
+                    let sock: &UdpSocket = iface.sockets.get(handle);
+                    sock.endpoint()
+                })
+                .map(|ep| {
+                    IpEndpoint::new(
+                        ep.addr.unwrap_or(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED)),
+                        ep.port,
+                    )
+                })
+            })
+        }),
         SocketType::Unix => None,
     };
 
@@ -2096,7 +2211,7 @@ pub(crate) fn tcp_send(handle: SocketHandle, nonblock: bool, data: &[u8]) -> isi
         })
         .unwrap_or(-1);
         crate::net::net_poll();
-        suspend_current_and_run_next();
+        crate::task::suspend_current_and_run_next_reason(crate::task::SuspendReason::NetYield);
         return result;
     }
 
@@ -2118,14 +2233,16 @@ pub(crate) fn tcp_send(handle: SocketHandle, nonblock: bool, data: &[u8]) -> isi
             offset += sent as usize;
         } else if sent == 0 {
             if !sock_can_send_tcp(handle) {
-                suspend_current_and_run_next();
+                crate::task::suspend_current_and_run_next_reason(
+                    crate::task::SuspendReason::NetYield,
+                );
             }
         } else {
             return sent;
         }
     }
     crate::net::net_poll();
-    suspend_current_and_run_next();
+    crate::task::suspend_current_and_run_next_reason(crate::task::SuspendReason::NetYield);
     offset as isize
 }
 
@@ -2175,7 +2292,9 @@ pub(crate) fn tcp_recv(handle: SocketHandle, nonblock: bool, buf: &mut [u8]) -> 
                 if tcp_receive_finished(handle) {
                     return 0;
                 }
-                suspend_current_and_run_next();
+                crate::task::suspend_current_and_run_next_reason(
+                    crate::task::SuspendReason::NetYield,
+                );
             }
             None => return -1,
         }

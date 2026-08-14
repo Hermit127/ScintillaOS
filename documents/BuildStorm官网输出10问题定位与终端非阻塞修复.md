@@ -1,0 +1,187 @@
+# BuildStorm 官网输出 10 问题定位与终端非阻塞修复
+
+## 1. 官网结果并非漏判编译成功
+
+`Riscv输出-10.txt` 中，正式构建在 34 分 34 秒后完成，ELF 与 BIN 产物均已生成，
+构建命令返回值也是 `rc=0`。但评测脚本随后还会启动生成的
+`arceos-helloworld`，验证产物能否实际运行。该阶段输出：
+
+```text
+----- boot arceos-helloworld in qemu (untimed, arch=riscv64) -----
+BUILDSTORM_RESULT mode=multi status=FAIL rc=0 cores=8 elapsed_s=2123.18 run=FAIL
+qemu-system-riscv64: Failed to set FD nonblocking: Invalid argument
+qemu-system-riscv64: could not connect serial device to character backend 'mon:stdio'
+```
+
+因此 RISC-V 的情况是“编译成功、产物启动验证失败”。评分器以最终
+`BUILDSTORM_RESULT` 为准，`status=FAIL` 不能获得题 2.2 的编译成功门槛分与时间分。
+
+`LoongArch输出-10.txt` 则停在 `Compiling ax-api v0.7.4`，没有输出构建完成、产物
+验证或最终结果标记。LoongArch 的零分来自构建链路没有走到可结算位置，与
+RISC-V 的终端错误不是同一个失败阶段。
+
+## 2. 根因
+
+QEMU 的 `mon:stdio` 字符后端会通过 `fcntl(F_SETFL)` 给继承的标准文件描述符设置
+`O_NONBLOCK`。内核的 `sys_fcntl` 已经实现 `F_GETFL/F_SETFL`，但 `Stdin` 和
+`Stdout` 没有覆盖 `File::set_flags`，因此落入默认实现并返回失败，用户态看到
+`EINVAL`。这使运行在 ScintillaOS 用户态中的内层 QEMU 无法建立串口字符后端。
+
+## 3. 修复设计
+
+`Stdin` 与 `Stdout` 分别新增原子非阻塞状态。初始 fd 0、fd 1 和 fd 2 各自创建
+独立的文件对象；fork 或 dup 仍通过现有 `Arc<dyn File>` 共享同一对象，因而符合
+Linux 中 open file description 状态由复制后的描述符共享的语义。
+
+`F_SETFL` 与 `FIONBIO` 现在可以更新标准终端对象的 `O_NONBLOCK`，`F_GETFL` 会返回
+该状态。非阻塞 stdin 在调试串口没有可读字符时返回 `-EAGAIN`，阻塞 stdin 仍沿用
+原有的睡眠等待路径；stdout/stderr 保存并报告标志，但输出仍可立即完成。
+
+## 4. 验证
+
+双架构内核检查均通过：
+
+```text
+cargo check -p os --target riscv64gc-unknown-none-elf
+cargo check -p os --target loongarch64-unknown-none
+```
+
+随后构建带临时探针的正式 RISC-V release 内核，并以 `-smp 8` 启动。探针依次验证
+fd 0、fd 1、fd 2 的 `F_SETFL(O_NONBLOCK)` 返回 0，fd 0 的 `F_GETFL` 包含
+`O_NONBLOCK`，以及无输入时 read 返回 `-EAGAIN`。串口结果为：
+
+```text
+STDIO_FCNTL_NONBLOCK PASS
+[kernel] shutdown requested by tid=1
+```
+
+临时探针在验证后已从 `initproc` 删除，正式评测顺序和脚本均未修改。本次修复只补齐
+通用终端与 `fcntl` 语义，不识别 BuildStorm 进程、产物路径或评分输出。
+
+## 5. 嵌套启动继续暴露的 Unix socket 用户指针问题
+
+终端非阻塞修复后，使用已经完成正式构建的 RISC-V 测试盘，从交互诊断内核执行
+`tg-xtask arceos qemu`。原来的 `Failed to set FD nonblocking` 已经消失，但
+`cargo metadata` 初始化期间外层内核出现读缺页：
+
+```text
+[fault-diag] invalid page-fault dispatch cpu=4 tid=75 user=false
+sepc=0xffffffc0802d2ece bad=0x98c1df
+[kernel] panic: read page fault outside a valid user task
+```
+
+使用与该次运行完全一致的未剥离 ELF 反汇编，`sepc` 位于 `memcpy` 的源字节读取，返回地址
+位于 `UnixSocketFile::send_with_flags` 调用 `copy_from_slice` 之后。寄存器同时显示目标地址是
+内核堆，源地址 `0x98c1df` 是当前用户进程地址，长度为 1。继续检查 syscall 边界后确认，
+`sys_sendto` 直接用 `slice::from_raw_parts` 把用户指针构造成内核切片；用户页尚未驻留或缓冲区
+跨页时，内核态 `memcpy` 不会进入正常的用户缺页处理路径，而会直接 panic。
+
+## 6. 安全拷贝与消息边界修复
+
+`sendto` 现在先在不持有 socket 队列锁的状态下，通过当前任务的地址空间完成需求分页和
+`copy_from_task_user`，再把内核暂存区交给 Unix、TCP 或 UDP 实现。`recvfrom` 先验证并准备
+用户可写页，数据先接收到内核暂存区，成功后再通过 `copy_to_task_user` 回写。无效地址按
+Linux 约定返回 `EFAULT`，不再把用户地址交给内核 `memcpy`。
+
+暂存区上限与现有 socket 缓冲区一致，为 64 KiB。TCP 和 Unix stream 保留短写语义；UDP
+超过单个数据报上限返回 `EMSGSIZE`。Unix seqpacket 由 socket 对象根据类型检查原始请求长度，
+超过记录上限同样返回 `EMSGSIZE`，不会因暂存区截断而错误成功。空缓冲区继续允许空指针并
+返回 0。用户页准备和复制都发生在获取 `UnixSocketState`、本地 TCP/UDP 队列或 smoltcp
+设备锁之前，因此没有引入“地址空间锁嵌套设备锁”的新锁序。
+
+## 7. 构建产物启动验证
+
+修改后 RISC-V 与 LoongArch 的 `cargo check` 均通过。独立临时 worktree 以正式提交
+`09642b80` 为基线，只叠加 socket 安全拷贝和临时 shell 入口，重新生成 8 核 RISC-V
+release 内核。正式 `initproc` 没有修改。
+
+在 `-smp 8 -m 8G` 外层系统中再次运行同一 `tg-xtask arceos qemu` 路径，工具可以完成
+`cargo metadata`、10.60 秒增量构建并真正启动内层 `qemu-system-riscv64`，原 Unix socket
+缺页 panic 没有再出现。镜像内精简版 QEMU 缺少 `efi-virtio.rom`，因此本地诊断为块设备和
+网卡显式使用空 `romfile`，并显式指定镜像已有的 OpenSBI；VirtIO 网卡本身仍然保留。Mac
+上的双层 TCG 在 300 秒内稳定到达 ArceOS 主入口和启动横幅，但因双层模拟速度过慢，在应用
+输出前被诊断超时终止，外层内核始终保持运行。
+
+为排除构建产物本身的问题，从同一成功测试盘提取正式 ELF，得到：
+
+```text
+size=1681000
+sha256=74e580679b57fa61db8640f615240af322162000444f00c31c34bf2ee50409e7
+```
+
+随后在宿主机使用同样的 512 MiB、单核、VirtIO 块设备、VirtIO 网卡和 `mon:stdio` 参数进行
+单层启动。产物完整输出 ArceOS 架构信息与 `Hello, world!`，QEMU 返回 0。该对照证明正式
+构建产物可运行；本地双层未在时限内到达应用输出是嵌套 TCG 性能限制，而不是 ELF、根文件
+系统或虚拟网卡被删除。修复仍是通用用户内存语义，不检查 QEMU、Cargo 或测试名称。
+
+## 8. 2026-08-12 最新官网双架构启动失败与修复
+
+最新官网日志显示两种架构都已完成正式构建并生成产物。RISC-V 的构建返回 `rc=0`，耗时
+`2347.69s`；LoongArch 的构建返回 `rc=0`，耗时 `1681.77s`。两者最终仍为零分，是因为官网
+新增的隐藏产物启动检查分别在 QEMU 入口失败：
+
+```text
+qemu-system-riscv64: Failed to set FD nonblocking: Invalid argument
+qemu-system-riscv64: could not connect serial device to character backend 'mon:stdio'
+qemu-system-loongarch64: TCG: unaligned access support required; exiting
+```
+
+RISC-V 的进一步根因是 shell 重定向会用 `/dev/null` 或普通文件替换标准描述符。此前只为
+`Stdin` 和 `Stdout` 保存了 `O_NONBLOCK`，简单设备仍落入 `File::set_flags` 的失败默认值。
+现在默认文件描述符按 Linux 的通用 `F_SETFL` 语义接受可设置状态位；对 `/dev/null`、
+`/dev/zero` 和 proc 文件等始终就绪对象，`O_NONBLOCK` 不改变实际 I/O 行为。管道、socket、
+eventfd、Unix socket、标准终端和普通 inode 继续使用各自的覆盖实现，因此没有削弱这些对象
+原有的阻塞、追加和状态共享语义。
+
+LoongArch 用户进程辅助向量此前把 `AT_HWCAP` 固定为 0。LoongArch 宿主上的 QEMU TCG 会
+通过 `getauxval(AT_HWCAP)` 检查宿主是否支持非对齐访问；Linux UAPI 将该能力定义为
+`HWCAP_LOONGARCH_UAL = 1 << 2`。内核现在只在 LoongArch 用户进程中报告这个确实由硬件和
+异常处理路径支持的位，RISC-V 仍保持原值，也没有虚报 LSX、LASX 等可选向量能力。
+
+两种目标的 `cargo check` 和官方 Docker release 构建均成功。随后临时把 shell 嵌入诊断
+内核，在外层分别以 8 核 RISC-V、12 核 LoongArch 启动官方 glibc 镜像，在 chroot 内调用
+镜像自带的真实 `qemu-system-*`。测试刻意使用 `stdin=/dev/null` 和普通文件重定向输出，
+并补齐镜像脚本使用的 QEMU 私有库、固件和 ROM 搜索路径。两个 QEMU 都完成动态装载、字符
+后端初始化、TCG 翻译和内层内核加载，最终均打印：
+
+```text
+[kernel] Hello, world!
+```
+
+诊断命令没有给内层 ScintillaOS 挂块设备，因此它在该标志之后报告“未找到块设备”，这是
+刻意设置的最小测试终点，不属于产物入口失败。输出中不再出现上述两个官网错误，也没有新的
+syscall、动态链接、信号、内存映射或 QEMU 主循环错误。临时 shell 已恢复为正式评测入口，
+正式 `initproc`、测试顺序、计时、构建并发度和评分标记均未修改。本轮没有重新执行数小时的
+完整 Cargo 构建，结论限定为双架构产物启动基础设施已经真实走通。
+
+## 9. 直接故障与发布构建风险的区分
+
+官网零分的直接原因不是内核或用户程序没有编译出来。两份原始日志中，RISC-V 和
+LoongArch 的 `rustc`、`cargo`、minibuild 均成功，正式 release 构建也分别在
+`2347.69s` 和 `1681.77s` 后返回 `rc=0`。唯一使最终 `BUILDSTORM_RESULT`
+变成 `status=FAIL` 的阶段，是评分脚本启动刚编译出的内层产物时，分别遇到
+`F_SETFL(O_NONBLOCK)` 和 `HWCAP_LOONGARCH_UAL` 语义缺口。第 8 节的两处修复和
+真实嵌套 QEMU 结果直接覆盖这一最终启动门。
+
+在直接故障已通过后，另外审计了发布构建的确定性。这一工作是必要的提交保护，但不是
+对官网日志的替代解释。仓库中跟踪了预编译的 `liblwext4-*.a`，旧构建脚本又使用文件
+mtime 判断是否重建；新 checkout 可能让旧归档的时间戳晚于已修复的 C 源码，从而错误链接旧
+lwext4。现在 Cargo 一旦运行该 build script，就从当前 checkout 的源码重建归档；RISC-V
+和 LoongArch 使用独立的 CMake 目录，根 `make all` 对四个最终目标串行发布，用户 ELF
+转换中任意一个 `objcopy` 失败也会立即使整体构建失败。这些改动只保证正确源码进入产物，
+不修改 guest 中的评测顺序、编译并发度、时钟或评分输出。
+
+在官方 `zhouzhouyi/os-contest:20260510` Docker 环境中从当前工作树执行标准
+`make all`，命令返回 0，并生成四个正确架构的产物：
+
+```text
+disk.img     512 MiB
+disk-la.img  512 MiB
+kernel-rv    RISC-V ELF, 3.7 MiB
+kernel-la    LoongArch ELF, 3.0 MiB
+```
+
+再从两个磁盘镜像中直接提取 `/bin/initproc`，其 SHA-256 分别与本轮 RISC-V 和
+LoongArch release 目标完全一致。两者的 ELF 架构也分别正确。`initproc.rs` 与正式提交
+`266bd1aa` 相比无差异，仍然依次挂载官方数据盘、`chroot` 到 `/glibc`、运行 CAgent
+和完整 BuildStorm 2.1 + 2.2，最后关机。

@@ -8,10 +8,12 @@ mod signal;
 mod task;
 
 use crate::mm::{translated_ref, translated_refmut};
-use crate::sync::FilesLock;
+use crate::sync::SleepLock;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::mem::size_of;
+#[cfg(feature = "lock-stats")]
+use core::sync::atomic::AtomicU64;
 use core::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use lazy_static::*;
 use log::*;
@@ -80,15 +82,21 @@ pub use manager::{
     net_blocked_snapshot, online_cpu_mask, pid2task, register_online_cpu, remove_sleep,
     publish_itimer_deadline, take_waitpid, task_snapshot, update_task_affinity,
     wake_local_tcp_acceptors, wake_local_tcp_connection_waiters, wake_local_tcp_readers,
-    wake_local_tcp_writers, wake_pipe_waiters, wake_task, wake_udp_waiters, BlockQueue,
+    wake_local_tcp_writers, wake_all_sleep_lock_waiters, wake_all_sleep_lock_waiters_any,
+    wake_exec_peer_waiters,
+    wake_file_page_load_waiters, wake_pipe_waiters, wake_sleep_lock_waiter, wake_task,
+    wake_udp_waiters, BlockQueue,
 };
 pub use pid::{pid_alloc, PidHandle};
 pub use processor::{
     current_hart_id, current_task, current_user_token, flush_remote_tlb, handle_ipi,
-    init_current_cpu, init_kernel_page, mark_current_task_address_space_active, record_timer_tick,
+    init_current_cpu, init_kernel_page, invalidate_user_float_state,
+    mark_current_task_address_space_active, mark_user_float_state_live, record_timer_tick,
     request_reschedule, run_tasks, schedule, scheduler_cpu_snapshots, take_current_task,
-    try_current_hart_id,
+    timer_preemption_needed, try_current_hart_id, user_float_state_is_live,
 };
+#[cfg(feature = "lock-stats")]
+pub use processor::dump_scheduler_runtime_stats;
 pub use signal::{PendingSignalInfo, SignalFlags, MAX_SIG};
 pub use task::{
     blank_kcontext, BlockReason, KernelStack, PosixTimer, TaskControlBlock, TaskControlBlockInner,
@@ -110,11 +118,79 @@ impl FileTableState {
     }
 }
 
-/// Serializes mutations of a CLONE_FILES descriptor group and owns its
-/// membership registry. The registry avoids rebuilding a shared file table
-/// through PID2TCB while the file-table lock is held.
-pub(crate) static FILE_TABLE_LOCK: FilesLock<FileTableState> =
-    FilesLock::new_named(FileTableState::new(), "Files.descriptor_tables");
+/// Serializes mutations of CLONE_FILES descriptor groups and owns their
+/// membership registry. Mutations may briefly collect several ordered
+/// TaskLocks, so unrelated groups sleep instead of spinning on another CPU.
+pub(crate) static FILE_TABLE_LOCK: SleepLock<FileTableState> =
+    SleepLock::new_named(FileTableState::new(), "Files.descriptor_tables");
+
+#[derive(Clone, Copy)]
+#[repr(usize)]
+pub(crate) enum SuspendReason {
+    Other,
+    TimerPreempt,
+    Frozen,
+    CopyToUserRetry,
+    SysYield,
+    ExecPeerWait,
+    SigSuspendWait,
+    FdInstallRetry,
+    FdCloseRetry,
+    FdDuplicateRetry,
+    FdReplaceRetry,
+    FdCloexecRetry,
+    ForkSnapshotRetry,
+    CloneSnapshotRetry,
+    CloneFilesRetry,
+    StdoutAcquire,
+    StdinPoll,
+    NetYield,
+}
+
+#[cfg(feature = "lock-stats")]
+const SUSPEND_REASON_NAMES: [&str; 18] = [
+    "other",
+    "timer-preempt",
+    "frozen",
+    "copy-to-user-retry",
+    "sys-yield",
+    "exec-peer-wait",
+    "sigsuspend-wait",
+    "fd-install-retry",
+    "fd-close-retry",
+    "fd-duplicate-retry",
+    "fd-replace-retry",
+    "fd-cloexec-retry",
+    "fork-snapshot-retry",
+    "clone-snapshot-retry",
+    "clone-files-retry",
+    "stdout-acquire",
+    "stdin-poll",
+    "net-yield",
+];
+#[cfg(feature = "lock-stats")]
+const SUSPEND_PID_SLOTS: usize = 128;
+#[cfg(feature = "lock-stats")]
+static SUSPEND_REASON_PID_COUNTS: [AtomicU64; SUSPEND_REASON_NAMES.len() * SUSPEND_PID_SLOTS] =
+    [const { AtomicU64::new(0) }; SUSPEND_REASON_NAMES.len() * SUSPEND_PID_SLOTS];
+
+#[cfg(feature = "lock-stats")]
+pub(super) fn dump_suspend_reason_stats() {
+    for (reason, name) in SUSPEND_REASON_NAMES.iter().enumerate() {
+        for pid in 0..SUSPEND_PID_SLOTS {
+            let count = SUSPEND_REASON_PID_COUNTS[reason * SUSPEND_PID_SLOTS + pid]
+                .load(AtomicOrdering::Relaxed);
+            if count != 0 {
+                crate::println!(
+                    "[suspend-stats] reason={} pid={} count={}",
+                    name,
+                    pid,
+                    count,
+                );
+            }
+        }
+    }
+}
 
 pub(crate) fn register_files_task(task: &Arc<TaskControlBlock>) {
     let files_id = task.inner_exclusive_access().files_id;
@@ -203,21 +279,27 @@ pub fn complete_vfork(task: &Arc<TaskControlBlock>) {
 }
 
 pub(super) fn reap_exited_tasks() {
-    for task in manager::take_exited_tasks() {
+    if let Some(task) = manager::take_exited_task() {
         #[cfg(feature = "smp-diagnostics")]
         if task.getpid() >= 20 {
             println!("[reap-diag] begin tid={}", task.getpid());
         }
         processor::set_scheduler_phase(40);
-        let (parent, files_to_close) = {
+        let replacement_memory_set = crate::mm::MemorySet::new_bare();
+        let (parent, mut retired_memory_set, files_to_close) = {
             let mut inner = task.inner_exclusive_access();
             processor::set_scheduler_phase(41);
             let parent = inner.parent.as_ref().and_then(|weak| weak.upgrade());
-            inner.memory_set.recycle_data_pages_inactive();
-            processor::set_scheduler_phase(42);
+            let retired_memory_set =
+                core::mem::replace(&mut inner.memory_set, replacement_memory_set);
             let files = inner.drain_fd_table();
-            (parent, files)
+            (parent, retired_memory_set, files)
         };
+        // Page-table and frame destruction can take milliseconds for compiler
+        // processes. The task is already inactive, so keep that work outside
+        // TaskLock and with local interrupts enabled.
+        retired_memory_set.recycle_data_pages_inactive();
+        processor::set_scheduler_phase(42);
         processor::set_scheduler_phase(43);
         for file in files_to_close {
             file.close_ref();
@@ -243,9 +325,24 @@ pub fn reap_exited_task(pid: usize) {
 }
 
 pub fn suspend_current_and_run_next() {
+    suspend_current_and_run_next_reason(SuspendReason::Other);
+}
+
+pub(crate) fn suspend_current_and_run_next_reason(reason: SuspendReason) {
     //trace!("os::task::suspend_current_and_run_next");
     // There must be an application running.
     let task = current_task().unwrap();
+
+    #[cfg(feature = "lock-stats")]
+    {
+        let pid = task.getpid();
+        if pid < SUSPEND_PID_SLOTS {
+            SUSPEND_REASON_PID_COUNTS[reason as usize * SUSPEND_PID_SLOTS + pid]
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        }
+    }
+    #[cfg(not(feature = "lock-stats"))]
+    let _ = reason;
 
     //added for kernel time accounting
     task.record_time_suspend();
@@ -690,6 +787,7 @@ pub fn force_exit_task(task: &Arc<TaskControlBlock>, exit_code: i32) {
     if !manager::begin_exit(task, exit_code) {
         return;
     }
+    manager::wake_exec_peer_waiters(task.thread_group_id());
     crate::syscall::process::cleanup_task_exit_futexes(task);
     remove_from_pid2task(pid);
 
@@ -1017,9 +1115,10 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
     if !manager::begin_exit(&task, exit_code) {
         panic!("current task {} exited twice", task.getpid());
     }
+    manager::wake_exec_peer_waiters(task.thread_group_id());
     #[cfg(feature = "smp-diagnostics")]
     if exit_diag {
-        println!("[exit-diag] tid={} zombie", pid);
+        println!("[exit-diag] tid={} exit-published", pid);
     }
     if LIFECYCLE_TRACE_ENABLED {
         println!("[lifecycle] exit-zombie pid={}", pid);
@@ -1112,6 +1211,7 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
     // Resource teardown is deferred until this hart has switched to its idle
     // context and boot page table.  The idle reaper publishes cleanup_done and
     // performs the final waitpid wake.
+    manager::finish_current_exit(&task);
     if let Some(current) = take_current_task() {
         defer_drop_task(current);
     }
@@ -1145,30 +1245,6 @@ static EMBEDDED_INITPROC: &[u8] =
 pub fn add_initproc() {
     trace!("os::task::add_initproc");
     add_task(INITPROC.clone());
-}
-
-pub fn check_signals_error_of_current() -> Option<(i32, &'static str)> {
-    trace!("os::task::check_signals_error_of_current");
-    let task = current_task()?;
-    let task_inner = task.try_inner_exclusive_access()?;
-    // Only an unmasked signal with the default disposition is a fatal
-    // fallback here.  Looking at the raw pending bitmap killed processes
-    // which had a valid user SIGSEGV handler whenever delivery was deferred
-    // for one trap boundary (notably the repeated `lat_sig prot` fault).
-    let pending = task_inner.signals & !task_inner.signal_mask;
-    for sig in 1..=MAX_SIG {
-        let Some(signal) = SignalFlags::from_bits(1u64 << sig) else {
-            continue;
-        };
-        if pending.contains(signal)
-            && task_inner.signal_actions.lock().table[sig].handler == 0
-        {
-            if let Some(error) = signal.check_error() {
-                return Some(error);
-            }
-        }
-    }
-    None
 }
 
 fn default_signal_interrupts(signal: SignalFlags) -> bool {
@@ -1542,66 +1618,75 @@ pub fn restore_current_signal_context() -> Option<isize> {
     Some(ret)
 }
 
-fn check_pending_signals() {
+enum PendingSignalAction {
+    State { killed: bool, frozen: bool },
+    Kernel(SignalFlags),
+    User(usize, SignalFlags),
+}
+
+fn check_pending_signals() -> Option<(Arc<TaskControlBlock>, bool, bool)> {
     trace!("os::task::check_pending_signals");
-    let task = match current_task() {
-        Some(t) => t,
-        None => return,
-    };
-    for sig in 0..(MAX_SIG + 1) {
-        let signal = SignalFlags::from_bits(1u64 << sig).unwrap();
-        let (masked, kernel_signal) = {
-            let Some(mut task_inner) = task.try_inner_exclusive_access() else {
-                return;
-            };
-            let from_sigsuspend = task_inner.sigsuspend_delivery == Some(signal);
-            if !task_inner.signals.contains(signal)
-                || (!from_sigsuspend && task_inner.signal_mask.contains(signal))
-            {
-                continue;
-            }
-            let mut m = true;
-            if task_inner.handling_sig == -1 {
-                m = false;
-            } else {
-                let hs = task_inner.handling_sig as usize;
-                if !task_inner.signal_actions.lock().table[hs]
-                    .mask
-                    .contains(signal)
-                {
-                    m = false;
+    let task = current_task()?;
+    loop {
+        let action = {
+            let mut task_inner = task.try_inner_exclusive_access()?;
+            let mut deliverable = task_inner.signals & !task_inner.signal_mask;
+            if let Some(signal) = task_inner.sigsuspend_delivery {
+                if task_inner.signals.contains(signal) {
+                    deliverable.insert(signal);
                 }
             }
-            if m {
-                continue;
+            if task_inner.handling_sig != -1 {
+                let hs = task_inner.handling_sig as usize;
+                deliverable &= !task_inner.signal_actions.lock().table[hs].mask;
             }
-            if from_sigsuspend {
-                task_inner.sigsuspend_delivery = None;
+            let sig = deliverable.bits().trailing_zeros() as usize;
+            if sig > MAX_SIG {
+                PendingSignalAction::State {
+                    killed: task_inner.killed,
+                    frozen: task_inner.frozen,
+                }
+            } else {
+                let signal = SignalFlags::from_bits(1u64 << sig).unwrap();
+                if task_inner.sigsuspend_delivery == Some(signal) {
+                    task_inner.sigsuspend_delivery = None;
+                }
+                #[cfg(feature = "smp-diagnostics")]
+                if sig == 14 || sig == 15 {
+                    let signal_action = task_inner.signal_actions.lock().table[sig];
+                    println!(
+                        "[signal-diag] pending tid={} sig={} status={:?} mask={:#x} handling={} handler={:#x}",
+                        task.getpid(),
+                        sig,
+                        task_inner.task_status,
+                        task_inner.signal_mask.bits(),
+                        task_inner.handling_sig,
+                        signal_action.handler,
+                    );
+                }
+                if signal == SignalFlags::SIGKILL
+                    || signal == SignalFlags::SIGSTOP
+                    || signal == SignalFlags::SIGCONT
+                    || signal == SignalFlags::SIGDEF
+                {
+                    PendingSignalAction::Kernel(signal)
+                } else {
+                    PendingSignalAction::User(sig, signal)
+                }
             }
-            #[cfg(feature = "smp-diagnostics")]
-            if sig == 14 || sig == 15 {
-                let action = task_inner.signal_actions.lock().table[sig];
-                println!(
-                    "[signal-diag] pending tid={} sig={} status={:?} mask={:#x} handling={} handler={:#x}",
-                    task.getpid(),
-                    sig,
-                    task_inner.task_status,
-                    task_inner.signal_mask.bits(),
-                    task_inner.handling_sig,
-                    action.handler,
-                );
-            }
-            let is_kernel = signal == SignalFlags::SIGKILL
-                || signal == SignalFlags::SIGSTOP
-                || signal == SignalFlags::SIGCONT
-                || signal == SignalFlags::SIGDEF;
-            (false, is_kernel)
         };
-        if kernel_signal {
-            call_kernel_signal_handler(signal);
-        } else {
-            call_user_signal_handler(sig, signal);
-            return;
+        match action {
+            PendingSignalAction::State { killed, frozen } => {
+                return Some((task, killed, frozen));
+            }
+            PendingSignalAction::Kernel(signal) => call_kernel_signal_handler(signal),
+            PendingSignalAction::User(sig, signal) => {
+                call_user_signal_handler(sig, signal);
+                let task_inner = task.try_inner_borrow()?;
+                let state = (task_inner.killed, task_inner.frozen);
+                drop(task_inner);
+                return Some((task, state.0, state.1));
+            }
         }
     }
 }
@@ -1609,19 +1694,10 @@ fn check_pending_signals() {
 pub fn handle_signals() {
     trace!("os::task::handle_signals");
     loop {
-        check_pending_signals();
-        let killed = {
-            let task = match current_task() {
-                Some(t) => t,
-                None => break,
-            };
-            let Some(task_inner) = task.try_inner_borrow() else {
-                break;
-            };
-            task_inner.killed
+        let Some((task, killed, frozen)) = check_pending_signals() else {
+            break;
         };
         if killed {
-            let task = current_task().unwrap();
             let (exit_code, terminating_for_exec, terminating_for_group) = {
                 let inner = task.inner_exclusive_access();
                 let sig = inner.exit_signal;
@@ -1644,21 +1720,11 @@ pub fn handle_signals() {
             }
             exit_current_and_run_next(exit_code);
         }
-        let frozen = {
-            let task = match current_task() {
-                Some(t) => t,
-                None => break,
-            };
-            let Some(task_inner) = task.try_inner_borrow() else {
-                break;
-            };
-            task_inner.frozen
-        };
         if !frozen {
             break;
         }
         crate::fs::stdio::stdout_release_if_owner();
-        suspend_current_and_run_next();
+        suspend_current_and_run_next_reason(SuspendReason::Frozen);
     }
 }
 

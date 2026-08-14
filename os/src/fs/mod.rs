@@ -157,10 +157,11 @@ pub trait File: Send + Sync {
         }
         0x8000 | flags
     }
-    // 默认不允许修改打开标志。
-    // 执行时默认忽略传入 flags 并返回 false，表示这个对象不支持动态修改标志。
+    // Descriptors without mutable status silently ignore F_SETFL bits. Linux
+    // accepts O_NONBLOCK for regular and simple device files even when I/O is
+    // always immediately ready; stateful files override this method.
     fn set_flags(&self, _flags: usize) -> bool {
-        false
+        true
     }
     // 默认认为普通文件总是可读可写且无异常。
     // 执行时直接返回可读、可写、无挂断，特殊文件或 socket 可以覆盖成真实状态。

@@ -9,14 +9,28 @@ mod vpn_range;
 pub use frame_allocator::add_frames_range;
 pub use frame_allocator::{
     allocated_frames, available_frames, frame_alloc, frame_alloc_failures, frame_alloc_persist,
-    frame_dealloc, frames_alloc, total_frames, FrameTracker,
+    frame_dealloc, frames_alloc, frames_alloc_batch, total_frames, FrameTracker,
 };
 #[cfg(feature = "smp-diagnostics")]
 pub use frame_allocator::{
     take_watched_frame_corruption, watch_frame, watched_frame_is_intact, watched_frame_paddr,
 };
-pub use heap_allocator::{add_heap_region, init_heap};
+pub use heap_allocator::{add_heap_region, heap_total_bytes, init_heap};
+#[cfg(feature = "lock-stats")]
+pub use heap_allocator::dump_heap_allocator_stats;
 pub use file_page_cache::invalidate_file_page_cache;
+#[cfg(feature = "lock-stats")]
+pub use file_page_cache::dump_file_page_cache_stats;
+pub(crate) use file_page_cache::{
+    cache_file_read, invalidate_file_page_cache_after_write, read_file_page_cache,
+    reserve_file_page_cache_read, wait_for_file_page_load, FilePageCacheRead,
+    FilePageCacheReadLoad, FilePageCacheWriteGuard, FILE_PAGE_READAHEAD_SIZE,
+};
+pub(crate) use frame_allocator::frames_dealloc_batch;
+#[cfg(feature = "lock-stats")]
+pub(crate) use file_page_cache::{
+    record_file_page_cache_hit, record_file_page_cache_miss,
+};
 pub use memory_set::{
     get_elf_interp, get_elf_interp_file, last_page_fault_failure, AddressSpaceActivityHandle,
     LoadedElf, MapArea, MapPermission, MapType, MemorySet, PageFaultAccess, PageFaultResult,

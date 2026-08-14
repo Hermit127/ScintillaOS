@@ -117,7 +117,6 @@ const SYSCALL_RSEQ: usize = 293;
 const SYSCALL_RISCV_HWPROBE: usize = 258;
 #[cfg(any(feature = "smp-diagnostics", feature = "buildstorm-diagnostics"))]
 const SYSCALL_FSOPEN: usize = 430;
-#[cfg(any(feature = "smp-diagnostics", feature = "buildstorm-diagnostics"))]
 const SYSCALL_CLONE3: usize = 435;
 const SYSCALL_CLONE: usize = 220;
 const SYSCALL_FORK: usize = 401;
@@ -524,6 +523,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SETGROUPS => sys_setgroups(args[0], args[1] as *const u32),
         SYSCALL_SET_TID_ADDRESS => sys_set_tid_address(args[0] as *mut i32),
         SYSCALL_CLONE => sys_clone(args[0], args[1], args[2], args[3], args[4]),
+        SYSCALL_CLONE3 => sys_clone3(args[0] as *const u8, args[1]),
         SYSCALL_FORK => sys_fork(),
         SYSCALL_EXEC => sys_exec(
             args[0] as *const u8,
@@ -720,7 +720,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     if ret == -38
         && !matches!(
             syscall_id,
-            SYSCALL_RSEQ | SYSCALL_RISCV_HWPROBE | SYSCALL_FSOPEN | SYSCALL_CLONE3
+            SYSCALL_RSEQ | SYSCALL_RISCV_HWPROBE | SYSCALL_FSOPEN
         )
     {
         crate::println!(

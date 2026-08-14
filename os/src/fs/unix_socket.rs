@@ -292,14 +292,21 @@ impl UnixSocketFile {
         }
     }
 
+    pub(crate) fn send_staging_len(&self, len: usize) -> Result<usize, isize> {
+        match self.kind {
+            UnixSocketKind::Stream => Ok(len.min(UNIX_SOCKET_PACKET_BYTES)),
+            UnixSocketKind::SeqPacket if len > UNIX_SOCKET_PACKET_BYTES => Err(-90),
+            UnixSocketKind::SeqPacket => Ok(len),
+        }
+    }
+
     pub fn send_with_flags(&self, buf: &[u8], flags: usize) -> isize {
         if buf.is_empty() {
             return 0;
         }
-        let write_len = match self.kind {
-            UnixSocketKind::Stream => buf.len().min(UNIX_SOCKET_PACKET_BYTES),
-            UnixSocketKind::SeqPacket if buf.len() > UNIX_SOCKET_PACKET_BYTES => return -90,
-            UnixSocketKind::SeqPacket => buf.len(),
+        let write_len = match self.send_staging_len(buf.len()) {
+            Ok(len) => len,
+            Err(errno) => return errno,
         };
         let packet = match Self::copy_packet(&buf[..write_len]) {
             Ok(packet) => packet,

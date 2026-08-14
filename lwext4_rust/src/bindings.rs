@@ -91,7 +91,7 @@ pub const CONFIG_HAVE_OWN_OFLAGS: u32 = 1;
 pub const CONFIG_HAVE_OWN_ERRNO: u32 = 1;
 pub const CONFIG_HAVE_OWN_ASSERT: u32 = 1;
 pub const CONFIG_USE_USER_MALLOC: u32 = 0;
-pub const CONFIG_BLOCK_DEV_CACHE_SIZE: u32 = 256;
+pub const CONFIG_BLOCK_DEV_CACHE_SIZE: u32 = 4096;
 pub const F_SET_EXT2: u32 = 2;
 pub const F_SET_EXT3: u32 = 3;
 pub const F_SET_EXT4: u32 = 4;
@@ -1775,6 +1775,16 @@ unsafe extern "C" {
     pub fn ext4_fremove(path: *const ::core::ffi::c_char) -> ::core::ffi::c_int;
 }
 unsafe extern "C" {
+    #[doc = "@brief Remove a child below an already resolved parent inode."]
+    pub fn ext4_remove_at(
+        mount_point: *const ::core::ffi::c_char,
+        parent_inode: u32,
+        child_inode: u32,
+        name: *const ::core::ffi::c_char,
+        is_dir: bool,
+    ) -> ::core::ffi::c_int;
+}
+unsafe extern "C" {
     #[doc = "@brief   Create a hardlink for a file.\n\n @param   path Path to file.\n @param   hardlink_path Path of hardlink.\n\n @return  Standard error code."]
     pub fn ext4_flink(
         path: *const ::core::ffi::c_char,
@@ -1800,6 +1810,21 @@ unsafe extern "C" {
     ) -> ::core::ffi::c_int;
 }
 unsafe extern "C" {
+    #[doc = "@brief Rename below already resolved source and destination directories."]
+    pub fn ext4_rename_at2(
+        mount_point: *const ::core::ffi::c_char,
+        source_parent_inode: u32,
+        source_inode: u32,
+        source_name: *const ::core::ffi::c_char,
+        target_parent_inode: u32,
+        target_name: *const ::core::ffi::c_char,
+        replaced_name: *const ::core::ffi::c_char,
+        flags: u32,
+        replaced_inode: *mut u32,
+        replaced_is_dir: *mut bool,
+    ) -> ::core::ffi::c_int;
+}
+unsafe extern "C" {
     #[doc = "@brief   File open function.\n\n @param   file  File handle.\n @param   path  File path, has to start from mount point:/my_partition/file.\n @param   flags File open flags.\n  |---------------------------------------------------------------|\n  |   r or rb                 O_RDONLY                            |\n  |---------------------------------------------------------------|\n  |   w or wb                 O_WRONLY|O_CREAT|O_TRUNC            |\n  |---------------------------------------------------------------|\n  |   a or ab                 O_WRONLY|O_CREAT|O_APPEND           |\n  |---------------------------------------------------------------|\n  |   r+ or rb+ or r+b        O_RDWR                              |\n  |---------------------------------------------------------------|\n  |   w+ or wb+ or w+b        O_RDWR|O_CREAT|O_TRUNC              |\n  |---------------------------------------------------------------|\n  |   a+ or ab+ or a+b        O_RDWR|O_CREAT|O_APPEND             |\n  |---------------------------------------------------------------|\n\n @return  Standard error code."]
     pub fn ext4_fopen(
         file: *mut ext4_file,
@@ -1813,6 +1838,29 @@ unsafe extern "C" {
         file: *mut ext4_file,
         path: *const ::core::ffi::c_char,
         flags: ::core::ffi::c_int,
+    ) -> ::core::ffi::c_int;
+}
+unsafe extern "C" {
+    #[doc = "@brief   Atomically create a regular file with its initial attributes.\n\n @param   file File handle returned for the new file.\n @param   path Absolute mounted path of the new file.\n @param   mode Initial permission bits.\n @param   uid  Initial owner user id.\n @param   gid  Initial owner group id.\n\n @return  EEXIST if the path already exists, otherwise a standard error code."]
+    pub fn ext4_fcreate_with_attrs(
+        file: *mut ext4_file,
+        path: *const ::core::ffi::c_char,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> ::core::ffi::c_int;
+}
+unsafe extern "C" {
+    #[doc = "@brief Create a file or directory below an already resolved parent inode."]
+    pub fn ext4_create_at_with_attrs(
+        file: *mut ext4_file,
+        mount_point: *const ::core::ffi::c_char,
+        parent_inode: u32,
+        name: *const ::core::ffi::c_char,
+        is_dir: bool,
+        mode: u32,
+        uid: u32,
+        gid: u32,
     ) -> ::core::ffi::c_int;
 }
 unsafe extern "C" {

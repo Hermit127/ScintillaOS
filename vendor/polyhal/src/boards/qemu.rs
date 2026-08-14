@@ -1,6 +1,6 @@
 use riscv::register::sstatus;
 
-pub const CLOCK_FREQ: usize = 12500000;
+pub const CLOCK_FREQ: usize = 10_000_000;
 
 pub fn init_device(hartid: usize, device_tree: usize) -> (usize, usize) {
     // 开启SUM位 让内核可以访问用户空间  踩坑：
