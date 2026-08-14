@@ -24,6 +24,7 @@
 | 合入的 `origin/main` | `ed815ffc003ccc567d7b4b8da1fcdca349d12905` |
 | 显式 merge commit，仅本地 | `41462075aa60004260892ce410d67f7fa81b6faa` |
 | 合并后文件写回和验证器修复，仅本地 | `0d7dd76be39891f1818c595062e52e752b4b7690` |
+| 高位用户 sockaddr 安全复制修复，仅本地 | `0b9ef7445dc13703442b94f5bf03b6c68488a8dd` |
 
 远程 `origin/on-site-final-2025-fixes` 当前停在 `a82b4ab`。merge、合并后修复及本文档提交都不应在未获明确授权时 push。
 
@@ -117,7 +118,8 @@ Git 和 Vim 依赖比普通文件写入更严格的语义：Git 配置用 `.lock
 - `/etc/resolv.conf` 由用户态测试覆盖层写入，内核不修改官方 raw 镜像。
 - 全局临时端口避免按 fd 重用同一源端口。
 - 修复 `getsockname`、`SO_ERROR`、TCP FIN/EOF、UDP 真实源地址、`MSG_PEEK` 和 close/abort 生命周期。
-- 用户缓冲沿用 main 的安全准备与 `copy_to_task_user` 路径。
+- sockaddr 输入/输出通过任务页表的 `copy_user_value`/`write_user_value` 复制，不能在内核态直接解引用用户虚拟地址；这覆盖了 musl `getent` 使用的 `0x1000000000` 以上高位映射。
+- 其余用户缓冲沿用 main 的安全准备与 `copy_to_task_user` 路径。
 
 测试环境外网经过宿主 HTTP CONNECT 代理。代理中继只监听 loopback、使用有界缓冲且不记录载荷；它只转发连接，不伪造 Git 结果。
 
@@ -256,7 +258,7 @@ make onsite-2025-proxy-relay
 make verify-onsite-2025-git-clone
 ```
 
-只有看到 `GIT_CLONE_RC=0`、有效提交号、`GIT_CLONE_TREE_OK` 和 `qemu-img check` 无错误才算 clone 通过。
+只有看到 `GETENT_DNS_OK`、`GIT_CLONE_RC=0`、有效提交号、`GIT_CLONE_TREE_OK` 和 `qemu-img check` 无错误才算 clone 通过。
 
 合并后完整 clone 已通过，官方仓库 HEAD 为：
 
@@ -378,6 +380,10 @@ qemu-img check artifacts/onsite2025/<UTC 时间>/alpine-overlay.qcow2
 ### Git 网络卡住或超时 300 秒
 
 依次检查：内核 DHCP 日志、`/etc/resolv.conf`、宿主代理、`make onsite-2025-proxy-relay` 是否仍在运行、客体两个 proxy 环境变量。先通过 network 回归，再做完整 clone。
+
+### `getent` 触发 `read page fault outside a valid user task`
+
+若 `sepc` 落在 `sys_connect` 且 `bad` 是类似 `0x1000091558` 的高位用户地址，说明网络系统调用直接解引用了用户 sockaddr。提交 `0b9ef744` 已改为经任务页表安全复制。复测必须同时出现 `GETENT_DNS_OK`、完整 clone 成功和网络回归的 `NETWORK_SOCKNAME_OK`/`NETWORK_TCP_EOF_OK`，不能只确认内核不 panic。
 
 ### Git 用户名提示后 Enter 无反应
 
