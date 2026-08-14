@@ -2242,12 +2242,14 @@ fn current_signal_sender(code: i32) -> PendingSignalInfo {
                 code,
                 sender_pid: inner.tgid as i32,
                 sender_uid: inner.euid,
+                ..PendingSignalInfo::default()
             }
         })
         .unwrap_or(PendingSignalInfo {
             code,
             sender_pid: 0,
             sender_uid: 0,
+            ..PendingSignalInfo::default()
         })
 }
 
@@ -3748,7 +3750,19 @@ pub fn sys_ppoll(
                     && ((pfd.events & POLLOUT) == 0 || !writable)
             })
         };
-        if let Some(deadline) = deadline_ns {
+        let polls_console_input = pollfds.iter().zip(files.iter()).any(|(pfd, file)| {
+            pfd.events & POLLIN != 0
+                && file.as_ref().is_some_and(|file| {
+                    file.as_any().is::<crate::fs::Stdin>()
+                        || file.as_any().is::<crate::fs::DevTty>()
+                })
+        });
+        // The polled debug UART has no interrupt-backed wait queue.  Keep a
+        // console waiter runnable so it can sample the UART again after other
+        // tasks and timer interrupts have made progress.
+        if polls_console_input {
+            suspend_current_and_run_next();
+        } else if let Some(deadline) = deadline_ns {
             block_current_until_if(BlockReason::PollWait, deadline, still_not_ready);
         } else {
             block_current_and_run_next_if(BlockReason::PollWait, still_not_ready);
@@ -4379,32 +4393,33 @@ struct RtSignalInfo {
     si_errno: i32,
     si_code: i32,
     _pad0: i32,
-    si_pid: i32,
-    si_uid: u32,
-    si_status: i32,
-    _pad1: i32,
-    si_utime: isize,
-    si_stime: isize,
-    _pad: [u8; 128 - 40],
+    data: [u8; 112],
 }
 
-fn write_signal_siginfo(task: &Arc<TaskControlBlock>, info_ptr: *mut u8, signum: i32) -> bool {
+fn write_signal_siginfo(
+    task: &Arc<TaskControlBlock>,
+    info_ptr: *mut u8,
+    signum: i32,
+    pending: PendingSignalInfo,
+) -> bool {
     if info_ptr.is_null() {
         return true;
     }
-    let info = RtSignalInfo {
+    let mut info = RtSignalInfo {
         si_signo: signum,
         si_errno: 0,
-        si_code: 0,
+        si_code: pending.code,
         _pad0: 0,
-        si_pid: 0,
-        si_uid: 0,
-        si_status: 0,
-        _pad1: 0,
-        si_utime: 0,
-        si_stime: 0,
-        _pad: [0; 128 - 40],
+        data: [0; 112],
     };
+    if pending.code == -2 {
+        info.data[0..4].copy_from_slice(&pending.timer_id.to_ne_bytes());
+        info.data[4..8].copy_from_slice(&pending.overrun.to_ne_bytes());
+        info.data[8..16].copy_from_slice(&pending.value.to_ne_bytes());
+    } else {
+        info.data[0..4].copy_from_slice(&pending.sender_pid.to_ne_bytes());
+        info.data[4..8].copy_from_slice(&pending.sender_uid.to_ne_bytes());
+    }
     write_user_value(task, info_ptr as *mut RtSignalInfo, &info)
 }
 
@@ -4425,6 +4440,14 @@ pub fn sys_rt_sigtimedwait(
     wanted.remove(SignalFlags::SIGKILL | SignalFlags::SIGSTOP);
     if wanted.is_empty() {
         return -22;
+    }
+    #[cfg(feature = "smp-diagnostics")]
+    if wanted.contains(SignalFlags::SIGRTMIN) {
+        crate::println!(
+            "[signal-diag] sigtimedwait-enter tid={} wanted={:#x}",
+            task.getpid(),
+            wanted.bits(),
+        );
     }
 
     let timeout_ns = if timeout.is_null() {
@@ -4456,8 +4479,10 @@ pub fn sys_rt_sigtimedwait(
             for sig in 1..=MAX_SIG {
                 if let Some(flag) = SignalFlags::from_bits(1u64 << sig) {
                     if pending.contains(flag) {
+                        let pending_info = inner.pending_signal_info[sig];
                         inner.signals.remove(flag);
-                        selected = Some(flag);
+                        inner.pending_signal_info[sig] = PendingSignalInfo::default();
+                        selected = Some((flag, pending_info));
                         break;
                     }
                 }
@@ -4465,9 +4490,15 @@ pub fn sys_rt_sigtimedwait(
             selected
         };
 
-        if let Some(signal) = found {
+        if let Some((signal, pending_info)) = found {
             let signum = signal_number(signal);
-            if !write_signal_siginfo(&task, info, signum) {
+            #[cfg(feature = "smp-diagnostics")]
+            crate::println!(
+                "[signal-diag] sigtimedwait-found tid={} signal={}",
+                task.getpid(),
+                signum,
+            );
+            if !write_signal_siginfo(&task, info, signum, pending_info) {
                 return -14;
             }
             return signum as isize;
@@ -5130,7 +5161,16 @@ pub fn sys_pselect6(
                     && (!fd_isset(&orig_efds, fd) || !error)
             })
         };
-        if let Some(deadline) = deadline_ns {
+        let selects_console_input = files.iter().enumerate().any(|(fd, file)| {
+            fd_isset(&orig_rfds, fd)
+                && file.as_ref().is_some_and(|file| {
+                    file.as_any().is::<crate::fs::Stdin>()
+                        || file.as_any().is::<crate::fs::DevTty>()
+                })
+        });
+        if selects_console_input {
+            suspend_current_and_run_next();
+        } else if let Some(deadline) = deadline_ns {
             block_current_until_if(BlockReason::PollWait, deadline, still_not_ready);
         } else {
             block_current_and_run_next_if(BlockReason::PollWait, still_not_ready);
@@ -5599,6 +5639,290 @@ pub fn sys_get_robust_list(pid: usize, head_ptr: *mut usize, len_ptr: *mut usize
         -14
     } else {
         0
+    }
+}
+
+const CLOCK_REALTIME: i32 = 0;
+const CLOCK_MONOTONIC: i32 = 1;
+const TIMER_ABSTIME: usize = 1;
+const SIGEV_SIGNAL: i32 = 0;
+const SIGEV_NONE: i32 = 1;
+const SIGEV_THREAD_ID: i32 = 4;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PosixTimeSpec {
+    tv_sec: isize,
+    tv_nsec: isize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PosixITimerSpec {
+    it_interval: PosixTimeSpec,
+    it_value: PosixTimeSpec,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct UserSigEvent {
+    value: usize,
+    signo: i32,
+    notify: i32,
+    thread_id: i32,
+    padding: [u8; 44],
+}
+
+fn posix_timer_owner() -> Option<Arc<TaskControlBlock>> {
+    let current = current_task()?;
+    let tgid = current.inner_exclusive_access().tgid;
+    pid2task(tgid).or(Some(current))
+}
+
+fn timespec_to_us(value: PosixTimeSpec) -> Result<u64, isize> {
+    if value.tv_sec < 0 || value.tv_nsec < 0 || value.tv_nsec >= 1_000_000_000 {
+        return Err(-22);
+    }
+    (value.tv_sec as u64)
+        .checked_mul(1_000_000)
+        .and_then(|seconds| seconds.checked_add(value.tv_nsec as u64 / 1_000))
+        .ok_or(-22)
+}
+
+fn us_to_timespec(value: u64) -> PosixTimeSpec {
+    PosixTimeSpec {
+        tv_sec: (value / 1_000_000) as isize,
+        tv_nsec: ((value % 1_000_000) * 1_000) as isize,
+    }
+}
+
+fn posix_timer_spec(timer: &crate::task::PosixTimer, now: u64) -> PosixITimerSpec {
+    PosixITimerSpec {
+        it_interval: us_to_timespec(timer.interval_us),
+        it_value: us_to_timespec(timer.expire_us.saturating_sub(now)),
+    }
+}
+
+pub fn sys_timer_create(clock_id: i32, event: *const u8, timer_id: *mut i32) -> isize {
+    #[cfg(feature = "smp-diagnostics")]
+    crate::println!(
+        "[posix-timer-diag] create clock={} event={:#x} result={:#x}",
+        clock_id,
+        event as usize,
+        timer_id as usize,
+    );
+    if !matches!(clock_id, CLOCK_REALTIME | CLOCK_MONOTONIC) {
+        return -22;
+    }
+    if timer_id.is_null() {
+        return -14;
+    }
+    let current = current_task().unwrap();
+    if !prepare_task_user_access(
+        &current,
+        timer_id as usize,
+        core::mem::size_of::<i32>(),
+        true,
+    ) {
+        return -14;
+    }
+    let (signal, target_tid, signal_value) = if event.is_null() {
+        (14, 0, 0)
+    } else {
+        let Some(event) = copy_user_value(&current, event as *const UserSigEvent) else {
+            return -14;
+        };
+        match event.notify {
+            SIGEV_SIGNAL if event.signo > 0 && event.signo as usize <= MAX_SIG => {
+                (event.signo, 0, event.value)
+            }
+            SIGEV_NONE => (0, 0, event.value),
+            SIGEV_THREAD_ID if event.signo > 0 && event.signo as usize <= MAX_SIG => {
+                if event.thread_id <= 0 {
+                    return -22;
+                }
+                let current_tgid = current.inner_exclusive_access().tgid;
+                let Some(target) = pid2task(event.thread_id as usize) else {
+                    return -3;
+                };
+                if target.inner_exclusive_access().tgid != current_tgid {
+                    return -22;
+                }
+                (event.signo, event.thread_id as usize, event.value)
+            }
+            _ => return -22,
+        }
+    };
+    #[cfg(feature = "smp-diagnostics")]
+    crate::println!(
+        "[posix-timer-diag] event signal={} target_tid={}",
+        signal,
+        target_tid,
+    );
+    let Some(owner) = posix_timer_owner() else {
+        return -3;
+    };
+    let timer_id_value = {
+        let mut inner = owner.inner_exclusive_access();
+        let timer = crate::task::PosixTimer {
+            clock_id,
+            signal,
+            target_tid,
+            value: signal_value,
+            expire_us: 0,
+            interval_us: 0,
+            overrun: 0,
+        };
+        if let Some(index) = inner.posix_timers.iter().position(Option::is_none) {
+            inner.posix_timers[index] = Some(timer);
+            index
+        } else {
+            inner.posix_timers.push(Some(timer));
+            inner.posix_timers.len() - 1
+        }
+    };
+    if timer_id_value > i32::MAX as usize {
+        return -11;
+    }
+    if write_user_value(&current, timer_id, &(timer_id_value as i32)) {
+        0
+    } else {
+        -14
+    }
+}
+
+pub fn sys_timer_gettime(timer_id: i32, current_value: *mut u8) -> isize {
+    if timer_id < 0 || current_value.is_null() {
+        return if current_value.is_null() { -14 } else { -22 };
+    }
+    let current = current_task().unwrap();
+    let Some(owner) = posix_timer_owner() else {
+        return -3;
+    };
+    let now = Time::now().to_usec() as u64;
+    let spec = {
+        let inner = owner.inner_exclusive_access();
+        let Some(timer) = inner
+            .posix_timers
+            .get(timer_id as usize)
+            .and_then(Option::as_ref)
+        else {
+            return -22;
+        };
+        posix_timer_spec(timer, now)
+    };
+    if write_user_value(&current, current_value as *mut PosixITimerSpec, &spec) {
+        0
+    } else {
+        -14
+    }
+}
+
+pub fn sys_timer_getoverrun(timer_id: i32) -> isize {
+    if timer_id < 0 {
+        return -22;
+    }
+    let Some(owner) = posix_timer_owner() else {
+        return -3;
+    };
+    let inner = owner.inner_exclusive_access();
+    inner
+        .posix_timers
+        .get(timer_id as usize)
+        .and_then(Option::as_ref)
+        .map(|timer| timer.overrun as isize)
+        .unwrap_or(-22)
+}
+
+pub fn sys_timer_settime(
+    timer_id: i32,
+    flags: usize,
+    new_value: *const u8,
+    old_value: *mut u8,
+) -> isize {
+    if timer_id < 0 || flags & !TIMER_ABSTIME != 0 {
+        return -22;
+    }
+    if new_value.is_null() {
+        return -14;
+    }
+    let current = current_task().unwrap();
+    let Some(new_spec) = copy_user_value(&current, new_value as *const PosixITimerSpec) else {
+        return -14;
+    };
+    #[cfg(feature = "smp-diagnostics")]
+    crate::println!(
+        "[posix-timer-diag] set id={} flags={:#x} value={}.{} interval={}.{}",
+        timer_id,
+        flags,
+        new_spec.it_value.tv_sec,
+        new_spec.it_value.tv_nsec,
+        new_spec.it_interval.tv_sec,
+        new_spec.it_interval.tv_nsec,
+    );
+    let Ok(value_us) = timespec_to_us(new_spec.it_value) else {
+        return -22;
+    };
+    let Ok(interval_us) = timespec_to_us(new_spec.it_interval) else {
+        return -22;
+    };
+    let Some(owner) = posix_timer_owner() else {
+        return -3;
+    };
+    let now_monotonic = Time::now().to_usec() as u64;
+    let (old_spec, expire_us) = {
+        let mut inner = owner.inner_exclusive_access();
+        let Some(timer) = inner
+            .posix_timers
+            .get_mut(timer_id as usize)
+            .and_then(Option::as_mut)
+        else {
+            return -22;
+        };
+        let old_spec = posix_timer_spec(timer, now_monotonic);
+        let expire_us = if value_us == 0 {
+            0
+        } else if flags & TIMER_ABSTIME == 0 {
+            now_monotonic.saturating_add(value_us)
+        } else {
+            let clock_now = if timer.clock_id == CLOCK_REALTIME {
+                crate::time::realtime_us()
+            } else {
+                now_monotonic
+            };
+            now_monotonic.saturating_add(value_us.saturating_sub(clock_now))
+        };
+        timer.expire_us = expire_us;
+        timer.interval_us = interval_us;
+        timer.overrun = 0;
+        (old_spec, expire_us)
+    };
+    if !old_value.is_null()
+        && !write_user_value(&current, old_value as *mut PosixITimerSpec, &old_spec)
+    {
+        return -14;
+    }
+    if expire_us != 0 {
+        crate::task::publish_itimer_deadline(expire_us);
+    }
+    0
+}
+
+pub fn sys_timer_delete(timer_id: i32) -> isize {
+    if timer_id < 0 {
+        return -22;
+    }
+    let Some(owner) = posix_timer_owner() else {
+        return -3;
+    };
+    let mut inner = owner.inner_exclusive_access();
+    let Some(slot) = inner.posix_timers.get_mut(timer_id as usize) else {
+        return -22;
+    };
+    if slot.take().is_some() {
+        0
+    } else {
+        -22
     }
 }
 

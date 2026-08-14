@@ -301,7 +301,11 @@ impl Device for VirtIONetAdapter {
             let mut inner = self.inner.exclusive_access();
             match inner.net.receive() {
                 Ok(rx_buf) => {
-                    let data = rx_buf.as_bytes();
+                    // `as_bytes()` starts with the device-only
+                    // `virtio_net_hdr`.  smoltcp expects the Ethernet header
+                    // at byte zero, so exposing that buffer directly makes
+                    // every received ARP/DHCP/TCP frame look malformed.
+                    let data = rx_buf.packet();
                     let len = data.len().min(NET_BUF_SIZE);
                     self.rx_buf[..len].copy_from_slice(&data[..len]);
                     self.rx_len = len;

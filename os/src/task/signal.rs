@@ -8,6 +8,9 @@ pub struct PendingSignalInfo {
     pub code: i32,
     pub sender_pid: i32,
     pub sender_uid: u32,
+    pub timer_id: i32,
+    pub overrun: i32,
+    pub value: usize,
 }
 
 bitflags! {

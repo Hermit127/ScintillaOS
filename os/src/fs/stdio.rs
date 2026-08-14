@@ -4,11 +4,188 @@ use polyhal::debug_console::DebugConsole;
 use super::{File, Kstat, S_IFBLK, S_IFCHR, S_IFREG, S_IFSOCK};
 use crate::sync::DeviceLock;
 use crate::task::{current_task, pid2task, suspend_current_and_run_next};
+use alloc::collections::VecDeque;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering};
+use lazy_static::*;
 
 static STDOUT_BUSY: AtomicBool = AtomicBool::new(false);
 static STDOUT_OWNER: AtomicI32 = AtomicI32::new(0);
+// Linux asm-generic termios input flags.  Keep the hot UART receive path
+// independent of the ioctl data lock while preserving the settings exposed
+// by TCGETS/TCSETS.
+const INLCR: u32 = 0x0040;
+const IGNCR: u32 = 0x0080;
+const ICRNL: u32 = 0x0100;
+const ICANON: u32 = 0x0002;
+const ECHO: u32 = 0x0008;
+const ECHOE: u32 = 0x0010;
+const ECHOK: u32 = 0x0020;
+const ECHONL: u32 = 0x0040;
+static CONSOLE_INPUT_FLAGS: AtomicU32 = AtomicU32::new(0x0500);
+static CONSOLE_LOCAL_FLAGS: AtomicU32 = AtomicU32::new(0x8a3b);
+static CONSOLE_VERASE: AtomicU8 = AtomicU8::new(0x7f);
+static CONSOLE_VKILL: AtomicU8 = AtomicU8::new(0x15);
+
+struct ConsoleInputState {
+    ready: VecDeque<u8>,
+    canonical: Vec<u8>,
+}
+
+lazy_static! {
+    static ref CONSOLE_INPUT: DeviceLock<ConsoleInputState> = DeviceLock::new_named(
+        ConsoleInputState {
+            ready: VecDeque::new(),
+            canonical: Vec::new(),
+        },
+        "Console.input",
+    );
+}
+
+pub fn set_console_termios(input_flags: u32, local_flags: u32, control_chars: &[u8; 19]) {
+    let was_canonical = CONSOLE_LOCAL_FLAGS.load(Ordering::Acquire) & ICANON != 0;
+    CONSOLE_INPUT_FLAGS.store(input_flags, Ordering::Release);
+    CONSOLE_VERASE.store(control_chars[2], Ordering::Release);
+    CONSOLE_VKILL.store(control_chars[3], Ordering::Release);
+    CONSOLE_LOCAL_FLAGS.store(local_flags, Ordering::Release);
+
+    if was_canonical && local_flags & ICANON == 0 {
+        let mut input = CONSOLE_INPUT.lock();
+        let ConsoleInputState { ready, canonical } = &mut *input;
+        ready.extend(canonical.drain(..));
+    }
+}
+
+pub fn flush_console_input() {
+    let mut input = CONSOLE_INPUT.lock();
+    input.ready.clear();
+    input.canonical.clear();
+}
+
+fn translate_console_input(byte: u8) -> Option<u8> {
+    let flags = CONSOLE_INPUT_FLAGS.load(Ordering::Acquire);
+    if byte == b'\r' {
+        if flags & IGNCR != 0 {
+            return None;
+        }
+        if flags & ICRNL != 0 {
+            return Some(b'\n');
+        }
+    } else if byte == b'\n' && flags & INLCR != 0 {
+        return Some(b'\r');
+    }
+    Some(byte)
+}
+
+fn echo_console_input(bytes: &[u8]) {
+    crate::console::write_bytes(bytes);
+}
+
+fn process_console_byte(input: &mut ConsoleInputState, byte: u8, echo_enabled: bool) {
+    let Some(byte) = translate_console_input(byte) else {
+        return;
+    };
+    let local_flags = CONSOLE_LOCAL_FLAGS.load(Ordering::Acquire);
+    if local_flags & ICANON == 0 {
+        input.ready.push_back(byte);
+        if echo_enabled && local_flags & ECHO != 0 {
+            echo_console_input(&[byte]);
+        }
+        return;
+    }
+
+    let erase = CONSOLE_VERASE.load(Ordering::Acquire);
+    if erase != 0 && byte == erase {
+        if input.canonical.pop().is_some() && echo_enabled && local_flags & ECHO != 0 {
+            if local_flags & ECHOE != 0 {
+                echo_console_input(b"\x08 \x08");
+            } else {
+                echo_console_input(&[byte]);
+            }
+        }
+        return;
+    }
+
+    let kill = CONSOLE_VKILL.load(Ordering::Acquire);
+    if kill != 0 && byte == kill {
+        input.canonical.clear();
+        if echo_enabled && local_flags & ECHO != 0 && local_flags & ECHOK != 0 {
+            echo_console_input(b"\n");
+        }
+        return;
+    }
+
+    if input.canonical.len() < 4095 || byte == b'\n' {
+        input.canonical.push(byte);
+    }
+    if echo_enabled
+        && (local_flags & ECHO != 0 || byte == b'\n' && local_flags & ECHONL != 0)
+    {
+        echo_console_input(&[byte]);
+    }
+    if byte == b'\n' {
+        let ConsoleInputState { ready, canonical } = input;
+        ready.extend(canonical.drain(..));
+    }
+}
+
+fn pump_console_input(input: &mut ConsoleInputState, echo_enabled: bool) {
+    for _ in 0..4096 {
+        let Some(byte) = DebugConsole::getchar() else {
+            break;
+        };
+        process_console_byte(input, byte, echo_enabled);
+    }
+}
+
+/// Pull every byte currently waiting in the UART into the console queue.
+/// Keeping the byte found by poll is essential: a readiness probe must not
+/// consume input that the following read expects to receive.
+pub fn console_input_available(echo_enabled: bool) -> usize {
+    let mut input = CONSOLE_INPUT.lock();
+    pump_console_input(&mut input, echo_enabled);
+    input.ready.len()
+}
+
+fn console_read(user_buf: &mut [u8], echo_enabled: bool) -> isize {
+    if user_buf.is_empty() {
+        return 0;
+    }
+    loop {
+        let read = {
+            let mut input = CONSOLE_INPUT.lock();
+            pump_console_input(&mut input, echo_enabled);
+            let mut read = 0;
+            while read < user_buf.len() {
+                let Some(byte) = input.ready.pop_front() else {
+                    break;
+                };
+                user_buf[read] = byte;
+                read += 1;
+            }
+            read
+        };
+        if read != 0 {
+            #[cfg(feature = "smp-diagnostics")]
+            for byte in &user_buf[..read] {
+                crate::println!("[tty-input-diag] byte={:#04x}", byte);
+            }
+            return read as isize;
+        }
+        stdout_release_if_owner();
+        suspend_current_and_run_next();
+    }
+}
+
+fn console_write(user_buf: &mut [u8]) -> isize {
+    stdout_acquire();
+    while STDOUT_BUSY.swap(true, Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+    crate::console::write_bytes(user_buf);
+    STDOUT_BUSY.store(false, Ordering::Release);
+    user_buf.len() as isize
+}
 
 // 让同一个进程连续写 stdout 时独占输出，减少 printf 被打散后互相穿插。
 // 执行时读取当前 pid，若 stdout 空闲就用原子 compare_exchange 抢占，否则主动让出 CPU 等待。
@@ -85,22 +262,15 @@ impl File for Stdin {
     // 从调试串口读一个字节；暂时没输入就主动切出去等。
     // 执行时先处理空缓冲区，再循环查询 DebugConsole；没字符时释放 stdout 并让出 CPU。
     fn read(&self, user_buf: &mut [u8]) -> isize {
-        if user_buf.is_empty() {
-            return 0;
-        }
-        loop {
-            if let Some(c) = DebugConsole::getchar() {
-                user_buf[0] = c;
-                return 1;
-            }
-            stdout_release_if_owner();
-            suspend_current_and_run_next();
-        }
+        console_read(user_buf, false)
     }
     // 往 stdin 写是内核逻辑错误，直接暴露出来。
     // 执行时直接 panic，因为内核不应该把标准输入当成可写文件使用。
     fn write(&self, _user_buf: &mut [u8]) -> isize {
         panic!("Cannot write to stdin!");
+    }
+    fn poll(&self) -> (bool, bool, bool) {
+        (console_input_available(false) != 0, false, false)
     }
     // stdin 在用户态表现为字符设备。
     // 执行时构造字符设备类型的 Kstat，不需要访问真实设备元数据。
@@ -133,14 +303,10 @@ impl File for Stdout {
     // 把用户缓冲区逐字节写到调试串口。
     // 执行时先取得 stdout 所有权，再用 STDOUT_BUSY 自旋保护逐字节输出，最后返回输入长度。
     fn write(&self, user_buf: &mut [u8]) -> isize {
-        stdout_acquire();
-        while STDOUT_BUSY.swap(true, Ordering::Acquire) {
-            core::hint::spin_loop();
-        }
-        crate::console::write_bytes(user_buf);
-        STDOUT_BUSY.store(false, Ordering::Release);
-        // stdout 所有权保留到进程让出 CPU，减少多次 write 组成的输出被打断。
-        user_buf.len() as isize
+        console_write(user_buf)
+    }
+    fn poll(&self) -> (bool, bool, bool) {
+        (false, true, false)
     }
     // stdout 在用户态表现为字符设备。
     // 执行时构造字符设备类型的 Kstat，不需要访问真实设备元数据。
@@ -149,6 +315,40 @@ impl File for Stdout {
     }
     // 给 fd 层做具体类型判断。
     // 执行时直接把当前对象转成 Any trait 引用，方便文件描述符层做具体类型判断。
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+pub struct DevTty;
+
+impl File for DevTty {
+    fn readable(&self) -> bool {
+        true
+    }
+
+    fn writable(&self) -> bool {
+        true
+    }
+
+    fn read(&self, user_buf: &mut [u8]) -> isize {
+        console_read(user_buf, true)
+    }
+
+    fn write(&self, user_buf: &mut [u8]) -> isize {
+        console_write(user_buf)
+    }
+
+    fn poll(&self) -> (bool, bool, bool) {
+        (console_input_available(true) != 0, true, false)
+    }
+
+    fn stat(&self) -> Kstat {
+        let mut stat = Kstat::new(S_IFCHR | 0o666);
+        stat.st_rdev = 0x0500;
+        stat
+    }
+
     fn as_any(&self) -> &dyn core::any::Any {
         self
     }

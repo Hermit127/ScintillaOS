@@ -36,16 +36,17 @@ mod imp {
 
             // Register loopback as a local IP so 127.0.0.1 traffic stays within the stack
             iface.update_ip_addrs(|addrs| {
-                // Register 127.0.0.1/32 first (host address, used as source IP)
-                let loopback_host = IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::new(127, 0, 0, 1), 32));
-                let _ = addrs.push(loopback_host);
-                // Register loopback network for routing
-                let loopback_net = IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::new(127, 0, 0, 0), 8));
-                let _ = addrs.push(loopback_net);
-                // Static IP as fallback in case DHCP never completes
+                // smoltcp selects the first IPv4 address as the source for an
+                // unspecified TCP bind, so the externally routable address
+                // must precede loopback.
                 let static_ip = IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::new(10, 0, 2, 15), 24));
                 let _ = addrs.push(static_ip);
+                let loopback = IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::new(127, 0, 0, 1), 8));
+                let _ = addrs.push(loopback);
             });
+            let _ = iface
+                .routes_mut()
+                .add_default_ipv4_route(Ipv4Address::new(10, 0, 2, 2));
 
             let mut sockets = SocketSet::new(alloc::vec::Vec::new());
             let dhcp_socket = DhcpSocket::new();
@@ -263,6 +264,18 @@ use imp::NET_IFACE;
     target_arch = "loongarch64"
 ))]
 use imp::NET_INITED;
+#[cfg(any(
+    target_arch = "riscv64",
+    target_arch = "aarch64",
+    target_arch = "loongarch64"
+))]
+use smoltcp::socket::dhcpv4::{Event as DhcpEvent, Socket as DhcpSocket};
+#[cfg(any(
+    target_arch = "riscv64",
+    target_arch = "aarch64",
+    target_arch = "loongarch64"
+))]
+use smoltcp::wire::{IpCidr, Ipv4Address, Ipv4Cidr};
 
 #[cfg(target_arch = "riscv64")]
 const VIRTIO_NET_MMIO: usize = 0x10003000;
@@ -312,7 +325,7 @@ pub fn net_poll() {
         if !NET_INITED.load(core::sync::atomic::Ordering::Relaxed) {
             return;
         }
-        let readiness_changed = {
+        let (readiness_changed, dhcp_update) = {
             let mut state = NET_IFACE.exclusive_access();
             let Some(state) = state.as_mut() else {
                 return;
@@ -332,16 +345,46 @@ pub fn net_poll() {
                 ..
             } = state;
             let readiness_changed = iface.poll(timestamp, device, sockets);
-
-            if !*dhcp_logged && iface.ip_addrs().len() > 2 {
-                *dhcp_logged = true;
-                println!("[net] DHCP assigned additional IP, total IPs:");
-                for addr in iface.ip_addrs() {
-                    println!("[net]   {}", addr);
-                }
+            let dhcp_update = dhcp_handle.and_then(|handle| {
+                let socket: &mut DhcpSocket = sockets.get_mut(handle);
+                socket.poll().map(|event| match event {
+                    DhcpEvent::Configured(config) => {
+                        let dns_servers = config
+                            .dns_servers
+                            .iter()
+                            .copied()
+                            .collect::<alloc::vec::Vec<_>>();
+                        (Some(config.address), config.router, dns_servers)
+                    }
+                    DhcpEvent::Deconfigured => (None, None, alloc::vec::Vec::new()),
+                })
+            });
+            if let Some((address, router, _)) = &dhcp_update {
+                let address = address.unwrap_or(Ipv4Cidr::new(Ipv4Address::new(10, 0, 2, 15), 24));
+                iface.update_ip_addrs(|addrs| {
+                    if !addrs.is_empty() {
+                        addrs[0] = IpCidr::Ipv4(address);
+                    } else {
+                        let _ = addrs.push(IpCidr::Ipv4(address));
+                    }
+                });
+                let gateway = router.unwrap_or(Ipv4Address::new(10, 0, 2, 2));
+                let _ = iface.routes_mut().add_default_ipv4_route(gateway);
+                *dhcp_logged = address.address() != Ipv4Address::new(10, 0, 2, 15)
+                    || router.is_some();
             }
-            readiness_changed
+            (readiness_changed, dhcp_update)
         };
+        if let Some((address, router, dns_servers)) = dhcp_update {
+            if let Some(address) = address {
+                println!("[net] DHCP address={} gateway={:?}", address, router);
+                for dns in dns_servers {
+                    println!("[net] DHCP DNS={}", dns);
+                }
+            } else {
+                println!("[net] DHCP lease lost; using static QEMU SLIRP fallback");
+            }
+        }
         if readiness_changed {
             wake_net_blocked_tasks();
         }
@@ -532,7 +575,11 @@ pub fn wake_net_blocked_tasks() {
                 let handle: SocketHandle = unsafe { core::mem::transmute(handle) };
                 with_net_iface(|iface| {
                     let sock: &TcpSocket = iface.sockets.get(handle);
-                    sock.is_active()
+                    // Wake on either successful establishment or a terminal
+                    // failure.  is_active() is true even in SYN-SENT and false
+                    // again after an RST, so it cannot represent connect(2)
+                    // completion.
+                    sock.state() != smoltcp::socket::tcp::State::SynSent
                 })
                 .unwrap_or(true)
             }

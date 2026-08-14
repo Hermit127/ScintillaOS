@@ -417,6 +417,8 @@ QEMU_ARGS_SINGLE := -drive file=$(FS_IMG),if=none,format=raw,id=x0,file.locking=
 # produced by the build, so make all cannot overwrite a downloaded test image.
 TEST_DISK ?= testcases.img
 ROOT_DISK ?= $(if $(filter loongarch64,$(ARCH)),disk-la.img,disk.img)
+ON_SITE_2025_DISK ?= ../alpine-linux-riscv64-ext4fs.img
+ON_SITE_2025_ARTIFACT_DIR ?= artifacts/onsite2025
 
 # Dual-disk mode (test disk bus 0, arch-matched root disk bus 1)
 QEMU_ARGS_DUAL := -drive file=$(TEST_DISK),if=none,format=raw,id=x0 \
@@ -458,6 +460,31 @@ run-dual-prebuilt:
 	@echo "Running with prebuilt dual-disk: $(TEST_DISK) + $(ROOT_DISK)"
 	$(QEMU_EXEC) $(QEMU_ARGS_DUAL) $(QEMU_NET_ARGS)
 
+run-onsite-2025-rv: kernel-rv
+	@ON_SITE_2025_DISK="$(ON_SITE_2025_DISK)" \
+		ON_SITE_2025_ROOT_DISK="$(ROOT_DISK)" \
+		ON_SITE_2025_ARTIFACT_DIR="$(ON_SITE_2025_ARTIFACT_DIR)" \
+		./scripts/run_onsite_2025_rv.sh
+
+onsite-2025-proxy-relay:
+	@python3 scripts/onsite_2025_proxy_relay.py
+
+verify-onsite-2025-vim: kernel-rv
+	@python3 scripts/verify_onsite_2025_vim.py \
+		--base-image "$(ON_SITE_2025_DISK)" --root-disk "$(ROOT_DISK)"
+
+verify-onsite-2025-regressions: kernel-rv
+	@python3 scripts/verify_onsite_2025_regressions.py \
+		--base-image "$(ON_SITE_2025_DISK)" --root-disk "$(ROOT_DISK)"
+
+verify-onsite-2025-network: kernel-rv
+	@python3 scripts/verify_onsite_2025_regressions.py --network-sockname \
+		--base-image "$(ON_SITE_2025_DISK)" --root-disk "$(ROOT_DISK)"
+
+verify-onsite-2025-git-clone: kernel-rv
+	@python3 scripts/verify_onsite_2025_git_clone.py \
+		--base-image "$(ON_SITE_2025_DISK)" --root-disk "$(ROOT_DISK)"
+
 debug: build
 	@tmux new-session -d \
 		"$(QEMU_EXEC) $(QEMU_ARGS_SINGLE) $(QEMU_NET_ARGS) -s -S" && \
@@ -471,4 +498,4 @@ gdbserver: build
 gdbclient:
 	@gdb -ex 'file $(KERNEL_ELF)' -ex 'set arch riscv:rv64' -ex 'target remote localhost:1234'
 
-.PHONY: all prepare-vendor kernel-rv kernel-la disk.img disk-rv.img disk-la.img build env kernel clean disasm disasm-vim run run-smp4 run-smp8 run-la-smp2 run-la-smp8 run-inner run-dual run-dual-smp4 run-la-dual-smp2 run-dual-prebuilt run-dual-smp4-prebuilt run-la-dual-smp2-prebuilt fs-img gdbserver gdbclient
+.PHONY: all prepare-vendor kernel-rv kernel-la disk.img disk-rv.img disk-la.img build env kernel clean disasm disasm-vim run run-smp4 run-smp8 run-la-smp2 run-la-smp8 run-inner run-dual run-dual-smp4 run-la-dual-smp2 run-dual-prebuilt run-dual-smp4-prebuilt run-la-dual-smp2-prebuilt run-onsite-2025-rv onsite-2025-proxy-relay verify-onsite-2025-vim verify-onsite-2025-regressions verify-onsite-2025-network verify-onsite-2025-git-clone fs-img gdbserver gdbclient

@@ -45,6 +45,7 @@ qemu.log
 # are archived outside the repository.
 artifacts/smp4-validation*/round-*/
 artifacts/smp4-validation*/failure-*/
+artifacts/onsite2025/
 
 # Local contest/test suites
 testsuits-for-oskernel

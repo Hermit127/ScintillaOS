@@ -191,6 +191,6 @@ pub use inode::{
 pub use epoll::{EpollEvent, EpollFile, EPOLL_MAX_INTERESTS};
 pub use eventfd::EventFdFile;
 pub use pipe::make_pipe;
-pub use stdio::{DevBlock, DevNull, DevZero, NullSocket, Stdin, Stdout, TmpFile, Urandom};
+pub use stdio::{DevBlock, DevNull, DevTty, DevZero, NullSocket, Stdin, Stdout, TmpFile, Urandom};
 pub use unix_socket::{make_unix_socket_pair, UnixSocketFile, UnixSocketKind};
 pub use vfs::{list_apps, mount_root};

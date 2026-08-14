@@ -201,13 +201,18 @@ impl File for SocketFile {
             crate::net::with_net_iface(|iface| match self.socket_type {
                 SocketType::Tcp => {
                     let sock: &TcpSocket = iface.sockets.get(handle);
+                    let connect_failed = self.get_peer_endpoint().is_some()
+                        && sock.state() == smoltcp::socket::tcp::State::Closed;
                     let has_pending = sock.is_active()
                         && !sock.is_listening()
                         && self.was_listening.load(Ordering::Relaxed);
                     (
                         sock.can_recv() || !sock.may_recv() || has_pending,
-                        sock.can_send() || !sock.is_active(),
-                        !sock.is_active() && !sock.is_listening() && sock.recv_queue() == 0,
+                        sock.can_send() || connect_failed,
+                        connect_failed
+                            || (!sock.is_active()
+                                && !sock.is_listening()
+                                && sock.recv_queue() == 0),
                     )
                 }
                 SocketType::Udp => {
@@ -259,6 +264,14 @@ impl File for SocketFile {
             target_arch = "loongarch64"
         ))]
         if self.socket_type != SocketType::Unix {
+            if self.socket_type == SocketType::Tcp {
+                crate::net::with_net_iface(|iface| {
+                    let sock: &mut smoltcp::socket::tcp::Socket =
+                        iface.sockets.get_mut(handle);
+                    sock.abort();
+                });
+                crate::net::net_poll();
+            }
             crate::net::with_net_iface(|iface| {
                 iface.sockets.remove(handle);
             });

@@ -100,6 +100,7 @@ make run-dual ARCH=riscv64 TEST_DISK=fs-img.img
 | `documents/libctest开发文档.md` | 为 libctest 补齐的内核语义和开发说明。 |
 | `documents/ltp测试指南.md` | LTP 集成和运行说明。 |
 | `documents/netperf测试指南.md` | netperf 差距分析和运行指南。 |
+| `documents/现场赛2025_RISCV验收指南.md` | 2025 现场赛 RISC-V Alpine 构建、网络、Git 和逐项验收流程。 |
 | `documents/MachineTest近期改动迁移说明2026-06-29.md` | MachineTest 近期改动迁移到 main 的说明。 |
 
 ## 总结与展望

@@ -91,7 +91,8 @@ pub use processor::{
 };
 pub use signal::{PendingSignalInfo, SignalFlags, MAX_SIG};
 pub use task::{
-    blank_kcontext, BlockReason, KernelStack, TaskControlBlock, TaskControlBlockInner, TaskStatus,
+    blank_kcontext, BlockReason, KernelStack, PosixTimer, TaskControlBlock, TaskControlBlockInner,
+    TaskStatus,
 };
 
 pub(crate) struct FileTableGroup {
@@ -455,16 +456,18 @@ pub fn check_itimers() {
     }
     let tasks = task_snapshot();
     let expired = Vec::with_capacity(tasks.len());
-    let Some(expired) = manager::scan_itimers_if_due(now, move || {
+    let directed = Vec::new();
+    let Some((expired, directed)) = manager::scan_itimers_if_due(now, move || {
         let mut expired = expired;
+        let mut directed = directed;
         let mut next_deadline = u64::MAX;
         for task in tasks {
             let mut inner = task.inner_exclusive_access();
-            if inner.task_status == TaskStatus::Zombie || inner.itimer_expire == 0 {
+            if inner.task_status == TaskStatus::Zombie {
                 continue;
             }
-            let expired_now = now >= inner.itimer_expire;
-            if expired_now {
+            let itimer_expired = inner.itimer_expire != 0 && now >= inner.itimer_expire;
+            if itimer_expired {
                 inner.signals.insert(SignalFlags::SIGALRM);
                 if inner.itimer_interval_us > 0 {
                     inner.itimer_expire = now.saturating_add(inner.itimer_interval_us);
@@ -475,12 +478,63 @@ pub fn check_itimers() {
             if inner.itimer_expire != 0 {
                 next_deadline = next_deadline.min(inner.itimer_expire);
             }
+            let mut timer_signals = SignalFlags::empty();
+            let mut timer_signal_numbers = Vec::new();
+            for (timer_id, timer) in inner.posix_timers.iter_mut().enumerate() {
+                let Some(timer) = timer.as_mut() else {
+                    continue;
+                };
+                if timer.expire_us == 0 {
+                    continue;
+                }
+                if now >= timer.expire_us {
+                    let expirations = if timer.interval_us == 0 {
+                        1
+                    } else {
+                        now.saturating_sub(timer.expire_us) / timer.interval_us + 1
+                    };
+                    timer.overrun = expirations.saturating_sub(1).min(i32::MAX as u64) as i32;
+                    if timer.signal > 0 && timer.signal as usize <= MAX_SIG {
+                        let info = PendingSignalInfo {
+                            code: -2,
+                            sender_pid: 0,
+                            sender_uid: 0,
+                            timer_id: timer_id as i32,
+                            overrun: timer.overrun,
+                            value: timer.value,
+                        };
+                        if timer.target_tid == 0 {
+                            timer_signals.insert(SignalFlags::from_bits_truncate(
+                                1u64 << timer.signal,
+                            ));
+                            timer_signal_numbers.push((timer.signal as usize, info));
+                        } else {
+                            directed.push((timer.target_tid, timer.signal as usize, info));
+                        }
+                    }
+                    if timer.interval_us == 0 {
+                        timer.expire_us = 0;
+                    } else {
+                        timer.expire_us = timer
+                            .expire_us
+                            .saturating_add(expirations.saturating_mul(timer.interval_us));
+                    }
+                }
+                if timer.expire_us != 0 {
+                    next_deadline = next_deadline.min(timer.expire_us);
+                }
+            }
+            inner.signals.insert(timer_signals);
+            for (signal, info) in timer_signal_numbers {
+                inner.pending_signal_info[signal] = info;
+            }
+            let expired_now = itimer_expired || !timer_signals.is_empty();
             drop(inner);
             if expired_now {
                 expired.push(task);
             }
         }
-        (expired, next_deadline)
+        ((expired, directed), next_deadline)
     }) else {
         return;
     };
@@ -492,6 +546,31 @@ pub fn check_itimers() {
             now,
         );
         wake_blocked_task(&task);
+    }
+    for (target_tid, signal, info) in directed {
+        let Some(task) = pid2task(target_tid) else {
+            continue;
+        };
+        let flag = SignalFlags::from_bits_truncate(1u64 << signal);
+        {
+            let mut inner = task.inner_exclusive_access();
+            if inner.task_status == TaskStatus::Zombie {
+                continue;
+            }
+            inner.signals.insert(flag);
+            inner.pending_signal_info[signal] = info;
+            #[cfg(feature = "smp-diagnostics")]
+            crate::println!(
+                "[posix-timer-diag] expire-directed tid={} signal={} status={:?} block={:?}",
+                target_tid,
+                signal,
+                inner.task_status,
+                inner.block_reason,
+            );
+        }
+        if !wake_signal_wait_task(&task, flag) {
+            wake_blocked_task(&task);
+        }
     }
 }
 
@@ -1389,10 +1468,16 @@ fn write_signal_frame(
         *translated_refmut(token, (frame_base + i) as *mut u8) = 0;
     }
     *translated_refmut(token, frame_base as *mut i32) = sig as i32;
-    // Linux generic 64-bit siginfo_t header followed by the _kill payload.
+    // Linux generic 64-bit siginfo_t header followed by the matching union payload.
     *translated_refmut(token, (frame_base + 8) as *mut i32) = info.code;
-    *translated_refmut(token, (frame_base + 16) as *mut i32) = info.sender_pid;
-    *translated_refmut(token, (frame_base + 20) as *mut u32) = info.sender_uid;
+    if info.code == -2 {
+        *translated_refmut(token, (frame_base + 16) as *mut i32) = info.timer_id;
+        *translated_refmut(token, (frame_base + 20) as *mut i32) = info.overrun;
+        *translated_refmut(token, (frame_base + 24) as *mut usize) = info.value;
+    } else {
+        *translated_refmut(token, (frame_base + 16) as *mut i32) = info.sender_pid;
+        *translated_refmut(token, (frame_base + 20) as *mut u32) = info.sender_uid;
+    }
     let ucontext_addr = frame_base + SIGINFO_SIZE;
     *translated_refmut(token, (ucontext_addr + UCONTEXT_SIGMASK_OFFSET) as *mut u64) =
         flags_to_user_sigset(old_mask);

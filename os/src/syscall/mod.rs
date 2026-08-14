@@ -53,6 +53,11 @@ const SYSCALL_RT_SIGTIMEDWAIT: usize = 137;
 const SYSCALL_SIGRETURN: usize = 139;
 const SYSCALL_GETITIMER: usize = 102;
 const SYSCALL_SETITIMER: usize = 103;
+const SYSCALL_TIMER_CREATE: usize = 107;
+const SYSCALL_TIMER_GETTIME: usize = 108;
+const SYSCALL_TIMER_GETOVERRUN: usize = 109;
+const SYSCALL_TIMER_SETTIME: usize = 110;
+const SYSCALL_TIMER_DELETE: usize = 111;
 const SYSCALL_TIMES: usize = 153;
 const SYSCALL_UNAME: usize = 160;
 const SYSCALL_GETCPU: usize = 168;
@@ -672,6 +677,18 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_CLOCK_GETTIME => sys_clock_gettime(args[0], args[1] as *mut u8),
         SYSCALL_CLOCK_GETRES => sys_clock_getres(args[0], args[1] as *mut u8),
         SYSCALL_CLOCK_NANOSLEEP => sys_clock_nanosleep(args[0], args[1], args[2], args[3]),
+        SYSCALL_TIMER_CREATE => {
+            sys_timer_create(args[0] as i32, args[1] as *const u8, args[2] as *mut i32)
+        }
+        SYSCALL_TIMER_GETTIME => sys_timer_gettime(args[0] as i32, args[1] as *mut u8),
+        SYSCALL_TIMER_GETOVERRUN => sys_timer_getoverrun(args[0] as i32),
+        SYSCALL_TIMER_SETTIME => sys_timer_settime(
+            args[0] as i32,
+            args[1],
+            args[2] as *const u8,
+            args[3] as *mut u8,
+        ),
+        SYSCALL_TIMER_DELETE => sys_timer_delete(args[0] as i32),
         SYSCALL_MOUNT => sys_mount(
             args[0] as *const u8,
             args[1] as *const u8,
@@ -750,6 +767,17 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             current_pid,
             syscall_id,
             ret,
+        );
+    }
+    #[cfg(feature = "smp-diagnostics")]
+    if ret == -9 {
+        crate::println!(
+            "[syscall-diag] EBADF tid={} nr={} a0={:#x} a1={:#x} a2={:#x}",
+            current_pid,
+            syscall_id,
+            args[0],
+            args[1],
+            args[2],
         );
     }
     #[cfg(feature = "buildstorm-diagnostics")]

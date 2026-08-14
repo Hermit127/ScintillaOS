@@ -272,7 +272,7 @@ pub fn path_fs_flags(fs_path: &str) -> usize {
 // ==================== OSInode ====================
 
 pub fn stat_dentry(dentry: &Arc<Dentry>) -> Kstat {
-    let info = dentry.inode_info();
+    let info = dentry.refresh_inode_info().or_else(|| dentry.inode_info());
     let mut st = match info {
         Some(info) => {
             let file_type = if dentry.is_dir || info.is_dir {
@@ -518,26 +518,30 @@ impl OSInode {
     }
 
     fn stat_inner(&self) -> Kstat {
-        let dentry_size = self
-            .dentry
-            .inode_info()
-            .map(|info| info.size as i64)
-            .unwrap_or(0);
-        {
+        let live_stat = {
             let mut inner = self.inner.exclusive_access();
             if let Some(mut st) = inner.cached_stat {
                 if let Some(ref mut file) = inner.file_handle {
                     st.st_ino = file.inode as u64;
-                    st.st_size = (unsafe { ext4_fsize(file) as i64 })
-                        .max(dentry_size);
+                    st.st_size = {
+                        let _fs_lock = self.dentry.super_block.lock_fs();
+                        unsafe { ext4_fsize(file) as i64 }
+                    };
                     st.st_blocks = ((st.st_size.max(0) as u64) + 511) / 512;
                     inner.cached_stat = Some(st);
+                    Some(st)
+                } else if self.dentry.is_dir || (st.st_mode & S_IFREG) != S_IFREG {
                     return st;
+                } else {
+                    None
                 }
-                if self.dentry.is_dir || (st.st_mode & S_IFREG) != S_IFREG {
-                    return st;
-                }
+            } else {
+                None
             }
+        };
+        if let Some(st) = live_stat {
+            self.dentry.update_cached_size(st.st_size.max(0) as u64);
+            return st;
         }
         let mut st = stat_dentry(&self.dentry);
         if !self.dentry.is_dir {

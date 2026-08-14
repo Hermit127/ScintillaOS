@@ -37,6 +37,7 @@ const MSG_NOSIGNAL: usize = 0x4000;
 
 const SOL_SOCKET: usize = 1;
 const SO_REUSEADDR: usize = 2;
+const SO_ERROR: usize = 4;
 const SO_RCVBUF: usize = 8;
 const SO_SNDBUF: usize = 7;
 const SO_KEEPALIVE: usize = 9;
@@ -1101,6 +1102,18 @@ pub fn sys_connect(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
         return -95;
     }
 
+    // Record an attempted peer independently of smoltcp's transient state.
+    // poll(2) and SO_ERROR use this to distinguish an unconnected socket from
+    // a failed nonblocking connect.
+    if let Some(task) = current_task() {
+        let inner = task.inner_exclusive_access();
+        if let Some(Some(file)) = inner.fd_table.get(sockfd) {
+            if let Some(sock) = file.as_any().downcast_ref::<SocketFile>() {
+                sock.set_peer_endpoint(remote);
+            }
+        }
+    }
+
     if local_tcp_endpoint(remote) {
         let local = source_addr_for_dest(
             IpEndpoint::new(
@@ -1135,44 +1148,83 @@ pub fn sys_connect(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
         return -97;
     }
 
+    let selected_local = get_socket_local_endpoint(sockfd);
     let local = IpListenEndpoint {
-        addr: None,
-        port: 32768 + ((sockfd as u16).wrapping_mul(7919) % 32767), // non-zero ephemeral port
+        addr: selected_local.and_then(|endpoint| match endpoint.addr {
+            IpAddress::Ipv4(address) if !address.is_unspecified() => Some(endpoint.addr),
+            _ => None,
+        }),
+        port: selected_local
+            .map(|endpoint| endpoint.port)
+            .filter(|port| *port != 0)
+            .unwrap_or_else(next_ephemeral_port),
     };
 
     let connect_ret = crate::net::with_net_iface_tcp_connect(handle, remote, local);
     if connect_ret < 0 {
         return connect_ret;
     }
+    // Linux exposes a usable local address through getsockname() as soon as
+    // connect has selected the ephemeral port, including while a nonblocking
+    // connect is still in progress.  Keep that endpoint independently of
+    // smoltcp's transient TCP state; libcurl queries it on Git's proxy path.
+    set_socket_local_endpoint(
+        sockfd,
+        source_addr_for_dest(
+            IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED), local.port),
+            remote,
+        ),
+    );
     crate::net::net_poll();
 
     if !nonblock {
         loop {
             crate::net::net_poll();
-            let connected = crate::net::with_net_iface(|iface| {
-                let sock: &TcpSocket = iface.sockets.get(handle);
-                sock.is_active()
-            })
-            .unwrap_or(false);
-            if connected {
-                return 0;
+            if current_task()
+                .map(|task| {
+                    let inner = task.inner_exclusive_access();
+                    crate::task::has_interrupting_signal(&inner)
+                })
+                .unwrap_or(false)
+            {
+                return -4; // EINTR
             }
-            block_current_and_run_next(BlockReason::TcpConnect(unsafe {
-                core::mem::transmute(handle)
-            }));
+            let state = crate::net::with_net_iface(|iface| {
+                let sock: &TcpSocket = iface.sockets.get(handle);
+                sock.state()
+            })
+            .unwrap_or(smoltcp::socket::tcp::State::Closed);
+            match state {
+                smoltcp::socket::tcp::State::Established
+                | smoltcp::socket::tcp::State::CloseWait => return 0,
+                smoltcp::socket::tcp::State::SynSent => {}
+                _ => return -111,
+            }
+            block_current_and_run_next_if(
+                BlockReason::TcpConnect(unsafe { core::mem::transmute(handle) }),
+                || {
+                    crate::net::net_poll();
+                    crate::net::with_net_iface(|iface| {
+                        let sock: &TcpSocket = iface.sockets.get(handle);
+                        sock.state() == smoltcp::socket::tcp::State::SynSent
+                    })
+                    .unwrap_or(false)
+                },
+            );
         }
     }
 
-    let connected = crate::net::with_net_iface(|iface| {
+    let state = crate::net::with_net_iface(|iface| {
         let sock: &TcpSocket = iface.sockets.get(handle);
-        sock.is_active()
+        sock.state()
     })
-    .unwrap_or(false);
-    if connected {
-        0
-    } else {
-        -115
-    } // EINPROGRESS
+    .unwrap_or(smoltcp::socket::tcp::State::Closed);
+    match state {
+        smoltcp::socket::tcp::State::Established
+        | smoltcp::socket::tcp::State::CloseWait => 0,
+        smoltcp::socket::tcp::State::SynSent => -115, // EINPROGRESS
+        _ => -111,
+    }
 }
 
 pub fn sys_listen(sockfd: usize, _backlog: usize) -> isize {
@@ -1456,14 +1508,33 @@ pub fn sys_recvfrom(
     src_addr: *mut u8,
     addrlen: *mut usize,
 ) -> isize {
+    if len != 0 && buf.is_null() {
+        return -14;
+    }
+    let task = current_task().unwrap();
+    // Never let smoltcp write directly through a userspace pointer while its
+    // device lock is held.  The destination may be a demand-mapped or COW
+    // page; touching it in memcpy would turn a recoverable user fault into a
+    // kernel-mode page fault (Git's HTTP worker reaches this path).
+    let mut recv_storage = alloc::vec![0u8; len.min(SOCKET_BUFFER_SIZE)];
+    let recv_buf = recv_storage.as_mut_slice();
+
     if let Some(result) = with_unix_socket(sockfd, |socket| {
         if !addrlen.is_null() {
             let token = current_user_token();
             *translated_refmut(token, addrlen as *mut u32) = 0;
         }
-        let recv_buf = unsafe { core::slice::from_raw_parts_mut(buf, len) };
         socket.recv_with_flags(recv_buf, flags)
     }) {
+        if result > 0
+            && !crate::syscall::process::copy_to_task_user(
+                &task,
+                buf as usize,
+                &recv_storage[..result as usize],
+            )
+        {
+            return -14;
+        }
         return result;
     }
 
@@ -1475,8 +1546,7 @@ pub fn sys_recvfrom(
     let dontwait = nonblock || (flags & MSG_DONTWAIT) != 0;
     let peek = (flags & MSG_PEEK) != 0;
 
-    let recv_buf = unsafe { core::slice::from_raw_parts_mut(buf, len) };
-
+    let mut udp_peer = None;
     let result = match st {
         SocketType::Tcp => {
             if let Some((conn_id, server_side, _)) = socket_local_tcp(sockfd) {
@@ -1488,14 +1558,24 @@ pub fn sys_recvfrom(
         SocketType::Udp => loop {
             if let Some(ret) = try_recv_local_udp(sockfd, handle, recv_buf, src_addr, addrlen, peek)
             {
+                if ret > 0
+                    && !crate::syscall::process::copy_to_task_user(
+                        &task,
+                        buf as usize,
+                        &recv_storage[..ret as usize],
+                    )
+                {
+                    return -14;
+                }
                 return ret;
             }
-            let ret = if net_ready() {
-                udp_recv(handle, true, recv_buf)
+            let (ret, peer) = if net_ready() {
+                udp_recv_from(handle, true, peek, recv_buf)
             } else {
-                -11
+                (-11, None)
             };
             if ret != -11 || dontwait {
+                udp_peer = peer;
                 break ret;
             }
             let reason = BlockReason::UdpRecv(unsafe { core::mem::transmute(handle) });
@@ -1507,21 +1587,27 @@ pub fn sys_recvfrom(
     };
 
     // Fill source address for UDP if requested
-    if result > 0 && !src_addr.is_null() && !addrlen.is_null() && st == SocketType::Udp && !peek {
-        let token = current_user_token();
-        let endpoint = crate::net::with_net_iface(|iface| {
-            let sock: &UdpSocket = iface.sockets.get(handle);
-            sock.endpoint()
-        });
-        if let Some(ep) = endpoint {
-            if let Some(addr) = ep.addr {
-                if let IpAddress::Ipv4(ipv4) = addr {
-                    *translated_refmut(token, addrlen as *mut u32) =
-                        core::mem::size_of::<SockAddrIn>() as u32;
-                    write_sockaddr_in(src_addr, u32::from_be_bytes(ipv4.0), ep.port);
-                }
-            }
+    if result > 0 && !src_addr.is_null() && !addrlen.is_null() && st == SocketType::Udp {
+        if let Some(IpEndpoint {
+            addr: IpAddress::Ipv4(ipv4),
+            port,
+        }) = udp_peer
+        {
+            let token = current_user_token();
+            *translated_refmut(token, addrlen as *mut u32) =
+                core::mem::size_of::<SockAddrIn>() as u32;
+            write_sockaddr_in(src_addr, u32::from_be_bytes(ipv4.0), port);
         }
+    }
+
+    if result > 0
+        && !crate::syscall::process::copy_to_task_user(
+            &task,
+            buf as usize,
+            &recv_storage[..result as usize],
+        )
+    {
+        return -14;
     }
 
     result
@@ -1636,6 +1722,7 @@ pub fn sys_recvmsg(sockfd: usize, msg: *mut u8, flags: usize) -> isize {
 
     let mut buf = alloc::vec![0u8; total.min(SOCKET_BUFFER_SIZE)];
 
+    let mut udp_peer = None;
     let result = match st {
         SocketType::Tcp => {
             if let Some((conn_id, server_side, _)) = socket_local_tcp(sockfd) {
@@ -1655,12 +1742,13 @@ pub fn sys_recvmsg(sockfd: usize, msg: *mut u8, flags: usize) -> isize {
             ) {
                 break ret;
             }
-            let ret = if net_ready() {
-                udp_recv(handle, true, &mut buf)
+            let (ret, peer) = if net_ready() {
+                udp_recv_from(handle, true, peek, &mut buf)
             } else {
-                -11
+                (-11, None)
             };
             if ret != -11 || dontwait {
+                udp_peer = peer;
                 break ret;
             }
             let reason = BlockReason::UdpRecv(unsafe { core::mem::transmute(handle) });
@@ -1679,22 +1767,25 @@ pub fn sys_recvmsg(sockfd: usize, msg: *mut u8, flags: usize) -> isize {
         let msghdr_mut: &mut Msghdr = translated_refmut(token, msg as *mut Msghdr);
         msghdr_mut.msg_flags = 0;
 
-        // Fill msg_name with peer address for UDP
-        if st == SocketType::Udp && !peek {
-            let endpoint = crate::net::with_net_iface(|iface| {
-                let sock: &UdpSocket = iface.sockets.get(handle);
-                sock.endpoint()
-            });
-            if let Some(ep) = endpoint {
-                if let Some(addr) = ep.addr {
-                    if let IpAddress::Ipv4(ipv4) = addr {
-                        if !msghdr.msg_name.is_null() {
-                            let max = core::mem::size_of::<SockAddrIn>();
-                            let copy = max.min(msghdr.msg_namelen as usize);
-                            msghdr_mut.msg_namelen = copy as u32;
-                            write_sockaddr_in(msghdr.msg_name, u32::from_be_bytes(ipv4.0), ep.port);
-                        }
-                    }
+        // Linux returns the datagram's *source* in msg_name.  Returning the
+        // socket's local bind address here makes musl reject otherwise valid
+        // DNS replies because they appear not to come from the configured
+        // nameserver.
+        if st == SocketType::Udp {
+            if let Some(IpEndpoint {
+                addr: IpAddress::Ipv4(ipv4),
+                port,
+            }) = udp_peer
+            {
+                if !msghdr.msg_name.is_null() {
+                    let max = core::mem::size_of::<SockAddrIn>();
+                    let copy = max.min(msghdr.msg_namelen as usize);
+                    msghdr_mut.msg_namelen = copy as u32;
+                    write_sockaddr_in(
+                        msghdr.msg_name,
+                        u32::from_be_bytes(ipv4.0),
+                        port,
+                    );
                 }
             }
         }
@@ -1792,6 +1883,24 @@ pub fn sys_getsockopt(
     let token = current_user_token();
 
     match (level, optname) {
+        (SOL_SOCKET, SO_ERROR) => {
+            let error = if st != SocketType::Tcp {
+                0
+            } else {
+                crate::net::with_net_iface(|iface| {
+                    let sock: &TcpSocket = iface.sockets.get(handle);
+                    match sock.state() {
+                        smoltcp::socket::tcp::State::SynSent => 115,
+                        smoltcp::socket::tcp::State::Closed => 111,
+                        _ => 0,
+                    }
+                })
+                .unwrap_or(111)
+            };
+            *translated_refmut(token, optlen as *mut u32) = 4;
+            *translated_refmut(token, optval as *mut i32) = error;
+            0
+        }
         (SOL_SOCKET, SO_REUSEADDR) | (SOL_SOCKET, SO_KEEPALIVE) => {
             *translated_refmut(token, optlen as *mut u32) = 4;
             *translated_refmut(token, optval as *mut i32) = 1;
@@ -1948,19 +2057,21 @@ pub fn sys_getsockname(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isi
         SocketType::Unix => None,
     };
 
-    match local {
-        Some(ep) => {
-            if let IpAddress::Ipv4(ipv4) = ep.addr {
-                let token = current_user_token();
-                *translated_refmut(token, addrlen as *mut u32) =
-                    core::mem::size_of::<SockAddrIn>() as u32;
-                write_sockaddr_in(addr, u32::from_be_bytes(ipv4.0), ep.port);
-                0
-            } else {
-                -97
-            }
-        }
-        None => -22, // EINVAL: not bound
+    // Linux returns AF_INET 0.0.0.0:0 for a newly-created, unbound Internet
+    // socket.  Returning EINVAL here breaks libcurl before it starts the
+    // connection used by `git clone` through an HTTP proxy.
+    let ep = local.unwrap_or(IpEndpoint::new(
+        IpAddress::Ipv4(Ipv4Address::UNSPECIFIED),
+        0,
+    ));
+    if let IpAddress::Ipv4(ipv4) = ep.addr {
+        let token = current_user_token();
+        *translated_refmut(token, addrlen as *mut u32) =
+            core::mem::size_of::<SockAddrIn>() as u32;
+        write_sockaddr_in(addr, u32::from_be_bytes(ipv4.0), ep.port);
+        0
+    } else {
+        -97
     }
 }
 
@@ -2026,7 +2137,12 @@ pub(crate) fn tcp_recv(handle: SocketHandle, nonblock: bool, buf: &mut [u8]) -> 
         crate::net::net_poll();
         return crate::net::with_net_iface(|iface| {
             let sock: &mut TcpSocket = iface.sockets.get_mut(handle);
-            if !sock.is_active() && sock.recv_queue() == 0 {
+            // CLOSE-WAIT is still "active" in smoltcp, but once the receive
+            // queue has been drained and the peer's FIN has arrived Linux
+            // recv(2) must report EOF.  Testing is_active() here caused both
+            // nonblocking reads to return EAGAIN and blocking reads to sleep
+            // forever after a clean HTTP response.
+            if sock.recv_queue() == 0 && !sock.may_recv() {
                 return 0;
             }
             match sock.recv_slice(buf) {
@@ -2043,6 +2159,9 @@ pub(crate) fn tcp_recv(handle: SocketHandle, nonblock: bool, buf: &mut [u8]) -> 
         crate::net::net_poll();
         let result = crate::net::with_net_iface(|iface| {
             let sock: &mut TcpSocket = iface.sockets.get_mut(handle);
+            if sock.recv_queue() == 0 && !sock.may_recv() {
+                return Ok(0);
+            }
             match sock.recv_slice(buf) {
                 Ok(0) if !sock.may_recv() => Ok(0),
                 Ok(0) => Err(()),
@@ -2053,7 +2172,7 @@ pub(crate) fn tcp_recv(handle: SocketHandle, nonblock: bool, buf: &mut [u8]) -> 
         match result {
             Some(Ok(n)) => return n as isize,
             Some(Err(())) => {
-                if !sock_is_active_tcp(handle) && sock_recv_queue_tcp(handle) == 0 {
+                if tcp_receive_finished(handle) {
                     return 0;
                 }
                 suspend_current_and_run_next();
@@ -2061,6 +2180,14 @@ pub(crate) fn tcp_recv(handle: SocketHandle, nonblock: bool, buf: &mut [u8]) -> 
             None => return -1,
         }
     }
+}
+
+fn tcp_receive_finished(handle: SocketHandle) -> bool {
+    crate::net::with_net_iface(|iface| {
+        let sock: &TcpSocket = iface.sockets.get(handle);
+        sock.recv_queue() == 0 && !sock.may_recv()
+    })
+    .unwrap_or(true)
 }
 
 pub(crate) fn udp_send(handle: SocketHandle, data: &[u8], dest: IpEndpoint) -> isize {
@@ -2091,24 +2218,43 @@ pub(crate) fn udp_write(handle: SocketHandle, data: &[u8], peer: Option<IpEndpoi
 }
 
 pub(crate) fn udp_recv(handle: SocketHandle, nonblock: bool, buf: &mut [u8]) -> isize {
+    udp_recv_from(handle, nonblock, false, buf).0
+}
+
+fn udp_recv_from(
+    handle: SocketHandle,
+    nonblock: bool,
+    peek: bool,
+    buf: &mut [u8],
+) -> (isize, Option<IpEndpoint>) {
     if nonblock {
         crate::net::net_poll();
         return crate::net::with_net_iface(|iface| {
             let sock: &mut UdpSocket = iface.sockets.get_mut(handle);
-            match sock.recv_slice(buf) {
-                Ok((n, _)) => n as isize,
-                Err(_) => -11,
+            let received = if peek {
+                sock.peek_slice(buf).map(|(n, meta)| (n, *meta))
+            } else {
+                sock.recv_slice(buf)
+            };
+            match received {
+                Ok((n, meta)) => (n as isize, Some(meta.endpoint)),
+                Err(_) => (-11, None),
             }
         })
-        .unwrap_or(-1);
+        .unwrap_or((-1, None));
     }
 
     loop {
         crate::net::net_poll();
         let result = crate::net::with_net_iface(|iface| {
             let sock: &mut UdpSocket = iface.sockets.get_mut(handle);
-            match sock.recv_slice(buf) {
-                Ok((n, _)) => Some(n as isize),
+            let received = if peek {
+                sock.peek_slice(buf).map(|(n, meta)| (n, *meta))
+            } else {
+                sock.recv_slice(buf)
+            };
+            match received {
+                Ok((n, meta)) => Some((n as isize, Some(meta.endpoint))),
                 Err(_) => None,
             }
         })
@@ -2138,12 +2284,4 @@ fn sock_can_send_tcp(handle: SocketHandle) -> bool {
         sock.can_send()
     })
     .unwrap_or(false)
-}
-
-fn sock_recv_queue_tcp(handle: SocketHandle) -> usize {
-    crate::net::with_net_iface(|iface| {
-        let sock: &TcpSocket = iface.sockets.get(handle);
-        sock.recv_queue()
-    })
-    .unwrap_or(0)
 }

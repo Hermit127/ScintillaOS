@@ -5,10 +5,10 @@ use crate::fs::vfs::{
 };
 use crate::fs::{
     follow_symlink, link_at, make_pipe, make_unix_socket_pair, open_file_at, rename_at,
-    symlink_at, DevBlock, DevNull, DevZero, EpollEvent, EpollFile, EventFdFile, File,
+    symlink_at, DevBlock, DevNull, DevTty, DevZero, EpollEvent, EpollFile, EventFdFile, File,
     Kstat, OpenFlags, UnixSocketKind, Urandom, EPOLL_MAX_INTERESTS, S_IFDIR, S_IFREG,
 };
-use crate::sync::TaskGuard;
+use crate::sync::{DeviceLock, TaskGuard};
 use crate::task::{
     current_task, current_user_token, file_group_tasks_locked, has_interrupting_signal,
     pid2task, TaskControlBlock, TaskControlBlockInner, FILE_TABLE_LOCK,
@@ -18,6 +18,8 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::{Deref, DerefMut};
+use core::sync::atomic::{AtomicI32, Ordering};
+use lazy_static::lazy_static;
 
 const AT_FDCWD: isize = -100;
 const O_NOATIME: u32 = 0x40000;
@@ -1193,6 +1195,12 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> isize
             .unwrap_or_else(|e| e);
     }
 
+    if path == "/dev/tty" || path == "/dev/console" {
+        return install_fd(&task, Arc::new(DevTty), cloexec)
+            .map(|fd| fd as isize)
+            .unwrap_or_else(|e| e);
+    }
+
     if path == "/dev/zero" {
         let (readable, writable) = OpenFlags::from_raw(flags).read_write();
         return install_fd(&task, Arc::new(DevZero::new(readable, writable)), cloexec)
@@ -1502,6 +1510,7 @@ fn special_device_stat(path: &str) -> Option<Kstat> {
     }
     let mut st = match path {
         "/dev/null" => Kstat::new(crate::fs::S_IFCHR | 0o666),
+        "/dev/tty" | "/dev/console" => Kstat::new(crate::fs::S_IFCHR | 0o666),
         "/dev/zero" => Kstat::new(crate::fs::S_IFCHR | 0o666),
         "/dev/random" | "/dev/urandom" => Kstat::new(crate::fs::S_IFCHR | 0o444),
         "/dev/rtc" | "/dev/misc/rtc" => Kstat::new(crate::fs::S_IFCHR | 0o444),
@@ -1517,6 +1526,7 @@ fn special_device_stat(path: &str) -> Option<Kstat> {
     };
     st.st_rdev = match path {
         "/dev/null" => 0x0103,
+        "/dev/tty" | "/dev/console" => 0x0500,
         "/dev/zero" => 0x0105,
         "/dev/random" => 0x0108,
         "/dev/urandom" => 0x0109,
@@ -1538,6 +1548,8 @@ fn block_device_index(path: &str) -> Option<usize> {
 
 fn special_device_as_parent(path: &str) -> bool {
     path.starts_with("/dev/null/")
+        || path.starts_with("/dev/tty/")
+        || path.starts_with("/dev/console/")
         || path.starts_with("/dev/zero/")
         || path.starts_with("/dev/random/")
         || path.starts_with("/dev/urandom/")
@@ -2682,14 +2694,26 @@ pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
 }
 
 const TCGETS: usize = 0x5401;
+const TCSETS: usize = 0x5402;
+const TCSETSW: usize = 0x5403;
+const TCSETSF: usize = 0x5404;
+const TCSBRK: usize = 0x5409;
+const TCFLSH: usize = 0x540b;
+const TIOCSCTTY: usize = 0x540e;
+const TIOCGPGRP: usize = 0x540f;
+const TIOCSPGRP: usize = 0x5410;
 const TIOCGWINSZ: usize = 0x5413;
+const TIOCSWINSZ: usize = 0x5414;
+const FIONREAD: usize = 0x541b;
 const FIONBIO: usize = 0x5421;
+const TIOCNOTTY: usize = 0x5422;
 const BLKGETSIZE: usize = 0x1260;
 const BLKGETSIZE64: usize = 0x80081272;
 const FS_IOC_GETFLAGS: usize = 0x80086601;
 const FS_IOC_SETFLAGS: usize = 0x40086602;
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct Termios {
     c_iflag: u32,
     c_oflag: u32,
@@ -2699,12 +2723,44 @@ struct Termios {
     c_cc: [u8; 19],
 }
 
+lazy_static! {
+    static ref CONSOLE_TERMIOS: DeviceLock<Termios> = DeviceLock::new_named(
+        Termios {
+            c_iflag: 0x0500,
+            c_oflag: 0x0005,
+            c_cflag: 0x04bf,
+            c_lflag: 0x8a3b,
+            c_line: 0,
+            c_cc: [
+                0x03, 0x1c, 0x7f, 0x15, 0x04, 0x00, 0x01, 0x00, 0x11, 0x13, 0x1a, 0x00,
+                0x12, 0x0f, 0x17, 0x16, 0x00, 0x00, 0x00,
+            ],
+        },
+        "Console.termios",
+    );
+}
+
+static CONSOLE_FOREGROUND_PGRP: AtomicI32 = AtomicI32::new(0);
+
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct Winsize {
     ws_row: u16,
     ws_col: u16,
     ws_xpixel: u16,
     ws_ypixel: u16,
+}
+
+lazy_static! {
+    static ref CONSOLE_WINSIZE: DeviceLock<Winsize> = DeviceLock::new_named(
+        Winsize {
+            ws_row: 24,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        },
+        "Console.winsize",
+    );
 }
 
 fn is_terminal_fd(fd: usize) -> bool {
@@ -2715,7 +2771,9 @@ fn is_terminal_fd(fd: usize) -> bool {
     let Some(file) = inner.fd_table.get(fd).and_then(|file| file.as_ref()) else {
         return false;
     };
-    file.as_any().is::<crate::fs::Stdin>() || file.as_any().is::<crate::fs::Stdout>()
+    file.as_any().is::<crate::fs::Stdin>()
+        || file.as_any().is::<crate::fs::Stdout>()
+        || file.as_any().is::<crate::fs::DevTty>()
 }
 
 pub fn sys_ioctl(fd: usize, request: usize, arg: usize) -> isize {
@@ -2896,16 +2954,93 @@ pub fn sys_ioctl(fd: usize, request: usize, arg: usize) -> isize {
             if arg == 0 {
                 return -14; // EFAULT
             }
-            let term = Termios {
-                c_iflag: 0x0500, // ICRNL | IXON
-                c_oflag: 0x0005, // OPOST | ONLCR
-                c_cflag: 0x04bf, // CREAD | CS8 | B38400 | ...
-                c_lflag: 0x8a3b, // ISIG | ICANON | ECHO | ECHOE | ECHOK | ...
-                c_line: 0,
-                c_cc: [0; 19],
-            };
+            let term = *CONSOLE_TERMIOS.lock();
             let task = current_task().unwrap();
             if super::process::write_user_value(&task, arg as *mut Termios, &term) {
+                0
+            } else {
+                -14
+            }
+        }
+        TCSETS | TCSETSW | TCSETSF => {
+            if !is_terminal_fd(fd) {
+                return -25;
+            }
+            if arg == 0 {
+                return -14;
+            }
+            let task = current_task().unwrap();
+            let Some(term) = super::process::copy_user_value(&task, arg as *const Termios) else {
+                return -14;
+            };
+            *CONSOLE_TERMIOS.lock() = term;
+            crate::fs::stdio::set_console_termios(term.c_iflag, term.c_lflag, &term.c_cc);
+            if request == TCSETSF {
+                crate::fs::stdio::flush_console_input();
+            }
+            0
+        }
+        TIOCSCTTY => {
+            if is_terminal_fd(fd) {
+                0
+            } else {
+                -25
+            }
+        }
+        TIOCGPGRP => {
+            if !is_terminal_fd(fd) {
+                return -25;
+            }
+            if arg == 0 {
+                return -14;
+            }
+            let task = current_task().unwrap();
+            let current_pgrp = task.inner_exclusive_access().pgid as i32;
+            let pgrp = match CONSOLE_FOREGROUND_PGRP.load(Ordering::Acquire) {
+                0 => current_pgrp,
+                value => value,
+            };
+            if super::process::write_user_value(&task, arg as *mut i32, &pgrp) {
+                0
+            } else {
+                -14
+            }
+        }
+        TIOCSPGRP => {
+            if !is_terminal_fd(fd) {
+                return -25;
+            }
+            if arg == 0 {
+                return -14;
+            }
+            let task = current_task().unwrap();
+            let Some(pgrp) = super::process::copy_user_value(&task, arg as *const i32) else {
+                return -14;
+            };
+            if pgrp <= 0 {
+                return -22;
+            }
+            CONSOLE_FOREGROUND_PGRP.store(pgrp, Ordering::Release);
+            0
+        }
+        TCSBRK | TCFLSH | TIOCNOTTY => {
+            if is_terminal_fd(fd) {
+                0
+            } else {
+                -25
+            }
+        }
+        FIONREAD => {
+            if !is_terminal_fd(fd) {
+                return -25;
+            }
+            if arg == 0 {
+                return -14;
+            }
+            let task = current_task().unwrap();
+            let available = crate::fs::stdio::console_input_available(false)
+                .min(i32::MAX as usize) as i32;
+            if super::process::write_user_value(&task, arg as *mut i32, &available) {
                 0
             } else {
                 -14
@@ -2918,18 +3053,27 @@ pub fn sys_ioctl(fd: usize, request: usize, arg: usize) -> isize {
             if arg == 0 {
                 return -14;
             }
-            let ws = Winsize {
-                ws_row: 24,
-                ws_col: 80,
-                ws_xpixel: 0,
-                ws_ypixel: 0,
-            };
+            let ws = *CONSOLE_WINSIZE.lock();
             let task = current_task().unwrap();
             if super::process::write_user_value(&task, arg as *mut Winsize, &ws) {
                 0
             } else {
                 -14
             }
+        }
+        TIOCSWINSZ => {
+            if !is_terminal_fd(fd) {
+                return -25;
+            }
+            if arg == 0 {
+                return -14;
+            }
+            let task = current_task().unwrap();
+            let Some(ws) = super::process::copy_user_value(&task, arg as *const Winsize) else {
+                return -14;
+            };
+            *CONSOLE_WINSIZE.lock() = ws;
+            0
         }
         _ => -25, // ENOTTY
     }

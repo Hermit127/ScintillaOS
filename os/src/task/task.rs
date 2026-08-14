@@ -89,6 +89,18 @@ pub struct KernelStack {
     inner: Arc<[u128; KERNEL_STACK_SIZE / size_of::<u128>()]>,
 }
 
+#[derive(Clone, Copy)]
+pub struct PosixTimer {
+    pub clock_id: i32,
+    pub signal: i32,
+    /// Linux SIGEV_THREAD_ID target. Zero means process-directed delivery.
+    pub target_tid: usize,
+    pub value: usize,
+    pub expire_us: u64,
+    pub interval_us: u64,
+    pub overrun: i32,
+}
+
 impl KernelStack {
     pub fn new() -> Self {
         Self {
@@ -180,6 +192,7 @@ pub struct TaskControlBlockInner {
     pub block_reason: Option<BlockReason>,
     pub itimer_expire: u64,
     pub itimer_interval_us: u64,
+    pub posix_timers: Vec<Option<PosixTimer>>,
     pub child_tid: usize,
     pub robust_list_head: usize,
     pub robust_list_len: usize,
@@ -416,6 +429,7 @@ impl TaskControlBlock {
                     block_reason: None,
                     itimer_expire: 0,
                     itimer_interval_us: 0,
+                    posix_timers: Vec::new(),
                     child_tid: 0,
                     robust_list_head: 0,
                     robust_list_len: 0,
@@ -722,17 +736,28 @@ impl TaskControlBlock {
         let mut inner = self.inner_exclusive_access();
         #[cfg(feature = "smp-diagnostics")]
         for (fd, file) in inner.fd_table.iter().enumerate() {
-            if inner.fd_cloexec.get(fd).copied().unwrap_or(false)
-                && file
+            if inner.fd_cloexec.get(fd).copied().unwrap_or(false) && file.is_some() {
+                let kind = if file
                     .as_ref()
                     .map(|file| file.as_any().is::<crate::fs::UnixSocketFile>())
                     .unwrap_or(false)
-            {
+                {
+                    "unix-socket"
+                } else if file
+                    .as_ref()
+                    .map(|file| file.as_any().is::<crate::net::socket::SocketFile>())
+                    .unwrap_or(false)
+                {
+                    "inet-socket"
+                } else {
+                    "file"
+                };
                 crate::println!(
-                    "[socketpair-diag] exec-close tid={} tgid={} fd={}",
+                    "[fd-diag] exec-close tid={} tgid={} fd={} kind={}",
                     self.getpid(),
                     inner.tgid,
                     fd,
+                    kind,
                 );
             }
         }
@@ -746,6 +771,7 @@ impl TaskControlBlock {
         inner.sigsuspend_delivery = None;
         inner.trap_ctx_backup = None;
         inner.signal_ucontext = None;
+        inner.posix_timers.clear();
         inner.heap_bottom = heap_bottom;
         inner.program_brk = heap_bottom;
         inner.fp_state = UserFloatState::new();
@@ -977,6 +1003,7 @@ impl TaskControlBlock {
                     block_reason: None,
                     itimer_expire: 0,
                     itimer_interval_us: 0,
+                    posix_timers: Vec::new(),
                     child_tid: 0,
                     robust_list_head: 0,
                     robust_list_len: 0,
@@ -1195,6 +1222,7 @@ impl TaskControlBlock {
                     block_reason: None,
                     itimer_expire: 0,
                     itimer_interval_us: 0,
+                    posix_timers: Vec::new(),
                     child_tid: 0,
                     robust_list_head: 0,
                     robust_list_len: 0,
