@@ -22,11 +22,12 @@
 |---|---|
 | 合并前现场赛实现备份，已推送远程 | `a82b4ab9baeeb6238142538e302c5b3023aab66b` |
 | 合入的 `origin/main` | `ed815ffc003ccc567d7b4b8da1fcdca349d12905` |
-| 显式 merge commit，仅本地 | `41462075aa60004260892ce410d67f7fa81b6faa` |
-| 合并后文件写回和验证器修复，仅本地 | `0d7dd76be39891f1818c595062e52e752b4b7690` |
+| 显式 merge commit，已进入远程历史 | `41462075aa60004260892ce410d67f7fa81b6faa` |
+| 合并后文件写回和验证器修复，已进入远程历史 | `0d7dd76be39891f1818c595062e52e752b4b7690` |
+| SMP4 MANIFEST/JSON 证据，当前远程 tip | `8803ab33cc0301a5c47d81a7704be0f8b47ad883` |
 | 高位用户 sockaddr 安全复制修复，仅本地 | `0b9ef7445dc13703442b94f5bf03b6c68488a8dd` |
 
-远程 `origin/on-site-final-2025-fixes` 当前停在 `a82b4ab`。merge、合并后修复及本文档提交都不应在未获明确授权时 push。
+远程 `origin/on-site-final-2025-fixes` 当前停在 `8803ab3`。最新 sockaddr 修复及其文档提交仍只在本地，不应在未获明确授权时 push。
 
 核对历史：
 
@@ -429,4 +430,4 @@ git log --oneline --decorate --graph -12
 2. 安装 LoongArch C 交叉工具链后重跑静态构建。
 3. 准备 LoongArch QEMU/镜像后做动态回归。
 4. 获得官方决赛镜像后单独完成 CAgent/BuildStorm 长测。
-5. 用户明确授权后，才把本地 merge、fix、docs 提交 push 到远程。
+5. 用户明确授权后，才把 `8803ab3` 之后的 sockaddr fix/docs 提交 push 到远程。
