@@ -1,0 +1,16 @@
+[
+  {
+    "round": 1,
+    "passed": false,
+    "detail": "no serial output for 120 seconds",
+    "log": "round-01/serial.log",
+    "metrics": {
+      "group_end": 0,
+      "case_start": 0,
+      "case_end": 0,
+      "pass": 0,
+      "fail": 0,
+      "skip": 0
+    }
+  }
+]

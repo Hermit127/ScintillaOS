@@ -1,0 +1,14 @@
+{
+  "kernel": {
+    "path": "/home/lyz/OS/oskernel2026test/kernel-rv",
+    "sha256": "a2acac0e4fc865ea9a9cfd19a8bf9dd136cbe452e549fabc062444e99dccc1ef"
+  },
+  "root disk": {
+    "path": "/home/lyz/OS/oskernel2026test/fs-img.img",
+    "sha256": "8f9e9e36297b68be53759809c78c8a64f2ea980c918f722bd2e88635f7426396"
+  },
+  "test disk": {
+    "path": "/home/lyz/OS/oskernel2026test/test_disk.img",
+    "sha256": "e861218ff4d1a78f4e0413a01a9746e280a98f69488fcae14cf8c22d2a282266"
+  }
+}
