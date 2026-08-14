@@ -167,12 +167,16 @@ def main() -> int:
         type=pathlib.Path,
     )
     parser.add_argument("--log", type=pathlib.Path)
+    parser.add_argument("--smp", type=int, default=1)
     parser.add_argument(
         "--network-sockname",
         action="store_true",
         help="also run host-gateway getsockname and TCP EOF regressions",
     )
     args = parser.parse_args()
+
+    if not 1 <= args.smp <= 12:
+        parser.error("--smp must be between 1 and 12")
 
     repo = pathlib.Path(__file__).resolve().parent.parent
     sources = [
@@ -209,7 +213,7 @@ def main() -> int:
         tty.setraw(slave)
         command = [
             "qemu-system-riscv64", "-machine", "virt", "-cpu", "max",
-            "-kernel", str(args.kernel), "-nographic", "-m", "1G", "-smp", "1",
+            "-kernel", str(args.kernel), "-nographic", "-m", "1G", "-smp", str(args.smp),
             "-drive", f"file={overlay},if=none,format=qcow2,id=x0",
             "-device", "virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0",
             "-drive", f"file={args.root_disk},if=none,format=raw,id=x1,file.locking=off",
@@ -338,6 +342,16 @@ def main() -> int:
             raise RuntimeError("host TCP EOF regression server did not finish")
         if eof_server_errors:
             raise RuntimeError("host TCP EOF regression server failed") from eof_server_errors[0]
+
+    if args.smp > 1:
+        expected_mask = f"[smp] online mask {hex((1 << args.smp) - 1)}".encode()
+        if expected_mask not in transcript:
+            print(
+                f"requested {args.smp} harts, but did not observe "
+                f"{expected_mask.decode()!r}",
+                file=sys.stderr,
+            )
+            return 1
 
     required = (
         b"TIMER_REGRESSION_OK",

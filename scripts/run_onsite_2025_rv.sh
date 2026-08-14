@@ -7,7 +7,13 @@ cd "$repo_dir"
 base_image=${ON_SITE_2025_DISK:-../alpine-linux-riscv64-ext4fs.img}
 root_disk=${ON_SITE_2025_ROOT_DISK:-disk.img}
 artifact_root=${ON_SITE_2025_ARTIFACT_DIR:-artifacts/onsite2025}
+smp=${ON_SITE_2025_SMP:-1}
 kernel=target/riscv64gc-unknown-none-elf/release/os.bin
+
+if [[ ! "$smp" =~ ^[1-9][0-9]*$ ]] || (( smp > 12 )); then
+    echo "invalid ON_SITE_2025_SMP: $smp (expected 1..12)" >&2
+    exit 2
+fi
 
 for required in "$base_image" "$root_disk" "$kernel"; do
     if [[ ! -f "$required" ]]; then
@@ -31,6 +37,7 @@ qemu-img create -f qcow2 -F raw -b "$(realpath "$base_image")" "$overlay"
     echo "git_commit=$(git rev-parse HEAD)"
     echo "git_branch=$(git branch --show-current)"
     echo "generated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "qemu_smp=$smp"
     echo "base_image=$(realpath "$base_image")"
     echo "overlay=$(realpath "$overlay")"
     sha256sum "$base_image" "$kernel"
@@ -50,7 +57,7 @@ qemu_command=(
     -serial chardev:onsite25console
     -mon chardev=onsite25console,mode=readline
     -m 1G
-    -smp 1
+    -smp "$smp"
     -drive "file=$overlay,if=none,format=qcow2,id=x0"
     -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
     -drive "file=$root_disk,if=none,format=raw,id=x1,file.locking=off"

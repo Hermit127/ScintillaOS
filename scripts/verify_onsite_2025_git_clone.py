@@ -69,7 +69,10 @@ def main() -> int:
     parser.add_argument("--log", type=pathlib.Path)
     parser.add_argument("--pcap", type=pathlib.Path)
     parser.add_argument("--timeout", type=float, default=600.0)
+    parser.add_argument("--smp", type=int, default=1)
     args = parser.parse_args()
+    if not 1 <= args.smp <= 12:
+        parser.error("--smp must be between 1 and 12")
     for required in (args.base_image, args.root_disk, args.kernel):
         if not required.is_file():
             parser.error(f"missing required file: {required}")
@@ -88,7 +91,7 @@ def main() -> int:
         tty.setraw(slave)
         command = [
             "qemu-system-riscv64", "-machine", "virt", "-cpu", "max",
-            "-kernel", str(args.kernel), "-nographic", "-m", "1G", "-smp", "1",
+            "-kernel", str(args.kernel), "-nographic", "-m", "1G", "-smp", str(args.smp),
             "-drive", f"file={overlay},if=none,format=qcow2,id=x0",
             "-device", "virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0",
             "-drive", f"file={args.root_disk},if=none,format=raw,id=x1,file.locking=off",
@@ -150,6 +153,16 @@ def main() -> int:
                 args.log.parent.mkdir(parents=True, exist_ok=True)
                 args.log.write_bytes(transcript)
         subprocess.run(["qemu-img", "check", str(overlay)], check=True)
+
+    if args.smp > 1:
+        expected_mask = f"[smp] online mask {hex((1 << args.smp) - 1)}".encode()
+        if expected_mask not in transcript:
+            print(
+                f"requested {args.smp} harts, but did not observe "
+                f"{expected_mask.decode()!r}",
+                file=sys.stderr,
+            )
+            return 1
 
     required = (b"GETENT_DNS_OK", b"GIT_CLONE_RC=0", b"GIT_CLONE_TREE_OK")
     missing = [marker for marker in required if marker not in transcript]

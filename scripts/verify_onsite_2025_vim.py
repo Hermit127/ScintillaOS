@@ -78,7 +78,11 @@ def main() -> int:
         type=pathlib.Path,
     )
     parser.add_argument("--log", type=pathlib.Path)
+    parser.add_argument("--smp", type=int, default=1)
     args = parser.parse_args()
+
+    if not 1 <= args.smp <= 12:
+        parser.error("--smp must be between 1 and 12")
 
     for required in (args.base_image, args.root_disk, args.kernel):
         if not required.is_file():
@@ -115,7 +119,7 @@ def main() -> int:
             "-m",
             "1G",
             "-smp",
-            "1",
+            str(args.smp),
             "-drive",
             f"file={overlay},if=none,format=qcow2,id=x0",
             "-device",
@@ -244,6 +248,16 @@ def main() -> int:
                 args.log.write_bytes(transcript)
 
         subprocess.run(["qemu-img", "check", str(overlay)], check=True)
+
+    if args.smp > 1:
+        expected_mask = f"[smp] online mask {hex((1 << args.smp) - 1)}".encode()
+        if expected_mask not in transcript:
+            print(
+                f"requested {args.smp} harts, but did not observe "
+                f"{expected_mask.decode()!r}",
+                file=sys.stderr,
+            )
+            return 1
 
     required_markers = (
         b"GIT_HELP_RC=0",

@@ -465,6 +465,7 @@ run-onsite-2025-rv: kernel-rv
 	@ON_SITE_2025_DISK="$(ON_SITE_2025_DISK)" \
 		ON_SITE_2025_ROOT_DISK="$(ROOT_DISK)" \
 		ON_SITE_2025_ARTIFACT_DIR="$(ON_SITE_2025_ARTIFACT_DIR)" \
+		ON_SITE_2025_SMP="$(QEMU_SMP)" \
 		./scripts/run_onsite_2025_rv.sh
 
 onsite-2025-proxy-relay:
@@ -472,19 +473,23 @@ onsite-2025-proxy-relay:
 
 verify-onsite-2025-vim: kernel-rv
 	@python3 scripts/verify_onsite_2025_vim.py \
-		--base-image "$(ON_SITE_2025_DISK)" --root-disk "$(ROOT_DISK)"
+		--base-image "$(ON_SITE_2025_DISK)" --root-disk "$(ROOT_DISK)" \
+		--smp "$(QEMU_SMP)"
 
 verify-onsite-2025-regressions: kernel-rv
 	@python3 scripts/verify_onsite_2025_regressions.py \
-		--base-image "$(ON_SITE_2025_DISK)" --root-disk "$(ROOT_DISK)"
+		--base-image "$(ON_SITE_2025_DISK)" --root-disk "$(ROOT_DISK)" \
+		--smp "$(QEMU_SMP)"
 
 verify-onsite-2025-network: kernel-rv
 	@python3 scripts/verify_onsite_2025_regressions.py --network-sockname \
-		--base-image "$(ON_SITE_2025_DISK)" --root-disk "$(ROOT_DISK)"
+		--base-image "$(ON_SITE_2025_DISK)" --root-disk "$(ROOT_DISK)" \
+		--smp "$(QEMU_SMP)"
 
 verify-onsite-2025-git-clone: kernel-rv
 	@python3 scripts/verify_onsite_2025_git_clone.py \
-		--base-image "$(ON_SITE_2025_DISK)" --root-disk "$(ROOT_DISK)"
+		--base-image "$(ON_SITE_2025_DISK)" --root-disk "$(ROOT_DISK)" \
+		--smp "$(QEMU_SMP)"
 
 debug: build
 	@tmux new-session -d \
