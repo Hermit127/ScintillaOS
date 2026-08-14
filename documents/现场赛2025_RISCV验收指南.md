@@ -9,6 +9,7 @@
 当前结论：
 
 - QEMU RISC-V64 上，Git 帮助、本地仓库、完整 HTTPS clone、Vim 帮助和真实交互编辑、GCC/Rustc 帮助及编译运行均已在合并后内核通过。
+- 现场赛启动和四个自动验证目标默认使用 1 核，也可通过 `QEMU_SMP=<核数>` 选择 2–12 核；4 核下 Vim/Git/GCC/Rustc、Timer/TTY/Ext4/socket、DNS 和完整 HTTPS clone 均已动态通过。
 - GitHub push/pull 已在合并前的同一套现场赛实现上手工通过；合并后的最终源码还应再手工输入 PAT 跑一遍，才能形成“当前提交完整 100 分”的严格证据。
 - `main` 带入的 RISC-V 四核调度、亲和性、clone、futex、mprotect、共享内存、管道和信号定向回归，release 3/3、diagnostics 1/1 通过。
 - LoongArch 当前不能声称构建或运行通过：本机缺少 `loongarch64-linux-gnu-gcc`，也没有 `qemu-system-loongarch64`、官方决赛大镜像或实体板卡。
@@ -26,8 +27,9 @@
 | 合并后文件写回和验证器修复，已进入远程历史 | `0d7dd76be39891f1818c595062e52e752b4b7690` |
 | SMP4 MANIFEST/JSON 证据，当前远程 tip | `8803ab33cc0301a5c47d81a7704be0f8b47ad883` |
 | 高位用户 sockaddr 安全复制修复，仅本地 | `0b9ef7445dc13703442b94f5bf03b6c68488a8dd` |
+| 现场赛可选 SMP 启动与验证，仅本地 | `bd87f185ae377f411ecf70481d2690a976a1655c` |
 
-远程 `origin/on-site-final-2025-fixes` 当前停在 `8803ab3`。最新 sockaddr 修复及其文档提交仍只在本地，不应在未获明确授权时 push。
+远程 `origin/on-site-final-2025-fixes` 当前停在 `8803ab3`。最新 sockaddr 修复、后续文档和可选 SMP 提交仍只在本地，不应在未获明确授权时 push。
 
 核对历史：
 
@@ -78,6 +80,8 @@ QEMU
 - `vda`：Alpine 基础镜像的临时 qcow2 覆盖层。
 - `vdb`：项目生成的 `disk.img`，包含 Rust shell、BusyBox 和回归程序。
 - VirtIO net：QEMU SLIRP，默认网关 `10.0.2.2`、DNS `10.0.2.3`。
+
+CPU 数量默认是 1，以保持与最初现场赛验收基线一致；需要并发压力时再显式传入 `QEMU_SMP`。当前内核的 `MAX_CPUS` 为 12，因此现场赛脚本接受 1–12，超出范围会在 QEMU 启动前报错。手工入口会把实际核数写入证据目录的 `metadata.txt`，字段为 `qemu_smp=<核数>`。
 
 验证脚本不会直接写官方 raw 镜像，而是每轮创建新覆盖层。四核 RISC-V 验证器的根盘必须用 `disk.img`；当前 `fs-img.img` 含 LoongArch 用户程序，不能用来冒充 RISC-V 根盘。
 
@@ -237,6 +241,22 @@ make verify-onsite-2025-regressions
 make verify-onsite-2025-network
 ```
 
+以上命令省略 `QEMU_SMP` 时都是单核。若要复测可选多核路径，推荐从 4 核开始：
+
+```bash
+make verify-onsite-2025-regressions QEMU_SMP=4
+make verify-onsite-2025-vim QEMU_SMP=4
+make verify-onsite-2025-network QEMU_SMP=4
+```
+
+三个 Python 验证器也都提供 `--smp 1..12`。当核数大于 1 时，验证器不只检查功能标记，还强制要求串口日志出现请求核数对应的完整在线掩码。例如 4 核必须出现：
+
+```text
+[smp] online mask 0xf
+```
+
+因此“QEMU 接受了 `-smp 4`，但内核只启动一个 hart”不会被误判为通过。单核不强求该日志行，以兼容不打印汇总掩码的正常单核启动。
+
 基础回归通过条件包括：客体 C 源 SHA-256 正确、`EXT4_RENAME_OK`、`TIMER_REGRESSION_OK`、TTY/ICRNL/原始 CR/DEL/Ctrl-H/ENOTTY 全部成功，且覆盖层无错误。
 
 Vim 回归还会执行真实 Git init/add/commit/log，检查四个软件帮助命令，真正进入交互 Vim 编辑保存，比较截短后的 stat/read 长度，并用 GCC/Rustc 编译运行新文件。不得用 `vim -es`、旧二进制或版本输出替代功能测试，也不得出现 `shorter than expected`、`GIT_LOCAL_FAILED` 或 `VIM_TRUNCATE_STAT_FAILED`。
@@ -259,6 +279,12 @@ make onsite-2025-proxy-relay
 make verify-onsite-2025-git-clone
 ```
 
+四核完整网络验收使用：
+
+```bash
+make verify-onsite-2025-git-clone QEMU_SMP=4
+```
+
 只有看到 `GETENT_DNS_OK`、`GIT_CLONE_RC=0`、有效提交号、`GIT_CLONE_TREE_OK` 和 `qemu-img check` 无错误才算 clone 通过。
 
 合并后完整 clone 已通过，官方仓库 HEAD 为：
@@ -266,6 +292,13 @@ make verify-onsite-2025-git-clone
 ```text
 f5dea58cc1057f2b076cdb90b446c2c21d91171e
 ```
+
+2026-08-14 对提交 `bd87f185` 的四核动态复测结果：
+
+- 四核 Vim 回归：观察到 `online mask 0xf`；Git 本地流程、Vim 真实交互编辑、81 字节 truncate/stat 一致性、GCC 和 Rustc 编译运行均通过；`qemu-img check` 无错误。
+- 四核综合网络回归：`TIMER_REGRESSION_OK hits=4`、`TTY_REGRESSION_OK`、`EXT4_RENAME_OK`、`NETWORK_SOCKNAME_OK address=10.0.2.15 ports=49152,49153` 和 `NETWORK_TCP_EOF_OK` 全部出现；覆盖层无错误。
+- 四核完整 clone：`GETENT_DNS_OK`、`GIT_CLONE_RC=0`、`GIT_CLONE_TREE_OK` 全部出现，官方仓库 HEAD 为上述 `f5dea58...`；覆盖层无错误。
+- 三项均未出现 panic、页故障、锁死或 hart 离线。多核是附加回归能力，不改变默认单核评分入口。
 
 ## 11. 手工 push 和 pull 验收
 
@@ -280,6 +313,14 @@ make onsite-2025-proxy-relay
 ```bash
 make run-onsite-2025-rv
 ```
+
+默认命令为单核。若要同时手工验证多核，将启动命令改为：
+
+```bash
+make run-onsite-2025-rv QEMU_SMP=4
+```
+
+进入 shell 前确认日志含 `Platform HART Count : 4` 和 `[smp] online mask 0xf`；证据目录的 `metadata.txt` 也应含 `qemu_smp=4`。后续 Alpine、push/pull 命令完全相同。
 
 进入 Rust shell 后挂载 Alpine，并配置由 DHCP 返回的 DNS 和宿主代理：
 
@@ -430,4 +471,4 @@ git log --oneline --decorate --graph -12
 2. 安装 LoongArch C 交叉工具链后重跑静态构建。
 3. 准备 LoongArch QEMU/镜像后做动态回归。
 4. 获得官方决赛镜像后单独完成 CAgent/BuildStorm 长测。
-5. 用户明确授权后，才把 `8803ab3` 之后的 sockaddr fix/docs 提交 push 到远程。
+5. 用户明确授权后，才把 `8803ab3` 之后的 sockaddr fix/docs 与可选 SMP 提交 push 到远程。
