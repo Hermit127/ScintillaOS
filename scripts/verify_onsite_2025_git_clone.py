@@ -123,9 +123,9 @@ def main() -> int:
                 b"echo GIT_CLONE_RC=$clone_rc\n"
                 b"if test $clone_rc -eq 0 && test -f /tmp/xv6-riscv/Makefile && "
                 b"test -z \"$(git -C /tmp/xv6-riscv status --porcelain)\"; then "
-                b"git -C /tmp/xv6-riscv rev-parse HEAD; echo GIT_CLONE_TREE_OK; "
-                b"else echo GIT_CLONE_TREE_FAILED; fi\n"
-                b"echo GIT_CLONE_BATCH_DONE\n"
+                b"git -C /tmp/xv6-riscv rev-parse HEAD; printf 'GIT_CLONE_TREE_%s\\n' OK; "
+                b"else printf 'GIT_CLONE_TREE_%s\\n' FAILED; fi\n"
+                b"printf 'GIT_CLONE_BATCH_%s\\n' DONE\n"
             )
             send_slow(master, transcript, commands)
             read_until(master, transcript, b"GIT_CLONE_BATCH_DONE", args.timeout)
@@ -150,6 +150,9 @@ def main() -> int:
     missing = [marker for marker in required if marker not in transcript]
     if missing:
         print(f"missing Git clone markers: {missing!r}", file=sys.stderr)
+        return 1
+    if b"GIT_CLONE_TREE_FAILED" in transcript:
+        print("Git clone tree validation failed", file=sys.stderr)
         return 1
     print("onsite 2025 full Git clone passed")
     return 0

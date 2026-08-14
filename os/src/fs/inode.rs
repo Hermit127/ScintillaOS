@@ -384,7 +384,16 @@ pub fn path_fs_flags(fs_path: &str) -> usize {
 // ==================== OSInode ====================
 
 pub fn stat_dentry(dentry: &Arc<Dentry>) -> Kstat {
-    let info = dentry.refresh_inode_info().or_else(|| dentry.inode_info());
+    // `main` may keep recently written data in the per-inode pending-write
+    // cache.  Path-based stat must publish that data before asking lwext4 for
+    // the on-disk length; otherwise tools such as GCC can see a zero-length
+    // source even though read(2) already returns the complete cached file.
+    let pending_flushed = dentry.flush_pending_writes();
+    let info = if pending_flushed {
+        dentry.refresh_inode_info().or_else(|| dentry.inode_info())
+    } else {
+        dentry.inode_info()
+    };
     let mut st = match info {
         Some(info) => {
             let file_type = if dentry.is_dir || info.is_dir {
@@ -718,6 +727,10 @@ impl OSInode {
     }
 
     fn stat_inner(&self) -> Kstat {
+        // Flush before taking the open-file lock so the global lock order stays
+        // mutation/VFS -> file handle -> lwext4.  Once flushed, ext4_fsize is
+        // the authoritative live length, including a Vim truncate.
+        let pending_flushed = self.dentry.flush_pending_writes();
         let live_stat = {
             let mut inner = self.inner.exclusive_access();
             if let Some(mut st) = inner.cached_stat {
@@ -725,7 +738,15 @@ impl OSInode {
                     st.st_ino = file.inode as u64;
                     st.st_size = {
                         let _fs_lock = self.dentry.super_block.lock_fs();
-                        unsafe { ext4_fsize(file) as i64 }
+                        let disk_size = unsafe { ext4_fsize(file) as i64 };
+                        if pending_flushed {
+                            disk_size
+                        } else {
+                            self.dentry
+                                .runtime_file_size()
+                                .map(|size| size as i64)
+                                .unwrap_or(disk_size)
+                        }
                     };
                     st.st_blocks = ((st.st_size.max(0) as u64) + 511) / 512;
                     inner.cached_stat = Some(st);
@@ -2434,6 +2455,12 @@ pub fn rename_at(
     let _second_mutation = second_parent
         .as_ref()
         .map(begin_cached_child_mutation);
+    let _source_file_mutation = (!old_dentry.is_dir)
+        .then(|| old_dentry.lock_file_mutation())
+        .flatten();
+    if !old_dentry.is_dir && !old_dentry.flush_pending_writes_during_mutation() {
+        return Err(-5);
+    }
     // ext4_rename_at2 revalidates both leaf entries and atomically reports a
     // replaced inode without repeating the VFS path walk.
     let replacement_dentry = vfs_cached_lookup_during_mutation(&new_parent, &new_name);
@@ -2615,6 +2642,20 @@ pub fn link_at(
         Err(_) => return false,
     };
 
+    // Git finalizes a loose object with link(2) followed by unlink(2).  The
+    // source may still live only in main's pending-write cache, so publish it
+    // before creating the durable hard link.  Serialize the destination name
+    // with other namespace mutations and avoid recursively taking that lock
+    // during cache invalidation below.
+    let _new_mutation = begin_cached_child_mutation(&new_parent);
+    if vfs_lookup_during_mutation(&new_parent, &new_name).is_some() {
+        return false;
+    }
+    let _source_file_mutation = old_dentry.lock_file_mutation();
+    if !old_dentry.flush_pending_writes_during_mutation() {
+        return false;
+    }
+
     let rc = {
         let _fs_lock = old_dentry.super_block.lock_fs();
         unsafe {
@@ -2637,7 +2678,7 @@ pub fn link_at(
         );
     }
     if rc == EOK as i32 {
-        invalidate_cached_child(&new_parent, &new_name);
+        invalidate_cached_child_during_mutation(&new_parent, &new_name);
         true
     } else {
         false

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import os
 import pathlib
 import pty
@@ -18,9 +19,15 @@ import time
 import tty
 
 
-def read_until(master: int, transcript: bytearray, marker: bytes, timeout: float) -> None:
+def read_until(
+    master: int,
+    transcript: bytearray,
+    marker: bytes,
+    timeout: float,
+    start: int = 0,
+) -> None:
     deadline = time.monotonic() + timeout
-    while marker not in transcript:
+    while marker not in transcript[start:]:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError(f"timed out waiting for {marker!r}")
@@ -33,12 +40,6 @@ def read_until(master: int, transcript: bytearray, marker: bytes, timeout: float
         transcript.extend(chunk)
         sys.stdout.buffer.write(chunk)
         sys.stdout.buffer.flush()
-        respond_to_terminal_queries(master, chunk)
-
-
-def respond_to_terminal_queries(master: int, chunk: bytes) -> None:
-    if b"\x1b[6n" in chunk:
-        os.write(master, b"\x1b[24;1R")
 
 
 def drain(master: int, transcript: bytearray, duration: float = 0.05) -> None:
@@ -57,7 +58,6 @@ def drain(master: int, transcript: bytearray, duration: float = 0.05) -> None:
         transcript.extend(chunk)
         sys.stdout.buffer.write(chunk)
         sys.stdout.buffer.flush()
-        respond_to_terminal_queries(master, chunk)
 
 
 def send_slow(master: int, transcript: bytearray, data: bytes, delay: float = 0.001) -> None:
@@ -66,19 +66,59 @@ def send_slow(master: int, transcript: bytearray, data: bytes, delay: float = 0.
         drain(master, transcript, delay)
 
 
+def send_commands(
+    master: int,
+    transcript: bytearray,
+    data: bytes,
+    timeout: float = 10,
+    delay: float = 0.003,
+) -> None:
+    """Send shell commands one line at a time and acknowledge each completion.
+
+    The emulated UART has a small receive FIFO.  Streaming several long base64
+    lines without waiting for the guest shell can silently drop characters and
+    turn a transport failure into a misleading compiler failure.
+    """
+    for index, command in enumerate(data.splitlines()):
+        if not command.strip():
+            continue
+        token = f"{len(transcript):x}_{index:x}".encode()
+        marker = b"__ONSITE_CMD_" + token + b"__"
+        # Build the marker from separate printf arguments so an echoing shell
+        # never places the complete success token in its command-line echo.
+        wrapped = (
+            command
+            + b"; printf '__ONSITE_%s_%s__\\n' 'CMD' '"
+            + token
+            + b"'\n"
+        )
+        start = len(transcript)
+        send_slow(master, transcript, wrapped, delay=delay)
+        read_until(master, transcript, marker, timeout, start=start)
+
+
 def encoded_install(source: pathlib.Path, destination: str) -> bytes:
-    encoded = base64.b64encode(source.read_bytes())
+    source_bytes = source.read_bytes()
+    encoded = base64.b64encode(source_bytes)
+    digest = hashlib.sha256(source_bytes).hexdigest().encode()
     encoded_path = destination + ".b64"
     commands = [b"rm -f " + encoded_path.encode() + b" " + destination.encode() + b"\n"]
     # Keep every terminal line well below the common 4096-byte canonical-mode
     # limit.  This also makes the transfer reliable on slower UART models.
-    for offset in range(0, len(encoded), 512):
-        chunk = encoded[offset : offset + 512]
+    for offset in range(0, len(encoded), 256):
+        chunk = encoded[offset : offset + 256]
         commands.append(
             b"printf '%s' '" + chunk + b"' >> " + encoded_path.encode() + b"\n"
         )
     commands.append(
         b"base64 -d " + encoded_path.encode() + b" > " + destination.encode() + b"\n"
+    )
+    commands.append(
+        b"printf '%s  %s\\n' '"
+        + digest
+        + b"' '"
+        + destination.encode()
+        + b"' | sha256sum -c -\n"
     )
     return b"".join(commands)
 
@@ -193,19 +233,41 @@ def main() -> int:
             )
             send_slow(master, transcript, setup)
             read_until(master, transcript, b"/ # ", 10)
-            send_slow(master, transcript, encoded_install(sources[0], "/tmp/timer_regression.c"))
-            send_slow(master, transcript, encoded_install(sources[1], "/tmp/tty_regression.c"))
-            send_slow(
+            # Avoid line-editor cursor-position probes while transporting long
+            # base64 commands.  Those terminal replies share the UART input
+            # stream and can otherwise race with the following command.
+            send_commands(master, transcript, b"stty cols 1000 -echo\n")
+            ext4_start = len(transcript)
+            ext4_commands = (
+                b"mkdir /tmp/ext4-regression\n"
+                b"mkdir /tmp/ext4-regression/.git\n"
+                b"printf 'old\\n' > /tmp/ext4-regression/.git/replace\n"
+                b"printf 'new\\n' > /tmp/ext4-regression/.git/replace.lock\n"
+                b"if mv -f /tmp/ext4-regression/.git/replace.lock /tmp/ext4-regression/.git/replace && "
+                b"test \"$(cat /tmp/ext4-regression/.git/replace)\" = new && "
+                b"test ! -e /tmp/ext4-regression/.git/replace.lock; then "
+                b"printf 'EXT4_RENAME_%s\\n' OK; else printf 'EXT4_RENAME_%s\\n' FAILED; fi\n"
+            )
+            send_commands(master, transcript, ext4_commands, timeout=30)
+            if b"EXT4_RENAME_OK" not in transcript[ext4_start:]:
+                raise RuntimeError("Ext4 overwrite-rename regression failed")
+            send_commands(
+                master, transcript, encoded_install(sources[0], "/tmp/timer_regression.c")
+            )
+            send_commands(
+                master, transcript, encoded_install(sources[1], "/tmp/tty_regression.c")
+            )
+            send_commands(
                 master,
                 transcript,
                 encoded_install(sources[2], "/tmp/tty_icrnl_regression.c"),
             )
+            send_commands(master, transcript, b"stty cols 80 echo\n")
             send_slow(
                 master,
                 transcript,
-                b"gcc -O2 -Wall -Wextra /tmp/tty_icrnl_regression.c "
-                b"-o /tmp/tty_icrnl_regression\n"
-                b"/tmp/tty_icrnl_regression; echo TTY_ICRNL_RC=$?\n",
+                b"gcc /tmp/tty_icrnl_regression.c -o /tmp/tty-icrnl\n"
+                b"/tmp/tty-icrnl; echo TTY_ICRNL_RC=$?\n",
             )
             read_until(master, transcript, b"TTY_ICRNL_SEND_CR", 30)
             os.write(master, b"\r")
@@ -218,13 +280,14 @@ def main() -> int:
             read_until(master, transcript, b"TTY_ERASE_SEND_BS", 10)
             os.write(master, b"abX\x08c\r")
             read_until(master, transcript, b"TTY_ICRNL_RC=0", 10)
+            send_commands(master, transcript, b"stty cols 1000 -echo\n")
             if args.network_sockname:
-                send_slow(
+                send_commands(
                     master,
                     transcript,
                     encoded_install(sources[3], "/tmp/network_sockname_regression.c"),
                 )
-                send_slow(
+                send_commands(
                     master,
                     transcript,
                     encoded_install(sources[4], "/tmp/network_tcp_eof_regression.c"),
@@ -244,31 +307,13 @@ def main() -> int:
                     b"/tmp/network_tcp_eof_regression; echo NETWORK_TCP_EOF_RC=$?\n"
                 )
             commands += (
-                b"mkdir -p /tmp/ext4-regression/.git\n"
-                b"printf 'old\\n' > /tmp/ext4-regression/.git/replace\n"
-                b"printf 'new\\n' > /tmp/ext4-regression/.git/replace.lock\n"
-                b"if mv -f /tmp/ext4-regression/.git/replace.lock /tmp/ext4-regression/.git/replace && "
-                b"test \"$(cat /tmp/ext4-regression/.git/replace)\" = new && "
-                b"test ! -e /tmp/ext4-regression/.git/replace.lock; then "
-                b"echo EXT4_RENAME_OK; else echo EXT4_RENAME_FAILED; fi\n"
                 b"/tmp/tty_regression; echo TTY_TEST_RC=$?; "
                 b"printf 'REGRESSION_BATCH_%s\\n' DONE\n"
             )
             start = len(transcript)
-            send_slow(master, transcript, commands)
-            deadline = time.monotonic() + 120
-            while b"REGRESSION_BATCH_DONE" not in transcript[start:]:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError("timed out waiting for regression batch")
-                ready, _, _ = select.select([master], [], [], min(remaining, 0.25))
-                if ready:
-                    chunk = os.read(master, 65536)
-                    if not chunk:
-                        raise RuntimeError("QEMU serial console closed unexpectedly")
-                    transcript.extend(chunk)
-                    sys.stdout.buffer.write(chunk)
-                    sys.stdout.buffer.flush()
+            send_commands(master, transcript, commands, timeout=120)
+            if b"REGRESSION_BATCH_DONE" not in transcript[start:]:
+                raise RuntimeError("regression batch completion marker missing")
         finally:
             try:
                 os.write(master, b"\x01x")

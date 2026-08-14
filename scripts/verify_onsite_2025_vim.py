@@ -149,7 +149,7 @@ def main() -> int:
                 b"printf '# OS onsite test\\n' > README.md\n"
                 b"git add . && git commit -m 'add README.md'\n"
                 b"if test -z \"$(git status --porcelain)\"; then git log --oneline -1; "
-                b"echo GIT_LOCAL_OK; else echo GIT_LOCAL_FAILED; fi\n"
+                b"printf 'GIT_LOCAL_%s\\n' OK; else printf 'GIT_LOCAL_%s\\n' FAILED; fi\n"
                 b"cd /\n"
                 b"vim -h >/tmp/vim-help 2>&1; vim_rc=$?; head -n 3 /tmp/vim-help; "
                 b"echo VIM_HELP_RC=$vim_rc\n"
@@ -159,7 +159,7 @@ def main() -> int:
                 b"echo RUSTC_HELP_RC=$rustc_rc\n"
                 b"printf 'THIS PREEXISTING FILE IS DELIBERATELY LONGER THAN THE VIM OUTPUT.\\n"
                 b"SECOND OLD LINE THAT MUST BE TRUNCATED.\\n' > /tmp/hello-vim.c\n"
-                b"echo OFFLINE_PREFLIGHT_DONE\n"
+                b"printf 'OFFLINE_PREFLIGHT_%s\\n' DONE\n"
             )
             send_slow(master, transcript, preflight, 0.012)
             read_until(
@@ -206,14 +206,15 @@ def main() -> int:
 
             verify_start = len(transcript)
             verify = (
-                b"printf 'VIM_FILE_BEGIN\\n'\n"
+                b"printf 'VIM_FILE_%s\\n' BEGIN\n"
                 b"cat /tmp/hello-vim.c\n"
-                b"printf 'VIM_FILE_END\\n'\n"
+                b"printf 'VIM_FILE_%s\\n' END\n"
                 b"vim_stat_size=$(stat -c %s /tmp/hello-vim.c)\n"
                 b"vim_read_size=$(cat /tmp/hello-vim.c | wc -c)\n"
                 b"echo VIM_STAT_SIZE=$vim_stat_size VIM_READ_SIZE=$vim_read_size\n"
                 b"if test \"$vim_stat_size\" = \"$vim_read_size\"; then "
-                b"echo VIM_TRUNCATE_STAT_OK; else echo VIM_TRUNCATE_STAT_FAILED; fi\n"
+                b"printf 'VIM_TRUNCATE_STAT_%s\\n' OK; "
+                b"else printf 'VIM_TRUNCATE_STAT_%s\\n' FAILED; fi\n"
                 b"gcc /tmp/hello-vim.c -o /tmp/hello-vim\n"
                 b"/tmp/hello-vim\n"
                 b"echo VIM_RC=$?\n"
@@ -266,6 +267,11 @@ def main() -> int:
         return 1
     if b"shorter than expected" in transcript:
         print("GCC observed stale file size after Vim truncate", file=sys.stderr)
+        return 1
+    forbidden_markers = (b"GIT_LOCAL_FAILED", b"VIM_TRUNCATE_STAT_FAILED")
+    present = [marker for marker in forbidden_markers if marker in transcript]
+    if present:
+        print(f"verification reported failures: {present!r}", file=sys.stderr)
         return 1
     print("interactive Vim verification passed")
     return 0

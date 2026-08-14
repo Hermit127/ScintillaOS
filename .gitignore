@@ -63,6 +63,7 @@ zig-macos-*/
 tmp-musl-cross.tgz
 
 # Temporary build/test artifacts
+**/__pycache__/
 tmp/*
 !tmp/
 !tmp/hello.c

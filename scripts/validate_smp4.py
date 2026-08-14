@@ -170,10 +170,14 @@ class QemuRun:
         argv: list[str],
         log_path: Path,
         stall_timeout: float,
+        post_prompt_delay: float = 0.0,
+        command_byte_delay: float = 0.0,
     ) -> None:
         self.argv = argv
         self.log_path = log_path
         self.stall_timeout = stall_timeout
+        self.post_prompt_delay = post_prompt_delay
+        self.command_byte_delay = command_byte_delay
         self.log = log_path.open("wb")
         self.proc = subprocess.Popen(
             argv,
@@ -278,11 +282,33 @@ class QemuRun:
                 raise TimeoutError(f"serial marker not seen: {marker!r}")
             self._read_once(deadline)
 
+    def drain_until_quiet(self, quiet_seconds: float, max_seconds: float = 30.0) -> None:
+        """Keep consuming diagnostics until the serial stream stays quiet."""
+        quiet_deadline = time.monotonic() + quiet_seconds
+        overall_deadline = time.monotonic() + max_seconds
+        while time.monotonic() < quiet_deadline:
+            if time.monotonic() >= overall_deadline:
+                return
+            events = self.selector.select(
+                min(0.1, max(0.0, quiet_deadline - time.monotonic()))
+            )
+            if not events:
+                continue
+            self._read_once(min(quiet_deadline, overall_deadline))
+            quiet_deadline = time.monotonic() + quiet_seconds
+
     def command(self, spec: GuestCommand) -> None:
         assert self.proc.stdin is not None
         start = len(self.all_output)
-        self.proc.stdin.write(spec.command.encode() + b"\n")
-        self.proc.stdin.flush()
+        payload = spec.command.encode() + b"\n"
+        if self.command_byte_delay:
+            for byte in payload:
+                self.proc.stdin.write(bytes([byte]))
+                self.proc.stdin.flush()
+                time.sleep(self.command_byte_delay)
+        else:
+            self.proc.stdin.write(payload)
+            self.proc.stdin.flush()
         # The Rust shell prints the prompt before reading the command, so the
         # serial transcript contains ``>> command``.  Searching for ``>> ``
         # from `start` would mistake that same prompt for the *next* prompt and
@@ -297,6 +323,12 @@ class QemuRun:
             assert marker_at >= 0
             completion_start = marker_at + len(spec.marker)
         self.wait_for(spec.prompt, spec.timeout, completion_start)
+        # Diagnostics can emit deferred task-exit lines after the shell has
+        # already printed its prompt.  Let the shell finish returning to its
+        # input loop before injecting the next command; otherwise a command
+        # can race the diagnostic tail and be lost by the UART frontend.
+        if self.post_prompt_delay:
+            self.drain_until_quiet(self.post_prompt_delay)
 
 
 def parse_command(value: str) -> GuestCommand:
@@ -469,7 +501,13 @@ def main() -> int:
         (round_dir / "qemu-command.txt").write_text(
             " ".join(argv) + "\n", encoding="utf-8"
         )
-        run = QemuRun(argv, log, args.stall_timeout)
+        run = QemuRun(
+            argv,
+            log,
+            args.stall_timeout,
+            post_prompt_delay=3.0 if args.diagnostics else 0.0,
+            command_byte_delay=0.002 if args.diagnostics else 0.0,
+        )
         passed = False
         detail = "completed"
         try:
