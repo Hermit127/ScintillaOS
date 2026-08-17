@@ -41,6 +41,7 @@ const MSG_NOSIGNAL: usize = 0x4000;
 
 const SOL_SOCKET: usize = 1;
 const SO_REUSEADDR: usize = 2;
+const SO_TYPE: usize = 3;
 const SO_ERROR: usize = 4;
 const SO_RCVBUF: usize = 8;
 const SO_SNDBUF: usize = 7;
@@ -199,6 +200,18 @@ fn write_sockaddr_with_len(
     let len = core::mem::size_of::<SockAddrIn>() as u32;
     write_user_value(&task, addrlen as *mut u32, &len)
         && write_sockaddr_in(ptr, sin_addr, sin_port)
+}
+
+fn write_unnamed_unix_sockaddr(ptr: *mut u8, addrlen: *mut usize) -> bool {
+    let Some(task) = current_task() else {
+        return false;
+    };
+    // An unnamed AF_UNIX socketpair has no sun_path.  Linux reports only the
+    // two-byte sa_family_t portion of sockaddr_un.
+    let family = AF_UNIX as u16;
+    let len = core::mem::size_of::<u16>() as u32;
+    write_user_value(&task, addrlen as *mut u32, &len)
+        && write_user_value(&task, ptr as *mut u16, &family)
 }
 
 fn iov_total_len(iov: *const Iovec, iovcnt: usize) -> usize {
@@ -368,6 +381,18 @@ fn get_socket_peer_endpoint(sockfd: usize) -> Option<IpEndpoint> {
     let file = inner.fd_table[sockfd].as_ref()?;
     let sock = file.as_any().downcast_ref::<SocketFile>()?;
     sock.get_peer_endpoint()
+}
+
+fn set_socket_peer_endpoint(sockfd: usize, endpoint: IpEndpoint) {
+    let Some(task) = current_task() else {
+        return;
+    };
+    let inner = task.inner_exclusive_access();
+    if let Some(Some(file)) = inner.fd_table.get(sockfd) {
+        if let Some(sock) = file.as_any().downcast_ref::<SocketFile>() {
+            sock.set_peer_endpoint(endpoint);
+        }
+    }
 }
 
 fn is_local_ipv4(addr: IpAddress) -> bool {
@@ -1141,14 +1166,11 @@ pub fn sys_connect(sockfd: usize, addr: *const u8, addrlen: usize) -> isize {
     );
 
     if st == SocketType::Udp {
-        let task = current_task().unwrap();
-        let inner = task.inner_exclusive_access();
-        if sockfd < inner.fd_table.len() {
-            if let Some(file) = &inner.fd_table[sockfd] {
-                if let Some(s) = file.as_any().downcast_ref::<SocketFile>() {
-                    s.set_peer_endpoint(remote);
-                }
-            }
+        set_socket_peer_endpoint(sockfd, remote);
+        // Linux implicitly binds an unbound UDP socket during connect(2).
+        // Without a local ephemeral port smoltcp cannot emit the datagram.
+        if let Some(handle) = handle {
+            let _ = ensure_udp_local_endpoint(sockfd, handle, remote);
         }
         return 0;
     }
@@ -1535,11 +1557,9 @@ pub fn sys_sendto(
 
     let dontwait = nonblock || (flags & MSG_DONTWAIT) != 0;
 
-    // For UDP, require destination address
-    if st == SocketType::Udp && (dest_addr.is_null() || addrlen < 8) {
-        return -89; // EDESTADDRREQ
-    }
-    // For TCP, dest_addr is ignored (use connected peer)
+    // TCP ignores dest_addr and uses its connected peer.  A connected UDP
+    // socket does the same when sendto(2) is called with a null destination;
+    // glibc's DNS resolver relies on this form after connect(2).
 
     if st == SocketType::Udp && len > SOCKET_BUFFER_SIZE {
         return -90;
@@ -1565,17 +1585,28 @@ pub fn sys_sendto(
             let Some(handle) = handle else {
                 return -107;
             };
-            let (ip, port) = match parse_sockaddr_in(dest_addr) {
-                Some(v) => v,
-                None => return -22,
+            let dest = if dest_addr.is_null() {
+                match get_socket_peer_endpoint(sockfd) {
+                    Some(dest) => dest,
+                    None => return -89,
+                }
+            } else {
+                if addrlen < 8 {
+                    return -22;
+                }
+                let (ip, port) = match parse_sockaddr_in(dest_addr) {
+                    Some(v) => v,
+                    None => return -22,
+                };
+                IpEndpoint::new(
+                    IpAddress::from(Ipv4Address::from_bytes(&ip.to_be_bytes())),
+                    port,
+                )
             };
-            let dest = IpEndpoint::new(
-                IpAddress::from(Ipv4Address::from_bytes(&ip.to_be_bytes())),
-                port,
-            );
             if let Some(ret) = try_send_local_udp(sockfd, handle, &data, dest) {
                 return ret;
             }
+            let _ = ensure_udp_local_endpoint(sockfd, handle, dest);
             udp_send(handle, &data, dest)
         }
         SocketType::Unix => -107,
@@ -1768,13 +1799,14 @@ pub fn sys_sendmsg(sockfd: usize, msg: *const u8, flags: usize) -> isize {
             } else {
                 None
             };
-            let dest = match dest {
-                Some(d) => d,
+            let dest = match dest.or_else(|| get_socket_peer_endpoint(sockfd)) {
+                Some(dest) => dest,
                 None => return -89,
             };
             if let Some(ret) = try_send_local_udp(sockfd, handle, &buf[..copied], dest) {
                 return ret;
             }
+            let _ = ensure_udp_local_endpoint(sockfd, handle, dest);
             udp_send(handle, &buf[..copied], dest)
         }
         SocketType::Unix => -107,
@@ -1989,6 +2021,28 @@ pub fn sys_getsockopt(
         return -14;
     }
 
+    // AF_UNIX socketpairs live in the VFS fd table rather than smoltcp's
+    // socket set.  CPython deliberately detaches the two raw descriptors
+    // returned by socketpair(2), then reconstructs high-level socket objects;
+    // that constructor queries SO_TYPE to validate each descriptor.
+    if let Some(socket_type) = with_unix_socket(sockfd, |socket| socket.socket_type_value()) {
+        return match (level, optname) {
+            (SOL_SOCKET, SO_TYPE) => {
+                let token = current_user_token();
+                *translated_refmut(token, optlen as *mut u32) = 4;
+                *translated_refmut(token, optval as *mut i32) = socket_type;
+                0
+            }
+            (SOL_SOCKET, SO_ERROR) => {
+                let token = current_user_token();
+                *translated_refmut(token, optlen as *mut u32) = 4;
+                *translated_refmut(token, optval as *mut i32) = 0;
+                0
+            }
+            _ => -92,
+        };
+    }
+
     let (handle, st, _nonblock) = match sock_lookup(sockfd) {
         Some(v) => v,
         None => return -9,
@@ -1997,6 +2051,16 @@ pub fn sys_getsockopt(
     let token = current_user_token();
 
     match (level, optname) {
+        (SOL_SOCKET, SO_TYPE) => {
+            let socket_type = match st {
+                SocketType::Tcp => 1,
+                SocketType::Udp => 2,
+                SocketType::Unix => 1,
+            };
+            *translated_refmut(token, optlen as *mut u32) = 4;
+            *translated_refmut(token, optval as *mut i32) = socket_type;
+            0
+        }
         (SOL_SOCKET, SO_ERROR) => {
             let error = if st != SocketType::Tcp {
                 0
@@ -2108,6 +2172,14 @@ pub fn sys_getpeername(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isi
         return -14;
     }
 
+    if with_unix_socket(sockfd, |_| ()).is_some() {
+        return if write_unnamed_unix_sockaddr(addr, addrlen) {
+            0
+        } else {
+            -14
+        };
+    }
+
     let (handle, st, _nonblock) = match sock_lookup(sockfd) {
         Some(v) => v,
         None => return -9,
@@ -2164,6 +2236,14 @@ pub fn sys_getpeername(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isi
 pub fn sys_getsockname(sockfd: usize, addr: *mut u8, addrlen: *mut usize) -> isize {
     if addr.is_null() || addrlen.is_null() {
         return -14;
+    }
+
+    if with_unix_socket(sockfd, |_| ()).is_some() {
+        return if write_unnamed_unix_sockaddr(addr, addrlen) {
+            0
+        } else {
+            -14
+        };
     }
 
     let (handle, st, _nonblock) = match sock_lookup(sockfd) {

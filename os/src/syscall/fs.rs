@@ -3848,6 +3848,170 @@ pub fn sys_readlinkat(dirfd: isize, path: *const u8, buf: *mut u8, bufsiz: usize
     len as isize
 }
 
+fn validate_xattr_path(path: *const u8, follow_symlink: bool) -> Result<(), isize> {
+    let path_str = translated_path_bounded(path)?;
+    if path_has_too_long_component(&path_str) {
+        return Err(-36);
+    }
+    if path_str.is_empty() {
+        return Err(-2);
+    }
+    if proc_exe_stat(path_str.as_str(), !follow_symlink).is_some()
+        || special_device_stat(path_str.as_str()).is_some()
+    {
+        return Ok(());
+    }
+    let task = current_task().ok_or(-9isize)?;
+    let base = resolve_base_dir_for_path(AT_FDCWD, &path_str)?;
+    let (euid, egid) = {
+        let inner = task.inner_exclusive_access();
+        (inner.euid, inner.egid)
+    };
+    check_traverse_to_leaf(&base, &path_str, euid, egid)?;
+    let dentry = resolve_path_checked(&base, &path_str)?;
+    if follow_symlink && dentry.is_link {
+        crate::fs::follow_symlink(&base, dentry, 0).ok_or(-40isize)?;
+    }
+    Ok(())
+}
+
+fn validate_xattr_fd(fd: usize) -> Result<(), isize> {
+    let task = current_task().ok_or(-9isize)?;
+    let inner = task.inner_exclusive_access();
+    if inner.fd_table.get(fd).and_then(|file| file.as_ref()).is_some() {
+        Ok(())
+    } else {
+        Err(-9)
+    }
+}
+
+fn validate_xattr_name(name: *const u8) -> Result<(), isize> {
+    let name = translated_path_bounded(name)?;
+    if name.is_empty() {
+        return Err(-34);
+    }
+    if name.len() > 255 {
+        return Err(-34);
+    }
+    Ok(())
+}
+
+pub fn sys_listxattr(
+    path: *const u8,
+    list: *mut u8,
+    size: usize,
+    follow_symlink: bool,
+) -> isize {
+    if size > 0 && !valid_user_write_buf(list, size) {
+        return -14;
+    }
+    if let Err(errno) = validate_xattr_path(path, follow_symlink) {
+        return errno;
+    }
+    0
+}
+
+pub fn sys_flistxattr(fd: usize, list: *mut u8, size: usize) -> isize {
+    if size > 0 && !valid_user_write_buf(list, size) {
+        return -14;
+    }
+    if let Err(errno) = validate_xattr_fd(fd) {
+        return errno;
+    }
+    0
+}
+
+pub fn sys_getxattr(
+    path: *const u8,
+    name: *const u8,
+    _value: *mut u8,
+    _size: usize,
+    follow_symlink: bool,
+) -> isize {
+    if let Err(errno) = validate_xattr_path(path, follow_symlink) {
+        return errno;
+    }
+    if let Err(errno) = validate_xattr_name(name) {
+        return errno;
+    }
+    -61
+}
+
+pub fn sys_fgetxattr(fd: usize, name: *const u8, _value: *mut u8, _size: usize) -> isize {
+    if let Err(errno) = validate_xattr_fd(fd) {
+        return errno;
+    }
+    if let Err(errno) = validate_xattr_name(name) {
+        return errno;
+    }
+    -61
+}
+
+pub fn sys_setxattr(
+    path: *const u8,
+    name: *const u8,
+    value: *const u8,
+    size: usize,
+    flags: usize,
+    follow_symlink: bool,
+) -> isize {
+    if flags & !3 != 0 || flags == 3 {
+        return -22;
+    }
+    if size > 0 && !valid_user_read_buf(value, size) {
+        return -14;
+    }
+    if let Err(errno) = validate_xattr_path(path, follow_symlink) {
+        return errno;
+    }
+    if let Err(errno) = validate_xattr_name(name) {
+        return errno;
+    }
+    -95
+}
+
+pub fn sys_fsetxattr(
+    fd: usize,
+    name: *const u8,
+    value: *const u8,
+    size: usize,
+    flags: usize,
+) -> isize {
+    if flags & !3 != 0 || flags == 3 {
+        return -22;
+    }
+    if size > 0 && !valid_user_read_buf(value, size) {
+        return -14;
+    }
+    if let Err(errno) = validate_xattr_fd(fd) {
+        return errno;
+    }
+    if let Err(errno) = validate_xattr_name(name) {
+        return errno;
+    }
+    -95
+}
+
+pub fn sys_removexattr(path: *const u8, name: *const u8, follow_symlink: bool) -> isize {
+    if let Err(errno) = validate_xattr_path(path, follow_symlink) {
+        return errno;
+    }
+    if let Err(errno) = validate_xattr_name(name) {
+        return errno;
+    }
+    -61
+}
+
+pub fn sys_fremovexattr(fd: usize, name: *const u8) -> isize {
+    if let Err(errno) = validate_xattr_fd(fd) {
+        return errno;
+    }
+    if let Err(errno) = validate_xattr_name(name) {
+        return errno;
+    }
+    -61
+}
+
 pub fn sys_fstatat(dirfd: isize, path: *const u8, stat_buf: *mut u8, flags: usize) -> isize {
     const AT_EMPTY_PATH: usize = 0x1000;
     const AT_SYMLINK_NOFOLLOW: usize = 0x100;
@@ -5089,6 +5253,25 @@ pub fn sys_ftruncate(fd: usize, length: u64) -> isize {
         }
         None => -22,
     }
+}
+
+/// Linux `truncate(2)` follows the final symlink and requires write access to
+/// the target.  Reuse the normal open/ftruncate path so path traversal,
+/// permissions, read-only mounts, tmpfs accounting, mapping invalidation and
+/// Ext4 cache refresh all retain the same semantics as `ftruncate(2)`.
+pub fn sys_truncate(path: *const u8, length: u64) -> isize {
+    const O_WRONLY: u32 = 1;
+
+    if length > isize::MAX as u64 {
+        return -22;
+    }
+    let fd = sys_openat(AT_FDCWD, path, O_WRONLY, 0);
+    if fd < 0 {
+        return fd;
+    }
+    let result = sys_ftruncate(fd as usize, length);
+    let _ = sys_close(fd as usize);
+    result
 }
 
 // ---- flock (32) ----

@@ -82,6 +82,13 @@ pub fn make_unix_socket_pair(
 }
 
 impl UnixSocketFile {
+    pub fn socket_type_value(&self) -> i32 {
+        match self.kind {
+            UnixSocketKind::Stream => 1,
+            UnixSocketKind::SeqPacket => 5,
+        }
+    }
+
     fn peer(&self) -> usize {
         self.endpoint ^ 1
     }

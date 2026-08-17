@@ -1,3 +1,15 @@
+const SYSCALL_SETXATTR: usize = 5;
+const SYSCALL_LSETXATTR: usize = 6;
+const SYSCALL_FSETXATTR: usize = 7;
+const SYSCALL_GETXATTR: usize = 8;
+const SYSCALL_LGETXATTR: usize = 9;
+const SYSCALL_FGETXATTR: usize = 10;
+const SYSCALL_LISTXATTR: usize = 11;
+const SYSCALL_LLISTXATTR: usize = 12;
+const SYSCALL_FLISTXATTR: usize = 13;
+const SYSCALL_REMOVEXATTR: usize = 14;
+const SYSCALL_LREMOVEXATTR: usize = 15;
+const SYSCALL_FREMOVEXATTR: usize = 16;
 const SYSCALL_DUP: usize = 23;
 const SYSCALL_DUP3: usize = 24;
 const SYSCALL_FCNTL: usize = 25;
@@ -15,6 +27,7 @@ const SYSCALL_MKDIRAT: usize = 34;
 const SYSCALL_UNLINKAT: usize = 35;
 const SYSCALL_SYMLINKAT: usize = 36;
 const SYSCALL_LINKAT: usize = 37;
+const SYSCALL_TRUNCATE: usize = 45;
 const SYSCALL_FTRUNCATE: usize = 46;
 const SYSCALL_FALLOCATE: usize = 47;
 const SYSCALL_CHDIR: usize = 49;
@@ -563,6 +576,63 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[2] as *mut u8,
             args[3],
         ),
+        SYSCALL_SETXATTR => sys_setxattr(
+            args[0] as *const u8,
+            args[1] as *const u8,
+            args[2] as *const u8,
+            args[3],
+            args[4],
+            true,
+        ),
+        SYSCALL_LSETXATTR => sys_setxattr(
+            args[0] as *const u8,
+            args[1] as *const u8,
+            args[2] as *const u8,
+            args[3],
+            args[4],
+            false,
+        ),
+        SYSCALL_FSETXATTR => sys_fsetxattr(
+            args[0],
+            args[1] as *const u8,
+            args[2] as *const u8,
+            args[3],
+            args[4],
+        ),
+        SYSCALL_GETXATTR => sys_getxattr(
+            args[0] as *const u8,
+            args[1] as *const u8,
+            args[2] as *mut u8,
+            args[3],
+            true,
+        ),
+        SYSCALL_LGETXATTR => sys_getxattr(
+            args[0] as *const u8,
+            args[1] as *const u8,
+            args[2] as *mut u8,
+            args[3],
+            false,
+        ),
+        SYSCALL_FGETXATTR => sys_fgetxattr(
+            args[0],
+            args[1] as *const u8,
+            args[2] as *mut u8,
+            args[3],
+        ),
+        SYSCALL_LISTXATTR => {
+            sys_listxattr(args[0] as *const u8, args[1] as *mut u8, args[2], true)
+        }
+        SYSCALL_LLISTXATTR => {
+            sys_listxattr(args[0] as *const u8, args[1] as *mut u8, args[2], false)
+        }
+        SYSCALL_FLISTXATTR => sys_flistxattr(args[0], args[1] as *mut u8, args[2]),
+        SYSCALL_REMOVEXATTR => {
+            sys_removexattr(args[0] as *const u8, args[1] as *const u8, true)
+        }
+        SYSCALL_LREMOVEXATTR => {
+            sys_removexattr(args[0] as *const u8, args[1] as *const u8, false)
+        }
+        SYSCALL_FREMOVEXATTR => sys_fremovexattr(args[0], args[1] as *const u8),
         SYSCALL_BRK => sys_brk(args[0]),
         SYSCALL_SLEEP => sys_sleep(args[0] as u64),
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4] as i32, args[5]),
@@ -725,6 +795,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3] as *const u8,
             args[4],
         ),
+        SYSCALL_TRUNCATE => sys_truncate(args[0] as *const u8, args[1] as u64),
         SYSCALL_FTRUNCATE => sys_ftruncate(args[0], args[1] as u64),
         SYSCALL_CLOSE_RANGE => sys_close_range(args[0], args[1], args[2]),
         _ => -38,

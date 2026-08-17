@@ -437,6 +437,11 @@ FINAL_2026_LA_IMAGE ?= testsuits-for-oskernel-final/image/sdcard-la-pub.img
 FINAL_2026_MODE ?= all
 FINAL_2026_MEMORY ?= 8G
 FINAL_2026_ARTIFACT_DIR ?= artifacts/final2026
+PYTHON_ONSITE_MODE ?= all
+PYTHON_ONSITE_SMP ?= 4
+PYTHON_ONSITE_MEMORY ?= 2G
+PYTHON_ONSITE_ARTIFACT_DIR ?= artifacts/onsite-python
+PYTHON_ONSITE_PROXY ?= http://10.0.2.2:27898
 
 # Dual-disk mode (test disk bus 0, arch-matched root disk bus 1)
 QEMU_ARGS_DUAL := -drive file=$(TEST_DISK),if=none,format=raw,id=x0 \
@@ -508,6 +513,37 @@ verify-onsite-2026-abi: kernel-rv
 		--base-image "$(ON_SITE_2025_DISK)" --root-disk "$(ROOT_DISK)" \
 		--smp "$(QEMU_SMP)"
 
+verify-onsite-python-rv: kernel-rv disk.img
+	@python3 scripts/verify_onsite_python.py --arch riscv64 \
+		--mode "$(PYTHON_ONSITE_MODE)" --test-image "$(FINAL_2026_RV_IMAGE)" \
+		--root-image disk.img --kernel kernel-rv --smp "$(PYTHON_ONSITE_SMP)" \
+		--memory "$(PYTHON_ONSITE_MEMORY)" --proxy "$(PYTHON_ONSITE_PROXY)" \
+		--artifact-root "$(PYTHON_ONSITE_ARTIFACT_DIR)"
+
+verify-onsite-python-core: kernel-rv disk.img
+	@$(MAKE) verify-onsite-python-rv PYTHON_ONSITE_MODE=core
+
+verify-onsite-python-fs: kernel-rv disk.img
+	@$(MAKE) verify-onsite-python-rv PYTHON_ONSITE_MODE=fs
+
+verify-onsite-python-concurrency: kernel-rv disk.img
+	@$(MAKE) verify-onsite-python-rv PYTHON_ONSITE_MODE=concurrency
+
+verify-onsite-python-network: kernel-rv disk.img
+	@$(MAKE) verify-onsite-python-rv PYTHON_ONSITE_MODE=network
+
+verify-onsite-python-all: kernel-rv disk.img
+	@$(MAKE) verify-onsite-python-rv PYTHON_ONSITE_MODE=all
+
+verify-onsite-python-la-docker:
+	@test -f kernel-la || { echo "missing kernel-la; build it in the official Docker environment first"; exit 1; }
+	@test -f disk-la.img || { echo "missing disk-la.img; build it in the official Docker environment first"; exit 1; }
+	@sh scripts/verify_onsite_python_docker.sh --arch loongarch64 \
+		--mode "$(PYTHON_ONSITE_MODE)" --test-image "$(FINAL_2026_LA_IMAGE)" \
+		--root-image disk-la.img --kernel kernel-la --smp 12 \
+		--memory "$(PYTHON_ONSITE_MEMORY)" --proxy "$(PYTHON_ONSITE_PROXY)" \
+		--artifact-root "$(PYTHON_ONSITE_ARTIFACT_DIR)"
+
 run-final-2026-rv: kernel-rv disk.img
 	@python3 scripts/run_final_2026.py --arch riscv64 \
 		--mode "$(FINAL_2026_MODE)" --test-image "$(FINAL_2026_RV_IMAGE)" \
@@ -552,4 +588,4 @@ gdbserver: build
 gdbclient:
 	@gdb -ex 'file $(KERNEL_ELF)' -ex 'set arch riscv:rv64' -ex 'target remote localhost:1234'
 
-.PHONY: all prepare-vendor kernel-rv kernel-la kernel-rv-final-diag disk.img disk-rv.img disk-la.img build env kernel clean disasm disasm-vim run run-smp4 run-smp8 run-la-smp2 run-la-smp8 run-inner run-dual run-dual-smp4 run-la-dual-smp2 run-dual-prebuilt run-dual-smp4-prebuilt run-la-dual-smp2-prebuilt run-onsite-2025-rv onsite-2025-proxy-relay verify-onsite-2025-vim verify-onsite-2025-regressions verify-onsite-2025-network verify-onsite-2025-git-clone verify-onsite-2026-abi run-final-2026-rv run-final-2026-la run-final-2026-la-docker verify-loongarch12-boot-docker fs-img gdbserver gdbclient
+.PHONY: all prepare-vendor kernel-rv kernel-la kernel-rv-final-diag disk.img disk-rv.img disk-la.img build env kernel clean disasm disasm-vim run run-smp4 run-smp8 run-la-smp2 run-la-smp8 run-inner run-dual run-dual-smp4 run-la-dual-smp2 run-dual-prebuilt run-dual-smp4-prebuilt run-la-dual-smp2-prebuilt run-onsite-2025-rv onsite-2025-proxy-relay verify-onsite-2025-vim verify-onsite-2025-regressions verify-onsite-2025-network verify-onsite-2025-git-clone verify-onsite-2026-abi verify-onsite-python-rv verify-onsite-python-core verify-onsite-python-fs verify-onsite-python-concurrency verify-onsite-python-network verify-onsite-python-all verify-onsite-python-la-docker run-final-2026-rv run-final-2026-la run-final-2026-la-docker verify-loongarch12-boot-docker fs-img gdbserver gdbclient

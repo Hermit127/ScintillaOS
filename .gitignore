@@ -48,6 +48,7 @@ artifacts/smp4-validation*/failure-*/
 artifacts/smp8-*/
 artifacts/onsite2025/
 artifacts/final2026/
+artifacts/onsite-python/
 kernel-rv-final-diag
 
 # Local contest/test suites
