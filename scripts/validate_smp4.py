@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cold-boot four-hart ScintillaOS validation without changing guest tests.
+"""Cold-boot multi-hart ScintillaOS validation without changing guest tests.
 
 The host owns all timeouts.  No timeout wrapper, CPU affinity, test argument,
 or replacement script is injected into the guest.
@@ -13,9 +13,11 @@ import hashlib
 import json
 import os
 import selectors
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -40,18 +42,20 @@ class GuestCommand:
     timeout: float = 180.0
 
 
-DIRECTED = (
-    GuestCommand("cpuinfotest", "cpuinfotest passed: online mask 0xf"),
-    GuestCommand("smpstress", "smpstress passed: online=0xf, observed=0xf"),
-    GuestCommand("affinitytest", "affinitytest passed: online=0xf"),
-    GuestCommand("clonesmptest", "clonesmptest passed:"),
-    GuestCommand("futextest", "futextest passed!"),
-    GuestCommand("mprotecttest", "mprotecttest passed!"),
-    GuestCommand("shmtest", "shmtest passed!"),
-    GuestCommand("run_pipe_test", "Iter 4 OK."),
-    GuestCommand("sig_simple", "signal_simple: Done"),
-    GuestCommand("sig_simple2", "signal_simple2: parent Done"),
-)
+def directed_commands(smp: int) -> tuple[GuestCommand, ...]:
+    mask = hex((1 << smp) - 1)
+    return (
+        GuestCommand("cpuinfotest", f"cpuinfotest passed: online mask {mask}"),
+        GuestCommand("smpstress", f"smpstress passed: online={mask}, observed={mask}"),
+        GuestCommand("affinitytest", f"affinitytest passed: online={mask}"),
+        GuestCommand("clonesmptest", "clonesmptest passed:"),
+        GuestCommand("futextest", "futextest passed!"),
+        GuestCommand("mprotecttest", "mprotecttest passed!"),
+        GuestCommand("shmtest", "shmtest passed!"),
+        GuestCommand("run_pipe_test", "Iter 4 OK."),
+        GuestCommand("sig_simple", "signal_simple: Done"),
+        GuestCommand("sig_simple2", "signal_simple2: parent Done"),
+    )
 
 
 def official_commands(suite: str) -> tuple[GuestCommand, ...]:
@@ -135,6 +139,31 @@ def qemu_version(qemu: str) -> str:
     return result.stdout.splitlines()[0]
 
 
+def verify_riscv_root_disk(path: Path) -> None:
+    """Reject an accidentally selected LoongArch root image before QEMU."""
+    if shutil.which("debugfs") is None:
+        return
+    with tempfile.TemporaryDirectory(prefix="smp-root-arch-") as temporary:
+        extracted = Path(temporary) / "user_shell"
+        result = subprocess.run(
+            ["debugfs", "-R", f"dump /bin/user_shell {extracted}", str(path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if result.returncode != 0 or not extracted.is_file():
+            return
+        header = extracted.read_bytes()[:20]
+        if len(header) < 20 or header[:4] != b"\x7fELF":
+            return
+        machine = int.from_bytes(header[18:20], "little")
+        if machine != 243:
+            raise ValueError(
+                f"root disk {path} contains e_machine={machine} /bin/user_shell; "
+                "RISC-V requires e_machine=243 (use disk.img, not disk-la.img/fs-img.img)"
+            )
+
+
 def serial_metrics(serial: str) -> dict[str, int]:
     return {
         "group_end": serial.count("#### OS COMP TEST GROUP END"),
@@ -164,18 +193,32 @@ def create_overlay(base: Path, overlay: Path) -> None:
     )
 
 
+def check_overlay(overlay: Path, destination: Path) -> bool:
+    """Persist qcow2 integrity output and report whether the check passed."""
+    completed = subprocess.run(
+        ["qemu-img", "check", str(overlay)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    destination.write_bytes(completed.stdout)
+    return completed.returncode == 0
+
+
 class QemuRun:
     def __init__(
         self,
         argv: list[str],
         log_path: Path,
         stall_timeout: float,
+        cpu_count: int,
         post_prompt_delay: float = 0.0,
         command_byte_delay: float = 0.0,
     ) -> None:
         self.argv = argv
         self.log_path = log_path
         self.stall_timeout = stall_timeout
+        self.cpu_count = cpu_count
         self.post_prompt_delay = post_prompt_delay
         self.command_byte_delay = command_byte_delay
         self.log = log_path.open("wb")
@@ -215,7 +258,7 @@ class QemuRun:
             self.proc.stdin.flush()
             time.sleep(0.1)
             commands = [b"info cpus\n"]
-            for cpu in range(4):
+            for cpu in range(self.cpu_count):
                 commands.extend(
                     (
                         f"cpu {cpu}\n".encode(),
@@ -346,11 +389,11 @@ def write_manifest(
 ) -> None:
     passed = sum(bool(result["passed"]) for result in results)
     lines = [
-        "# SMP4 validation manifest",
+        "# SMP validation manifest",
         "",
         f"- Generated: {time.strftime('%Y-%m-%d %H:%M:%S %z')}",
         f"- QEMU: `{qemu}`",
-        f"- Topology: `-smp 4 -m 256M`",
+        f"- Topology: `-smp {args.smp} -m {args.memory}`",
         f"- Suite: `{args.suite}`",
         f"- Result: `{passed}/{len(results)} passed`",
         "",
@@ -405,6 +448,8 @@ def main() -> int:
         help="custom command as COMMAND[:::REQUIRED_MARKER[:::PROMPT]]",
     )
     parser.add_argument("--rounds", type=int, default=3)
+    parser.add_argument("--smp", type=int, default=4)
+    parser.add_argument("--memory", default="256M")
     parser.add_argument("--stall-timeout", type=float, default=120.0)
     parser.add_argument(
         "--output-dir", type=Path, default=Path("artifacts/smp4-validation")
@@ -422,8 +467,14 @@ def main() -> int:
     for path in (args.kernel, args.root_disk, args.test_disk):
         if not path.is_file():
             parser.error(f"missing input: {path}")
+    try:
+        verify_riscv_root_disk(args.root_disk)
+    except ValueError as error:
+        parser.error(str(error))
     if args.rounds < 1:
         parser.error("--rounds must be positive")
+    if not 1 <= args.smp <= 8:
+        parser.error("--smp must be between 1 and 8 for RISC-V")
     if args.suite == "custom" and not args.command:
         parser.error("--suite custom requires --command")
 
@@ -441,7 +492,7 @@ def main() -> int:
     commands = (
         tuple(parse_command(value) for value in args.command)
         if args.command
-        else DIRECTED
+        else directed_commands(args.smp)
         if args.suite == "directed"
         else official_commands(args.suite)
     )
@@ -486,9 +537,9 @@ def main() -> int:
             str(args.kernel.resolve()),
             "-nographic",
             "-m",
-            "256M",
+            args.memory,
             "-smp",
-            "4",
+            str(args.smp),
             "-drive",
             f"file={test_overlay},if=none,format=qcow2,id=x0",
             "-device",
@@ -505,19 +556,21 @@ def main() -> int:
             argv,
             log,
             args.stall_timeout,
+            args.smp,
             post_prompt_delay=3.0 if args.diagnostics else 0.0,
             command_byte_delay=0.002 if args.diagnostics else 0.0,
         )
         passed = False
         detail = "completed"
         try:
-            run.wait_for("[smp] online mask 0xf", 90, 0)
+            mask = hex((1 << args.smp) - 1)
+            run.wait_for(f"[smp] online mask {mask}", 90, 0)
             run.wait_for(">> ", 90, 0)
             for command in commands:
                 run.command(command)
             serial = bytes(run.all_output).decode("utf-8", "replace")
-            if args.suite == "directed" and "observed=0xf" not in serial:
-                raise RuntimeError("four-hart user execution evidence missing")
+            if args.suite == "directed" and f"observed={mask}" not in serial:
+                raise RuntimeError(f"{args.smp}-hart user execution evidence missing")
             if args.suite == "libctest-musl" and any(
                 line.startswith("FAIL ") for line in serial.splitlines()
             ):
@@ -536,6 +589,15 @@ def main() -> int:
             run.monitor_dump(round_dir / "monitor-dump.txt")
         finally:
             run.close()
+        overlays_ok = all(
+            (
+                check_overlay(test_overlay, round_dir / "test-qemu-img-check.txt"),
+                check_overlay(root_overlay, round_dir / "root-qemu-img-check.txt"),
+            )
+        )
+        if not overlays_ok:
+            passed = False
+            detail = f"{detail}; qemu-img check failed"
         results.append(
             {
                 "round": round_number,

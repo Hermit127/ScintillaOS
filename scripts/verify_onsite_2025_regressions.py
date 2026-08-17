@@ -173,6 +173,11 @@ def main() -> int:
         action="store_true",
         help="also run host-gateway getsockname and TCP EOF regressions",
     )
+    parser.add_argument(
+        "--abi-2026",
+        action="store_true",
+        help="also run procfs, eventfd/epoll/timerfd, mmap and pthread regressions",
+    )
     args = parser.parse_args()
 
     if not 1 <= args.smp <= 12:
@@ -184,13 +189,15 @@ def main() -> int:
         repo / "tests/onsite2025/tty_regression.c",
         repo / "tests/onsite2025/tty_icrnl_regression.c",
     ]
+    abi_source = repo / "tests/onsite2026/abi_regression.c"
+    if args.abi_2026:
+        sources.append(abi_source)
+    network_sources = [
+        repo / "tests/onsite2025/network_sockname_regression.c",
+        repo / "tests/onsite2025/network_tcp_eof_regression.c",
+    ]
     if args.network_sockname:
-        sources.extend(
-            [
-                repo / "tests/onsite2025/network_sockname_regression.c",
-                repo / "tests/onsite2025/network_tcp_eof_regression.c",
-            ]
-        )
+        sources.extend(network_sources)
     for required in (args.base_image, args.root_disk, args.kernel, *sources):
         if not required.is_file():
             parser.error(f"missing required file: {required}")
@@ -266,6 +273,12 @@ def main() -> int:
                 transcript,
                 encoded_install(sources[2], "/tmp/tty_icrnl_regression.c"),
             )
+            if args.abi_2026:
+                send_commands(
+                    master,
+                    transcript,
+                    encoded_install(abi_source, "/tmp/abi_regression.c"),
+                )
             send_commands(master, transcript, b"stty cols 80 echo\n")
             send_slow(
                 master,
@@ -289,18 +302,28 @@ def main() -> int:
                 send_commands(
                     master,
                     transcript,
-                    encoded_install(sources[3], "/tmp/network_sockname_regression.c"),
+                    encoded_install(
+                        network_sources[0], "/tmp/network_sockname_regression.c"
+                    ),
                 )
                 send_commands(
                     master,
                     transcript,
-                    encoded_install(sources[4], "/tmp/network_tcp_eof_regression.c"),
+                    encoded_install(
+                        network_sources[1], "/tmp/network_tcp_eof_regression.c"
+                    ),
                 )
             commands = (
                 b"gcc -O2 -Wall -Wextra /tmp/timer_regression.c -o /tmp/timer_regression\n"
                 b"/tmp/timer_regression; echo TIMER_TEST_RC=$?\n"
                 b"gcc -O2 -Wall -Wextra /tmp/tty_regression.c -o /tmp/tty_regression\n"
             )
+            if args.abi_2026:
+                commands += (
+                    b"gcc -O2 -Wall -Wextra -pthread /tmp/abi_regression.c "
+                    b"-o /tmp/abi-regression\n"
+                    b"/tmp/abi-regression; echo ABI2026_TEST_RC=$?\n"
+                )
             if args.network_sockname:
                 commands += (
                     b"gcc -O2 -Wall -Wextra /tmp/network_sockname_regression.c "
@@ -370,11 +393,25 @@ def main() -> int:
             b"NETWORK_TCP_EOF_OK",
             b"NETWORK_TCP_EOF_RC=0",
         )
+    if args.abi_2026:
+        required += (
+            b"ABI2026_PROCFS_OK",
+            b"ABI2026_EVENTFD_EPOLL_OK",
+            b"ABI2026_TIMERFD_OK",
+            b"ABI2026_FILE_MAPPING_OK",
+            b"ABI2026_GLIBC_THREAD_OK",
+            b"ABI2026_RESOURCE_RECLAIM_OK",
+            b"ABI2026_REGRESSION_OK",
+            b"ABI2026_TEST_RC=0",
+        )
     missing = [marker for marker in required if marker not in transcript]
     if missing:
         print(f"missing regression markers: {missing!r}", file=sys.stderr)
         return 1
-    print("onsite 2025 timer/TTY/Ext4 regressions passed")
+    if args.abi_2026:
+        print("onsite 2026 ABI regressions passed")
+    else:
+        print("onsite 2025 timer/TTY/Ext4 regressions passed")
     return 0
 
 

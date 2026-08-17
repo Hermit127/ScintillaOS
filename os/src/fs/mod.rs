@@ -6,6 +6,7 @@ pub mod inode;
 mod pipe;
 pub mod proc;
 pub mod stdio;
+mod timerfd;
 mod unix_socket;
 pub mod vfs;
 
@@ -193,5 +194,10 @@ pub use epoll::{EpollEvent, EpollFile, EPOLL_MAX_INTERESTS};
 pub use eventfd::EventFdFile;
 pub use pipe::make_pipe;
 pub use stdio::{DevBlock, DevNull, DevTty, DevZero, NullSocket, Stdin, Stdout, TmpFile, Urandom};
+pub use timerfd::{
+    check_timerfds, TimerFdFile, TimerFdSpec, CLOCK_BOOTTIME as TIMERFD_CLOCK_BOOTTIME,
+    CLOCK_MONOTONIC as TIMERFD_CLOCK_MONOTONIC, CLOCK_REALTIME as TIMERFD_CLOCK_REALTIME,
+    TFD_NONBLOCK, TFD_TIMER_ABSTIME, TFD_TIMER_CANCEL_ON_SET,
+};
 pub use unix_socket::{make_unix_socket_pair, UnixSocketFile, UnixSocketKind};
 pub use vfs::{list_apps, mount_root};

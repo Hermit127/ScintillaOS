@@ -30,6 +30,9 @@ buildstorm-diagnostics = []
 # Failure-only tracing for user-buffer validation during long BuildStorm runs.
 # Unlike buildstorm-diagnostics, this has no per-syscall success-path output.
 buildstorm-mm-diagnostics = []
+# Failure-only reporting for genuinely unsupported syscalls.  Keep this
+# separate from the much noisier SMP/BuildStorm traces for long stress runs.
+unknown-syscall-diagnostics = []
 # Lightweight mount-path tracing for local SMP diagnosis. Unlike
 # `smp-diagnostics`, this does not enable lock-dependency instrumentation.
 mount-trace = []

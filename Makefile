@@ -7,9 +7,15 @@ COMMA := ,
 QEMU_SMP ?= 1
 QEMU_CPU ?= max
 SMP_DIAGNOSTICS ?= 0
+OS_FEATURES_EXTRA ?=
 
 ifeq ($(SMP_DIAGNOSTICS),1)
-  OS_FEATURES := --features smp-diagnostics
+  OS_FEATURES_LIST := smp-diagnostics $(OS_FEATURES_EXTRA)
+else
+  OS_FEATURES_LIST := $(OS_FEATURES_EXTRA)
+endif
+ifneq ($(strip $(OS_FEATURES_LIST)),)
+  OS_FEATURES := --features "$(strip $(OS_FEATURES_LIST))"
 endif
 
 ifeq ($(ARCH), x86_64)
@@ -119,6 +125,12 @@ kernel-la:
 	@$(MAKE) kernel ARCH=loongarch64
 	@cp target/loongarch64-unknown-none/release/os kernel-la
 	@echo "kernel-la ready"
+
+kernel-rv-final-diag:
+	@$(MAKE) kernel-rv ARCH=riscv64 \
+		OS_FEATURES_EXTRA="lockdep lock-stats scheduler-stall-diagnostics buildstorm-mm-diagnostics unknown-syscall-diagnostics"
+	@cp kernel-rv kernel-rv-final-diag
+	@echo "kernel-rv-final-diag ready (ELF)"
 
 disk.img: fs-img
 	@if [ -f $(FS_IMG) ]; then \
@@ -420,6 +432,11 @@ TEST_DISK ?= testcases.img
 ROOT_DISK ?= $(if $(filter loongarch64,$(ARCH)),disk-la.img,disk.img)
 ON_SITE_2025_DISK ?= ../alpine-linux-riscv64-ext4fs.img
 ON_SITE_2025_ARTIFACT_DIR ?= artifacts/onsite2025
+FINAL_2026_RV_IMAGE ?= testsuits-for-oskernel-final/image/sdcard-rv-pub.img
+FINAL_2026_LA_IMAGE ?= testsuits-for-oskernel-final/image/sdcard-la-pub.img
+FINAL_2026_MODE ?= all
+FINAL_2026_MEMORY ?= 8G
+FINAL_2026_ARTIFACT_DIR ?= artifacts/final2026
 
 # Dual-disk mode (test disk bus 0, arch-matched root disk bus 1)
 QEMU_ARGS_DUAL := -drive file=$(TEST_DISK),if=none,format=raw,id=x0 \
@@ -486,6 +503,31 @@ verify-onsite-2025-network: kernel-rv
 		--base-image "$(ON_SITE_2025_DISK)" --root-disk "$(ROOT_DISK)" \
 		--smp "$(QEMU_SMP)"
 
+verify-onsite-2026-abi: kernel-rv
+	@python3 scripts/verify_onsite_2025_regressions.py --abi-2026 \
+		--base-image "$(ON_SITE_2025_DISK)" --root-disk "$(ROOT_DISK)" \
+		--smp "$(QEMU_SMP)"
+
+run-final-2026-rv: kernel-rv disk.img
+	@python3 scripts/run_final_2026.py --arch riscv64 \
+		--mode "$(FINAL_2026_MODE)" --test-image "$(FINAL_2026_RV_IMAGE)" \
+		--root-image disk.img --kernel kernel-rv --smp 8 \
+		--memory "$(FINAL_2026_MEMORY)" --artifact-root "$(FINAL_2026_ARTIFACT_DIR)"
+
+run-final-2026-la: kernel-la disk-la.img
+	@python3 scripts/run_final_2026.py --arch loongarch64 \
+		--mode "$(FINAL_2026_MODE)" --test-image "$(FINAL_2026_LA_IMAGE)" \
+		--root-image disk-la.img --kernel kernel-la --smp 12 \
+		--memory "$(FINAL_2026_MEMORY)" --artifact-root "$(FINAL_2026_ARTIFACT_DIR)"
+
+run-final-2026-la-docker:
+	@test -f kernel-la || { echo "missing kernel-la; build it in the official Docker environment first"; exit 1; }
+	@test -f disk-la.img || { echo "missing disk-la.img; build it in the official Docker environment first"; exit 1; }
+	@sh scripts/run_final_2026_docker.sh --arch loongarch64 \
+		--mode "$(FINAL_2026_MODE)" --test-image "$(FINAL_2026_LA_IMAGE)" \
+		--root-image disk-la.img --kernel kernel-la --smp 12 \
+		--memory "$(FINAL_2026_MEMORY)" --artifact-root "$(FINAL_2026_ARTIFACT_DIR)"
+
 verify-onsite-2025-git-clone: kernel-rv
 	@python3 scripts/verify_onsite_2025_git_clone.py \
 		--base-image "$(ON_SITE_2025_DISK)" --root-disk "$(ROOT_DISK)" \
@@ -504,4 +546,4 @@ gdbserver: build
 gdbclient:
 	@gdb -ex 'file $(KERNEL_ELF)' -ex 'set arch riscv:rv64' -ex 'target remote localhost:1234'
 
-.PHONY: all prepare-vendor kernel-rv kernel-la disk.img disk-rv.img disk-la.img build env kernel clean disasm disasm-vim run run-smp4 run-smp8 run-la-smp2 run-la-smp8 run-inner run-dual run-dual-smp4 run-la-dual-smp2 run-dual-prebuilt run-dual-smp4-prebuilt run-la-dual-smp2-prebuilt run-onsite-2025-rv onsite-2025-proxy-relay verify-onsite-2025-vim verify-onsite-2025-regressions verify-onsite-2025-network verify-onsite-2025-git-clone fs-img gdbserver gdbclient
+.PHONY: all prepare-vendor kernel-rv kernel-la kernel-rv-final-diag disk.img disk-rv.img disk-la.img build env kernel clean disasm disasm-vim run run-smp4 run-smp8 run-la-smp2 run-la-smp8 run-inner run-dual run-dual-smp4 run-la-dual-smp2 run-dual-prebuilt run-dual-smp4-prebuilt run-la-dual-smp2-prebuilt run-onsite-2025-rv onsite-2025-proxy-relay verify-onsite-2025-vim verify-onsite-2025-regressions verify-onsite-2025-network verify-onsite-2025-git-clone verify-onsite-2026-abi run-final-2026-rv run-final-2026-la run-final-2026-la-docker fs-img gdbserver gdbclient

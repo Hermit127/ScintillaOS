@@ -6,7 +6,9 @@ use crate::fs::vfs::{
 use crate::fs::{
     follow_symlink, link_at, make_pipe, make_unix_socket_pair, open_file_at, rename_at,
     symlink_at, DevBlock, DevNull, DevTty, DevZero, EpollEvent, EpollFile, EventFdFile, File,
-    Kstat, OpenFlags, UnixSocketKind, Urandom, EPOLL_MAX_INTERESTS, S_IFDIR, S_IFREG,
+    Kstat, OpenFlags, TimerFdFile, TimerFdSpec, UnixSocketKind, Urandom, EPOLL_MAX_INTERESTS,
+    S_IFDIR, S_IFREG, TFD_NONBLOCK, TFD_TIMER_ABSTIME, TFD_TIMER_CANCEL_ON_SET,
+    TIMERFD_CLOCK_BOOTTIME, TIMERFD_CLOCK_MONOTONIC, TIMERFD_CLOCK_REALTIME,
 };
 use crate::sync::{DeviceLock, TaskGuard, VfsLock};
 use crate::task::{
@@ -634,6 +636,156 @@ pub fn sys_eventfd2(initval: u32, flags: usize) -> isize {
     install_fd_shared(&task, file, flags & EFD_CLOEXEC != 0)
         .map(|fd| fd as isize)
         .unwrap_or_else(|errno| errno)
+}
+
+const TFD_CLOEXEC: usize = 0x80000;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct TimerFdTimeSpec {
+    tv_sec: isize,
+    tv_nsec: isize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct TimerFdITimerSpec {
+    it_interval: TimerFdTimeSpec,
+    it_value: TimerFdTimeSpec,
+}
+
+fn timerfd_timespec_to_ns(value: TimerFdTimeSpec) -> Result<u64, isize> {
+    if value.tv_sec < 0 || value.tv_nsec < 0 || value.tv_nsec >= 1_000_000_000 {
+        return Err(-22);
+    }
+    (value.tv_sec as u64)
+        .checked_mul(1_000_000_000)
+        .and_then(|seconds| seconds.checked_add(value.tv_nsec as u64))
+        .ok_or(-22)
+}
+
+fn timerfd_timespec_from_ns(value: u64) -> TimerFdTimeSpec {
+    TimerFdTimeSpec {
+        tv_sec: (value / 1_000_000_000).min(isize::MAX as u64) as isize,
+        tv_nsec: (value % 1_000_000_000) as isize,
+    }
+}
+
+fn timerfd_file_for_current_task(fd: usize) -> Result<Arc<dyn File + Send + Sync>, isize> {
+    let file = epoll_fd_for_current_task(fd)?;
+    if file.as_any().is::<TimerFdFile>() {
+        Ok(file)
+    } else {
+        Err(-22)
+    }
+}
+
+pub fn sys_timerfd_create(clock_id: i32, flags: usize) -> isize {
+    if !matches!(
+        clock_id,
+        TIMERFD_CLOCK_REALTIME | TIMERFD_CLOCK_MONOTONIC | TIMERFD_CLOCK_BOOTTIME
+    ) || flags & !(TFD_NONBLOCK | TFD_CLOEXEC) != 0
+    {
+        return -22;
+    }
+    let task = current_task().unwrap();
+    let timerfd = Arc::new(TimerFdFile::new(clock_id, flags));
+    TimerFdFile::register(&timerfd);
+    let file: Arc<dyn File + Send + Sync> = timerfd;
+    install_fd_shared(&task, file, flags & TFD_CLOEXEC != 0)
+        .map(|fd| fd as isize)
+        .unwrap_or_else(|errno| errno)
+}
+
+pub fn sys_timerfd_settime(
+    fd: usize,
+    flags: usize,
+    new_value: *const u8,
+    old_value: *mut u8,
+) -> isize {
+    if flags & !(TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET) != 0 {
+        return -22;
+    }
+    if flags & TFD_TIMER_CANCEL_ON_SET != 0 && flags & TFD_TIMER_ABSTIME == 0 {
+        return -22;
+    }
+    if new_value.is_null() {
+        return -14;
+    }
+    let task = current_task().unwrap();
+    let Some(new_spec) = super::process::copy_user_value(
+        &task,
+        new_value as *const TimerFdITimerSpec,
+    ) else {
+        return -14;
+    };
+    let Ok(value_ns) = timerfd_timespec_to_ns(new_spec.it_value) else {
+        return -22;
+    };
+    let Ok(interval_ns) = timerfd_timespec_to_ns(new_spec.it_interval) else {
+        return -22;
+    };
+    let file = match timerfd_file_for_current_task(fd) {
+        Ok(file) => file,
+        Err(errno) => return errno,
+    };
+    let timerfd = file
+        .as_any()
+        .downcast_ref::<TimerFdFile>()
+        .expect("timerfd type changed after validation");
+    if flags & TFD_TIMER_CANCEL_ON_SET != 0 && timerfd.clock_id() != TIMERFD_CLOCK_REALTIME {
+        return -22;
+    }
+    let old_spec = timerfd.set_time(
+        flags,
+        TimerFdSpec {
+            interval_ns,
+            value_ns,
+        },
+    );
+    if !old_value.is_null() {
+        let old_user = TimerFdITimerSpec {
+            it_interval: timerfd_timespec_from_ns(old_spec.interval_ns),
+            it_value: timerfd_timespec_from_ns(old_spec.value_ns),
+        };
+        if !super::process::write_user_value(
+            &task,
+            old_value as *mut TimerFdITimerSpec,
+            &old_user,
+        ) {
+            return -14;
+        }
+    }
+    0
+}
+
+pub fn sys_timerfd_gettime(fd: usize, current_value: *mut u8) -> isize {
+    if current_value.is_null() {
+        return -14;
+    }
+    let task = current_task().unwrap();
+    let file = match timerfd_file_for_current_task(fd) {
+        Ok(file) => file,
+        Err(errno) => return errno,
+    };
+    let timerfd = file
+        .as_any()
+        .downcast_ref::<TimerFdFile>()
+        .expect("timerfd type changed after validation");
+    let spec = timerfd.get_time();
+    let user_spec = TimerFdITimerSpec {
+        it_interval: timerfd_timespec_from_ns(spec.interval_ns),
+        it_value: timerfd_timespec_from_ns(spec.value_ns),
+    };
+    if super::process::write_user_value(
+        &task,
+        current_value as *mut TimerFdITimerSpec,
+        &user_spec,
+    ) {
+        0
+    } else {
+        -14
+    }
 }
 
 pub fn sys_epoll_create1(flags: usize) -> isize {

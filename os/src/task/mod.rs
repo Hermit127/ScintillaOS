@@ -669,6 +669,7 @@ pub fn check_itimers() {
             wake_blocked_task(&task);
         }
     }
+    crate::fs::check_timerfds(now);
 }
 
 fn notify_parent_sigchld(parent: &Arc<TaskControlBlock>) {

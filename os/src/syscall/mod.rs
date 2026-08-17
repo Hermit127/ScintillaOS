@@ -113,9 +113,16 @@ const SYSCALL_EPOLL_CTL: usize = 21;
 const SYSCALL_EPOLL_PWAIT: usize = 22;
 const SYSCALL_STATX: usize = 291;
 const SYSCALL_EVENTFD2: usize = 19;
+const SYSCALL_TIMERFD_CREATE: usize = 85;
+const SYSCALL_TIMERFD_SETTIME: usize = 86;
+const SYSCALL_TIMERFD_GETTIME: usize = 87;
 const SYSCALL_RSEQ: usize = 293;
 const SYSCALL_RISCV_HWPROBE: usize = 258;
-#[cfg(any(feature = "smp-diagnostics", feature = "buildstorm-diagnostics"))]
+#[cfg(any(
+    feature = "smp-diagnostics",
+    feature = "buildstorm-diagnostics",
+    feature = "unknown-syscall-diagnostics"
+))]
 const SYSCALL_FSOPEN: usize = 430;
 const SYSCALL_CLONE3: usize = 435;
 const SYSCALL_CLONE: usize = 220;
@@ -668,6 +675,14 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[4] as *mut u8,
         ),
         SYSCALL_EVENTFD2 => sys_eventfd2(args[0] as u32, args[1]),
+        SYSCALL_TIMERFD_CREATE => sys_timerfd_create(args[0] as i32, args[1]),
+        SYSCALL_TIMERFD_SETTIME => sys_timerfd_settime(
+            args[0],
+            args[1],
+            args[2] as *const u8,
+            args[3] as *mut u8,
+        ),
+        SYSCALL_TIMERFD_GETTIME => sys_timerfd_gettime(args[0], args[1] as *mut u8),
         SYSCALL_RSEQ => -38,
         SYSCALL_RISCV_HWPROBE => -38,
         SYSCALL_TIMES => sys_times(args[0]),
@@ -716,7 +731,11 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     };
     #[cfg(any(debug_assertions, feature = "smp-diagnostics", feature = "timeout-trace"))]
     LAST_SYSCALL_RET.store(ret as usize, Ordering::Relaxed);
-    #[cfg(any(feature = "smp-diagnostics", feature = "buildstorm-diagnostics"))]
+    #[cfg(any(
+        feature = "smp-diagnostics",
+        feature = "buildstorm-diagnostics",
+        feature = "unknown-syscall-diagnostics"
+    ))]
     if ret == -38
         && !matches!(
             syscall_id,
