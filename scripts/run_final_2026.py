@@ -135,8 +135,11 @@ def read_until(
 
 def drain(master: int, transcript: bytearray, duration: float = 0.05) -> None:
     deadline = time.monotonic() + duration
-    while time.monotonic() < deadline:
-        ready, _, _ = select.select([master], [], [], min(0.01, deadline - time.monotonic()))
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        ready, _, _ = select.select([master], [], [], min(0.01, remaining))
         if not ready:
             continue
         try:
@@ -401,7 +404,7 @@ def main() -> int:
         send_line_wait_prompt(
             master,
             transcript,
-            b"/busybox sh -c 'rm -f /mnt/tmp/final2026-run.b64 /mnt/tmp/final2026-run.sh'",
+            b"/busybox sh -c '/busybox rm -f /mnt/tmp/final2026-run.b64 /mnt/tmp/final2026-run.sh'",
         )
         for offset in range(0, len(driver), 192):
             chunk = driver[offset : offset + 192]
@@ -417,13 +420,27 @@ def main() -> int:
             transcript,
             b"/busybox sh -c '/busybox base64 -d /mnt/tmp/final2026-run.b64 > /mnt/tmp/final2026-run.sh'",
         )
-        send_line_wait_prompt(
+        # Wait for the explicit command result before accepting the following
+        # shell prompt.  With a fast guest the byte-wise sender can observe a
+        # delayed prompt from the previous command while it is still typing;
+        # treating that stale prompt as completion made a successful preflight
+        # look like a failure in the durable transcript.
+        preflight_start = len(transcript)
+        send_slow(
             master,
             transcript,
-            b"/busybox sh -c 'test -x /mnt/bin/bash -a -s /mnt/tmp/final2026-run.sh && echo FINAL2026_PREFLIGHT_OK'",
+            b"/busybox sh -c 'test -x /mnt/bin/bash -a -s /mnt/tmp/final2026-run.sh && echo FINAL2026_PREFLIGHT_OK'\n",
         )
-        if b"FINAL2026_PREFLIGHT_OK" not in transcript:
-            raise RuntimeError("official image preflight failed")
+        preflight_result = b"\nFINAL2026_PREFLIGHT_OK"
+        read_until(
+            master,
+            transcript,
+            preflight_result,
+            20,
+            start=preflight_start,
+        )
+        prompt_start = transcript.find(preflight_result, preflight_start)
+        read_until(master, transcript, b">> ", 20, start=prompt_start)
         start = len(transcript)
         send_slow(
             master,
