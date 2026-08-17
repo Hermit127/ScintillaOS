@@ -528,6 +528,12 @@ run-final-2026-la-docker:
 		--root-image disk-la.img --kernel kernel-la --smp 12 \
 		--memory "$(FINAL_2026_MEMORY)" --artifact-root "$(FINAL_2026_ARTIFACT_DIR)"
 
+verify-loongarch12-boot-docker:
+	@test -f kernel-la || { echo "missing kernel-la; build it in the official Docker environment first"; exit 1; }
+	@test -f disk-la.img || { echo "missing disk-la.img; build it in the official Docker environment first"; exit 1; }
+	@sh scripts/validate_loongarch12_boot_docker.sh \
+		--kernel kernel-la --root-image disk-la.img --smp 12 --memory 2G
+
 verify-onsite-2025-git-clone: kernel-rv
 	@python3 scripts/verify_onsite_2025_git_clone.py \
 		--base-image "$(ON_SITE_2025_DISK)" --root-disk "$(ROOT_DISK)" \
@@ -546,4 +552,4 @@ gdbserver: build
 gdbclient:
 	@gdb -ex 'file $(KERNEL_ELF)' -ex 'set arch riscv:rv64' -ex 'target remote localhost:1234'
 
-.PHONY: all prepare-vendor kernel-rv kernel-la kernel-rv-final-diag disk.img disk-rv.img disk-la.img build env kernel clean disasm disasm-vim run run-smp4 run-smp8 run-la-smp2 run-la-smp8 run-inner run-dual run-dual-smp4 run-la-dual-smp2 run-dual-prebuilt run-dual-smp4-prebuilt run-la-dual-smp2-prebuilt run-onsite-2025-rv onsite-2025-proxy-relay verify-onsite-2025-vim verify-onsite-2025-regressions verify-onsite-2025-network verify-onsite-2025-git-clone verify-onsite-2026-abi run-final-2026-rv run-final-2026-la run-final-2026-la-docker fs-img gdbserver gdbclient
+.PHONY: all prepare-vendor kernel-rv kernel-la kernel-rv-final-diag disk.img disk-rv.img disk-la.img build env kernel clean disasm disasm-vim run run-smp4 run-smp8 run-la-smp2 run-la-smp8 run-inner run-dual run-dual-smp4 run-la-dual-smp2 run-dual-prebuilt run-dual-smp4-prebuilt run-la-dual-smp2-prebuilt run-onsite-2025-rv onsite-2025-proxy-relay verify-onsite-2025-vim verify-onsite-2025-regressions verify-onsite-2025-network verify-onsite-2025-git-clone verify-onsite-2026-abi run-final-2026-rv run-final-2026-la run-final-2026-la-docker verify-loongarch12-boot-docker fs-img gdbserver gdbclient
