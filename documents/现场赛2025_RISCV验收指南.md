@@ -2,6 +2,8 @@
 
 本文是 `on-site-final-2025-fixes` 分支的项目说明、实现原理、复现步骤和验收记录。后续即使不查看本次聊天，也应能据此知道赛题要求什么、为什么使用 Alpine/BusyBox、内核改了什么、怎样复测，以及哪些结论仍不能声称通过。
 
+本文负责可直接执行的操作与验收流程。若要了解原始系统为何失败、各子系统的源码级修改原理、个人排查时间线以及合入 `main` 时的冲突选择，请阅读《[2025 现场赛 RISC-V 适配与修改全记录](2025现场赛RISC-V适配与修改全记录.md)》。
+
 ## 1. 结论与验证边界
 
 现场赛不是要求在内核里重新实现 Git、Vim、GCC 或 Rustc。官方 Alpine Ext4 镜像已经包含这些原版 Linux 用户程序；参赛内核要提供足够兼容的 Linux 系统调用、Ext4、TTY、进程/信号/计时器和网络语义，使它们能够真实运行。
@@ -9,7 +11,7 @@
 当前结论：
 
 - QEMU RISC-V64 上，Git 帮助、本地仓库、完整 HTTPS clone、Vim 帮助和真实交互编辑、GCC/Rustc 帮助及编译运行均已在合并后内核通过。
-- 现场赛启动和四个自动验证目标默认使用 1 核，也可通过 `QEMU_SMP=<核数>` 选择 2–12 核；4 核下 Vim/Git/GCC/Rustc、Timer/TTY/Ext4/socket、DNS 和完整 HTTPS clone 均已动态通过。
+- 现场赛启动和四个自动验证目标默认使用 1 核，也可通过 `QEMU_SMP=<核数>` 选择多核。脚本参数当前接受 1–12，但 RISC-V 的 `PLATFORM_CPUS=8`，超过 8 个 hart 不会全部上线；目前只有 4 核完成 Vim/Git/GCC/Rustc、Timer/TTY/Ext4/socket、DNS 和完整 HTTPS clone 的全套动态验证。
 - GitHub push/pull 已在合并前的同一套现场赛实现上手工通过；合并后的最终源码还应再手工输入 PAT 跑一遍，才能形成“当前提交完整 100 分”的严格证据。
 - `main` 带入的 RISC-V 四核调度、亲和性、clone、futex、mprotect、共享内存、管道和信号定向回归，release 3/3、diagnostics 1/1 通过。
 - LoongArch 当前不能声称构建或运行通过：本机缺少 `loongarch64-linux-gnu-gcc`，也没有 `qemu-system-loongarch64`、官方决赛大镜像或实体板卡。
@@ -25,11 +27,12 @@
 | 合入的 `origin/main` | `ed815ffc003ccc567d7b4b8da1fcdca349d12905` |
 | 显式 merge commit，已进入远程历史 | `41462075aa60004260892ce410d67f7fa81b6faa` |
 | 合并后文件写回和验证器修复，已进入远程历史 | `0d7dd76be39891f1818c595062e52e752b4b7690` |
-| SMP4 MANIFEST/JSON 证据，当前远程 tip | `8803ab33cc0301a5c47d81a7704be0f8b47ad883` |
-| 高位用户 sockaddr 安全复制修复，仅本地 | `0b9ef7445dc13703442b94f5bf03b6c68488a8dd` |
-| 现场赛可选 SMP 启动与验证，仅本地 | `bd87f185ae377f411ecf70481d2690a976a1655c` |
+| SMP4 MANIFEST/JSON 证据 | `8803ab33cc0301a5c47d81a7704be0f8b47ad883` |
+| 高位用户 sockaddr 安全复制修复 | `0b9ef7445dc13703442b94f5bf03b6c68488a8dd` |
+| 现场赛可选 SMP 启动与验证 | `bd87f185ae377f411ecf70481d2690a976a1655c` |
+| 本指南描述的分支状态，已推送远程 | `a236e1e54597e64d4c5aecc65fd7f9b26b9c5218` |
 
-远程 `origin/on-site-final-2025-fixes` 当前停在 `8803ab3`。最新 sockaddr 修复、后续文档和可选 SMP 提交仍只在本地，不应在未获明确授权时 push。
+本指南更新时，本地与远程 `origin/on-site-final-2025-fixes` 均指向 `a236e1e`。后续复测应先记录当时的实际 `HEAD` 和远程状态，不要把这里的历史快照当作永远不变的远程 tip。
 
 核对历史：
 
@@ -81,7 +84,7 @@ QEMU
 - `vdb`：项目生成的 `disk.img`，包含 Rust shell、BusyBox 和回归程序。
 - VirtIO net：QEMU SLIRP，默认网关 `10.0.2.2`、DNS `10.0.2.3`。
 
-CPU 数量默认是 1，以保持与最初现场赛验收基线一致；需要并发压力时再显式传入 `QEMU_SMP`。当前内核的 `MAX_CPUS` 为 12，因此现场赛脚本接受 1–12，超出范围会在 QEMU 启动前报错。手工入口会把实际核数写入证据目录的 `metadata.txt`，字段为 `qemu_smp=<核数>`。
+CPU 数量默认是 1，以保持与最初现场赛验收基线一致；需要并发压力时再显式传入 `QEMU_SMP`。现场赛脚本的参数检查当前接受 1–12，超出范围会在 QEMU 启动前报错；但这只是脚本输入范围，不是 RISC-V 的在线 CPU 能力。当前全局 `MAX_CPUS=12`，RISC-V `PLATFORM_CPUS=8`，所以 RISC-V 最多按平台配置管理 8 个 CPU。手工入口会把请求核数写入证据目录的 `metadata.txt`，字段为 `qemu_smp=<核数>`；必须结合启动日志的 online mask 判断实际在线数。目前只有 4 核完成全套现场赛动态验证。
 
 验证脚本不会直接写官方 raw 镜像，而是每轮创建新覆盖层。四核 RISC-V 验证器的根盘必须用 `disk.img`；当前 `fs-img.img` 含 LoongArch 用户程序，不能用来冒充 RISC-V 根盘。
 
@@ -249,7 +252,7 @@ make verify-onsite-2025-vim QEMU_SMP=4
 make verify-onsite-2025-network QEMU_SMP=4
 ```
 
-三个 Python 验证器也都提供 `--smp 1..12`。当核数大于 1 时，验证器不只检查功能标记，还强制要求串口日志出现请求核数对应的完整在线掩码。例如 4 核必须出现：
+三个 Python 验证器也都提供 `--smp 1..12`，但 RISC-V 实际复测应限制在 `1..8`；传入 9–12 时，验证器会等待请求核数对应的完整在线掩码，而当前 `PLATFORM_CPUS=8` 不可能满足，因此参数被解析接受不代表该配置受平台支持。当核数大于 1 时，验证器不只检查功能标记，还强制要求串口日志出现请求核数对应的完整在线掩码。例如 4 核必须出现：
 
 ```text
 [smp] online mask 0xf

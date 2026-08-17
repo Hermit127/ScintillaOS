@@ -131,7 +131,9 @@ make run ARCH=loongarch64 QEMU_SMP=12
 | `documents/libctest开发文档.md` | 为 libctest 补齐的内核语义和开发说明。 |
 | `documents/ltp测试指南.md` | LTP 集成和运行说明。 |
 | `documents/netperf测试指南.md` | netperf 差距分析和运行指南。 |
+| `documents/2025现场赛RISC-V适配与修改全记录.md` | 2025 现场赛 RISC-V 适配的故障时间线、源码原理、main 合并复盘和验证边界。 |
 | `documents/现场赛2025_RISCV验收指南.md` | 2025 现场赛 RISC-V Alpine 构建、网络、Git 和逐项验收流程。 |
+| `documents/2026现场赛准备与复测指南.md` | 2026 CAgent/BuildStorm 题目分析、准备分支、两架构正式复测、诊断与性能实验流程。 |
 | `documents/MachineTest近期改动迁移说明2026-06-29.md` | MachineTest 近期改动迁移到 main 的说明。 |
 | `documents/四核SMP适配与死锁修复全记录.md` | SMP 启动、调度、阻塞状态机、IPI、远端 TLB 和锁诊断记录。 |
 | `documents/决赛提交分支迁移与双架构验证记录.md` | `finalsubmission` 迁移、双架构 CAgent/BuildStorm 入口和验证记录。 |
