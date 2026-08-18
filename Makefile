@@ -442,6 +442,11 @@ PYTHON_ONSITE_SMP ?= 4
 PYTHON_ONSITE_MEMORY ?= 2G
 PYTHON_ONSITE_ARTIFACT_DIR ?= artifacts/onsite-python
 PYTHON_ONSITE_PROXY ?= http://10.0.2.2:27898
+TOOLCHAIN_ONSITE_MODE ?= all
+TOOLCHAIN_ONSITE_SMP ?= 4
+TOOLCHAIN_ONSITE_MEMORY ?= 2G
+TOOLCHAIN_ONSITE_ARTIFACT_DIR ?= artifacts/onsite-toolchain
+TOOLCHAIN_ONSITE_PROXY ?= http://10.0.2.2:27898
 
 # Dual-disk mode (test disk bus 0, arch-matched root disk bus 1)
 QEMU_ARGS_DUAL := -drive file=$(TEST_DISK),if=none,format=raw,id=x0 \
@@ -544,6 +549,40 @@ verify-onsite-python-la-docker:
 		--memory "$(PYTHON_ONSITE_MEMORY)" --proxy "$(PYTHON_ONSITE_PROXY)" \
 		--artifact-root "$(PYTHON_ONSITE_ARTIFACT_DIR)"
 
+verify-onsite-toolchain-rv: kernel-rv disk.img
+	@python3 scripts/verify_onsite_toolchain.py --arch riscv64 \
+		--mode "$(TOOLCHAIN_ONSITE_MODE)" --test-image "$(FINAL_2026_RV_IMAGE)" \
+		--root-image disk.img --kernel kernel-rv --smp "$(TOOLCHAIN_ONSITE_SMP)" \
+		--memory "$(TOOLCHAIN_ONSITE_MEMORY)" --proxy "$(TOOLCHAIN_ONSITE_PROXY)" \
+		--artifact-root "$(TOOLCHAIN_ONSITE_ARTIFACT_DIR)"
+
+verify-onsite-toolchain-versions: kernel-rv disk.img
+	@$(MAKE) verify-onsite-toolchain-rv TOOLCHAIN_ONSITE_MODE=versions
+
+verify-onsite-toolchain-build: kernel-rv disk.img
+	@$(MAKE) verify-onsite-toolchain-rv TOOLCHAIN_ONSITE_MODE=build
+
+verify-onsite-toolchain-cargo: kernel-rv disk.img
+	@$(MAKE) verify-onsite-toolchain-rv TOOLCHAIN_ONSITE_MODE=cargo
+
+verify-onsite-toolchain-python: kernel-rv disk.img
+	@$(MAKE) verify-onsite-toolchain-rv TOOLCHAIN_ONSITE_MODE=python
+
+verify-onsite-toolchain-curl: kernel-rv disk.img
+	@$(MAKE) verify-onsite-toolchain-rv TOOLCHAIN_ONSITE_MODE=curl
+
+verify-onsite-toolchain-all: kernel-rv disk.img
+	@$(MAKE) verify-onsite-toolchain-rv TOOLCHAIN_ONSITE_MODE=all
+
+verify-onsite-toolchain-la-docker:
+	@test -f kernel-la || { echo "missing kernel-la; build it in the official Docker environment first"; exit 1; }
+	@test -f disk-la.img || { echo "missing disk-la.img; build it in the official Docker environment first"; exit 1; }
+	@sh scripts/verify_onsite_toolchain_docker.sh --arch loongarch64 \
+		--mode "$(TOOLCHAIN_ONSITE_MODE)" --test-image "$(FINAL_2026_LA_IMAGE)" \
+		--root-image disk-la.img --kernel kernel-la --smp 12 \
+		--memory "$(TOOLCHAIN_ONSITE_MEMORY)" --proxy "$(TOOLCHAIN_ONSITE_PROXY)" \
+		--artifact-root "$(TOOLCHAIN_ONSITE_ARTIFACT_DIR)"
+
 run-final-2026-rv: kernel-rv disk.img
 	@python3 scripts/run_final_2026.py --arch riscv64 \
 		--mode "$(FINAL_2026_MODE)" --test-image "$(FINAL_2026_RV_IMAGE)" \
@@ -588,4 +627,4 @@ gdbserver: build
 gdbclient:
 	@gdb -ex 'file $(KERNEL_ELF)' -ex 'set arch riscv:rv64' -ex 'target remote localhost:1234'
 
-.PHONY: all prepare-vendor kernel-rv kernel-la kernel-rv-final-diag disk.img disk-rv.img disk-la.img build env kernel clean disasm disasm-vim run run-smp4 run-smp8 run-la-smp2 run-la-smp8 run-inner run-dual run-dual-smp4 run-la-dual-smp2 run-dual-prebuilt run-dual-smp4-prebuilt run-la-dual-smp2-prebuilt run-onsite-2025-rv onsite-2025-proxy-relay verify-onsite-2025-vim verify-onsite-2025-regressions verify-onsite-2025-network verify-onsite-2025-git-clone verify-onsite-2026-abi verify-onsite-python-rv verify-onsite-python-core verify-onsite-python-fs verify-onsite-python-concurrency verify-onsite-python-network verify-onsite-python-all verify-onsite-python-la-docker run-final-2026-rv run-final-2026-la run-final-2026-la-docker verify-loongarch12-boot-docker fs-img gdbserver gdbclient
+.PHONY: all prepare-vendor kernel-rv kernel-la kernel-rv-final-diag disk.img disk-rv.img disk-la.img build env kernel clean disasm disasm-vim run run-smp4 run-smp8 run-la-smp2 run-la-smp8 run-inner run-dual run-dual-smp4 run-la-dual-smp2 run-dual-prebuilt run-dual-smp4-prebuilt run-la-dual-smp2-prebuilt run-onsite-2025-rv onsite-2025-proxy-relay verify-onsite-2025-vim verify-onsite-2025-regressions verify-onsite-2025-network verify-onsite-2025-git-clone verify-onsite-2026-abi verify-onsite-python-rv verify-onsite-python-core verify-onsite-python-fs verify-onsite-python-concurrency verify-onsite-python-network verify-onsite-python-all verify-onsite-python-la-docker verify-onsite-toolchain-rv verify-onsite-toolchain-versions verify-onsite-toolchain-build verify-onsite-toolchain-cargo verify-onsite-toolchain-python verify-onsite-toolchain-curl verify-onsite-toolchain-all verify-onsite-toolchain-la-docker run-final-2026-rv run-final-2026-la run-final-2026-la-docker verify-loongarch12-boot-docker fs-img gdbserver gdbclient

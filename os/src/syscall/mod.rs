@@ -62,6 +62,7 @@ const SYSCALL_SIGALTSTACK: usize = 132;
 const SYSCALL_SIGSUSPEND: usize = 133;
 const SYSCALL_SIGACTION: usize = 134;
 const SYSCALL_SIGPROCMASK: usize = 135;
+const SYSCALL_RT_SIGPENDING: usize = 136;
 const SYSCALL_RT_SIGTIMEDWAIT: usize = 137;
 const SYSCALL_SIGRETURN: usize = 139;
 const SYSCALL_GETITIMER: usize = 102;
@@ -504,6 +505,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[2] as *mut u8,
             args[3],
         ),
+        SYSCALL_RT_SIGPENDING => sys_rt_sigpending(args[0] as *mut u8, args[1]),
         SYSCALL_RT_SIGTIMEDWAIT => sys_rt_sigtimedwait(
             args[0] as *const u8,
             args[1] as *mut u8,

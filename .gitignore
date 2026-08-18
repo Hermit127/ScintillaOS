@@ -49,6 +49,7 @@ artifacts/smp8-*/
 artifacts/onsite2025/
 artifacts/final2026/
 artifacts/onsite-python/
+artifacts/onsite-toolchain/
 kernel-rv-final-diag
 
 # Local contest/test suites

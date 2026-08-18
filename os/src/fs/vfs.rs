@@ -1030,6 +1030,12 @@ impl VfsSuperBlock {
         } else {
             format!("{}/{}", parent_path, name)
         };
+        // A newly created Linux inode has meaningful atime/mtime/ctime even
+        // before its first data write.  This matters for build tools that
+        // compare a freshly emitted target with its inputs.  The low-level
+        // create-at helper initializes a blank lwext4 inode, so publish the
+        // kernel realtime timestamp explicitly instead of exposing epoch 0.
+        let now = crate::time::realtime_sec().clamp(0, u32::MAX as i64) as u32;
 
         let (created, _raw_rc) = self.with_fs(|_fs| {
             let c_mount = match CString::new(self.lwext4_mount_path.as_bytes()) {
@@ -1078,9 +1084,9 @@ impl VfsSuperBlock {
                         is_link: false,
                         mode,
                         size,
-                        atime: 0,
-                        mtime: 0,
-                        ctime: 0,
+                        atime: now,
+                        mtime: now,
+                        ctime: now,
                         blocks_count: 0,
                         links_count: if is_dir { 2 } else { 1 },
                         uid,
@@ -1092,6 +1098,15 @@ impl VfsSuperBlock {
             )
         });
         if created.is_some() {
+            self.set_atime(&full_path, now);
+            self.set_mtime(&full_path, now);
+            self.set_ctime(&full_path, now);
+            crate::fs::inode::update_path_cached_times(
+                &full_path,
+                Some(now as i64),
+                Some(now as i64),
+                Some(now as i64),
+            );
             record_path_owner(&full_path, uid, gid);
         }
         #[cfg(feature = "buildstorm-diagnostics")]

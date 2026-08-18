@@ -4484,7 +4484,10 @@ pub fn sys_sigaltstack(ss: *const u8, old_ss: *mut u8) -> isize {
 
 // ---- sigpending / rt_sigpending (136) ----
 
-pub fn sys_rt_sigpending(set: *mut u8, _sigsize: usize) -> isize {
+pub fn sys_rt_sigpending(set: *mut u8, sigsize: usize) -> isize {
+    if sigsize != core::mem::size_of::<u64>() {
+        return -22;
+    }
     if set.is_null() {
         return -14;
     }
