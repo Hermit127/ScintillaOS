@@ -48,7 +48,7 @@
 \title{\bfseries ScintillaOS\\[0.4em]
 BuildStorm 题二 2.3 内核设计与优化实现文档}
 \author{雷雨泽（队长）\quad 杜宇恒\quad 宋天琦}
-\date{2026 年 8 月 12 日}
+\date{2026 年 8 月 18 日}
 
 \begin{document}
 
@@ -62,10 +62,10 @@ BuildStorm 题二 2.3 内核设计与优化实现文档}
 crate，最终生成并启动 arceos-helloworld。该工作负载同时覆盖动态链接、进程和线程、
 futex、epoll、虚拟内存、ext4、VirtIO 块设备、多核调度和双架构页表等内核子系统。
 
-2026 年 8 月 12 日官网最终日志证明：RISC-V64 与 LoongArch64 均通过工具链检查、
+2026 年 8 月 18 日官网最新有效日志证明：RISC-V64 与 LoongArch64 均通过工具链检查、
 最小项目构建、完整 release 构建、产物大小检查和产物启动检查。RISC-V64 的正式构建
-耗时为 2270.92 秒，LoongArch64 为 1700.89 秒；BuildStorm 双平台原始得分合计
-311.4 分，前置 CAgent 回归双平台均为 199.1 分，整次官网评测总分为 709.6 分。
+耗时为 2155.80 秒，LoongArch64 为 1573.79 秒；BuildStorm 双平台原始得分合计
+319.9 分，前置 CAgent 回归双平台均为 199.1 分，整次官网评测总分为 718.1 分。
 本文给出从故障定位到最终结果的完整证据链，并明确区分最终保留的实现与实验后回退的
 候选方案。
 \end{abstract}
@@ -74,8 +74,9 @@ futex、epoll、虚拟内存、ext4、VirtIO 块设备、多核调度和双架�
 \noindent\colorbox{ScintillaGray}{%
 \parbox{0.96\textwidth}{
 \textbf{文档对应版本。}
-官网成功样本的最后关键修复对应提交 \code{266bd1aa}；其后提交
-\code{8632a3e1} 只补充双架构本地构建的确定性和并行构建隔离，不冒充官网计时样本。
+官网成功样本包含提交 \code{0566fb67}，其中最后关键内核修复对应 \code{266bd1aa}，
+\code{8632a3e1} 补充了双架构构建确定性和并行构建隔离。2026 年 8 月 18 日开始的
+RISC-V ASID 优化仍作为独立候选，不冒充已进入官网正式计时样本。
 本文位于 \code{documents/BuildStorm题二2.3内核设计优化实现文档.tex}，
 最终提交分支为 \code{finalsubmission}。
 }}
@@ -106,7 +107,7 @@ AI 使用与可复现步骤（4 分） & AI 的真实参与边界、错误修正
 
 \subsection{最终官网结果}
 
-最新官网日志为 \code{Riscv输出-11.txt} 和 \code{LoongArch输出-11.txt}。
+最新官网日志为 \code{Riscv输出-13.txt} 和 \code{LoongArch输出-13.txt}。
 两份日志都出现 \code{TOOLCHAIN_RESULT status=OK}、
 \code{MINIBUILD_RESULT status=OK} 和最终的
 \code{BUILDSTORM_RESULT ... status=OK ... run=OK}，随后正常输出测试组结束标记并关机。
@@ -118,13 +119,13 @@ AI 使用与可复现步骤（4 分） & AI 的真实参与边界、错误修正
 \toprule
 平台 & 核数 & 正式构建耗时 & 产物大小 & 自动评测得分 & 产物启动 \\
 \midrule
-RISC-V64 & 8 & 2270.92 s & 1,681,000 B & 131.4 / 200 & OK \\
-LoongArch64 & 12 & 1700.89 s & 1,714,568 B & 180.0 / 200 & OK \\
+RISC-V64 & 8 & 2155.80 s & 1,681,000 B & 139.9 / 200 & OK \\
+LoongArch64 & 12 & 1573.79 s & 1,714,568 B & 180.0 / 200 & OK \\
 \midrule
-双平台合计 & --- & --- & --- & 311.4 / 400 & 均通过 \\
+双平台合计 & --- & --- & --- & 319.9 / 400 & 均通过 \\
 \bottomrule
 \end{tabular}
-\caption{2026-08-12 官网 BuildStorm 自动评测最终结果}
+\caption{2026-08-18 官网 BuildStorm 自动评测最新结果}
 \label{tab:official-result}
 \end{table}
 
@@ -133,7 +134,7 @@ LoongArch64 & 12 & 1700.89 s & 1,714,568 B & 180.0 / 200 & OK \\
 \[
 S_{time}=120\times\operatorname{clamp}\left(\frac{2B-t}{B},0,1\right)
 \]
-计算。RISC-V64 的 2270.92 秒对应 71.4 分；LoongArch64 的 1700.89 秒快于其基线，
+计算。RISC-V64 的 2155.80 秒对应 79.9 分；LoongArch64 的 1573.79 秒快于其基线，
 得到 120 分。两平台还分别获得工具链 8 分、最小构建 12 分和完整构建 40 分。题 2.3
 的 20 分为本文对应的人工评审项，不在上述脚本自动得分中。
 同一轮 CAgent 十项在两平台均全通过且均获得 199.1 分，说明 BuildStorm 改动没有破坏
@@ -337,6 +338,13 @@ create/remove/rename 以父目录 inode 为原子命名空间锁域，并在 lwe
 in-flight 状态合并，只由一个线程读取，其他线程等待代际完成；truncate、写入和回收会使
 旧代际失效。写路径使用按 inode 共享的延迟写回页，读可以直接命中尚未落盘的最新脏数据。
 
+进一步的候选优化覆盖“磁盘上仍是旧版本、内存中已有待写区间”的两层文件视图。小范围
+读取不再退化为每次精确 ext4 I/O，而是复用固定 64 KiB 对齐预读；发布页缓存前先按系统
+调用顺序叠加待写区间，使普通 \code{read}、文件缺页和 \code{mmap} 观察同一逻辑内容。
+成功写回后按 inode 使整组逻辑页失效，防止旧的内存快照越过持久化边界。待写区间只在
+真正写回前合并：先按文件偏移求出相交或相邻分量，再按原始系统调用顺序重放数据，因此
+后一次重叠 \code{pwrite} 仍覆盖前一次；内存不足或整数溢出时保持原区间并走旧路径。
+
 块设备层把线性槽位查找改为预分配哈希索引，并使用全局 CLOCK 淘汰近似 LRU。脏块达到
 高水位时批量写到低水位，连续物理块最多合并为 128 KiB 的逻辑写回，再按驱动 64 KiB
 bounce 边界提交。高低水位滞回避免每个 miss 都触发一轮写回；写回前后都检查块代际，
@@ -356,6 +364,29 @@ bounce 边界提交。高低水位滞回避免每个 miss 都触发一轮写回�
 亲和性变化或锁读取失败时仍调度。睡眠读写锁的等待谓词只读取
 \code{reader_count/writer_count}，不再调用有副作用的 \code{try_read/try_write}；状态发布、
 等待者登记和唤醒顺序保持明确的 acquire/release 关系。
+
+\subsection{RISC-V ASID、TLB 代际与唤醒亲和性候选}
+
+官网 RISC-V64 配置固定为 8 核，因此本轮不以增加核心数获取性能，而是减少这 8 个 hart
+之间不必要的页表切换、全局 TLB 失效和任务迁移。内核启动时探测 \code{satp.ASID} 可写
+位；地址空间获得本次启动期间不复用的唯一 ASID，进出用户态时写入带 ASID 的
+\code{satp}，不再为每次普通上下文切换执行全 TLB 刷新。ASID 空间耗尽或硬件不支持时
+自动退回 ASID 0 和原有全刷新路径，而不是复用可能仍驻留于 hart TLB 中的标识。
+
+每个地址空间维护全局 \code{tlb_generation}、每 CPU 已观察代际和 active CPU mask。
+修改映射时先发布新代际，只对当前正在运行该地址空间的远端 hart 执行 SBI
+\code{remote_sfence_vma_asid}；未活动 hart 下次进入地址空间时若发现代际落后，再局部执行
+\code{sfence.vma}。进入路径在登记 active bit 前后复查代际，关闭“失效方读取 mask 与目标
+CPU 进入地址空间交错”的竞态。并发完成使用单调 \code{fetch_max}，避免较旧 shootdown
+完成后覆盖较新代际。私有 COW 替换物理页也显式报告 translation changed，和
+\code{munmap/mprotect/mremap} 一样进入该失效协议，不能因为 VMA 元数据未变而遗漏刷新。
+
+调度器方面，RISC-V 被阻塞任务唤醒后优先回到 \code{last_cpu}，保留该 hart 上的 TLB、
+指令缓存和数据缓存热度；空闲 CPU 仍可从其他队列窃取，但不会迁移受害 CPU 唯一的 warm
+task。CPU affinity 始终高于该提示，因此该设计不改变 \code{sched_setaffinity} 语义。
+上述逻辑均以 \code{target_arch = "riscv64"} 隔离，LoongArch 保持已获满分的调度与 TLB
+路径。该候选先经过 COW、SMP、futex、共享内存、mprotect、fork 和大管道语义测试，再进入
+双架构官方 Docker 构建；只有官网完整构建 A/B 确认收益后才会并入正式提交分支。
 
 \subsection{LoongArch 页表、TLB 与设备}
 
@@ -384,6 +415,44 @@ LoongArch auxv 报告 \code{HWCAP_LOONGARCH_UAL}，使 glibc 与实际硬件非�
 负数代表耗时、请求或等待下降。Mac 本地的 x86\_64 QEMU 经 Rosetta 运行，绝对 wall-clock
 不能外推到官网原生评测机；因此本地表主要用来证明方向和排除回归，最终时间结论只采用
 官网 guest \code{/proc/uptime}。
+
+\subsection{RISC-V 8 核 ASID 候选的短测证据}
+
+在同一 RISC-V 8 核 rustc 并发短负载中，稳定对照均值为 29.445 秒；加入 ASID、按地址
+空间代际惰性刷新和唤醒亲和性后，三次结果为 25.77、27.05 和 26.09 秒，均值
+26.303 秒，相对下降 10.67\%。单独检查唤醒亲和性的相邻样本从 37.54 秒降至 34.79 秒，
+下降 7.33\%；统计插桩显示远端 TLB 目标数约下降 98\%。这些数据说明减少 TLB 冷启动和
+跨核迁移值得继续，但短测的 10.67\% 不能直接外推成完整 BuildStorm 的同等收益，三个
+百分比也不能相加。候选 ZIP 必须在相同官网镜像上与 2155.80 秒基线做 A/B；在结果返回前，
+文档只把它列为待验证候选。
+
+正确性验证使用正式 8 核配置：\code{clonesmptest} 连续 9 次通过，其中包含一个 hart
+保留旧 TLB、另一个 hart 解除映射并重新映射、原 hart 必须观察新物理页的跨核场景；
+\code{smpstress} 观察到全部 8 个 CPU；\code{mprotecttest}、\code{forktest}、
+\code{forktest2}、\code{futextest}、\code{shmtest} 和 \code{pipe_large_test} 均通过。
+随后使用官方 Docker 工具链同时生成 \code{kernel-rv} 与 \code{kernel-la}，两架构构建成功。
+
+\subsection{待写视图预读与区间合并候选的配对短测}
+
+在 ASID 候选之上加入待写视图 64 KiB 预读和写回前区间合并，并使用同一 RISC-V 镜像、
+8 核、8 GiB 内存与 8 个并发 rustc 交替运行 \code{opt1--opt2--opt1--opt2}。第一对从
+115.37 秒降至 108.08 秒，下降 6.32\%；第二对从 170.14 秒降至 155.20 秒，下降
+8.78\%。两组算术均值从 142.755 秒降至 131.640 秒，配对均值下降 7.79\%。宿主机两轮
+绝对耗时波动很大，但候选在相邻两对中方向一致且 8/8 rustc 均成功，因此可以进入官方
+完整 A/B；该结果仍不能替代官网 \code{/proc/uptime} 的最终结论。
+
+正确性测试首先暴露出一次真实回归：旧实现把未叠加待写数据的磁盘页发布到页缓存，导致
+普通 \code{read} 正确而随后 \code{mmap} 读到旧字节。修复为“先叠加、后发布”后，512 个
+16 KiB 文件的跨页小写入、完整读取与 \code{mmap} 对比全部通过，测得 1130 ms。综合
+文件系统测试还覆盖 960 个并发产物、rename 覆盖、稀疏扩展、重叠 \code{pwrite} 的
+写前/写后结果、8 线程共享 append 与定址写，全部通过，整组 11.94 秒。
+
+\code{lock-stats} 的 4 路 rustc 样本进一步记录到 ext4 卷锁累计等待 32.237059 秒，
+VM 锁累计等待 21.219184 秒；待写视图预读点有 3344 次卷锁获取、6.252314 秒持锁时间和
+21.262110 秒等待时间。基于该证据曾只对待写视图尝试“连续读取确认后从 64 KiB 增长到
+128/256 KiB”，而不取消 lwext4 锁。它通过全部文件语义测试，但相邻 8 路 rustc 从
+77.69 秒增至 86.64 秒，退化 11.52\%，故立即恢复固定 64 KiB。说明卷锁确为后续大头，
+但扩大 I/O 窗口不是安全收益路径，下一阶段应减少锁内重复解析或建立可验证的只读快路径。
 
 \subsection{最终保留优化的逐项 A/B}
 
@@ -415,6 +484,7 @@ ELF \code{PT_LOAD} 按需装入 & \code{cargo --version} 中位数 & 9.07 s & 6.
 同上 & 1 GiB 并行退出 & 30.98 s & 8.18 s & $-73.60\%$ \\
 同上 & buddy 累计等待 & 145.893205 s & 0.161926 s & $-99.89\%$ \\
 按需周期调度 & 调度器锁调用 & 235,213 & 169,668 & $-27.87\%$ \\
+待写视图预读与区间合并候选 & 8 路 rustc 配对均值 & 142.755 s & 131.640 s & $-7.79\%$ \\
 \bottomrule
 \end{longtable}
 
@@ -459,6 +529,7 @@ VM 锁全部 SeqCst & LA 越过 443 后在 \code{444/446} 重现空锁等待者 
 \endhead
 VirtIO bounce 64 KiB 扩至 128 KiB & \code{FS_QUICK} 34.77 s 增至 38.03 s（$+9.38\%$） & 大缓冲复制成本增加约 175\%，抵消请求合并 & \reverted \\
 顺序预读自适应扩至 128 KiB & 相同工作量无稳定收益 & 短 ELF 和离散元数据产生无效预读 & \reverted \\
+待写视图确认后扩至 128/256 KiB & 8 路 rustc 77.69 s 增至 86.64 s（$+11.52\%$） & 已确认顺序仍不足以抵消额外读放大和缓存污染 & \reverted \\
 文件缺页 fault-around 聚簇映射 & cargo 6.20 s，处于波动；页表锁调用 $+63.21\%$ & 预读命中不代表进程会访问相邻页 & \reverted \\
 私有可写 ELF 页初始共享 & cargo $+5.17\%$；四路 rustc $+1.47\%$ & 很快发生 COW，新增写缺页和页表修改 & \reverted \\
 目录删除查询结果复用 & 两轮均值 35.85 s 增至 38.55 s（$+7.52\%$） & 局部查询占比小，事务内复核仍不可省 & \reverted \\
@@ -475,17 +546,17 @@ allocator 2/8 批处理 & 125.54 s 增至 127.19 s（$+1.31\%$） & 锁次数下
 预构建为 54 分 51 秒，正式构建 1642.49 秒，产物 1,714,568 字节。由于本地宿主并发负载
 和 Rosetta 影响，这些数字用于证明全链路完成，不作为官网基线。
 
-官网最终结果如表 \ref{tab:official-result}。RISC-V64 日志在 36 分 59 秒完成 release profile，
-最终 guest 计时为 2270.92 秒；LoongArch64 在 27 分 40 秒完成，最终计时 1700.89 秒。
+官网最新结果如表 \ref{tab:official-result}。RISC-V64 日志在 35 分 00 秒完成 release profile，
+最终 guest 计时为 2155.80 秒；LoongArch64 在 25 分 33 秒完成，最终计时 1573.79 秒。
 两边都打印对应目标三元组的产物路径、非零字节数和 \code{run=OK}，随后测试组结束。
 
 \begin{Verbatim}[fontsize=\small,frame=single]
 BUILDSTORM_RESULT mode=multi status=OK rc=0 cores=8 \
-  elapsed_s=2270.92 artifact=target/riscv64gc-unknown-linux-musl/
+  elapsed_s=2155.80 artifact=target/riscv64gc-unknown-linux-musl/
   release/arceos-helloworld bytes=1681000 run=OK
 
 BUILDSTORM_RESULT mode=multi status=OK rc=0 cores=12 \
-  elapsed_s=1700.89 artifact=target/loongarch64-unknown-linux-musl/
+  elapsed_s=1573.79 artifact=target/loongarch64-unknown-linux-musl/
   release/arceos-helloworld bytes=1714568 run=OK
 \end{Verbatim}
 

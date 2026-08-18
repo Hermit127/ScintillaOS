@@ -27,6 +27,8 @@ pub(crate) use file_page_cache::{
     FilePageCacheReadLoad, FilePageCacheWriteGuard, FILE_PAGE_READAHEAD_SIZE,
 };
 pub(crate) use frame_allocator::frames_dealloc_batch;
+#[cfg(target_arch = "riscv64")]
+pub(crate) use memory_set::{init_riscv_asids, riscv_asids_enabled};
 #[cfg(feature = "lock-stats")]
 pub(crate) use file_page_cache::{
     record_file_page_cache_hit, record_file_page_cache_miss,

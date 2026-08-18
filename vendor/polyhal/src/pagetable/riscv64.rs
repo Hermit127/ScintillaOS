@@ -194,6 +194,32 @@ impl PageTable {
         unsafe { satp::write(Satp::from_bits((8 << 60) | (self.0.raw() >> 12))) }
         TLB::flush_all();
     }
+
+    /// Probe the WARL ASID field without changing the active page-table root.
+    pub fn probe_asid_mask() -> usize {
+        const ASID_SHIFT: usize = 44;
+        const ASID_MASK: usize = 0xffff;
+
+        let original = satp::read();
+        let probe = (original.bits() & !(ASID_MASK << ASID_SHIFT))
+            | (ASID_MASK << ASID_SHIFT);
+        unsafe { satp::write(Satp::from_bits(probe)) }
+        let supported = satp::read().asid();
+        unsafe { satp::write(original) }
+        TLB::flush_all();
+        supported
+    }
+
+    /// Install this root with an ASID that has never been reused this boot.
+    #[inline]
+    pub fn change_with_asid(&self, asid: usize) {
+        debug_assert_eq!(asid & !0xffff, 0);
+        unsafe {
+            satp::write(Satp::from_bits(
+                (8 << 60) | (asid << 44) | (self.0.raw() >> 12),
+            ))
+        }
+    }
 }
 
 /// TLB operations
@@ -206,6 +232,19 @@ impl TLB {
     pub fn flush_vaddr(vaddr: VirtAddr) {
         unsafe {
             sfence_vma(vaddr.raw(), 0);
+        }
+    }
+
+    /// Invalidate every cached translation belonging to one address space.
+    #[inline]
+    pub fn flush_asid(asid: usize) {
+        debug_assert_ne!(asid, 0);
+        unsafe {
+            core::arch::asm!(
+                "sfence.vma x0, {asid}",
+                asid = in(reg) asid,
+                options(nostack)
+            );
         }
     }
 
