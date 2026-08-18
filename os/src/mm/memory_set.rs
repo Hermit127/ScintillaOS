@@ -2,7 +2,7 @@ use super::vpn_range::VAddrRange;
 use super::{
     file_page_cache::load_file_page, frame_alloc, frames_dealloc_batch, FrameTracker,
 };
-use crate::config::{MAX_CPUS, PAGE_SIZE, USER_STACK_SIZE};
+use crate::config::{PAGE_SIZE, USER_STACK_SIZE};
 use crate::fs::File;
 use crate::sync::{VmPageTableRwLock, VmPagesGuard, VmPagesLock, VmRwLock};
 use alloc::boxed::Box;
@@ -15,46 +15,11 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use log::*;
 use polyhal::pagetable::{MappingFlags, MappingSize, PageTable, PageTableWrapper};
-#[cfg(target_arch = "riscv64")]
-use polyhal::pagetable::TLB;
 use polyhal::{PhysAddr, VirtAddr};
 use xmas_elf::header::Type as ElfType;
-
-#[cfg(target_arch = "riscv64")]
-static RISCV_ASID_MASK: AtomicUsize = AtomicUsize::new(0);
-#[cfg(target_arch = "riscv64")]
-static RISCV_NEXT_ASID: AtomicUsize = AtomicUsize::new(1);
-
-#[cfg(target_arch = "riscv64")]
-pub(crate) fn init_riscv_asids() -> usize {
-    let mask = PageTable::probe_asid_mask();
-    RISCV_ASID_MASK.store(mask, Ordering::Release);
-    mask
-}
-
-#[cfg(target_arch = "riscv64")]
-pub(crate) fn riscv_asids_enabled() -> bool {
-    RISCV_ASID_MASK.load(Ordering::Acquire) != 0
-}
-
-#[cfg(target_arch = "riscv64")]
-fn allocate_riscv_asid() -> usize {
-    let max_asid = RISCV_ASID_MASK.load(Ordering::Acquire).saturating_sub(1);
-    if max_asid == 0 {
-        return 0;
-    }
-    RISCV_NEXT_ASID
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |next| {
-            (next <= max_asid).then_some(next + 1)
-        })
-        .unwrap_or(0)
-}
-
 struct AddressSpacePageTable {
     inner: PageTableWrapper,
     access: VmPageTableRwLock<()>,
-    #[cfg(target_arch = "riscv64")]
-    asid: usize,
 }
 
 impl AddressSpacePageTable {
@@ -62,8 +27,6 @@ impl AddressSpacePageTable {
         Self {
             inner: PageTableWrapper::alloc(),
             access: VmPageTableRwLock::new_named((), "Vm.page_table"),
-            #[cfg(target_arch = "riscv64")]
-            asid: allocate_riscv_asid(),
         }
     }
 
@@ -148,17 +111,7 @@ impl AddressSpacePageTable {
     }
 
     fn change(&self) {
-        #[cfg(target_arch = "riscv64")]
-        if self.asid != 0 {
-            self.inner.change_with_asid(self.asid);
-            return;
-        }
         self.inner.change();
-    }
-
-    #[cfg(target_arch = "riscv64")]
-    fn asid(&self) -> usize {
-        self.asid
     }
 }
 
@@ -277,26 +230,12 @@ impl MremapResult {
 
 struct AddressSpaceActivity {
     active_cpus: AtomicUsize,
-    #[cfg(target_arch = "riscv64")]
-    tlb_generation: AtomicUsize,
-    #[cfg(target_arch = "riscv64")]
-    cpu_tlb_generations: [AtomicUsize; MAX_CPUS],
-    #[cfg(target_arch = "riscv64")]
-    asid: usize,
 }
 
 impl AddressSpaceActivity {
-    fn new(page_table: &AddressSpacePageTable) -> Self {
-        #[cfg(not(target_arch = "riscv64"))]
-        let _ = page_table;
+    const fn new() -> Self {
         Self {
             active_cpus: AtomicUsize::new(0),
-            #[cfg(target_arch = "riscv64")]
-            tlb_generation: AtomicUsize::new(0),
-            #[cfg(target_arch = "riscv64")]
-            cpu_tlb_generations: [const { AtomicUsize::new(0) }; MAX_CPUS],
-            #[cfg(target_arch = "riscv64")]
-            asid: page_table.asid(),
         }
     }
 }
@@ -311,32 +250,6 @@ pub struct AddressSpaceActivityHandle(Arc<AddressSpaceActivity>);
 impl AddressSpaceActivityHandle {
     pub fn active_cpu_mask(&self) -> usize {
         self.0.active_cpus.load(Ordering::Acquire)
-    }
-
-    #[cfg(target_arch = "riscv64")]
-    pub fn asid(&self) -> usize {
-        self.0.asid
-    }
-
-    #[cfg(target_arch = "riscv64")]
-    pub fn begin_tlb_invalidation(&self, current_cpu: usize) -> usize {
-        let generation = self
-            .0
-            .tlb_generation
-            .fetch_add(1, Ordering::AcqRel)
-            .wrapping_add(1);
-        assert_ne!(generation, 0, "address-space TLB generation wrapped");
-        self.0.cpu_tlb_generations[current_cpu].fetch_max(generation, Ordering::Release);
-        generation
-    }
-
-    #[cfg(target_arch = "riscv64")]
-    pub fn complete_tlb_invalidation(&self, cpus: usize, generation: usize) {
-        for cpu in 0..MAX_CPUS {
-            if cpus & (1usize << cpu) != 0 {
-                self.0.cpu_tlb_generations[cpu].fetch_max(generation, Ordering::Release);
-            }
-        }
     }
 }
 
@@ -367,7 +280,6 @@ fn retired_user_page_table() -> Arc<AddressSpacePageTable> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PageFaultResult {
     Handled,
-    TranslationChanged,
     SharedMetadataChanged,
     SharedTranslationChanged,
 }
@@ -642,22 +554,16 @@ impl MemorySet {
     }
 
     pub fn new_bare() -> Self {
-        let page_table = Arc::new(AddressSpacePageTable::alloc());
-        let activity = Arc::new(AddressSpaceActivity::new(&page_table));
         Self {
-            page_table,
+            page_table: Arc::new(AddressSpacePageTable::alloc()),
             areas: Arc::new(VmRwLock::new_named(Vec::new(), "Vm.address_space_areas")),
             shared_page_table: false,
-            activity,
+            activity: Arc::new(AddressSpaceActivity::new()),
             program_brk: Arc::new(AtomicUsize::new(0)),
         }
     }
     pub fn token(&self) -> PageTable {
         self.page_table.token()
-    }
-    #[cfg(target_arch = "riscv64")]
-    pub(crate) fn asid(&self) -> usize {
-        self.page_table.asid()
     }
     pub fn mark_shared(&mut self) {
         self.shared_page_table = true;
@@ -703,25 +609,9 @@ impl MemorySet {
             "invalid address-space CPU {}",
             cpu
         );
-        let cpu_bit = 1usize << cpu;
-        #[cfg(target_arch = "riscv64")]
-        if self.activity.asid != 0 {
-            loop {
-                let generation = self.activity.tlb_generation.load(Ordering::Acquire);
-                let local_generation =
-                    self.activity.cpu_tlb_generations[cpu].load(Ordering::Acquire);
-                if local_generation != generation {
-                    TLB::flush_asid(self.activity.asid);
-                    self.activity.cpu_tlb_generations[cpu]
-                        .fetch_max(generation, Ordering::Release);
-                }
-                self.activity.active_cpus.fetch_or(cpu_bit, Ordering::AcqRel);
-                if self.activity.tlb_generation.load(Ordering::Acquire) == generation {
-                    return;
-                }
-            }
-        }
-        self.activity.active_cpus.fetch_or(cpu_bit, Ordering::Release);
+        self.activity
+            .active_cpus
+            .fetch_or(1usize << cpu, Ordering::Release);
     }
 
     /// Remove `cpu` after it has switched back to the kernel page table.
@@ -1530,7 +1420,7 @@ impl MemorySet {
                     let result = if cow.shared_translation {
                         PageFaultResult::SharedTranslationChanged
                     } else {
-                        PageFaultResult::TranslationChanged
+                        PageFaultResult::Handled
                     };
                     self.page_table.unmap_page(vpn);
                     self.page_table.map_page(
@@ -2045,7 +1935,7 @@ impl MemorySet {
             // this local handle.
             self.page_table = retired_user_page_table();
             self.areas = Arc::new(VmRwLock::new_named(Vec::new(), "Vm.detached_areas"));
-            self.activity = Arc::new(AddressSpaceActivity::new(&self.page_table));
+            self.activity = Arc::new(AddressSpaceActivity::new());
             self.shared_page_table = false;
             return;
         }
@@ -2062,7 +1952,7 @@ impl MemorySet {
                 &mut self.areas,
                 Arc::new(VmRwLock::new_named(Vec::new(), "Vm.detached_areas")),
             );
-            self.activity = Arc::new(AddressSpaceActivity::new(&self.page_table));
+            self.activity = Arc::new(AddressSpaceActivity::new());
             self.shared_page_table = false;
             drop(old_areas);
             drop(old_page_table);

@@ -953,60 +953,8 @@ impl OSInode {
         let loaded = if backing_len == 0 {
             0
         } else {
-            let mut cache_miss = None;
-            let cached = self.file_page_cache_key().and_then(|key| {
-                match read_file_page_cache(key, offset, &mut buf[..backing_len]) {
-                    FilePageCacheRead::Hit(loaded) if loaded == backing_len => {
-                        #[cfg(feature = "lock-stats")]
-                        crate::mm::record_file_page_cache_hit(loaded);
-                        Some(loaded)
-                    }
-                    FilePageCacheRead::Hit(_) => None,
-                    FilePageCacheRead::Miss(generation) => {
-                        #[cfg(feature = "lock-stats")]
-                        crate::mm::record_file_page_cache_miss(backing_len);
-                        cache_miss = Some((key, generation));
-                        None
-                    }
-                }
-            });
-            if let Some(loaded) = cached {
-                loaded
-            } else if let Some((key, generation)) = cache_miss {
-                if let Some(mut read_ahead) = Self::allocate_read_ahead(backing_len) {
-                    let loaded_offset = Self::read_ahead_offset(offset, backing_len);
-                    let loaded_len = {
-                        let _fs_lock = self.dentry.super_block.lock_fs();
-                        self.read_handle_at(file, loaded_offset, backing_size, &mut read_ahead)
-                    };
-                    if loaded_len != 0 {
-                        self.dentry.overlay_pending_read(
-                            loaded_offset,
-                            &mut read_ahead[..loaded_len],
-                        );
-                    }
-                    let source_offset = offset - loaded_offset;
-                    let returned = loaded_len
-                        .saturating_sub(source_offset)
-                        .min(backing_len);
-                    buf[..returned]
-                        .copy_from_slice(&read_ahead[source_offset..source_offset + returned]);
-                    cache_file_read(
-                        key,
-                        generation,
-                        loaded_offset,
-                        &read_ahead[..loaded_len],
-                        backing_size,
-                    );
-                    returned
-                } else {
-                    let _fs_lock = self.dentry.super_block.lock_fs();
-                    self.read_handle_at(file, offset, backing_size, &mut buf[..backing_len])
-                }
-            } else {
-                let _fs_lock = self.dentry.super_block.lock_fs();
-                self.read_handle_at(file, offset, backing_size, &mut buf[..backing_len])
-            }
+            let _fs_lock = self.dentry.super_block.lock_fs();
+            self.read_handle_at(file, offset, backing_size, &mut buf[..backing_len])
         };
         file.fpos = saved_pos;
         file.fsize = saved_size;

@@ -170,17 +170,6 @@ pub unsafe extern "C" fn context_switch_pt(
     context_switch_pt_impl(from, to, pt_token.root().raw());
 }
 
-/// Switch page tables while retaining TLB entries tagged with a unique ASID.
-#[inline]
-pub unsafe extern "C" fn context_switch_pt_asid(
-    from: *mut KContext,
-    to: *const KContext,
-    pt_token: PageTable,
-    asid: usize,
-) {
-    context_switch_pt_asid_impl(from, to, pt_token.root().raw(), asid);
-}
-
 /// Context Switch With Page Table Implement
 ///
 /// The detail implementation of [context_switch_pt].
@@ -204,28 +193,6 @@ unsafe extern "C" fn context_switch_pt_impl(
         // Restore Kernel Context.
         restore_callee_regs!(),
         // Return to the caller.
-        ret!(),
-    )
-}
-
-#[naked]
-unsafe extern "C" fn context_switch_pt_asid_impl(
-    from: *mut KContext,
-    to: *const KContext,
-    pt_token: usize,
-    asid: usize,
-) {
-    naked_asm!(
-        save_callee_regs!(),
-        "
-            srli    a2,   a2, 12
-            slli    a3,   a3, 44
-            li      a4,   8 << 60
-            or      a2,   a2, a3
-            or      a2,   a2, a4
-            csrw    satp, a2
-        ",
-        restore_callee_regs!(),
         ret!(),
     )
 }

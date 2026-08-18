@@ -20,6 +20,3 @@ pub enum KContextArgs {
 }
 
 pub_use_arch!(context_switch, context_switch_pt);
-
-#[cfg(target_arch = "riscv64")]
-pub use riscv64::context_switch_pt_asid;

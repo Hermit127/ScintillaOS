@@ -753,9 +753,9 @@ pub(crate) fn prepare_task_user_access(
     if !memory_set.valid_user_buf(addr as *const u8, len, need_write) {
         return false;
     }
-    let mut translation_activity = None;
-    let mut translation_flush_start = usize::MAX;
-    let mut translation_flush_end = 0usize;
+    let mut shared_activity = None;
+    let mut shared_flush_start = usize::MAX;
+    let mut shared_flush_end = 0usize;
     let mut page = start;
     while page < end {
         let vaddr = polyhal::VirtAddr::from(page);
@@ -773,28 +773,27 @@ pub(crate) fn prepare_task_user_access(
                 PageFaultAccess::Read
             };
             let result = memory_set.handle_page_fault(vaddr, access);
-            let translation_changed = match result {
+            match result {
                 Some(
-                    PageFaultResult::TranslationChanged
+                    PageFaultResult::SharedMetadataChanged
                     | PageFaultResult::SharedTranslationChanged,
-                ) => true,
-                Some(PageFaultResult::Handled | PageFaultResult::SharedMetadataChanged) => false,
+                ) => {}
+                Some(PageFaultResult::Handled) => {}
                 None => return false,
-            };
-            if translation_changed {
-                translation_activity = Some(memory_set.activity_handle());
-                translation_flush_start = translation_flush_start.min(page);
-                translation_flush_end =
-                    translation_flush_end.max(page + crate::config::PAGE_SIZE);
+            }
+            if result.is_some() && memory_set.is_shared() {
+                shared_activity = Some(memory_set.activity_handle());
+                shared_flush_start = shared_flush_start.min(page);
+                shared_flush_end = shared_flush_end.max(page + crate::config::PAGE_SIZE);
             }
         }
         page += crate::config::PAGE_SIZE;
     }
-    if let Some(activity) = translation_activity.as_ref() {
+    if let Some(activity) = shared_activity.as_ref() {
         let _ = flush_remote_tlb(
             activity,
-            translation_flush_start,
-            translation_flush_end - translation_flush_start,
+            shared_flush_start,
+            shared_flush_end - shared_flush_start,
         );
     }
     true

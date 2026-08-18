@@ -58,8 +58,6 @@ static PENDING_CACHE_FLUSHES: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "lock-stats")]
 static PENDING_CACHE_FLUSHED_BYTES: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "lock-stats")]
-static PENDING_CACHE_FLUSHED_RANGES: AtomicUsize = AtomicUsize::new(0);
-#[cfg(feature = "lock-stats")]
 static PENDING_CACHE_PRESSURE_FLUSHES: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "lock-stats")]
 static PENDING_CACHE_DEFERRED_CLOSES: AtomicUsize = AtomicUsize::new(0);
@@ -157,73 +155,6 @@ impl PendingFileWrites {
             self.file = Some(file);
         }
         Some(self.buffered_bytes >= PENDING_WRITEBACK_PER_INODE_LIMIT)
-    }
-
-    fn coalesce_ranges(&mut self) -> Option<usize> {
-        if self.ranges.len() < 2 {
-            return Some(0);
-        }
-
-        let mut order = Vec::new();
-        order.try_reserve_exact(self.ranges.len()).ok()?;
-        order.extend(0..self.ranges.len());
-        order.sort_unstable_by_key(|&index| self.ranges[index].offset);
-
-        let mut range_components = Vec::new();
-        range_components
-            .try_reserve_exact(self.ranges.len())
-            .ok()?;
-        range_components.resize(self.ranges.len(), 0usize);
-        let mut components = Vec::new();
-        components.try_reserve_exact(self.ranges.len()).ok()?;
-        for index in order {
-            let range = &self.ranges[index];
-            let range_end = range.offset.checked_add(range.data.len())?;
-            let component = match components.last_mut() {
-                Some((_, end)) if range.offset <= *end => {
-                    *end = (*end).max(range_end);
-                    components.len() - 1
-                }
-                _ => {
-                    components.push((range.offset, range_end));
-                    components.len() - 1
-                }
-            };
-            range_components[index] = component;
-        }
-        if components.len() == self.ranges.len() {
-            return Some(0);
-        }
-
-        let mut merged = Vec::new();
-        merged.try_reserve_exact(components.len()).ok()?;
-        for (start, end) in components {
-            let len = end.checked_sub(start)?;
-            let mut data = Vec::new();
-            data.try_reserve_exact(len).ok()?;
-            data.resize(len, 0);
-            merged.push(PendingWriteRange {
-                offset: start,
-                data,
-            });
-        }
-
-        // Replay in syscall order so later overlapping writes retain POSIX
-        // pwrite semantics after the extents are sorted for writeback.
-        for (index, range) in self.ranges.iter().enumerate() {
-            let target = &mut merged[range_components[index]];
-            let destination = range.offset - target.offset;
-            target.data[destination..destination + range.data.len()]
-                .copy_from_slice(&range.data);
-        }
-
-        let merged_bytes = merged
-            .iter()
-            .fold(0usize, |total, range| total.saturating_add(range.data.len()));
-        let released = self.buffered_bytes.saturating_sub(merged_bytes);
-        self.ranges = merged;
-        self.buffered_bytes = merged_bytes;
-        Some(released)
     }
 
     fn read_fully(&self, offset: usize, buf: &mut [u8], file_size: u64) -> Option<usize> {
@@ -379,7 +310,7 @@ fn flush_pending_write_state(state: &InodeRuntimeSize) -> bool {
     if !state.pending_dirty.load(Ordering::Acquire) {
         return true;
     }
-    let mut pending = {
+    let pending = {
         let mut slot = state.pending_writes.lock();
         if slot.ranges.is_empty() {
             state.pending_dirty.store(false, Ordering::Release);
@@ -388,8 +319,6 @@ fn flush_pending_write_state(state: &InodeRuntimeSize) -> bool {
         }
         core::mem::replace(&mut *slot, PendingFileWrites::new())
     };
-    let released = pending.coalesce_ranges().unwrap_or(0);
-    subtract_pending_write_bytes(released);
 
     let Some(super_block) = pending.super_block.as_ref() else {
         let mut slot = state.pending_writes.lock();
@@ -436,21 +365,13 @@ fn flush_pending_write_state(state: &InodeRuntimeSize) -> bool {
     }
 
     if ok {
-        let flushed_bytes = pending.buffered_bytes;
-        #[cfg(feature = "lock-stats")]
-        let flushed_ranges = pending.ranges.len();
-        crate::mm::invalidate_file_page_cache(crate::fs::FilePageCacheKey {
-            super_block: Arc::as_ptr(super_block) as usize,
-            inode: file.inode,
-        });
         state.pending_dirty.store(false, Ordering::Release);
         state.dirty_sequence.store(0, Ordering::Release);
-        subtract_pending_write_bytes(flushed_bytes);
+        subtract_pending_write_bytes(pending.buffered_bytes);
         #[cfg(feature = "lock-stats")]
         {
             PENDING_CACHE_FLUSHES.fetch_add(1, Ordering::Relaxed);
-            PENDING_CACHE_FLUSHED_BYTES.fetch_add(flushed_bytes, Ordering::Relaxed);
-            PENDING_CACHE_FLUSHED_RANGES.fetch_add(flushed_ranges, Ordering::Relaxed);
+            PENDING_CACHE_FLUSHED_BYTES.fetch_add(pending.buffered_bytes, Ordering::Relaxed);
         }
         true
     } else {
@@ -2840,7 +2761,7 @@ fn flush_all_pending_file_writes() -> bool {
 #[cfg(feature = "lock-stats")]
 pub fn dump_pending_write_stats() {
     crate::println!(
-        "[pending-write-stats] dirty_bytes={} limit={} cache_reads={} cache_read_bytes={} overlay_reads={} overlay_bytes={} flushes={} flushed_bytes={} flushed_ranges={} pressure_flushes={} deferred_closes={}",
+        "[pending-write-stats] dirty_bytes={} limit={} cache_reads={} cache_read_bytes={} overlay_reads={} overlay_bytes={} flushes={} flushed_bytes={} pressure_flushes={} deferred_closes={}",
         PENDING_WRITE_BYTES.load(Ordering::Relaxed),
         pending_writeback_limit(),
         PENDING_CACHE_READS.load(Ordering::Relaxed),
@@ -2849,7 +2770,6 @@ pub fn dump_pending_write_stats() {
         PENDING_CACHE_OVERLAY_BYTES.load(Ordering::Relaxed),
         PENDING_CACHE_FLUSHES.load(Ordering::Relaxed),
         PENDING_CACHE_FLUSHED_BYTES.load(Ordering::Relaxed),
-        PENDING_CACHE_FLUSHED_RANGES.load(Ordering::Relaxed),
         PENDING_CACHE_PRESSURE_FLUSHES.load(Ordering::Relaxed),
         PENDING_CACHE_DEFERRED_CLOSES.load(Ordering::Relaxed),
     );

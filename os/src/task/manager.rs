@@ -20,12 +20,6 @@ static SWITCHING_COMPLETIONS: [AtomicU64; 128] = [const { AtomicU64::new(0) }; 1
 static BLOCKING_COMPLETIONS: [AtomicU64; 128] = [const { AtomicU64::new(0) }; 128];
 #[cfg(feature = "lock-stats")]
 static WAKE_PENDING_COMPLETIONS: [AtomicU64; 128] = [const { AtomicU64::new(0) }; 128];
-#[cfg(feature = "lock-stats")]
-static TASK_MIGRATIONS: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "lock-stats")]
-static WAKE_AFFINE_ENQUEUES: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "lock-stats")]
-static WAKE_AFFINE_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(feature = "lock-stats")]
 pub fn dump_context_switch_stats() {
@@ -43,12 +37,6 @@ pub fn dump_context_switch_stats() {
             );
         }
     }
-    crate::println!(
-        "[scheduler-affinity-stats] migrations={} wake_affine={} wake_fallbacks={}",
-        TASK_MIGRATIONS.load(Ordering::Relaxed),
-        WAKE_AFFINE_ENQUEUES.load(Ordering::Relaxed),
-        WAKE_AFFINE_FALLBACKS.load(Ordering::Relaxed),
-    );
 }
 
 fn publish_sleep_deadline(deadline_ns: usize) {
@@ -217,37 +205,6 @@ impl SchedulerState {
         cpu
     }
 
-    fn add_priority_to_preferred_cpu(
-        &mut self,
-        task: Arc<TaskControlBlock>,
-        preferred_cpu: usize,
-    ) -> usize {
-        #[cfg(not(target_arch = "riscv64"))]
-        {
-            let _ = preferred_cpu;
-            return self.add_priority(task);
-        }
-        #[cfg(target_arch = "riscv64")]
-        {
-            let allowed = task.allowed_cpus() & online_cpu_mask();
-            let preferred = preferred_cpu < MAX_CPUS && allowed & (1usize << preferred_cpu) != 0;
-            let cpu = if preferred {
-                preferred_cpu
-            } else {
-                self.select_cpu(&task)
-            };
-            #[cfg(feature = "lock-stats")]
-            if preferred {
-                WAKE_AFFINE_ENQUEUES.fetch_add(1, Ordering::Relaxed);
-            } else {
-                WAKE_AFFINE_FALLBACKS.fetch_add(1, Ordering::Relaxed);
-            }
-            task.mark_enqueued();
-            self.ready_queues[cpu].push_front(task);
-            cpu
-        }
-    }
-
     fn promote_priority(&mut self, task: Arc<TaskControlBlock>) -> usize {
         if task.is_enqueued() {
             assert!(
@@ -256,8 +213,7 @@ impl SchedulerState {
                 task.getpid()
             );
         }
-        let preferred_cpu = task.last_cpu();
-        self.add_priority_to_preferred_cpu(task, preferred_cpu)
+        self.add_priority(task)
     }
     pub fn fetch(&mut self, cpu: usize) -> Option<Arc<TaskControlBlock>> {
         let task = if let Some(task) = self.ready_queues.get_mut(cpu)?.pop_front() {
@@ -266,34 +222,16 @@ impl SchedulerState {
             let mut stolen = None;
             for offset in 1..MAX_CPUS {
                 let victim = (cpu + offset) % MAX_CPUS;
-                #[cfg(not(target_arch = "riscv64"))]
-                {
-                    let reserved = usize::from(self.running[victim] == 0);
-                    if self.ready_queues[victim].len() <= reserved {
-                        continue;
-                    }
-                }
-                #[cfg(target_arch = "riscv64")]
-                let queue_len = self.ready_queues[victim].len();
-                #[cfg(target_arch = "riscv64")]
-                if queue_len == 0 {
+                // Leave one runnable task for an otherwise idle victim. It is
+                // normally the task that CPU just preempted and is about to
+                // resume; stealing it would cause migration on every quantum.
+                let reserved = usize::from(self.running[victim] == 0);
+                if self.ready_queues[victim].len() <= reserved {
                     continue;
                 }
                 let Some(index) = self.ready_queues[victim]
                     .iter()
-                    .position(|task| {
-                        task.allowed_cpus() & (1usize << cpu) != 0
-                            && {
-                                #[cfg(target_arch = "riscv64")]
-                                {
-                                    queue_len > 1 || task.last_cpu() != victim
-                                }
-                                #[cfg(not(target_arch = "riscv64"))]
-                                {
-                                    true
-                                }
-                            }
-                    })
+                    .position(|task| task.allowed_cpus() & (1usize << cpu) != 0)
                 else {
                     continue;
                 };
@@ -448,10 +386,6 @@ pub fn fetch_task() -> Option<Arc<TaskControlBlock>> {
                 inner.task_status = TaskStatus::Running;
                 drop(inner);
                 scheduler.mark_running(cpu, task.getpid());
-                #[cfg(feature = "lock-stats")]
-                if task.last_cpu() < MAX_CPUS && task.last_cpu() != cpu {
-                    TASK_MIGRATIONS.fetch_add(1, Ordering::Relaxed);
-                }
                 task.mark_running_on(cpu);
                 break task;
             }
@@ -520,7 +454,7 @@ pub fn complete_context_switch(task: Arc<TaskControlBlock>) {
     };
     drop(inner);
     let target = if priority {
-        scheduler.add_priority_to_preferred_cpu(task, previous_cpu)
+        scheduler.add_priority(task)
     } else {
         // Keep a preempted or yielding task on its warm CPU. An idle CPU can
         // still steal it below, and an affinity change overrides the hint.
@@ -711,9 +645,7 @@ fn wake_task_filtered(task: Arc<TaskControlBlock>, filter: WakeFilter) -> bool {
             );
         }
         drop(inner);
-        let preferred_cpu = task.last_cpu();
-        let target = enqueue_now
-            .then(|| scheduler.add_priority_to_preferred_cpu(task.clone(), preferred_cpu));
+        let target = enqueue_now.then(|| scheduler.add_priority(task.clone()));
         #[cfg(any(feature = "smp-diagnostics", feature = "timeout-trace"))]
         if let Some(cpu) = target {
             if task.getpid() >= 3 {
@@ -779,9 +711,7 @@ fn wake_net_waiters_matching(mut matches_reason: impl FnMut(BlockReason) -> bool
                     inner.task_status = TaskStatus::Ready;
                     inner.block_reason = None;
                     drop(inner);
-                    let preferred_cpu = task.last_cpu();
-                    let target =
-                        scheduler.add_priority_to_preferred_cpu(task, preferred_cpu);
+                    let target = scheduler.add_priority(task);
                     all_targets |= 1usize << target;
                 }
                 TaskStatus::WakePending => {

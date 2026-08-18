@@ -96,7 +96,7 @@ fn expected_cpu_mask() -> usize {
     (1usize << cpu_count) - 1
 }
 
-fn sync_vm_after_page_fault(
+fn sync_shared_vm_after_page_fault(
     task: &alloc::sync::Arc<task::TaskControlBlock>,
     vaddr: polyhal::VirtAddr,
     translation_changed: bool,
@@ -108,6 +108,9 @@ fn sync_vm_after_page_fault(
         let inner = task.inner_exclusive_access();
         inner.memory_set.fault_view()
     };
+    if !memory_set.is_shared() {
+        return;
+    }
     let vpn = vaddr.floor();
     let activity = memory_set.activity_handle();
     let _ = crate::task::flush_remote_tlb(
@@ -150,7 +153,6 @@ fn handle_current_user_page_fault(vaddr: polyhal::VirtAddr, access: crate::mm::P
     {
         let result = match fault_result {
             Some(crate::mm::PageFaultResult::Handled) => "handled",
-            Some(crate::mm::PageFaultResult::TranslationChanged) => "translation",
             Some(crate::mm::PageFaultResult::SharedMetadataChanged) => "shared-metadata",
             Some(crate::mm::PageFaultResult::SharedTranslationChanged) => "shared-translation",
             None => "failed",
@@ -262,13 +264,10 @@ fn handle_current_user_page_fault(vaddr: polyhal::VirtAddr, access: crate::mm::P
     };
     match fault_result {
         crate::mm::PageFaultResult::SharedMetadataChanged => {
-            sync_vm_after_page_fault(&task, vaddr, false);
-        }
-        crate::mm::PageFaultResult::TranslationChanged => {
-            sync_vm_after_page_fault(&task, vaddr, true);
+            sync_shared_vm_after_page_fault(&task, vaddr, false);
         }
         crate::mm::PageFaultResult::SharedTranslationChanged => {
-            sync_vm_after_page_fault(&task, vaddr, true);
+            sync_shared_vm_after_page_fault(&task, vaddr, true);
         }
         crate::mm::PageFaultResult::Handled => {}
     }

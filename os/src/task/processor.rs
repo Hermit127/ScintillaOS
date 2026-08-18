@@ -18,8 +18,6 @@ use core::sync::atomic::{fence, AtomicBool};
 use lazyinit::LazyInit;
 use log::*;
 use polyhal::irq::IRQ;
-#[cfg(target_arch = "riscv64")]
-use polyhal::kcontext::context_switch_pt_asid;
 use polyhal::kcontext::{context_switch_pt, read_current_tp, KContext, KContextArgs};
 use polyhal::pagetable::PageTable;
 /// State that belongs exclusively to the current hart.
@@ -440,29 +438,23 @@ pub fn flush_remote_tlb(
     size: usize,
 ) -> bool {
     let current = current_hart_id();
-    #[cfg(target_arch = "riscv64")]
-    let generation = activity.begin_tlb_invalidation(current);
-    let target_cpus = activity.active_cpu_mask();
-    let remote = target_cpus & super::manager::online_cpu_mask() & !(1usize << current);
+    let remote = activity
+        .active_cpu_mask()
+        & super::manager::online_cpu_mask()
+        & !(1usize << current);
     if remote == 0 {
         return true;
     }
 
     #[cfg(target_arch = "riscv64")]
     {
-        let asid = activity.asid();
-        let result = if asid == 0 {
-            sbi_rt::remote_sfence_vma(remote, 0, start_addr, size)
-        } else {
-            sbi_rt::remote_sfence_vma_asid(remote, 0, start_addr, size, asid)
-        };
+        let result = sbi_rt::remote_sfence_vma(remote, 0, start_addr, size);
         if result.is_err() {
             panic!(
-                "remote sfence.vma failed: targets={:#x}, asid={:#x}, start={:#x}, size={:#x}, sbi={:?}",
-                remote, asid, start_addr, size, result
+                "remote sfence.vma failed: targets={:#x}, start={:#x}, size={:#x}, sbi={:?}",
+                remote, start_addr, size, result
             );
         }
-        activity.complete_tlb_invalidation(remote, generation);
     }
 
     #[cfg(target_arch = "loongarch64")]
@@ -646,8 +638,6 @@ pub fn run_tasks() {
             }
             let next_task_cx_ptr = &task_inner.task_cx as *const KContext;
             let token = task_inner.memory_set.token();
-            #[cfg(target_arch = "riscv64")]
-            let asid = task_inner.memory_set.asid();
             drop(task_inner);
             // Publishing `current` and entering its saved context form one
             // ownership handoff.  A timer in between used to preempt the idle
@@ -665,18 +655,7 @@ pub fn run_tasks() {
                 cpu.get_idle_task_cx_ptr()
             };
             // 从 idle 切到用户任务，同时切换到该任务的用户页表。
-            #[cfg(target_arch = "riscv64")]
-            unsafe {
-                if crate::mm::riscv_asids_enabled() && asid != 0 {
-                    context_switch_pt_asid(idle_task_cx_ptr, next_task_cx_ptr, token, asid)
-                } else {
-                    context_switch_pt(idle_task_cx_ptr, next_task_cx_ptr, token)
-                }
-            }
-            #[cfg(not(target_arch = "riscv64"))]
-            unsafe {
-                context_switch_pt(idle_task_cx_ptr, next_task_cx_ptr, token)
-            }
+            unsafe { context_switch_pt(idle_task_cx_ptr, next_task_cx_ptr, token) }
         } else {
             #[cfg(feature = "lock-stats")]
             SCHEDULER_IDLE_WAITS[cpu_id].fetch_add(1, Ordering::Relaxed);
@@ -816,16 +795,9 @@ pub fn schedule(switched_task_cx_ptr: *mut KContext) {
     // The kernel itself does not use floating-point/vector registers. Keep
     // user state live across ordinary traps and materialize it only at a real
     // scheduling boundary, before the task can migrate to another hart.
-    let current = current_task();
-    if let Some(task) = &current {
+    if let Some(task) = current_task() {
         task.save_user_float_state();
     }
-    #[cfg(target_arch = "riscv64")]
-    let outgoing_asid = current
-        .as_ref()
-        .map(|task| task.inner_exclusive_access().memory_set.asid())
-        .unwrap_or(0);
-    drop(current);
     invalidate_user_float_state();
     // A task remains published as this CPU's current task until the switch
     // reaches the idle context.  Keep that ownership handoff atomic with
@@ -836,13 +808,6 @@ pub fn schedule(switched_task_cx_ptr: *mut KContext) {
     let idle_task_cx_ptr = current_cpu().exclusive_access().get_idle_task_cx_ptr();
     // 当前任务主动让出或退出时，先切回 idle，并恢复启动时记录的内核页表。
     unsafe {
-        #[cfg(target_arch = "riscv64")]
-        if crate::mm::riscv_asids_enabled() && outgoing_asid != 0 {
-            context_switch_pt_asid(switched_task_cx_ptr, idle_task_cx_ptr, *BOOT_PAGE_TABLE, 0);
-        } else {
-            context_switch_pt(switched_task_cx_ptr, idle_task_cx_ptr, *BOOT_PAGE_TABLE);
-        }
-        #[cfg(not(target_arch = "riscv64"))]
         context_switch_pt(switched_task_cx_ptr, idle_task_cx_ptr, *BOOT_PAGE_TABLE);
     }
     // This continuation runs only after a previously saved task context has
@@ -858,9 +823,4 @@ pub fn schedule(switched_task_cx_ptr: *mut KContext) {
 // 执行时只初始化一次 BOOT_PAGE_TABLE，供 schedule 恢复内核地址空间。
 pub fn init_kernel_page() {
     BOOT_PAGE_TABLE.init_once(PageTable::current());
-    #[cfg(target_arch = "riscv64")]
-    {
-        let mask = crate::mm::init_riscv_asids();
-        println!("[mm] RISC-V ASID mask={:#x}", mask);
-    }
 }
