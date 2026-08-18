@@ -11,7 +11,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use log::*;
 use polyhal::pagetable::{MappingFlags, MappingSize, PageTable, PageTableWrapper};
@@ -104,6 +104,25 @@ impl AddressSpacePageTable {
             core::ptr::copy_nonoverlapping(src.as_ptr(), paddr.get_mut_ptr::<u8>(), src.len());
         }
         true
+    }
+
+    /// Atomically load one aligned user futex word while keeping the PTE
+    /// stable.  The page-table read guard prevents a concurrent COW or unmap
+    /// from replacing the translation between lookup and the physical load.
+    fn load_user_atomic_u32(&self, vaddr: VirtAddr) -> Option<u32> {
+        if vaddr.raw() & (core::mem::align_of::<u32>() - 1) != 0
+            || (vaddr.raw() & (PAGE_SIZE - 1)) > PAGE_SIZE - core::mem::size_of::<u32>()
+        {
+            return None;
+        }
+        let _access = self.access.read();
+        let (paddr, flags) = self.inner.translate(vaddr)?;
+        if !flags.contains(MappingFlags::P)
+            || (!flags.contains(MappingFlags::R) && !flags.contains(MappingFlags::W))
+        {
+            return None;
+        }
+        Some(unsafe { (&*paddr.get_ptr::<AtomicU32>()).load(Ordering::Acquire) })
     }
 
     fn token(&self) -> PageTable {
@@ -1858,6 +1877,31 @@ impl MemorySet {
             copied += chunk;
         }
         true
+    }
+
+    /// Read a futex word without ever dereferencing its user virtual address
+    /// in kernel mode.  The VMA guard prevents removal or permission changes;
+    /// `load_user_atomic_u32` then holds the PTE stable through the load.
+    pub(crate) fn load_user_atomic_u32_stable(&self, addr: usize) -> Option<u32> {
+        if addr & (core::mem::align_of::<u32>() - 1) != 0 {
+            return None;
+        }
+        let end = addr.checked_add(core::mem::size_of::<u32>())?;
+        let areas = self.areas.read();
+        let start_vaddr = VirtAddr::from(addr);
+        let end_vaddr = VirtAddr::from(end);
+        let area = areas.iter().find(|area| {
+            area.vaddr_range.get_start() <= start_vaddr
+                && end_vaddr <= area.vaddr_range.get_end()
+        })?;
+        if !area.map_perm.contains(MapPermission::U)
+            || !area
+                .map_perm
+                .intersects(MapPermission::R | MapPermission::W)
+        {
+            return None;
+        }
+        self.page_table.load_user_atomic_u32(start_vaddr)
     }
 
     pub fn clone_frame_metadata(&self, vpn: VirtAddr) -> Option<FrameTracker> {

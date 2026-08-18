@@ -19,7 +19,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use log::info;
 use polyhal::irq::IRQ;
@@ -5371,13 +5371,15 @@ pub fn sys_futex(
     ) {
         return -14;
     }
-    let cur = futex_word_load(uaddr);
-    let op = futex_op & 0x7F;
-    let shared = futex_op & 128 == 0;
     let memory_set = {
         let inner = task.inner_exclusive_access();
         inner.memory_set.fault_view()
     };
+    let Some(cur) = memory_set.load_user_atomic_u32_stable(uaddr as usize) else {
+        return -14;
+    };
+    let op = futex_op & 0x7F;
+    let shared = futex_op & 128 == 0;
     let key = futex_keys_for_addr(&memory_set, uaddr as usize, shared)[0];
     #[cfg(feature = "smp-diagnostics")]
     let record_call = !matches!(op, 0 | 9) || val2 == 0;
@@ -5399,6 +5401,7 @@ pub fn sys_futex(
                 FutexWaitResult::TimedOut => -110,
                 FutexWaitResult::Interrupted => -4,
                 FutexWaitResult::ValueChanged => -11,
+                FutexWaitResult::Fault => -14,
             }
         }
         9 => {
@@ -5414,6 +5417,7 @@ pub fn sys_futex(
                 FutexWaitResult::TimedOut => -110,
                 FutexWaitResult::Interrupted => -4,
                 FutexWaitResult::ValueChanged => -11,
+                FutexWaitResult::Fault => -14,
             }
         }
         1 | 10 => futex_wake_key(key, val),
@@ -5457,17 +5461,7 @@ enum FutexWaitResult {
     TimedOut,
     Interrupted,
     ValueChanged,
-}
-
-/// Read a futex word with acquire semantics after the syscall has validated
-/// its user range.  `translated_ref` is deliberately not used while holding
-/// `FutexLock`: address-space inspection must complete before a spin lock is
-/// acquired, while this atomic load closes the wait-versus-wake race.
-#[inline]
-fn futex_word_load(uaddr: *const u32) -> u32 {
-    // Linux requires a naturally aligned futex word.  `sys_futex` enforces
-    // that contract before this helper is reachable.
-    unsafe { (&*(uaddr as *const AtomicU32)).load(Ordering::Acquire) }
+    Fault,
 }
 
 fn futex_timeout_ns(
@@ -5637,15 +5631,23 @@ fn futex_wait_current(
     let task = current_task().unwrap();
     let pid = task.getpid();
     task.record_time_suspend();
+    let memory_set = task.inner_exclusive_access().memory_set.fault_view();
 
     let task_cx_ptr = {
         // FutexLock precedes SchedulerLock.  Holding it until `begin_block`
         // has published `Blocking` makes registration and state transition a
         // single operation from the perspective of FUTEX_WAKE.
         let mut waiters = FUTEX_WAITERS.exclusive_access();
-        if futex_word_load(uaddr) != expected {
-            task.record_time_resume();
-            return FutexWaitResult::ValueChanged;
+        match memory_set.load_user_atomic_u32_stable(uaddr as usize) {
+            Some(value) if value == expected => {}
+            Some(_) => {
+                task.record_time_resume();
+                return FutexWaitResult::ValueChanged;
+            }
+            None => {
+                task.record_time_resume();
+                return FutexWaitResult::Fault;
+            }
         }
         let queue = waiters.entry(key).or_insert_with(Vec::new);
         queue.retain(|queued| queued.getpid() != pid);
