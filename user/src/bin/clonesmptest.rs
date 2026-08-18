@@ -224,6 +224,10 @@ pub fn main() -> i32 {
         println!("clonesmptest failed: exec child status {}", exit_code);
         return 1;
     }
+    if sys_waitpid(-1, &mut exit_code) != -10 {
+        println!("clonesmptest failed: empty wait set did not return ECHILD");
+        return 1;
+    }
     println!("clonesmptest passed: parent CPU0, child CPU{}", child_cpu);
     0
 }

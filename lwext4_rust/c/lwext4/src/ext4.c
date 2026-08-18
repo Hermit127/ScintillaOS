@@ -2301,7 +2301,7 @@ Finish:
 int ext4_create_at_with_attrs(ext4_file *file, const char *mount_point,
 			      uint32_t parent_inode, const char *name,
 			      bool is_dir, uint32_t mode, uint32_t uid,
-			      uint32_t gid)
+			      uint32_t gid, uint32_t timestamp)
 {
 	struct ext4_mountpoint *mp = ext4_get_mount(mount_point);
 	struct ext4_dir_search_result result;
@@ -2376,6 +2376,9 @@ int ext4_create_at_with_attrs(ext4_file *file, const char *mount_point,
 	ext4_inode_set_mode(&mp->fs.sb, child_ref.inode, inode_mode);
 	ext4_inode_set_uid(child_ref.inode, uid);
 	ext4_inode_set_gid(child_ref.inode, gid);
+	ext4_inode_set_access_time(child_ref.inode, timestamp);
+	ext4_inode_set_modif_time(child_ref.inode, timestamp);
+	ext4_inode_set_change_inode_time(child_ref.inode, timestamp);
 	child_ref.dirty = true;
 
 	file->mp = mp;

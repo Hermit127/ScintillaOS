@@ -1861,6 +1861,7 @@ unsafe extern "C" {
         mode: u32,
         uid: u32,
         gid: u32,
+        timestamp: u32,
     ) -> ::core::ffi::c_int;
 }
 unsafe extern "C" {

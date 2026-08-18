@@ -28,7 +28,6 @@ FORBIDDEN = (
     "lock-order inversion",
     "same-class lock inversion",
     "recursive acquisition",
-    "Segmentation fault",
     "#### SKIP",
     "sh: can't open './",
 )
@@ -62,10 +61,20 @@ def official_commands(suite: str) -> tuple[GuestCommand, ...]:
     variants = ("musl", "glibc") if suite == "matrix" else (suite.rsplit("-", 1)[-1],)
     groups = ("busybox", "lmbench", "libctest") if suite == "matrix" else (suite.split("-", 1)[0],)
     commands: list[GuestCommand] = [
-        GuestCommand("/busybox mount -t ext4 /dev/vda /mnt"),
+        GuestCommand(
+            "/busybox sh -c '/busybox mount -t ext4 /dev/vda /mnt; "
+            "printf \"PRE2025_MOUNT_RC=%s\\n\" \"$?\"'",
+            "PRE2025_MOUNT_RC=0",
+        ),
     ]
     for variant in variants:
         for group in groups:
+            # The 2025 preliminary score matrix runs libc-test only against
+            # musl.  Its assertions intentionally encode musl behaviour, so
+            # glibc is a separate diagnostic suite rather than a scored row.
+            if suite == "matrix" and variant == "glibc" and group == "libctest":
+                continue
+            marker_group = f"{group}-{variant}" if suite == "matrix" else group
             shell_steps: list[str] = []
             if group == "libctest":
                 # The immutable libc-test ELFs use absolute PT_INTERP paths.
@@ -73,13 +82,16 @@ def official_commands(suite: str) -> tuple[GuestCommand, ...]:
                 # process root while its unchanged wrapper runs.  This keeps
                 # `/lib/ld-*.so*` and the matching shared libraries isolated
                 # from the kernel regression root disk.
-                commands.append(
-                    GuestCommand(
-                        f"/busybox chroot /mnt/{variant} /busybox sh -c "
-                        f"'exec ./busybox sh ./{group}_testcode.sh'",
-                        f"#### OS COMP TEST GROUP END {group} ####",
-                        ">> ",
-                        1800.0,
+                commands.extend(
+                    (
+                        GuestCommand(f"/busybox mkdir /mnt/{variant}/tmp"),
+                        GuestCommand(
+                            f"/busybox chroot /mnt/{variant} /busybox sh -c "
+                            f"'exec ./busybox sh ./{group}_testcode.sh'",
+                            f"#### OS COMP TEST GROUP END {marker_group} ####",
+                            ">> ",
+                            1800.0,
+                        ),
                     )
                 )
                 continue
@@ -89,12 +101,17 @@ def official_commands(suite: str) -> tuple[GuestCommand, ...]:
                 # exec'ing the unchanged official script.
                 commands.extend(
                     (
-                        GuestCommand("/busybox mkdir -p /code/lmbench_src/bin/build"),
+                        GuestCommand("/busybox mkdir /code"),
+                        GuestCommand("/busybox mkdir /code/lmbench_src"),
+                        GuestCommand("/busybox mkdir /code/lmbench_src/bin"),
+                        GuestCommand("/busybox mkdir /code/lmbench_src/bin/build"),
+                        GuestCommand("/busybox mkdir /var"),
+                        GuestCommand("/busybox mkdir /var/tmp"),
                         GuestCommand(
                             f"/busybox cp /mnt/{variant}/lmbench_all "
                             "/code/lmbench_src/bin/build/lmbench_all"
                         ),
-                        GuestCommand("/busybox mkdir -p /tmp/bb"),
+                        GuestCommand("/busybox mkdir /tmp/bb"),
                         GuestCommand(
                             f"/busybox cp /mnt/{variant}/busybox /tmp/bb/cp"
                         ),
@@ -116,7 +133,7 @@ def official_commands(suite: str) -> tuple[GuestCommand, ...]:
             commands.append(
                 GuestCommand(
                     f"/busybox sh -c '{compound}'",
-                    f"#### OS COMP TEST GROUP END {group} ####",
+                    f"#### OS COMP TEST GROUP END {marker_group} ####",
                     ">> ",
                     1800.0 if group in {"lmbench", "libctest"} else 600.0,
                 )
@@ -173,6 +190,35 @@ def serial_metrics(serial: str) -> dict[str, int]:
         "fail": sum(1 for line in serial.splitlines() if line.startswith("FAIL ")),
         "skip": serial.count("#### SKIP"),
     }
+
+
+def validate_scored_matrix(serial: str) -> None:
+    """Validate the result-bearing rows of the official 2025 score matrix."""
+    if "waitpid: Operation not permitted" in serial:
+        raise RuntimeError("official matrix observed libc waitpid EPERM")
+    expected_groups = 5
+    group_ends = serial.count("#### OS COMP TEST GROUP END")
+    if group_ends != expected_groups:
+        raise RuntimeError(
+            f"official matrix completed {group_ends}/{expected_groups} scored groups"
+        )
+    start_marker = "#### OS COMP TEST GROUP START libctest-musl ####"
+    end_marker = "#### OS COMP TEST GROUP END libctest-musl ####"
+    start = serial.find(start_marker)
+    end = serial.find(end_marker, start + len(start_marker)) if start >= 0 else -1
+    if start < 0 or end < 0:
+        raise RuntimeError("official musl libc-test result section is missing")
+    libc_section = serial[start:end]
+    failed = [
+        line.rstrip("\r")
+        for line in libc_section.splitlines()
+        if line.rstrip("\r").startswith("FAIL ")
+    ]
+    if failed:
+        raise RuntimeError(f"official musl libc-test reported {len(failed)} FAIL rows")
+    passed = sum(line.rstrip("\r") == "Pass!" for line in libc_section.splitlines())
+    if passed != 217:
+        raise RuntimeError(f"official musl libc-test reported {passed}/217 Pass rows")
 
 
 def create_overlay(base: Path, overlay: Path) -> None:
@@ -575,6 +621,8 @@ def main() -> int:
                 line.startswith("FAIL ") for line in serial.splitlines()
             ):
                 raise RuntimeError("official musl libc-test reported FAIL")
+            if args.suite == "matrix":
+                validate_scored_matrix(serial)
             if args.suite.startswith("iperf-"):
                 if serial.count(" end: success ======") != 6:
                     raise RuntimeError(

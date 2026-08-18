@@ -1057,6 +1057,7 @@ impl VfsSuperBlock {
                     mode,
                     uid,
                     gid,
+                    now,
                 )
             };
             if create_rc != EOK as i32 {
@@ -1098,9 +1099,6 @@ impl VfsSuperBlock {
             )
         });
         if created.is_some() {
-            self.set_atime(&full_path, now);
-            self.set_mtime(&full_path, now);
-            self.set_ctime(&full_path, now);
             crate::fs::inode::update_path_cached_times(
                 &full_path,
                 Some(now as i64),

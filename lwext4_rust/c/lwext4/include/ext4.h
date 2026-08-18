@@ -400,12 +400,13 @@ int ext4_fcreate_with_attrs(ext4_file *file, const char *path, uint32_t mode,
  * @param mode Initial permission bits.
  * @param uid Initial owner user id.
  * @param gid Initial owner group id.
+ * @param timestamp Initial atime, mtime and ctime in POSIX seconds.
  *
  * @return EEXIST if the name already exists, otherwise a standard error code. */
 int ext4_create_at_with_attrs(ext4_file *file, const char *mount_point,
 			      uint32_t parent_inode, const char *name,
 			      bool is_dir, uint32_t mode, uint32_t uid,
-			      uint32_t gid);
+			      uint32_t gid, uint32_t timestamp);
 
 /**@brief   File close function.
  *

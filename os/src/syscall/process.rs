@@ -2075,8 +2075,8 @@ fn wait_block_current_or_retry(
     true
 }
 
-/// If there is not a child process whose pid is same as given, return -1.
-/// Else if there is a child process but it is still running, return -2.
+/// Return Linux-style `-ECHILD` when no matching waitable child exists.
+/// A matching live child blocks unless `WNOHANG` is present.
 pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: usize) -> isize {
     const WNOHANG: usize = 1;
     const WUNTRACED: usize = 2;
@@ -2109,11 +2109,11 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: usize) -> isize
     loop {
         let (has_child, zombie) = take_waitable_child(&task, pid, group_wide, true);
         if !has_child {
-            // The in-tree Rust and C user libraries expose the historic
-            // rCore waitpid ABI: no matching child is reported as -1.
-            // Keep that compatibility boundary here; `waitid` retains
-            // its Linux-style ECHILD result independently.
-            return -1;
+            // Linux wait4(2) reports ECHILD when the requested child set is
+            // empty.  Returning the historic raw -1 is interpreted by libc
+            // as EPERM and makes BusyBox emit a waitpid error after every
+            // successfully reaped child.
+            return -10;
         }
 
         if let Some(child) = zombie {

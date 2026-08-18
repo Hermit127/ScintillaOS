@@ -7,7 +7,7 @@ mod signal;
 #[allow(clippy::module_inception)]
 mod task;
 
-use crate::mm::{translated_ref, translated_refmut};
+use crate::mm::MemorySet;
 use crate::sync::SleepLock;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -1427,15 +1427,25 @@ fn call_user_signal_handler(sig: usize, signal: SignalFlags) {
                 );
             }
         }
-        let token = task_inner.get_user_token();
-        let frame_base = write_signal_frame(
-            token,
+        let memory_set = task_inner.memory_set.fault_view();
+        let Some(frame_base) = write_signal_frame(
+            &memory_set,
             interrupted[TrapFrameArgs::SP],
             sig,
             signal_info,
             old_mask,
             &interrupted,
-        );
+        ) else {
+            println!(
+                "[signal-frame] write failed tid={} sig={} sp={:#x}",
+                task.getpid(),
+                sig,
+                interrupted[TrapFrameArgs::SP],
+            );
+            task_inner.killed = true;
+            task_inner.exit_signal = -(SIGSEGV_NUM as i32);
+            return;
+        };
         let siginfo_addr = frame_base;
         let ucontext_addr = frame_base + SIGINFO_SIZE;
         let trap_ctx = task_inner.get_trap_cx();
@@ -1531,70 +1541,112 @@ fn user_sigset_to_flags(raw: u64) -> SignalFlags {
     flags
 }
 
+fn signal_frame_write<T: Copy>(frame: &mut [u8], offset: usize, value: T) -> bool {
+    let Some(end) = offset.checked_add(size_of::<T>()) else {
+        return false;
+    };
+    if end > frame.len() {
+        return false;
+    }
+    unsafe {
+        (frame.as_mut_ptr().add(offset) as *mut T).write_unaligned(value);
+    }
+    true
+}
+
+fn signal_frame_read<T: Copy>(frame: &[u8], offset: usize) -> Option<T> {
+    let end = offset.checked_add(size_of::<T>())?;
+    if end > frame.len() {
+        return None;
+    }
+    Some(unsafe { (frame.as_ptr().add(offset) as *const T).read_unaligned() })
+}
+
 fn write_signal_frame(
-    token: polyhal::pagetable::PageTable,
+    memory_set: &MemorySet,
     sp: usize,
     sig: usize,
     info: PendingSignalInfo,
     old_mask: SignalFlags,
     interrupted: &TrapFrame,
-) -> usize {
+) -> Option<usize> {
     let frame_size = SIGINFO_SIZE + UCONTEXT_SIZE;
-    let frame_base = sp.saturating_sub(frame_size) & !15;
-    for i in 0..frame_size {
-        *translated_refmut(token, (frame_base + i) as *mut u8) = 0;
-    }
-    *translated_refmut(token, frame_base as *mut i32) = sig as i32;
+    let frame_base = sp.checked_sub(frame_size)? & !15;
+    let mut frame = alloc::vec![0u8; frame_size];
+    signal_frame_write(&mut frame, 0, sig as i32);
     // Linux generic 64-bit siginfo_t header followed by the matching union payload.
-    *translated_refmut(token, (frame_base + 8) as *mut i32) = info.code;
+    signal_frame_write(&mut frame, 8, info.code);
     if info.code == -2 {
-        *translated_refmut(token, (frame_base + 16) as *mut i32) = info.timer_id;
-        *translated_refmut(token, (frame_base + 20) as *mut i32) = info.overrun;
-        *translated_refmut(token, (frame_base + 24) as *mut usize) = info.value;
+        signal_frame_write(&mut frame, 16, info.timer_id);
+        signal_frame_write(&mut frame, 20, info.overrun);
+        signal_frame_write(&mut frame, 24, info.value);
     } else {
-        *translated_refmut(token, (frame_base + 16) as *mut i32) = info.sender_pid;
-        *translated_refmut(token, (frame_base + 20) as *mut u32) = info.sender_uid;
+        signal_frame_write(&mut frame, 16, info.sender_pid);
+        signal_frame_write(&mut frame, 20, info.sender_uid);
     }
-    let ucontext_addr = frame_base + SIGINFO_SIZE;
-    *translated_refmut(token, (ucontext_addr + UCONTEXT_SIGMASK_OFFSET) as *mut u64) =
-        flags_to_user_sigset(old_mask);
-    *translated_refmut(token, (ucontext_addr + UCONTEXT_PC_OFFSET) as *mut usize) =
-        interrupted[TrapFrameArgs::SEPC];
+    signal_frame_write(
+        &mut frame,
+        SIGINFO_SIZE + UCONTEXT_SIGMASK_OFFSET,
+        flags_to_user_sigset(old_mask),
+    );
+    signal_frame_write(
+        &mut frame,
+        SIGINFO_SIZE + UCONTEXT_PC_OFFSET,
+        interrupted[TrapFrameArgs::SEPC],
+    );
     for reg in 1..32 {
-        *translated_refmut(
-            token,
-            (ucontext_addr + UCONTEXT_MCONTEXT_OFFSET + reg * size_of::<usize>())
-                as *mut usize,
-        ) = trap_gpr(interrupted, reg);
+        signal_frame_write(
+            &mut frame,
+            SIGINFO_SIZE + UCONTEXT_MCONTEXT_OFFSET + reg * size_of::<usize>(),
+            trap_gpr(interrupted, reg),
+        );
     }
-    frame_base
+    // A CLONE_VM peer can write-protect or discard a resident page between
+    // preparation and the copy.  Keep the VMA stable while copying and retry
+    // transient page-table changes instead of turning them into a spurious
+    // SIGSEGV.  A genuinely unmapped or non-writable signal stack still
+    // fails immediately through handle_page_fault.
+    for _ in 0..8 {
+        if memory_set.copy_to_user_stable(frame_base, &frame) {
+            return Some(frame_base);
+        }
+        let frame_end = frame_base.checked_add(frame_size)?;
+        let mut page = frame_base & !(crate::config::PAGE_SIZE - 1);
+        while page < frame_end {
+            memory_set.handle_page_fault(
+                polyhal::VirtAddr::from(page),
+                crate::mm::PageFaultAccess::Write,
+            )?;
+            page = page.checked_add(crate::config::PAGE_SIZE)?;
+        }
+    }
+    None
 }
 
 pub fn restore_current_signal_context() -> Option<isize> {
     let task = current_task()?;
     let mut inner = task.inner_exclusive_access();
     let frame_base = inner.get_trap_cx()[TrapFrameArgs::SP];
-    let ucontext_addr = frame_base.checked_add(SIGINFO_SIZE)?;
-    let token = inner.get_user_token();
-    let raw_mask = *translated_ref(
-        token,
-        (ucontext_addr + UCONTEXT_SIGMASK_OFFSET) as *const u64,
-    );
-    let pc = *translated_ref(
-        token,
-        (ucontext_addr + UCONTEXT_PC_OFFSET) as *const usize,
-    );
+    let mut frame = alloc::vec![0u8; SIGINFO_SIZE + UCONTEXT_SIZE];
+    let memory_set = inner.memory_set.fault_view();
+    if !memory_set.copy_from_user_stable(frame_base, &mut frame) {
+        return None;
+    }
+    let raw_mask = signal_frame_read::<u64>(
+        &frame,
+        SIGINFO_SIZE + UCONTEXT_SIGMASK_OFFSET,
+    )?;
+    let pc = signal_frame_read::<usize>(&frame, SIGINFO_SIZE + UCONTEXT_PC_OFFSET)?;
     if pc == 0 {
         return None;
     }
     let mut restored = inner.get_trap_cx().clone();
     restored[TrapFrameArgs::SEPC] = pc;
     for reg in 1..32 {
-        let value = *translated_ref(
-            token,
-            (ucontext_addr + UCONTEXT_MCONTEXT_OFFSET + reg * size_of::<usize>())
-                as *const usize,
-        );
+        let value = signal_frame_read::<usize>(
+            &frame,
+            SIGINFO_SIZE + UCONTEXT_MCONTEXT_OFFSET + reg * size_of::<usize>(),
+        )?;
         set_trap_gpr(&mut restored, reg, value);
     }
     let ret = restored[TrapFrameArgs::RET] as isize;

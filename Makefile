@@ -609,6 +609,31 @@ verify-loongarch12-boot-docker:
 	@sh scripts/validate_loongarch12_boot_docker.sh \
 		--kernel kernel-la --root-image disk-la.img --smp 12 --memory 2G
 
+verify-loongarch12-directed-docker:
+	@test -f kernel-la || { echo "missing kernel-la; build it in the official Docker environment first"; exit 1; }
+	@test -f disk-la.img || { echo "missing disk-la.img; build it in the official Docker environment first"; exit 1; }
+	@sh scripts/validate_loongarch12_boot_docker.sh \
+		--kernel kernel-la --root-image disk-la.img --smp 12 --memory 2G \
+		--suite directed
+
+verify-loongarch12-pre2025-docker:
+	@test -n "$(TEST_DISK)" || { echo "usage: make $@ TEST_DISK=/path/to/sdcard-la.img"; exit 1; }
+	@test -f "$(TEST_DISK)" || { echo "missing TEST_DISK=$(TEST_DISK)"; exit 1; }
+	@test -f kernel-la || { echo "missing kernel-la; build it in the official Docker environment first"; exit 1; }
+	@test -f disk-la.img || { echo "missing disk-la.img; build it in the official Docker environment first"; exit 1; }
+	@sh scripts/validate_loongarch12_boot_docker.sh \
+		--kernel kernel-la --root-image disk-la.img --test-image "$(TEST_DISK)" \
+		--smp 12 --memory 2G --suite matrix
+
+verify-loongarch12-signal-docker:
+	@test -n "$(TEST_DISK)" || { echo "usage: make $@ TEST_DISK=/path/to/sdcard-la.img"; exit 1; }
+	@test -f "$(TEST_DISK)" || { echo "missing TEST_DISK=$(TEST_DISK)"; exit 1; }
+	@test -f kernel-la || { echo "missing kernel-la; build it in the official Docker environment first"; exit 1; }
+	@test -f disk-la.img || { echo "missing disk-la.img; build it in the official Docker environment first"; exit 1; }
+	@sh scripts/validate_loongarch12_boot_docker.sh \
+		--kernel kernel-la --root-image disk-la.img --test-image "$(TEST_DISK)" \
+		--smp 12 --memory 2G --suite signal
+
 verify-onsite-2025-git-clone: kernel-rv
 	@python3 scripts/verify_onsite_2025_git_clone.py \
 		--base-image "$(ON_SITE_2025_DISK)" --root-disk "$(ROOT_DISK)" \
@@ -627,4 +652,4 @@ gdbserver: build
 gdbclient:
 	@gdb -ex 'file $(KERNEL_ELF)' -ex 'set arch riscv:rv64' -ex 'target remote localhost:1234'
 
-.PHONY: all prepare-vendor kernel-rv kernel-la kernel-rv-final-diag disk.img disk-rv.img disk-la.img build env kernel clean disasm disasm-vim run run-smp4 run-smp8 run-la-smp2 run-la-smp8 run-inner run-dual run-dual-smp4 run-la-dual-smp2 run-dual-prebuilt run-dual-smp4-prebuilt run-la-dual-smp2-prebuilt run-onsite-2025-rv onsite-2025-proxy-relay verify-onsite-2025-vim verify-onsite-2025-regressions verify-onsite-2025-network verify-onsite-2025-git-clone verify-onsite-2026-abi verify-onsite-python-rv verify-onsite-python-core verify-onsite-python-fs verify-onsite-python-concurrency verify-onsite-python-network verify-onsite-python-all verify-onsite-python-la-docker verify-onsite-toolchain-rv verify-onsite-toolchain-versions verify-onsite-toolchain-build verify-onsite-toolchain-cargo verify-onsite-toolchain-python verify-onsite-toolchain-curl verify-onsite-toolchain-all verify-onsite-toolchain-la-docker run-final-2026-rv run-final-2026-la run-final-2026-la-docker verify-loongarch12-boot-docker fs-img gdbserver gdbclient
+.PHONY: all prepare-vendor kernel-rv kernel-la kernel-rv-final-diag disk.img disk-rv.img disk-la.img build env kernel clean disasm disasm-vim run run-smp4 run-smp8 run-la-smp2 run-la-smp8 run-inner run-dual run-dual-smp4 run-la-dual-smp2 run-dual-prebuilt run-dual-smp4-prebuilt run-la-dual-smp2-prebuilt run-onsite-2025-rv onsite-2025-proxy-relay verify-onsite-2025-vim verify-onsite-2025-regressions verify-onsite-2025-network verify-onsite-2025-git-clone verify-onsite-2026-abi verify-onsite-python-rv verify-onsite-python-core verify-onsite-python-fs verify-onsite-python-concurrency verify-onsite-python-network verify-onsite-python-all verify-onsite-python-la-docker verify-onsite-toolchain-rv verify-onsite-toolchain-versions verify-onsite-toolchain-build verify-onsite-toolchain-cargo verify-onsite-toolchain-python verify-onsite-toolchain-curl verify-onsite-toolchain-all verify-onsite-toolchain-la-docker run-final-2026-rv run-final-2026-la run-final-2026-la-docker verify-loongarch12-boot-docker verify-loongarch12-directed-docker verify-loongarch12-pre2025-docker verify-loongarch12-signal-docker fs-img gdbserver gdbclient

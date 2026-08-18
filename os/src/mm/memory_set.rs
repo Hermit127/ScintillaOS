@@ -1759,6 +1759,107 @@ impl MemorySet {
         true
     }
 
+    /// Copy to a prepared writable user range while keeping its VMA layout
+    /// stable for the whole operation.
+    ///
+    /// Signal delivery needs this stronger variant: another thread sharing
+    /// the address space may otherwise remove the VMA after the signal stack
+    /// was faulted in but before the page-table copy starts.  Page-table COW
+    /// or `madvise` can still invalidate a prepared PTE, in which case the
+    /// caller must fault the range again and retry.
+    pub(crate) fn copy_to_user_stable(&self, addr: usize, src: &[u8]) -> bool {
+        if src.is_empty() {
+            return true;
+        }
+        let Some(last) = addr.checked_add(src.len() - 1) else {
+            return false;
+        };
+        let Some(end) = (last & !(PAGE_SIZE - 1)).checked_add(PAGE_SIZE) else {
+            return false;
+        };
+        let mut cursor = addr & !(PAGE_SIZE - 1);
+        let areas = self.areas.read();
+        while cursor < end {
+            let vaddr = VirtAddr::from(cursor);
+            let Some(area) = areas.iter().find(|area| {
+                area.vaddr_range.get_start() <= vaddr && vaddr < area.vaddr_range.get_end()
+            }) else {
+                return false;
+            };
+            if !area.map_perm.contains(MapPermission::U | MapPermission::W) {
+                return false;
+            }
+            cursor = area.vaddr_range.get_end().raw().min(end);
+        }
+
+        let mut copied = 0usize;
+        while copied < src.len() {
+            let Some(user_addr) = addr.checked_add(copied) else {
+                return false;
+            };
+            let page_remaining = PAGE_SIZE - (user_addr & (PAGE_SIZE - 1));
+            let chunk = page_remaining.min(src.len() - copied);
+            if !self.page_table.copy_to_user_page(
+                VirtAddr::from(user_addr),
+                &src[copied..copied + chunk],
+            ) {
+                return false;
+            }
+            copied += chunk;
+        }
+        true
+    }
+
+    /// Snapshot a readable user range while preventing concurrent VMA
+    /// removal or permission changes.  This is the read-side counterpart of
+    /// `copy_to_user_stable` and is used when restoring an rt signal frame.
+    pub(crate) fn copy_from_user_stable(&self, addr: usize, dst: &mut [u8]) -> bool {
+        if dst.is_empty() {
+            return true;
+        }
+        let Some(last) = addr.checked_add(dst.len() - 1) else {
+            return false;
+        };
+        let Some(end) = (last & !(PAGE_SIZE - 1)).checked_add(PAGE_SIZE) else {
+            return false;
+        };
+        let mut cursor = addr & !(PAGE_SIZE - 1);
+        let areas = self.areas.read();
+        while cursor < end {
+            let vaddr = VirtAddr::from(cursor);
+            let Some(area) = areas.iter().find(|area| {
+                area.vaddr_range.get_start() <= vaddr && vaddr < area.vaddr_range.get_end()
+            }) else {
+                return false;
+            };
+            if !area.map_perm.contains(MapPermission::U)
+                || !area
+                    .map_perm
+                    .intersects(MapPermission::R | MapPermission::W)
+            {
+                return false;
+            }
+            cursor = area.vaddr_range.get_end().raw().min(end);
+        }
+
+        let mut copied = 0usize;
+        while copied < dst.len() {
+            let Some(user_addr) = addr.checked_add(copied) else {
+                return false;
+            };
+            let page_remaining = PAGE_SIZE - (user_addr & (PAGE_SIZE - 1));
+            let chunk = page_remaining.min(dst.len() - copied);
+            if !self.page_table.copy_from_user_page(
+                VirtAddr::from(user_addr),
+                &mut dst[copied..copied + chunk],
+            ) {
+                return false;
+            }
+            copied += chunk;
+        }
+        true
+    }
+
     pub fn clone_frame_metadata(&self, vpn: VirtAddr) -> Option<FrameTracker> {
         let areas = self.areas.read();
         let area = areas

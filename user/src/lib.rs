@@ -199,7 +199,7 @@ pub fn wait(exit_code: &mut i32) -> isize {
             -2 => {
                 yield_();
             }
-            // -1 or a real pid
+            // A negative errno (normally -ECHILD) or a real pid.
             exit_pid => {
                 if exit_pid > 0 {
                     *exit_code = decode_wait_status(*exit_code);
@@ -216,7 +216,7 @@ pub fn waitpid(pid: usize, exit_code: &mut i32) -> isize {
             -2 => {
                 yield_();
             }
-            // -1 or a real pid
+            // A negative errno (normally -ECHILD) or a real pid.
             exit_pid => {
                 if exit_pid > 0 {
                     *exit_code = decode_wait_status(*exit_code);

@@ -139,6 +139,7 @@ make run ARCH=loongarch64 QEMU_SMP=12
 | `documents/MachineTest近期改动迁移说明2026-06-29.md` | MachineTest 近期改动迁移到 main 的说明。 |
 | `documents/四核SMP适配与死锁修复全记录.md` | SMP 启动、调度、阻塞状态机、IPI、远端 TLB 和锁诊断记录。 |
 | `documents/决赛提交分支迁移与双架构验证记录.md` | `finalsubmission` 迁移、双架构 CAgent/BuildStorm 入口和验证记录。 |
+| `documents/finalsubmission合并与双架构全阶段复测报告.md` | 现场准备分支合入 `finalsubmission` 后的初赛、决赛、2025 现场赛和 2026 准备负载复测证据与边界。 |
 | `documents/BuildStorm题二第一问适配与验证记录.md` | glibc/Rust 工具链、线程组、共享 fd、eventfd/epoll/socketpair 等适配说明。 |
 | `documents/BuildStorm题二复杂构建适配与验证记录.md` | BuildStorm 复杂构建的故障定位、正确性修复、性能实验和双架构闭环。 |
 | `documents/BuildStorm官网输出10问题定位与终端非阻塞修复.md` | 最终产物启动检查、终端非阻塞与双架构启动 ABI 修复记录。 |

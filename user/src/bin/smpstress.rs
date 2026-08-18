@@ -12,10 +12,11 @@ use user_lib::{
 const CLONE_VM: usize = 0x100;
 const SIGCHLD: usize = 17;
 const CPUSET_BYTES: usize = core::mem::size_of::<usize>();
-// Keep one runnable worker per secondary CPU when QEMU exposes the supported
-// eight-hart topology. This makes the stress check exercise every scheduler
-// queue instead of relying on incidental migration.
-const WORKERS: usize = 8;
+// Keep enough runnable workers to cover the largest supported contest
+// topology (LoongArch has 12 harts; RISC-V currently has 8).  Extra workers
+// are harmless on the smaller topology and make every scheduler queue
+// observable without relying on incidental migration.
+const WORKERS: usize = 12;
 const ITERATIONS: usize = 100_000;
 const CHILD_STACK_SIZE: usize = 16 * 1024;
 
@@ -73,7 +74,15 @@ pub fn main() -> i32 {
         sys_sched_getaffinity(0, &mut online),
         CPUSET_BYTES as isize
     );
-    let online_mask = online[0] as usize;
+    // sched_getaffinity returns a byte array.  Reading only online[0] silently
+    // truncated LoongArch's 0xfff mask to 0xff and made a 12-hart run look like
+    // an 8-hart test.  Fold every returned byte into the native mask.
+    let online_mask = online
+        .iter()
+        .enumerate()
+        .fold(0usize, |mask, (index, byte)| {
+            mask | ((*byte as usize) << (index * 8))
+        });
     assert_ne!(online_mask, 0);
 
     let mut children = [0isize; WORKERS];
