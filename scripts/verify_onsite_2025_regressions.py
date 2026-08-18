@@ -252,6 +252,9 @@ def main() -> int:
             ext4_commands = (
                 b"mkdir /tmp/ext4-regression\n"
                 b"mkdir /tmp/ext4-regression/.git\n"
+                b"if mkdir -p /tmp/ext4-regression/nested/leaf && "
+                b"test -d /tmp/ext4-regression/nested/leaf; then "
+                b"printf 'MKDIR_P_%s\\n' OK; else printf 'MKDIR_P_%s\\n' FAILED; fi\n"
                 b"printf 'old\\n' > /tmp/ext4-regression/.git/replace\n"
                 b"printf 'new\\n' > /tmp/ext4-regression/.git/replace.lock\n"
                 b"if mv -f /tmp/ext4-regression/.git/replace.lock /tmp/ext4-regression/.git/replace && "
@@ -384,6 +387,7 @@ def main() -> int:
         b"TTY_ICRNL_OK",
         b"TTY_ICRNL_RC=0",
         b"TTY_ERASE_OK",
+        b"MKDIR_P_OK",
         b"EXT4_RENAME_OK",
     )
     if args.network_sockname:

@@ -1928,12 +1928,35 @@ pub fn sys_mkdirat(dirfd: isize, path: *const u8, mode: u32) -> isize {
     if path.is_empty() {
         return -2;
     }
+    // Linux reports EEXIST when mkdirat names the already-existing lookup
+    // root (for example "/", ".", or redundant slash/dot spellings).
+    // There is no final component for resolve_parent_and_name_checked() in
+    // these cases, so letting them fall through incorrectly produces ENOENT.
+    // BusyBox `mkdir -p /absolute/path` probes "/" first and relies on this
+    // EEXIST result before creating the remaining components.
+    if path
+        .split('/')
+        .all(|component| component.is_empty() || component == ".")
+    {
+        return -17; // EEXIST
+    }
     #[cfg(feature = "smp-diagnostics")]
     if path.starts_with("/mnt") {
         crate::println!("[mkdir-diag] base-ready path={}", path);
     }
     if special_device_stat(path.as_str()).is_some() {
         return -17;
+    }
+    // Check the target before entering the create path.  Besides matching
+    // Linux's EEXIST result for files, directories, and dangling symlinks,
+    // this avoids relying on a lookup performed after a failed Ext4 create:
+    // that failure may have populated a transient negative dentry cache for
+    // an object which already exists.  BusyBox mkdir -p probes each existing
+    // prefix (for example /tmp) and must see EEXIST rather than ENOENT.
+    match resolve_path_checked(&base_dir, path.as_str()) {
+        Ok(_) => return -17, // EEXIST
+        Err(-2) => {}
+        Err(errno) => return errno,
     }
     #[cfg(feature = "smp-diagnostics")]
     if path.starts_with("/mnt") {

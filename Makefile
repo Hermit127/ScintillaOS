@@ -432,6 +432,9 @@ TEST_DISK ?= testcases.img
 ROOT_DISK ?= $(if $(filter loongarch64,$(ARCH)),disk-la.img,disk.img)
 ON_SITE_2025_DISK ?= ../alpine-linux-riscv64-ext4fs.img
 ON_SITE_2025_ARTIFACT_DIR ?= artifacts/onsite2025
+ON_SITE_2026_PREDICT_BASE ?= ../alpine-linux-riscv64-ext4fs.img
+ON_SITE_2026_PREDICT_DISK ?= artifacts/onsite26-predict/starryos-onsite26-riscv64.img
+ON_SITE_2026_PREDICT_ARTIFACT_DIR ?= artifacts/onsite26-predict-runs
 FINAL_2026_RV_IMAGE ?= testsuits-for-oskernel-final/image/sdcard-rv-pub.img
 FINAL_2026_LA_IMAGE ?= testsuits-for-oskernel-final/image/sdcard-la-pub.img
 FINAL_2026_MODE ?= all
@@ -492,6 +495,18 @@ run-onsite-2025-rv: kernel-rv
 	@ON_SITE_2025_DISK="$(ON_SITE_2025_DISK)" \
 		ON_SITE_2025_ROOT_DISK="$(ROOT_DISK)" \
 		ON_SITE_2025_ARTIFACT_DIR="$(ON_SITE_2025_ARTIFACT_DIR)" \
+		ON_SITE_2025_SMP="$(QEMU_SMP)" \
+		./scripts/run_onsite_2025_rv.sh
+
+onsite-2026-predict-disk:
+	@python3 scripts/build_onsite26_predict_disk.py \
+		--base-image "$(ON_SITE_2026_PREDICT_BASE)" \
+		--output "$(ON_SITE_2026_PREDICT_DISK)"
+
+run-onsite-2026-predict-rv: kernel-rv disk.img onsite-2026-predict-disk
+	@ON_SITE_2025_DISK="$(ON_SITE_2026_PREDICT_DISK)" \
+		ON_SITE_2025_ROOT_DISK="disk.img" \
+		ON_SITE_2025_ARTIFACT_DIR="$(ON_SITE_2026_PREDICT_ARTIFACT_DIR)" \
 		ON_SITE_2025_SMP="$(QEMU_SMP)" \
 		./scripts/run_onsite_2025_rv.sh
 
@@ -652,4 +667,4 @@ gdbserver: build
 gdbclient:
 	@gdb -ex 'file $(KERNEL_ELF)' -ex 'set arch riscv:rv64' -ex 'target remote localhost:1234'
 
-.PHONY: all prepare-vendor kernel-rv kernel-la kernel-rv-final-diag disk.img disk-rv.img disk-la.img build env kernel clean disasm disasm-vim run run-smp4 run-smp8 run-la-smp2 run-la-smp8 run-inner run-dual run-dual-smp4 run-la-dual-smp2 run-dual-prebuilt run-dual-smp4-prebuilt run-la-dual-smp2-prebuilt run-onsite-2025-rv onsite-2025-proxy-relay verify-onsite-2025-vim verify-onsite-2025-regressions verify-onsite-2025-network verify-onsite-2025-git-clone verify-onsite-2026-abi verify-onsite-python-rv verify-onsite-python-core verify-onsite-python-fs verify-onsite-python-concurrency verify-onsite-python-network verify-onsite-python-all verify-onsite-python-la-docker verify-onsite-toolchain-rv verify-onsite-toolchain-versions verify-onsite-toolchain-build verify-onsite-toolchain-cargo verify-onsite-toolchain-python verify-onsite-toolchain-curl verify-onsite-toolchain-all verify-onsite-toolchain-la-docker run-final-2026-rv run-final-2026-la run-final-2026-la-docker verify-loongarch12-boot-docker verify-loongarch12-directed-docker verify-loongarch12-pre2025-docker verify-loongarch12-signal-docker fs-img gdbserver gdbclient
+.PHONY: all prepare-vendor kernel-rv kernel-la kernel-rv-final-diag disk.img disk-rv.img disk-la.img build env kernel clean disasm disasm-vim run run-smp4 run-smp8 run-la-smp2 run-la-smp8 run-inner run-dual run-dual-smp4 run-la-dual-smp2 run-dual-prebuilt run-dual-smp4-prebuilt run-la-dual-smp2-prebuilt run-onsite-2025-rv onsite-2026-predict-disk run-onsite-2026-predict-rv onsite-2025-proxy-relay verify-onsite-2025-vim verify-onsite-2025-regressions verify-onsite-2025-network verify-onsite-2025-git-clone verify-onsite-2026-abi verify-onsite-python-rv verify-onsite-python-core verify-onsite-python-fs verify-onsite-python-concurrency verify-onsite-python-network verify-onsite-python-all verify-onsite-python-la-docker verify-onsite-toolchain-rv verify-onsite-toolchain-versions verify-onsite-toolchain-build verify-onsite-toolchain-cargo verify-onsite-toolchain-python verify-onsite-toolchain-curl verify-onsite-toolchain-all verify-onsite-toolchain-la-docker run-final-2026-rv run-final-2026-la run-final-2026-la-docker verify-loongarch12-boot-docker verify-loongarch12-directed-docker verify-loongarch12-pre2025-docker verify-loongarch12-signal-docker fs-img gdbserver gdbclient

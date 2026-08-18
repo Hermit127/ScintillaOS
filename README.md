@@ -136,6 +136,7 @@ make run ARCH=loongarch64 QEMU_SMP=12
 | `documents/2026现场赛准备与复测指南.md` | 2026 CAgent/BuildStorm 题目分析、准备分支、两架构正式复测、诊断与性能实验流程。 |
 | `documents/Python3.13现场赛模拟题适配与验收指南.md` | 按 2025 形式设计的 Python 3.13 模拟题、内核适配原理、双架构自动/手工验收和验证边界。 |
 | `documents/六工具现场赛模拟题适配与验收指南.md` | Make/CMake/Ninja/Cargo/Python/curl 六工具模拟题、内核适配、双架构复现与证据说明。 |
+| `documents/StarryOS_2026现场赛预测测试盘规划.md` | 基于 2025 Alpine 赛事盘制作 2026 预测测试盘的题目矩阵、制盘、校验和演练流程。 |
 | `documents/MachineTest近期改动迁移说明2026-06-29.md` | MachineTest 近期改动迁移到 main 的说明。 |
 | `documents/四核SMP适配与死锁修复全记录.md` | SMP 启动、调度、阻塞状态机、IPI、远端 TLB 和锁诊断记录。 |
 | `documents/决赛提交分支迁移与双架构验证记录.md` | `finalsubmission` 迁移、双架构 CAgent/BuildStorm 入口和验证记录。 |

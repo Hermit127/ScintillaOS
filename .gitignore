@@ -50,10 +50,13 @@ artifacts/onsite2025/
 artifacts/final2026/
 artifacts/onsite-python/
 artifacts/onsite-toolchain/
+artifacts/onsite26-predict/
+artifacts/onsite26-predict-runs/
 # Local evidence from the finalsubmission merge audit.  These directories
 # contain large writable overlays and machine-specific absolute image paths;
 # keep the reproducible commands and conclusions in the audit document.
 artifacts/finalsubmission-merge-*/
+artifacts/finalsubmission-merge-*.*
 kernel-rv-final-diag
 
 # Local contest/test suites
