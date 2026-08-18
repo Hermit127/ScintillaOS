@@ -15,6 +15,8 @@
 | `b1d0ffc` | 添加 2026 预测盘；修正 `mkdirat` 的 Linux `EEXIST` 语义，使 `mkdir -p` 可用 |
 | `fd57333` | 不再从内核直接解引用用户 futex 地址；通过页表稳定读取并发 futex 字 |
 | `c54ba3d` | 保持 PTE 安全检查，同时移除 futex 热路径上的 VMA 全局读锁，恢复 BuildStorm 性能 |
+| `c40d08b` | 更新本报告，记录最终双架构全阶段复测结果 |
+| `5e60ced` | 再次合入最新 `origin/finalsubmission@631456c`；该远程增量为一次优化及其完整回退，净文件差异为空 |
 
 最终动态测试对应源码为：
 
@@ -22,7 +24,16 @@
 c54ba3d90d1e33d83a647c24456353699d9dbf47
 ```
 
-`finalsubmission` 合并没有更改内核代码，因此后续发现的 `mkdirat`、futex 安全性和性能问题属于既有功能组合被更高覆盖率测试暴露，不应错误归因给 PPT 合并。
+`finalsubmission` 第一次合并没有更改内核代码，因此后续发现的 `mkdirat`、futex 安全性和性能问题属于既有功能组合被更高覆盖率测试暴露，不应错误归因给 PPT 合并。
+
+最终审计时，远程又增加了 `e9fd3dc`（“优化 RISC-V 地址空间切换与文件读写路径”）和 `631456c`（完整回退前者）。为保留完整历史，已通过 `5e60ced` 第二次显式合入。等价性核验如下：
+
+```text
+5e60ced^{tree} = c40d08b^{tree}
+                 7ef79b9c0c7073f65cf650f9ac2e26bcabe9c35e
+```
+
+同时，`git diff c54ba3d..5e60ced -- . ':!documents/finalsubmission合并与双架构全阶段复测报告.md'` 为空。因此最终 HEAD 的源码、构建脚本、测试脚本和运行输入与已完成全部动态复测的版本完全相同；第二次合并只补齐被回退的远程历史，不产生新的可执行内容。
 
 ## 2. 本轮新增问题与修复原理
 
@@ -289,7 +300,7 @@ docker run --rm -e HOME=/root \
 
 可以由本轮证据支持：
 
-- `finalsubmission` 已以普通 merge commit 合入，无代码冲突和历史改写；
+- 最新 `origin/finalsubmission@631456c` 已以普通 merge commit 合入，无代码冲突和历史改写；
 - RISC-V 8 核与 LoongArch 12 核初赛公开矩阵均在最终源码上通过；
 - 两架构决赛 CAgent、Q2.1、BuildStorm 均在最终源码、官方镜像和赛事核心数下逐题冷启动通过；
 - RISC-V 2025 现场赛 Git/Vim/GCC/Rustc、网络和完整 clone 在最终源码上通过；
