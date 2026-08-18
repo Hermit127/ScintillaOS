@@ -117,7 +117,7 @@ impl AddressSpacePageTable {
         }
         let _access = self.access.read();
         let (paddr, flags) = self.inner.translate(vaddr)?;
-        if !flags.contains(MappingFlags::P)
+        if !flags.contains(MappingFlags::P | MappingFlags::U)
             || (!flags.contains(MappingFlags::R) && !flags.contains(MappingFlags::W))
         {
             return None;
@@ -1880,27 +1880,16 @@ impl MemorySet {
     }
 
     /// Read a futex word without ever dereferencing its user virtual address
-    /// in kernel mode.  The VMA guard prevents removal or permission changes;
-    /// `load_user_atomic_u32` then holds the PTE stable through the load.
+    /// in kernel mode.  A single aligned word cannot cross a page boundary,
+    /// and the page-table read guard in `load_user_atomic_u32` prevents COW,
+    /// unmap, permission changes, and physical-page release through the load.
+    /// Avoid taking the VMA topology lock on this hot path: the PTE's U/P/R/W
+    /// flags provide the complete access check needed for this one word.
     pub(crate) fn load_user_atomic_u32_stable(&self, addr: usize) -> Option<u32> {
         if addr & (core::mem::align_of::<u32>() - 1) != 0 {
             return None;
         }
-        let end = addr.checked_add(core::mem::size_of::<u32>())?;
-        let areas = self.areas.read();
         let start_vaddr = VirtAddr::from(addr);
-        let end_vaddr = VirtAddr::from(end);
-        let area = areas.iter().find(|area| {
-            area.vaddr_range.get_start() <= start_vaddr
-                && end_vaddr <= area.vaddr_range.get_end()
-        })?;
-        if !area.map_perm.contains(MapPermission::U)
-            || !area
-                .map_perm
-                .intersects(MapPermission::R | MapPermission::W)
-        {
-            return None;
-        }
         self.page_table.load_user_atomic_u32(start_vaddr)
     }
 
